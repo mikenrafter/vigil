@@ -6,7 +6,8 @@ calls one tool, `keepalive`, over and over. Each call returns the tick count,
 elapsed time, what changed, and what the watcher decided. The big model
 spends almost no inference while it waits, and its prompt cache stays warm.
 
-Written in Rust. Status: spec, phase 0 done (`FINDINGS.md`); not built.
+Written in Rust. Status: spec reviewed (round 1); phase 0 research in
+`FINDINGS.md`, its live-client checks still open (V28); not built.
 
 ## Why this exists
 
@@ -264,18 +265,22 @@ Failure rules:
 Files only, under `$XDG_STATE_HOME/vigil/` (default `~/.local/state/vigil/`).
 Nothing is written to the working tree, `$XDG_CONFIG_HOME` or any repository.
 
-- `watches/<id>.json`: the watch as created, plus `status`, `created_at`,
-  `deadline_at` (absolute UTC), `tick`, `last_tick_at`, per-input last hash
-  and file offset, `judge_strikes`, the events list (last 50), and
-  `delivered_through` (highest event tick already returned, so each event is
-  returned once).
+- `watches/<id>.json`: the watch as created (paths already absolute, see
+  V11), plus `status`, `created_at`, `deadline_at` (absolute UTC),
+  `finished_at`, `tick`, `last_tick_at`, per-input observation state (V9),
+  `judge_strikes`, the pending change (V14, R7), `last_digest`, and the
+  terminal events.
 - Writes are atomic: write `<id>.json.tmp` in the same directory, fsync,
   rename.
-- A tick holds an exclusive lock on `watches/<id>.lock` for the whole
-  read-modify-write, so two sessions on one watch cannot double-tick or lose
-  an update. The due-time check is repeated after taking the lock.
-- Finished watches (fired, expired, cancelled) are deleted 7 days after they
-  finish, by any `vigil` run.
+- **One lock for everything** (V4, V5): every mutation (create, tick,
+  cancel, prune) holds an exclusive `flock` on `$XDG_STATE_HOME/vigil/lock`
+  for its read-modify-write, and re-reads the watch after taking it. The lock
+  file is never deleted. Waiting for it counts against the call budget (V2).
+- Terminal states (fired, expired, cancelled) are immutable. The first one
+  written under the lock wins; a later cancel or tick on a finished watch
+  returns the stored result unchanged.
+- Finished watches are deleted 7 days after `finished_at`. A pending watch
+  past its deadline counts as expired with `finished_at = deadline_at` (V16).
 - Elapsed time survives restarts for free: `created_at` and `deadline_at` are
   in the file.
 
@@ -400,3 +405,70 @@ server that returns canned answers.
   newest first, cut to `VIGIL_JUDGE_STATE_BYTES`.
 - R8 `vigil wait` has no `--stream`: under D1 a watch fires once, so a stream
   would only ever print one event. Removed.
+
+## Spec review round 1 (Sol, 2026-10-29)
+
+These override anything above that disagrees.
+
+- V1 (was R1): the baseline is recorded at `watch_create`, not at the first
+  tick. A change between create and the first `keepalive` is a change.
+- V2 one call budget: a `keepalive` call ends by `max_s` measured on a
+  monotonic clock. Lock wait, every input read (`cmd`/`url`/`port` timeouts)
+  and the judge request (10 s) are each capped at the budget left. A tick that
+  cannot finish inside the budget writes nothing, so its change is not
+  consumed; the next call sees it again.
+- V3 (replaces `delivered_through`): under D1 the only events are terminal.
+  The terminal result is stored once and replayed unchanged on every later
+  `keepalive`, `wait` or `watch_status` for that id. Events carry a stable
+  `event_id` (`<watch_id>:<tick>`). Delivery is at least once.
+- V4/V5: see State (one global lock, never deleted; terminal immutable).
+- V6: any id that still has a file (pending or finished) cannot be reused.
+- V7/V2-scope: a no-id `keepalive` covers this process's pending watches plus
+  its finished watches whose terminal result this process has not yet
+  returned (an in-memory set, so a restart may replay once).
+- V8: the envelope has `watch_id`. Its watch fields all describe that watch:
+  the earliest-finished covered watch if any finished, else the one with the
+  nearest deadline (ties: lowest id).
+- V9 file changes are by position, not hash: the file input stores
+  `(dev, inode, size, mtime, offset)`. New bytes past `offset` are a change
+  (two identical appends are two changes). A different `(dev, inode)`, a
+  smaller size, or the same size with a new mtime means the file was replaced
+  or rewritten: reset `offset` to 0 and treat the last `tail_bytes` as new.
+  Other inputs keep hashing their reading.
+- V11 relative paths, glob patterns and `cmd` working directory are resolved
+  against the creating process's cwd at `watch_create` and stored absolute.
+- V12 capture limits: each input reads at most 64 KiB per tick (`cmd`
+  stdout+stderr combined, `url` body, `file` new bytes; the excess is
+  skipped and the reading says `[truncated]`); a glob reports at most 1000
+  matches; a watch has at most 16 inputs; `prompt` at most 1024 bytes.
+- V13 `cmd` runs in its own process group (setsid). On timeout, or when the
+  call is cancelled or dropped, the whole group gets SIGKILL and is reaped.
+- V14 digests: a pending envelope's `digest` is the content that changed
+  during this call (accumulated in memory, cut to `VIGIL_DIGEST_MAX_BYTES`),
+  empty if nothing changed. A terminal envelope's `digest` is `last_digest`.
+  Quiet returns never repeat earlier content.
+- V15 judge state: prompt first (at most 1024 bytes, V12), then the
+  observation budget (`VIGIL_JUDGE_STATE_BYTES` minus the prompt, at least
+  1536) split evenly across the changed inputs, each newest lines first.
+- V16: see State (overdue pending watches expire for pruning).
+- V17 process input: `watch_create` records the start time from
+  `/proc/<pid>/stat`. `exited` = pid gone, zombie (`Z`), or start time
+  differs (pid reused).
+- V18 MCP progress uses a call-local counter that only increases; per-watch
+  tick counts go in the progress message.
+- V19 create-time validation (errors, not clamps): judge probabilities and
+  `min_confidence` in 0..=1; `deadline_s` 1..=604800 (7 days);
+  `interval_s` clamped 1..=3600 (D10); `cmd.argv` non-empty;
+  `url` scheme http only (https and redirects to https are errors, D7);
+  `timeout_s` 0.1..=60.
+- V20 `next` has three exact wire values: `"call keepalive again"`,
+  `"act on events"`, `"watch ended; create a new watch if still needed"`.
+  Server instructions say: stop calling when `next` is not
+  `"call keepalive again"`.
+- V21: R8 applies; `--stream` tests are removed.
+- V26 D9: the envelope has `max_s` (the clamped ceiling used) and `waited_s`
+  (time actually waited). D10: `interval_s` default 20, clamped 1..=3600.
+- V27: `VIGIL_DIGEST_MAX_BYTES` bounds the whole digest including the
+  `[digest cut]` marker.
+- V28: live-client checks (FINDINGS "Still unverified") are an acceptance
+  gate, run on host-b before calling the clients compatible.
