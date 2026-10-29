@@ -420,7 +420,7 @@ These override anything above that disagrees.
 - V3 (replaces `delivered_through`): under D1 the only events are terminal.
   The terminal result is stored once and replayed unchanged on every later
   `keepalive`, `wait` or `watch_status` for that id. Events carry a stable
-  `event_id` (`<watch_id>:<tick>`). Delivery is at least once.
+  `event_id` (`<watch_id>:<tick>:<n>`, W1). Delivery is at least once.
 - V4/V5: see State (one global lock, never deleted; terminal immutable).
 - V6: any id that still has a file (pending or finished) cannot be reused.
 - V7/V2-scope: a no-id `keepalive` covers this process's pending watches plus
@@ -522,3 +522,13 @@ Round 2 was the last spec round; these are decisions, not open questions.
 - X6 (T1-T3, T6, T7) the red tests follow W1 (`:0` suffix), W6 exit codes,
   await MCP progress asynchronously, and test the W2/W3 floors and the W7
   cap through the engine.
+
+## Green-gate fixes (from the final red run)
+
+- X7 (X4 arithmetic): `timeout_s` is 0.1..=19, so the worst tick reserve is
+  19 + 10 (judge) + 1 = 30 s and fits the smallest call. Supersedes 20 in X4.
+  The tick reserve counts the judge timeout only for `fire = "judge"`;
+  `file`, `glob`, `process` inputs count 0, `url`/`port` count their timeout.
+- X8 (lock inode split): after taking a watch lock, compare the locked fd's
+  `(dev, inode)` with the lock path's; if they differ or the path is gone,
+  release and retry (bounded by the call budget).
