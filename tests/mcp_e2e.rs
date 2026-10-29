@@ -341,10 +341,10 @@ async fn a_cancelled_keepalive_stops_sensing_and_does_not_consume_a_finished_res
     //      notifications/cancelled but never drops the handler, so the
     //      cancelled call kept sensing and could mark a terminal result
     //      returned (V7) while rmcp discarded the response, hiding it from
-    //      later no-id calls. Setup: watch `f` is already finished (cancelled)
-    //      and unreturned; watch `s` has a command that hangs on a gate. A
-    //      no-id keepalive starts s's tick; the client then cancels the
-    //      request. The server must stop: s's command group dies, s's file is
+    //      later no-id calls. Setup: watch `s` has a command that hangs on a
+    //      gate. A no-id keepalive starts s's tick; watch `f` is then
+    //      cancelled (finished, unreturned) while the call is in flight; the
+    //      client then cancels the request. The server must stop: s's command group dies, s's file is
     //      untouched (tick 0). After the gate opens, a NEW no-id keepalive
     //      must still return f's terminal result (cancelled), because the
     //      cancelled call did not mark it returned.
@@ -357,13 +357,15 @@ async fn a_cancelled_keepalive_stops_sensing_and_does_not_consume_a_finished_res
     let peer = client.peer();
     assert_ne!(call(peer, "watch_create", watch_args("f", &input)).await.is_error, Some(true));
     assert_ne!(call(peer, "watch_create", gated_cmd_args("s", &gate, &pid_file)).await.is_error, Some(true));
-    assert_eq!(text_json(&call(peer, "watch_cancel", serde_json::json!({"watch_id": "f"})).await)["status"], "cancelled");
     std::fs::remove_file(&gate).unwrap();
     std::fs::remove_file(&pid_file).unwrap();
 
     let handle = start_call(peer, "keepalive", serde_json::json!({})).await;
     assert!(wait_until_async(Duration::from_secs(5), || pid_in(&pid_file) != 0).await, "s's tick never started");
     let cmd_pid = pid_in(&pid_file);
+    // f finishes while the call is in flight (review round 3: a watch already
+    // finished when a call starts is returned at once, before any tick).
+    assert_eq!(text_json(&call(peer, "watch_cancel", serde_json::json!({"watch_id": "f"})).await)["status"], "cancelled");
     handle.cancel(Some("test".into())).await.unwrap();
     assert!(
         wait_until_async(Duration::from_secs(3), || proc_is_dead(cmd_pid)).await,

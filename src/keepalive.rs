@@ -201,6 +201,14 @@ impl crate::engine::Vigil {
         let mut ticks_in_call = 0u64;
         let mut first_pass = true;
         loop {
+            // C12: a covered watch that is already terminal (finished before
+            // this call, or by another process) is returned before any round
+            // is awaited, so a held lock elsewhere cannot hold it back.
+            for id in covered {
+                if self.load_watch(id)?.status.is_finished() {
+                    return Ok(changed_in_call);
+                }
+            }
             let now = self.clock.now();
             let mut round: Vec<&WatchId> = Vec::new();
             for id in covered {
@@ -1690,6 +1698,32 @@ mod tests {
         assert_eq!((envelope.watch_id, envelope.status), (a, WatchStatus::Fired));
         drop(guard);
         assert_eq!(std::fs::read(vigil.store().watch_path(&b)).unwrap(), before, "the unfinished tick wrote nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_already_finished_before_the_call_is_not_held_back_by_a_locked_watch() {
+        // why: code review round 3, C12 still open: a round skips watches that
+        //      are terminal when the call starts, so with `a` already fired
+        //      (unreturned) and `b`'s lock held, the round held only `b` and
+        //      the ready result of `a` waited the whole 270 s. Covered terminal
+        //      results must be returned before any round is awaited.
+        // proves: CLAIM(call-budget)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:a", "v1");
+        env.reader.set_text("cmd:b", "same");
+        let a = scripted_watch(&vigil, "a", vec![cmd("a", Some(19.0))], 20).await;
+        let b = scripted_watch(&vigil, "b", vec![cmd("b", Some(19.0))], 20).await;
+        env.reader.set_text("cmd:a", "v2");
+        vigil.tick_due(&a).await.unwrap();
+        assert_eq!(vigil.store().load(&a).unwrap().status, WatchStatus::Fired, "precondition: a finished outside any keepalive");
+        let guard = env.vigil.store().lock_watch(&b).unwrap();
+
+        let started = Instant::now();
+        let envelope = vigil.keepalive(no_id(Some(270))).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(30), "the ready result waited {:?}", started.elapsed());
+        assert_eq!((envelope.watch_id, envelope.status), (a, WatchStatus::Fired));
+        drop(guard);
     }
 
     #[tokio::test(start_paused = true)]
