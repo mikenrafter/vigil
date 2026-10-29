@@ -721,3 +721,94 @@ fn wait_help_lists_every_exit_code() {
     }
     assert!(!help.contains("2 expired") && !help.contains("3 cancelled"), "stale round-2 codes in the help: {help}");
 }
+
+// ---- code review round 1: C9 (signals), C10 (prune never blocks) ----
+
+/// Start `vigil <args>` on a watch whose next tick hangs in a long-running
+/// child, signal vigil, and check it exits with `code` and takes the child's
+/// whole process group with it.
+fn signal_stops_vigil_and_its_command_group(args: &[&str], signal: &str, code: i32) {
+    let sandbox = Sandbox::new();
+    let (go, pid_file) = (sandbox.input("go"), sandbox.input("cmd.pid"));
+    let created = sandbox.run(&["create", &hanging_cmd_watch_json("w", &go, &pid_file)]);
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    std::fs::write(&go, "").unwrap();
+
+    let child = piped({
+        let mut command = sandbox.command();
+        command.args(args);
+        command
+    });
+    let vigil_pid = child.id();
+    let cmd_pid = wait_for_pid(&pid_file, Duration::from_secs(5));
+    assert!(!proc_is_dead(cmd_pid), "precondition: the command is running");
+    send_signal(signal, vigil_pid);
+
+    let output = finish_within(child, Duration::from_secs(2));
+    assert_eq!(output.status.code(), Some(code), "exit code after {signal}: {:?}", output.status);
+    assert!(
+        wait_until(Duration::from_secs(2), || proc_is_dead(cmd_pid)),
+        "the command's process group outlived vigil after {signal}"
+    );
+}
+
+#[test]
+fn sigterm_to_a_waiting_vigil_exits_143_and_kills_the_command_it_was_running() {
+    // why: code review C9: SIGTERM ended vigil without dropping its futures,
+    //      and command inputs run in their own session, so a stopped
+    //      background `vigil wait` left its command tree running with its
+    //      timeout gone. The binary now handles the signal: cancel active
+    //      work, let the command cleanup run, exit 143.
+    // proves: CLAIM(signal-cleanup)
+    signal_stops_vigil_and_its_command_group(&["wait", "w"], "-TERM", 143);
+}
+
+#[test]
+fn sigint_to_a_blocked_keepalive_exits_130_and_kills_the_command_it_was_running() {
+    // why: code review C9, same for Ctrl-C on `vigil keepalive`: exit 130.
+    // proves: CLAIM(signal-cleanup)
+    signal_stops_vigil_and_its_command_group(&["keepalive", "w", "--max-s", "30"], "-INT", 130);
+}
+
+#[tokio::test]
+async fn a_busy_global_lock_never_stops_housekeeping_from_letting_a_command_finish() {
+    // why: code review C10: the binary prunes before every command, and
+    //      prune waited on the global lock without limit, so one stale watch
+    //      plus a held global lock hung an otherwise instant `keepalive` on
+    //      an already finished watch. Prune now only try-locks the global
+    //      lock and skips what it cannot take. A stale finished watch (made
+    //      10 days ago with a manual clock) is the prune candidate, a fresh
+    //      cancelled one the watch asked about; the test holds the global
+    //      lock; the keepalive must exit 0 well inside the limit.
+    //      Control: the stale watch is still there afterwards (skipped, not
+    //      deleted), and is pruned once the lock is free.
+    // proves: CLAIM(prune-never-blocks)
+    use std::sync::Arc;
+    use vigil::testing::{change_request, default_config, ManualClock, ScriptedJudge};
+    let sandbox = Sandbox::new();
+    let now = vigil::Timestamp(chrono::Utc::now());
+    let clock = Arc::new(ManualClock::new(now.minus_secs(10 * 24 * 3600)));
+    let library = vigil::Vigil::new(sandbox.state_root(), clock.clone(), Arc::new(ScriptedJudge::new()), default_config());
+    let input = sandbox.input("a.log");
+    library.create(change_request("stale", &input, 20)).await.unwrap();
+    library.cancel(&vigil::WatchId::parse("stale").unwrap()).await.unwrap();
+    clock.set(now);
+    library.create(change_request("done", &input, 20)).await.unwrap();
+    library.cancel(&vigil::WatchId::parse("done").unwrap()).await.unwrap();
+
+    let store = vigil::Store::new(sandbox.state_root());
+    let global = store.lock().unwrap();
+    let child = piped({
+        let mut command = sandbox.command();
+        command.args(["keepalive", "done", "--max-s", "30"]);
+        command
+    });
+    let output = finish_within(child, Duration::from_secs(5));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(stdout_json(&output)["status"], "cancelled");
+    assert!(sandbox.watch_file("stale").is_some(), "control: prune skipped the candidate it could not lock");
+    drop(global);
+
+    assert!(sandbox.run(&["list"]).status.success());
+    assert!(sandbox.watch_file("stale").is_none(), "control: pruned once the lock is free");
+}

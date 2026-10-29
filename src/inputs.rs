@@ -151,8 +151,11 @@ fn settle(label: String, previous: &InputState, observed: Observed, proc_start: 
 
 fn read_file(label: String, path: &Path, tail_bytes: Option<u64>, previous: &InputState) -> Reading {
     match read_file_position(path, tail_bytes, previous) {
-        Ok((text, state)) => {
-            let changed = !is_baseline(previous) && !text.is_empty();
+        Ok((text, state, restarted)) => {
+            // C3: a change is new bytes OR a position/identity/error-recovery
+            // transition (the read restarted at 0), whatever the length.
+            let changed = !is_baseline(previous) && (restarted || !text.is_empty());
+            let text = if changed && text.is_empty() { EMPTY_FILE_NOTE.to_string() } else { text };
             Reading { label, text, changed, is_error: false, want_met: None, state }
         }
         Err(error) => {
@@ -166,15 +169,26 @@ fn read_file(label: String, path: &Path, tail_bytes: Option<u64>, previous: &Inp
     }
 }
 
+/// What a file reading says when the file changed but holds no new text
+/// (created empty, truncated to empty, replaced by an empty file).
+const EMPTY_FILE_NOTE: &str = "[file is empty]";
+
+/// `open(2)` flag `O_NONBLOCK`: the same value on Linux x86_64 and aarch64.
+const O_NONBLOCK: i32 = 0o4000;
+
+/// The new text, the state to persist, and whether the read restarted at 0
+/// (the file was replaced, shrunk, rewritten, or came back from an error).
 fn read_file_position(
     path: &Path,
     tail_bytes: Option<u64>,
     previous: &InputState,
-) -> std::io::Result<(String, InputState)> {
+) -> std::io::Result<(String, InputState, bool)> {
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let mut file = std::fs::File::open(path)?;
+    // C8: a FIFO with no writer blocks a plain open(2) forever, so open
+    // nonblocking, look at what it is, and refuse anything but a regular file.
+    let mut file = std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::other("not a regular file"));
@@ -190,15 +204,15 @@ fn read_file_position(
     let baseline = is_baseline(previous);
     // V9: where reading starts. A replaced, shrunk or rewritten file restarts
     // at 0; a plain append continues at the stored offset.
-    let start = match (&previous.file, previous.offset) {
-        _ if baseline => stamp.size,
+    let (start, restarted) = match (&previous.file, previous.offset) {
+        _ if baseline => (stamp.size, false),
         (Some(old), Some(offset)) => {
             let replaced = (old.dev, old.ino) != (stamp.dev, stamp.ino);
             let shrunk = stamp.size < old.size;
             let rewritten = stamp.size == old.size && (old.mtime_secs, old.mtime_nanos) != (stamp.mtime_secs, stamp.mtime_nanos);
-            if replaced || shrunk || rewritten { 0 } else { offset.min(stamp.size) }
+            if replaced || shrunk || rewritten { (0, true) } else { (offset.min(stamp.size), false) }
         }
-        _ => 0, // recovered from a read error: everything is new
+        _ => (0, true), // recovered from a read error: everything is new
     };
 
     let new_len = stamp.size - start;
@@ -215,7 +229,7 @@ fn read_file_position(
         text = format!("{TRUNCATED_MARKER}\n{text}");
     }
     let state = InputState { offset: Some(stamp.size), file: Some(stamp), ..InputState::default() };
-    Ok((if baseline { String::new() } else { text }, state))
+    Ok((if baseline { String::new() } else { text }, state, restarted))
 }
 
 // ---- glob (V12, X2) ----
@@ -302,6 +316,16 @@ impl Capture {
     }
 }
 
+impl Capture {
+    /// This capture followed by `next`, together at most `MAX_CAPTURE_BYTES`
+    /// (V12): `next` gets whatever room is left.
+    fn then(mut self, next: Capture) -> Capture {
+        self.push(&next.bytes);
+        self.truncated |= next.truncated;
+        self
+    }
+}
+
 /// Reap a leader that was just SIGKILLed. Polls `try_wait` with short
 /// blocking sleeps instead of awaiting the exit: a SIGKILL takes effect in
 /// well under a millisecond, and awaiting real process I/O here would let a
@@ -356,7 +380,9 @@ async fn observe_cmd(argv: &[String], timeout_s: Option<f64>, cwd: Option<&Path>
         return Observed::error(format!("cannot capture output of {program}"));
     };
 
-    let mut capture = Capture::default();
+    // C4: the streams are captured apart and assembled stdout, then stderr,
+    // so the text never depends on which pipe `select!` polled first.
+    let (mut out_capture, mut err_capture) = (Capture::default(), Capture::default());
     let mut exit = None;
     let run = async {
         let (mut out_buf, mut err_buf) = ([0u8; 8192], [0u8; 8192]);
@@ -373,11 +399,11 @@ async fn observe_cmd(argv: &[String], timeout_s: Option<f64>, cwd: Option<&Path>
                 }
                 n = read_chunk(&mut stdout, &mut out_buf), if out_open => match n {
                     0 => out_open = false,
-                    n => capture.push(&out_buf[..n]),
+                    n => out_capture.push(&out_buf[..n]),
                 },
                 n = read_chunk(&mut stderr, &mut err_buf), if err_open => match n {
                     0 => err_open = false,
-                    n => capture.push(&err_buf[..n]),
+                    n => err_capture.push(&err_buf[..n]),
                 },
                 () = tokio::time::sleep_until(drain_until.unwrap_or_else(tokio::time::Instant::now)), if drain_until.is_some() => break,
             }
@@ -402,6 +428,7 @@ async fn observe_cmd(argv: &[String], timeout_s: Option<f64>, cwd: Option<&Path>
         Some(Err(error)) => return Observed::error(format!("cannot wait for {program}: {error}")),
         None => return Observed::error(format!("{program} did not exit")),
     };
+    let capture = out_capture.then(err_capture);
     let mut text = format!("exit={code}\n{}", String::from_utf8_lossy(&capture.bytes));
     if capture.truncated {
         text.push_str(&format!("\n{TRUNCATED_MARKER}"));
@@ -1335,5 +1362,144 @@ mod tests {
         assert!(mismatch.changed);
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    // ---- code review round 1: C3, C4, C8 ----
+
+    #[tokio::test]
+    async fn a_missing_file_that_appears_empty_is_a_change() {
+        // why: code review C3: file `changed` came from nonempty text, so a
+        //      watch on a not-yet-existing completion file never fired when
+        //      the file was created EMPTY (touch done.flag). Recovering from
+        //      a read error is a transition and must be a change whatever the
+        //      length. Controls: while still missing, a repeated identical
+        //      error is quiet; once present and empty, a further read is quiet.
+        // proves: CLAIM(positional-file-change)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("done.flag");
+        let input = file_input(&path, None);
+        let baseline = read_input(&input, &InputState::default()).await;
+        assert!(baseline.is_error && !baseline.changed, "baseline of a missing file is an error reading");
+        let still_missing = read_input(&input, &baseline.state).await;
+        assert!(!still_missing.changed, "control: the same error again is not a change");
+
+        write_file(&path, "");
+        let created = read_input(&input, &still_missing.state).await;
+        assert!(!created.is_error);
+        assert!(created.changed, "a file created empty is a change");
+        let quiet = read_input(&input, &created.state).await;
+        assert!(!quiet.changed, "control: nothing happened since");
+    }
+
+    #[tokio::test]
+    async fn truncating_a_file_to_empty_is_a_change() {
+        // why: code review C3: truncation to empty resets the position to 0
+        //      and yields no new text, which was silently consumed. A shrink
+        //      is a position transition and is a change. Control: an empty
+        //      file that stays empty is quiet.
+        // proves: CLAIM(positional-file-change)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        write_file(&path, "old\n");
+        let input = file_input(&path, None);
+        let baseline = read_input(&input, &InputState::default()).await;
+
+        write_file(&path, "");
+        let truncated = read_input(&input, &baseline.state).await;
+        assert!(truncated.changed, "truncation to empty is a change");
+        assert!(!truncated.is_error);
+        let quiet = read_input(&input, &truncated.state).await;
+        assert!(!quiet.changed, "control: the emptied file stays quiet");
+    }
+
+    #[tokio::test]
+    async fn replacing_a_file_with_an_empty_file_is_a_change() {
+        // why: code review C3: a new inode (rotation, rename-over) holding no
+        //      bytes yet is an identity transition; it was consumed silently.
+        // proves: CLAIM(positional-file-change)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        write_file(&path, "old\n");
+        let input = file_input(&path, None);
+        let baseline = read_input(&input, &InputState::default()).await;
+
+        let replacement = dir.path().join("a.log.new");
+        write_file(&replacement, "");
+        std::fs::rename(&replacement, &path).unwrap();
+        let replaced = read_input(&input, &baseline.state).await;
+        assert!(replaced.changed, "replacement by an empty file is a change");
+        let quiet = read_input(&input, &replaced.state).await;
+        assert!(!quiet.changed, "control: the replacement stays quiet");
+    }
+
+    #[tokio::test]
+    async fn a_command_writing_to_both_streams_reads_identically_every_time() {
+        // why: code review C4: stdout and stderr were appended to one buffer
+        //      in whichever order `select!` happened to poll them, so
+        //      `echo out; echo err >&2` produced "out,err" on one tick and
+        //      "err,out" on the next: a different hash, a false change that
+        //      fires fire=change watches. Streams are captured separately and
+        //      assembled stdout then stderr. 40 reads, none may be a change,
+        //      and the text is the stable order every time.
+        // proves: CLAIM(cmd-capture)
+        let input = Input::Cmd {
+            argv: vec!["sh".into(), "-c".into(), "echo out; echo err >&2".into()],
+            timeout_s: Some(5.0),
+            cwd: None,
+        };
+        let mut state = read_input(&input, &InputState::default()).await.state;
+        for round in 0..40 {
+            let reading = read_input(&input, &state).await;
+            assert_eq!(reading.text, "exit=0\nout\nerr\n", "round {round}");
+            assert!(!reading.changed, "round {round}: an unchanged command must not be a change");
+            state = reading.state;
+        }
+
+        // Arrival order must not matter: here stderr is written (and read)
+        // first, 100 ms before stdout, yet stdout still comes first.
+        let late_stdout = Input::Cmd {
+            argv: vec!["sh".into(), "-c".into(), "echo err >&2; sleep 0.1; echo out".into()],
+            timeout_s: Some(5.0),
+            cwd: None,
+        };
+        let reading = read_input(&late_stdout, &InputState::default()).await;
+        assert_eq!(reading.text, "exit=0\nout\nerr\n", "stdout first, then stderr, whatever arrived first");
+    }
+
+    unsafe extern "C" {
+        fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> i32;
+    }
+
+    #[test]
+    fn a_fifo_with_no_writer_is_an_input_error_and_never_blocks_the_read() {
+        // why: code review C8: `File::open` on a FIFO with no writer blocks
+        //      in open(2) before the regular-file check runs, and enough of
+        //      them occupy every Tokio worker so budget timers and
+        //      cancellation never fire. Inputs open O_NONBLOCK, fstat, and
+        //      reject a non-regular file as an input error before reading it.
+        //      The path first holds a regular file (baseline), then becomes a
+        //      FIFO: the read must come back within the limit, as an error
+        //      reading that is a change. The read runs on its own thread so a
+        //      regression fails this test instead of hanging the suite.
+        // proves: CLAIM(input-error-as-change)
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe");
+        write_file(&path, "old\n");
+        let input = file_input(&path, None);
+        let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let baseline = runtime().block_on(read_input(&input, &InputState::default()));
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(runtime().block_on(read_input(&input, &baseline.state)));
+        });
+        let reading = receiver.recv_timeout(Duration::from_secs(5)).expect("the read of a writer-less FIFO blocked");
+        assert!(reading.is_error, "{reading:?}");
+        assert!(reading.changed, "regular file -> FIFO is an error-as-change: {reading:?}");
+        assert!(reading.text.contains("not a regular file"), "{}", reading.text);
     }
 }

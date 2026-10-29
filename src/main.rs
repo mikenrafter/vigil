@@ -43,15 +43,40 @@ enum Command {
     Wait { id: String },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
-    match run(cli).await {
-        Ok(()) => {}
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("cannot start the async runtime");
+    let code = runtime.block_on(async_main(cli));
+    // C9: shutting the runtime down drops every task that is still running,
+    // and with them the reads whose drop SIGKILLs a command's process group.
+    // The timeout only bounds threads stuck in blocking I/O (stdin); nothing
+    // needs them.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+    std::process::exit(code);
+}
+
+/// Run the command; SIGINT or SIGTERM cancels it (C9): the command's future is
+/// dropped here, `main` then shuts the runtime down so command cleanup runs,
+/// and the process exits 130 (SIGINT) or 143 (SIGTERM).
+async fn async_main(cli: Cli) -> i32 {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut interrupt, mut terminate) = match (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
+        (Ok(interrupt), Ok(terminate)) => (interrupt, terminate),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("error: cannot handle signals: {error}");
+            return 1;
         }
+    };
+    tokio::select! {
+        result = run(cli) => match result {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("error: {error}");
+                1
+            }
+        },
+        _ = interrupt.recv() => 130,
+        _ = terminate.recv() => 143,
     }
 }
 
@@ -73,7 +98,8 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+/// The process exit code on success.
+async fn run(cli: Cli) -> anyhow::Result<i32> {
     let vigil = build_vigil(cli.root)?;
     // D4: finished watches are deleted 7 days after they finish, by any run.
     // Housekeeping must not turn a working command into a failing one.
@@ -89,23 +115,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             };
             let request: CreateRequest = serde_json::from_str(&raw).map_err(|error| anyhow::anyhow!("invalid watch JSON: {error}"))?;
-            print_json(&vigil.create(request).await?)
+            print_json(&vigil.create(request).await?)?;
+            Ok(0)
         }
-        Command::Status { id } => print_json(&vigil.status(&WatchId::parse(&id)?).await?),
-        Command::List => print_json(&vigil.list().await?),
-        Command::Cancel { id } => print_json(&vigil.cancel(&WatchId::parse(&id)?).await?),
+        Command::Status { id } => print_json(&vigil.status(&WatchId::parse(&id)?).await?).map(|()| 0),
+        Command::List => print_json(&vigil.list().await?).map(|()| 0),
+        Command::Cancel { id } => print_json(&vigil.cancel(&WatchId::parse(&id)?).await?).map(|()| 0),
         Command::Keepalive { id, max_s } => {
             let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s };
-            print_json(&vigil.keepalive(request).await?)
+            print_json(&vigil.keepalive(request).await?)?;
+            Ok(0)
         }
         Command::Wait { id } => {
             let envelope = vigil.wait(&WatchId::parse(&id)?).await?;
             print_json(&envelope)?;
-            if let Some(code) = wait_exit_code(&envelope) {
-                std::process::exit(code);
-            }
-            Ok(())
+            Ok(wait_exit_code(&envelope).unwrap_or(0))
         }
-        Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil)).await,
+        Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil)).await.map(|()| 0),
     }
 }

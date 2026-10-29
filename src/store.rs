@@ -162,6 +162,20 @@ impl Store {
             Err(std::fs::TryLockError::Error(error)) => Err(io_error(error)),
         }
     }
+    /// `try_lock`, retried until `end`: a lock released a moment ago can look
+    /// held while a forked child that has not yet exec'd still shares its open
+    /// file description. `Ok(None)` once `end` has passed and it is still held.
+    fn try_lock_until(&self, end: std::time::Instant) -> Result<Option<StoreLock>, StoreError> {
+        loop {
+            if let Some(lock) = self.try_lock()? {
+                return Ok(Some(lock));
+            }
+            if std::time::Instant::now() >= end {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
     /// Block until the exclusive lock of watch `id` is held (creates
     /// `locks/` and `locks/<id>.lock` on demand). Independent of the global
     /// lock and of every other watch's lock (X3).
@@ -197,10 +211,13 @@ impl Store {
     /// the global lock, re-checks the candidate under both, deletes the watch
     /// file, THEN that watch's lock file, and releases. A candidate whose
     /// watch lock is held by someone else is skipped or waited for (either is
-    /// allowed) but never deleted while held. The global lock file is never
+    /// allowed) but never deleted while held. A busy global lock also skips
+    /// the candidate (C10): prune only try-locks, so housekeeping never
+    /// blocks the command that runs it. The global lock file is never
     /// deleted. Returns the deleted ids.
     pub fn prune(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
         let mut deleted = Vec::new();
+        let patience_ends = std::time::Instant::now() + PRUNE_LOCK_PATIENCE;
         for candidate in self.list()? {
             if !is_prunable(&candidate, now) {
                 continue;
@@ -211,7 +228,11 @@ impl Store {
             let Some(_watch_lock) = self.try_lock_watch(&id)? else {
                 continue;
             };
-            let _global_lock = self.lock()?;
+            // Housekeeping never blocks (C10): a busy global lock means
+            // someone is reserving an id; leave this candidate for the next run.
+            let Some(_global_lock) = self.try_lock_until(patience_ends)? else {
+                continue;
+            };
             // Re-check under both locks: the file may have changed since list().
             match self.load(&id) {
                 Ok(current) if is_prunable(&current, now) => {}
@@ -224,6 +245,10 @@ impl Store {
         Ok(deleted)
     }
 }
+
+/// How long one `prune` call waits, in total, for a busy global lock before it
+/// skips the candidates it cannot lock (C10).
+const PRUNE_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// D4/V16: a finished watch, or a pending one past its deadline, is prunable
 /// once its finish time (`finished_at`, else `deadline_at`) is 7 days old.

@@ -4,10 +4,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData, Peer, RoleServer, ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
+    service::RequestContext,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, MetaObject, ProgressNotificationParam, ProtocolVersion, RequestMetaObject,
+        CallToolResult, ContentBlock, MetaObject, ProgressNotificationParam, ProtocolVersion,
         ServerCapabilities, ServerConfig,
     },
     schemars, tool, tool_handler, tool_router,
@@ -94,6 +95,57 @@ impl ProgressSink for ChannelProgress {
     }
 }
 
+/// How long queued progress may still be flushed once the engine has
+/// returned, and only as far as the call's own `max_s` allows.
+const PROGRESS_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Run a keepalive call, handing each progress update to `notify`, and stop
+/// when `cancel` completes (`Ok(None)`, C2). Progress is best effort (C11): a
+/// notification that cannot be delivered never holds up the result. When the
+/// engine returns, forwarding is dropped after a short flush of what is
+/// already queued, which never reaches past the call's `max_s`.
+async fn run_keepalive<N, F>(
+    vigil: &Vigil,
+    request: KeepaliveRequest,
+    cancel: impl std::future::Future<Output = ()>,
+    mut notify: N,
+) -> Result<Option<crate::envelope::Envelope>, VigilError>
+where
+    N: FnMut(ProgressUpdate) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let call_end = tokio::time::Instant::now() + std::time::Duration::from_secs(crate::keepalive::clamp_max_s(request.max_s));
+    let (sender, mut updates) = mpsc::unbounded_channel::<ProgressUpdate>();
+    let outcome = {
+        let sink = ChannelProgress(sender);
+        let run = vigil.keepalive_cancellable(request, &sink, cancel);
+        let forward = async {
+            while let Some(update) = updates.recv().await {
+                notify(update).await;
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            biased;
+            outcome = run => outcome,
+            () = forward => unreachable!("the forwarder never completes"),
+        }
+    };
+    // The sender went with `run`; what is queued can still be sent, briefly.
+    let flush = PROGRESS_FLUSH.min(call_end.saturating_duration_since(tokio::time::Instant::now()));
+    let _ = tokio::time::timeout(flush, async {
+        while let Some(update) = updates.recv().await {
+            notify(update).await;
+        }
+    })
+    .await;
+    outcome
+}
+
+fn cancelled_result() -> CallToolResult {
+    text_result(true, "cancelled".to_string())
+}
+
 #[derive(Clone)]
 pub struct VigilServer {
     vigil: Arc<Vigil>,
@@ -138,12 +190,17 @@ impl VigilServer {
     }
 
     #[tool(description = "Create a watch: inputs to sense, an interval, a deadline, and a fire rule (judge, change or condition). No tick runs until keepalive.")]
-    async fn watch_create(&self, Parameters(args): Parameters<CreateArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn watch_create(&self, Parameters(args): Parameters<CreateArgs>, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
         let request = serde_json::to_value(&args)
             .and_then(serde_json::from_value::<CreateRequest>)
             .map_err(|error| format!("invalid watch: {error}"));
         Ok(match request {
-            Ok(request) => reply(self.vigil.create(request).await),
+            // C2: a cancelled create stops reading its baseline.
+            Ok(request) => tokio::select! {
+                biased;
+                () = ctx.ct.cancelled() => cancelled_result(),
+                created = self.vigil.create(request) => reply(created),
+            },
             Err(message) => text_result(true, message),
         })
     }
@@ -155,30 +212,31 @@ impl VigilServer {
     async fn keepalive(
         &self,
         Parameters(args): Parameters<KeepaliveArgs>,
-        meta: RequestMetaObject,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let watch_id = match args.watch_id.as_deref().map(parse_id).transpose() {
             Ok(id) => id,
             Err(error) => return Ok(reply::<()>(Err(error))),
         };
         let request = KeepaliveRequest { watch_id, max_s: args.max_s };
-        let (sender, mut updates) = mpsc::unbounded_channel::<ProgressUpdate>();
-        let token = meta.get_progress_token();
-        let forward = async {
-            while let Some(update) = updates.recv().await {
-                if let Some(token) = &token {
-                    let notice = ProgressNotificationParam::new(token.clone(), update.progress as f64)
+        let token = ctx.meta.get_progress_token();
+        let outcome = run_keepalive(&self.vigil, request, ctx.ct.cancelled(), |update| {
+            let peer = ctx.peer.clone();
+            let token = token.clone();
+            async move {
+                if let Some(token) = token {
+                    let notice = ProgressNotificationParam::new(token, update.progress as f64)
                         .with_message(format!("{} tick {}", update.watch_id, update.tick));
                     let _ = peer.notify_progress(notice).await;
                 }
             }
-        };
-        let run = async { self.vigil.keepalive_with_progress(request, &ChannelProgress(sender)).await };
-        // The sink (and its sender) is dropped when `run` ends, which ends
-        // `forward` after it has flushed what was queued.
-        let (outcome, ()) = tokio::join!(run, forward);
-        Ok(reply(outcome))
+        })
+        .await;
+        Ok(match outcome {
+            Ok(None) => cancelled_result(),
+            Ok(Some(envelope)) => reply(Ok(envelope)),
+            Err(error) => reply::<()>(Err(error)),
+        })
     }
 
     #[tool(description = "Non-blocking: the current envelope of one watch, plus judge reachability. Does not tick.")]
@@ -238,5 +296,33 @@ mod tests {
             assert!(text.contains(needle), "instructions must mention {needle:?}: {text}");
         }
         assert!(text.to_lowercase().contains("stop"), "must say when to stop: {text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_that_never_delivers_cannot_delay_the_result_past_max_s() {
+        // why: code review C11: the handler joined the engine call with the
+        //      progress forwarder, and `notify_progress` awaits transport
+        //      completion, so a stalled client (backpressure) held the result
+        //      past max_s. Progress is best effort: when the engine returns,
+        //      forwarding is stopped and dropped. The notifier here never
+        //      completes; a quiet watch ticks at 0 s and 20 s, so progress is
+        //      produced and blocks. The call must still return at exactly 30 s
+        //      (virtual time; the outer 60 s timeout only turns a regression
+        //      into a failure instead of a hang).
+        // proves: CLAIM(call-budget)
+        use crate::testing::*;
+        let env = Env::with_clock(std::sync::Arc::new(TokioClock::new(spec_instant())));
+        let path = env.input_path("w.log");
+        write_file(&path, "old\n");
+        env.vigil.create(change_request("w", &path, 20)).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let call = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30) }, std::future::pending::<()>(), |_update| std::future::pending::<()>());
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(60), call)
+            .await
+            .expect("the result was held back by a progress notification that never completes")
+            .unwrap()
+            .expect("not cancelled");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
+        assert_eq!(envelope.status, crate::watch::WatchStatus::Pending);
     }
 }

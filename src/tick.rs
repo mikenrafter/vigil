@@ -19,6 +19,9 @@ pub enum TickOutcome {
     /// The watch is finished (fired, expired, cancelled), possibly just now
     /// because the deadline passed.
     Finished(WatchStatus),
+    /// The call budget ran out before the tick could commit; nothing was
+    /// written (V2).
+    OutOfBudget,
 }
 
 /// What one `tick_report` call did, for callers (the keepalive loop) that
@@ -52,6 +55,19 @@ impl Vigil {
 
     /// `tick_due` plus the content the tick found changed.
     pub async fn tick_report(&self, id: &WatchId) -> Result<TickReport, VigilError> {
+        self.tick_report_until(id, None).await
+    }
+
+    /// `tick_report` inside a call budget.
+    pub(crate) async fn tick_report_until(
+        &self,
+        id: &WatchId,
+        budget_end: Option<tokio::time::Instant>,
+    ) -> Result<TickReport, VigilError> {
+        // C5: the budget is checked by the tick itself, right before it
+        // persists. `timeout_at` alone polls the inner future first, so a tick
+        // resumed after the budget with its readings ready would still write.
+        let out_of_budget = || budget_end.is_some_and(|end| tokio::time::Instant::now() > end);
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
 
@@ -60,6 +76,9 @@ impl Vigil {
         }
         if watch.is_overdue(now) {
             // R5: expiry runs no final tick and adds no event.
+            if out_of_budget() {
+                return Ok(TickReport::without_changes(TickOutcome::OutOfBudget));
+            }
             let expired = expired_if_overdue(watch, now);
             self.store.save(&expired)?;
             return Ok(TickReport::without_changes(TickOutcome::Finished(expired.status)));
@@ -70,6 +89,7 @@ impl Vigil {
 
         // A placeholder left by a create that died before its baseline has
         // fewer states than inputs; the missing ones start as baselines.
+        let unticked = watch.clone();
         let mut states = watch.input_states.clone();
         states.resize(watch.spec.inputs.len(), InputState::default());
         let readings = self.read_all(&watch.spec.inputs, &states).await;
@@ -95,6 +115,19 @@ impl Vigil {
                 }
             }
         };
+
+        // Sensing and judging took time. Past the call budget nothing is
+        // written (C5); past the watch's deadline the watch expires instead of
+        // firing on a late result (C6, R5: no event, finished at the deadline).
+        if out_of_budget() {
+            return Ok(TickReport::without_changes(TickOutcome::OutOfBudget));
+        }
+        let after = self.clock.now();
+        if unticked.is_overdue(after) {
+            let expired = expired_if_overdue(unticked, after);
+            self.store.save(&expired)?;
+            return Ok(TickReport::without_changes(TickOutcome::Finished(expired.status)));
+        }
 
         watch.tick = tick;
         watch.last_tick_at = Some(now);
@@ -1505,5 +1538,37 @@ mod tests {
             }
         }
         out
+    }
+
+    // ---- C5: no write after the call budget ----
+
+    #[tokio::test]
+    async fn a_tick_whose_budget_is_already_spent_when_it_would_commit_writes_nothing() {
+        // why: code review C5: `timeout_at` polls the inner future first, so a
+        //      tick that resumed after the budget with its readings ready
+        //      could still save offsets and events. The tick itself must check
+        //      the monotonic budget deadline immediately before it persists.
+        //      Here the deadline is already in the past when the (instant)
+        //      readings are ready: the change is on disk waiting, the tick
+        //      must report OutOfBudget and leave the watch file byte-for-byte
+        //      as it was, so the change is not consumed. Control: with a
+        //      deadline in the future the same tick commits and fires.
+        // proves: CLAIM(call-budget)
+        let f = fixture();
+        let (id, path) = f.baselined_change_watch("w").await;
+        append_file(&path, "ERROR: ready but too late\n");
+        f.clock.advance_secs(20);
+        let before = std::fs::read(f.env.vigil.store().watch_path(&id)).unwrap();
+
+        let spent = tokio::time::Instant::now() - Duration::from_secs(1);
+        let report = f.env.vigil.tick_report_until(&id, Some(spent)).await.unwrap();
+        assert_eq!(report.outcome, TickOutcome::OutOfBudget);
+        assert!(report.changed.is_empty());
+        assert_eq!(std::fs::read(f.env.vigil.store().watch_path(&id)).unwrap(), before, "an out-of-budget tick writes nothing");
+
+        let open = tokio::time::Instant::now() + Duration::from_secs(60);
+        let report = f.env.vigil.tick_report_until(&id, Some(open)).await.unwrap();
+        assert_eq!(report.outcome, TickOutcome::Ticked, "control: inside the budget the change is still there");
+        assert_eq!(f.load(&id).status, WatchStatus::Fired);
     }
 }

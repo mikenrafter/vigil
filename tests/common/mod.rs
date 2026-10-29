@@ -229,3 +229,36 @@ pub fn finish_within(mut child: std::process::Child, limit: Duration) -> Output 
     }
     child.wait_with_output().unwrap()
 }
+
+/// Dead = gone, or a zombie waiting for someone else to reap it. Read from
+/// /proc, independent of the code under test.
+pub fn proc_is_dead(pid: u32) -> bool {
+    let Ok(line) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return true };
+    line.rfind(')').and_then(|end| line[end + 1..].trim_start().chars().next()).is_none_or(|state| state == 'Z')
+}
+
+/// A watch whose only input is a command that, once `go` exists, records its
+/// pid in `pid_file` and sleeps 60 s (otherwise it prints `ok` at once). The
+/// create-time baseline runs without `go`, so create returns promptly; the
+/// test then creates `go` to make the next tick hang in a long-lived child.
+pub fn hanging_cmd_watch_json(id: &str, go: &Path, pid_file: &Path) -> String {
+    let script = format!("if [ -e '{}' ]; then echo $$ > '{}'; sleep 60; fi; echo ok", go.display(), pid_file.display());
+    serde_json::json!({
+        "id": id,
+        "inputs": [{"kind": "cmd", "argv": ["sh", "-c", script], "timeout_s": 19}],
+        "interval_s": 1,
+        "deadline_s": 3600,
+        "fire": "change"
+    })
+    .to_string()
+}
+
+/// Wait for a pid file written by a test command and parse it.
+pub fn wait_for_pid(pid_file: &Path, limit: Duration) -> u32 {
+    assert!(wait_until(limit, || std::fs::read_to_string(pid_file).is_ok_and(|text| text.trim().parse::<u32>().is_ok())), "no pid in {}", pid_file.display());
+    std::fs::read_to_string(pid_file).unwrap().trim().parse().unwrap()
+}
+
+pub fn send_signal(signal: &str, pid: u32) {
+    assert!(Command::new("kill").args([signal, &pid.to_string()]).status().unwrap().success());
+}

@@ -310,3 +310,110 @@ async fn a_blocked_keepalive_emits_a_strictly_increasing_counter_with_the_watch_
     }
     client.cancel().await.unwrap();
 }
+
+// ---- code review round 1: C2 (cancellation), C9 (signals) ----
+
+/// Send `tools/call` and keep the request handle, so the test can send
+/// `notifications/cancelled` for it later.
+async fn start_call(peer: &Peer<RoleClient>, tool: &'static str, arguments: serde_json::Value) -> rmcp::service::RequestHandle<RoleClient> {
+    use rmcp::model::{CallToolRequest, ClientRequest};
+    use rmcp::service::PeerRequestOptions;
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(tool).with_arguments(args(arguments))));
+    peer.send_cancellable_request(request, PeerRequestOptions::no_options()).await.unwrap()
+}
+
+/// The pid a test command wrote, or 0 while the file is absent or partial.
+fn pid_in(pid_file: &std::path::Path) -> u32 {
+    std::fs::read_to_string(pid_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
+/// A cmd watch input whose reads wait until `gate` exists, writing its pid
+/// first. With `gate` present it just prints `ok`.
+fn gated_cmd_args(id: &str, gate: &std::path::Path, pid_file: &std::path::Path) -> serde_json::Value {
+    let script = format!("echo $$ > '{}'; while [ ! -e '{}' ]; do sleep 0.05; done; echo ok", pid_file.display(), gate.display());
+    serde_json::json!({"id": id, "inputs": [{"kind": "cmd", "argv": ["sh", "-c", script], "timeout_s": 19}],
+        "interval_s": 1, "deadline_s": 3600, "fire": "change"})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_keepalive_stops_sensing_and_does_not_consume_a_finished_result() {
+    // why: code review C2: rmcp signals `RequestContext.ct` on
+    //      notifications/cancelled but never drops the handler, so the
+    //      cancelled call kept sensing and could mark a terminal result
+    //      returned (V7) while rmcp discarded the response, hiding it from
+    //      later no-id calls. Setup: watch `f` is already finished (cancelled)
+    //      and unreturned; watch `s` has a command that hangs on a gate. A
+    //      no-id keepalive starts s's tick; the client then cancels the
+    //      request. The server must stop: s's command group dies, s's file is
+    //      untouched (tick 0). After the gate opens, a NEW no-id keepalive
+    //      must still return f's terminal result (cancelled), because the
+    //      cancelled call did not mark it returned.
+    // proves: CLAIM(cancel-stops-work)
+    let sandbox = Sandbox::new();
+    let (input, gate, pid_file) = (sandbox.input("f.log"), sandbox.input("gate"), sandbox.input("s.pid"));
+    std::fs::write(&input, "boot\n").unwrap();
+    std::fs::write(&gate, "").unwrap();
+    let (client, _) = connect(&sandbox).await;
+    let peer = client.peer();
+    assert_ne!(call(peer, "watch_create", watch_args("f", &input)).await.is_error, Some(true));
+    assert_ne!(call(peer, "watch_create", gated_cmd_args("s", &gate, &pid_file)).await.is_error, Some(true));
+    assert_eq!(text_json(&call(peer, "watch_cancel", serde_json::json!({"watch_id": "f"})).await)["status"], "cancelled");
+    std::fs::remove_file(&gate).unwrap();
+    std::fs::remove_file(&pid_file).unwrap();
+
+    let handle = start_call(peer, "keepalive", serde_json::json!({})).await;
+    assert!(wait_until_async(Duration::from_secs(5), || pid_in(&pid_file) != 0).await, "s's tick never started");
+    let cmd_pid = pid_in(&pid_file);
+    handle.cancel(Some("test".into())).await.unwrap();
+    assert!(
+        wait_until_async(Duration::from_secs(3), || proc_is_dead(cmd_pid)).await,
+        "the cancelled call kept sensing: s's command is still running"
+    );
+    assert_eq!(sandbox.watch_file("s").unwrap()["tick"], 0, "the cancelled call wrote nothing");
+
+    std::fs::write(&gate, "").unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(5), call(peer, "keepalive", serde_json::json!({})))
+        .await
+        .expect("a fresh no-id keepalive should return f's result");
+    let envelope = text_json(&next);
+    assert_eq!(envelope["watch_id"], "f", "{envelope}");
+    assert_eq!(envelope["status"], "cancelled", "{envelope}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_watch_create_stops_reading_its_baseline() {
+    // why: code review C2 for `watch_create`: the baseline read of a hanging
+    //      command must stop when the client cancels the request, not run on
+    //      for the command's whole timeout.
+    // proves: CLAIM(cancel-stops-work)
+    let sandbox = Sandbox::new();
+    let (gate, pid_file) = (sandbox.input("gate"), sandbox.input("s.pid"));
+    let (client, _) = connect(&sandbox).await;
+    let handle = start_call(client.peer(), "watch_create", gated_cmd_args("s", &gate, &pid_file)).await;
+    assert!(wait_until_async(Duration::from_secs(5), || pid_in(&pid_file) != 0).await, "the baseline read never started");
+    let cmd_pid = pid_in(&pid_file);
+    handle.cancel(None).await.unwrap();
+    assert!(wait_until_async(Duration::from_secs(3), || proc_is_dead(cmd_pid)).await, "the cancelled create kept reading");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_to_the_mcp_server_exits_it_and_kills_the_commands_it_was_running() {
+    // why: code review C9 for `vigil mcp`: a terminated server must cancel
+    //      active work so command process groups (their own sessions) do not
+    //      outlive it.
+    // proves: CLAIM(signal-cleanup)
+    let sandbox = Sandbox::new();
+    let (go, pid_file) = (sandbox.input("go"), sandbox.input("cmd.pid"));
+    let created = sandbox.run(&["create", &hanging_cmd_watch_json("w", &go, &pid_file)]);
+    assert!(created.status.success());
+    std::fs::write(&go, "").unwrap();
+    let (client, server_pid) = connect(&sandbox).await;
+    let _blocked = start_call(client.peer(), "keepalive", serde_json::json!({"watch_id": "w"})).await;
+    assert!(wait_until_async(Duration::from_secs(5), || pid_in(&pid_file) != 0).await, "the tick never started");
+    let cmd_pid = pid_in(&pid_file);
+    send_signal("-TERM", server_pid);
+    assert!(wait_until_async(Duration::from_secs(2), || proc_is_dead(server_pid)).await, "the server did not exit");
+    assert!(wait_until_async(Duration::from_secs(2), || proc_is_dead(cmd_pid)).await, "the command outlived the server");
+}

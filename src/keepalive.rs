@@ -78,6 +78,36 @@ pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
     }
 }
 
+/// Poll `futures` together and hand each output to `on_done` as soon as it is
+/// ready (completion order, ties by position). Stops at the first `Err`,
+/// dropping what is still pending. Used so that one slow tick never holds
+/// back another's result or its commit (C1).
+async fn for_each_completed<F, E>(
+    futures: impl IntoIterator<Item = F>,
+    mut on_done: impl FnMut(F::Output) -> Result<(), E>,
+) -> Result<(), E>
+where
+    F: std::future::Future,
+{
+    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    std::future::poll_fn(|cx| {
+        let mut index = 0;
+        while index < pending.len() {
+            match pending[index].as_mut().poll(cx) {
+                std::task::Poll::Ready(output) => {
+                    drop(pending.remove(index));
+                    if let Err(error) = on_done(output) {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                }
+                std::task::Poll::Pending => index += 1,
+            }
+        }
+        if pending.is_empty() { std::task::Poll::Ready(Ok(())) } else { std::task::Poll::Pending }
+    })
+    .await
+}
+
 impl crate::engine::Vigil {
     /// Block until a covered watch fires or expires, or `max_s` (clamped)
     /// elapses. SPEC "keepalive" + V2/V7/V8/V14/V26.
@@ -100,62 +130,99 @@ impl crate::engine::Vigil {
         request: KeepaliveRequest,
         progress: &dyn ProgressSink,
     ) -> Result<Envelope, VigilError> {
+        let outcome = self.keepalive_cancellable(request, progress, std::future::pending::<()>()).await?;
+        Ok(outcome.expect("a call that cannot be cancelled always finishes"))
+    }
+
+    /// `keepalive_with_progress` that stops when `cancel` completes (C2): the
+    /// sensing is dropped, nothing more is written, and NO result is marked
+    /// returned (V7), so a later no-id call still delivers it. `Ok(None)` is
+    /// "cancelled". `cancel` is polled first, so once it is ready the call
+    /// cannot go on to mark anything returned.
+    pub async fn keepalive_cancellable(
+        &self,
+        request: KeepaliveRequest,
+        progress: &dyn ProgressSink,
+        cancel: impl std::future::Future<Output = ()>,
+    ) -> Result<Option<Envelope>, VigilError> {
         let max_s = clamp_max_s(request.max_s);
         let started = Instant::now();
         let budget_end = started + Duration::from_secs(max_s);
         let covered = self.covered_ids(request.watch_id.as_ref())?;
+        let finish = async {
+            let changed_in_call = self.sense(&covered, budget_end, progress).await?;
+            self.keepalive_envelope(&covered, &changed_in_call, started.elapsed().as_secs(), max_s)
+        };
+        tokio::select! {
+            biased;
+            () = cancel => Ok(None),
+            envelope = finish => envelope.map(Some),
+        }
+    }
 
+    /// The blocking part of a call: tick covered watches until one finishes or
+    /// the budget ends. Returns what changed during the call (V14).
+    ///
+    /// Each round ticks every due covered watch CONCURRENTLY inside the shared
+    /// budget, each under its own watch lock (C1), so a slow watch cannot
+    /// starve another. A tick runs only if the budget left covers its reserve
+    /// (X4), except the one due when the call starts. Expiry never needs a
+    /// reserve and its deadline wake is kept when sensing is skipped (C7).
+    async fn sense(&self, covered: &[WatchId], budget_end: Instant, progress: &dyn ProgressSink) -> Result<Vec<ChangedInput>, VigilError> {
         let mut changed_in_call: Vec<ChangedInput> = Vec::new();
         let mut ticks_in_call = 0u64;
         let mut first_pass = true;
-        'call: loop {
+        loop {
+            let now = self.clock.now();
+            let mut round: Vec<&WatchId> = Vec::new();
+            for id in covered {
+                let watch = self.load_watch(id)?;
+                if watch.status.is_finished() {
+                    continue;
+                }
+                if watch.is_overdue(now) || (is_due(&watch, now) && (first_pass || !self.reserve_blocks(&watch, budget_end))) {
+                    round.push(id);
+                }
+            }
+            // V2: a tick that cannot finish in the budget is dropped before it
+            // writes anything (it also checks the deadline itself, C5).
+            let ticks = round.into_iter().map(|id| async move {
+                (id, tokio::time::timeout_at(budget_end, self.tick_report_until(id, Some(budget_end))).await)
+            });
+            for_each_completed(ticks, |(id, outcome)| -> Result<(), VigilError> {
+                let Ok(report) = outcome else { return Ok(()) };
+                let report = report?;
+                if report.outcome == TickOutcome::Ticked {
+                    ticks_in_call += 1;
+                    changed_in_call.extend(report.changed);
+                    let tick = self.load_watch(id)?.tick;
+                    progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick });
+                }
+                Ok(())
+            })
+            .await?;
+            first_pass = false;
+
             let now = self.clock.now();
             let mut any_finished = false;
             let mut next_wake: Option<Timestamp> = None;
-            for id in &covered {
-                let mut watch = self.load_watch(id)?;
+            for id in covered {
+                let watch = self.load_watch(id)?;
                 if watch.status.is_finished() {
                     any_finished = true;
                     continue;
                 }
-                if watch.is_overdue(now) || is_due(&watch, now) {
-                    let reserve = tick_reserve(
-                        &watch.spec.inputs,
-                        matches!(watch.spec.fire, FireRule::Judge { .. }),
-                        self.config.judge_timeout,
-                    );
-                    // X4: the tick due when the call starts runs regardless.
-                    if !first_pass && budget_end.saturating_duration_since(Instant::now()) < reserve {
-                        continue;
-                    }
-                    // V2: a tick that cannot finish in the budget is dropped
-                    // before it writes anything.
-                    let Ok(report) = tokio::time::timeout_at(budget_end, self.tick_report(id)).await else {
-                        break 'call;
-                    };
-                    let report = report?;
-                    watch = self.load_watch(id)?;
-                    if report.outcome == TickOutcome::Ticked {
-                        ticks_in_call += 1;
-                        changed_in_call.extend(report.changed);
-                        progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick: watch.tick });
-                    }
-                    if watch.status.is_finished() {
-                        any_finished = true;
-                        continue;
-                    }
-                }
                 let due_at = watch.last_tick_at.map_or(now, |last| last.plus_secs(watch.spec.interval_s));
-                let wake = due_at.min(watch.deadline_at);
+                // A due tick the reserve forbids is not waited for; its deadline still is.
+                let wake = if is_due(&watch, now) && self.reserve_blocks(&watch, budget_end) { watch.deadline_at } else { due_at.min(watch.deadline_at) };
                 next_wake = Some(next_wake.map_or(wake, |current| current.min(wake)));
             }
-            first_pass = false;
             if any_finished {
-                break;
+                return Ok(changed_in_call);
             }
             let left = budget_end.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                break;
+                return Ok(changed_in_call);
             }
             // Sleep to the next tick or deadline, or to the end of the budget.
             let until_wake = next_wake
@@ -163,9 +230,12 @@ impl crate::engine::Vigil {
                 .unwrap_or(left);
             tokio::time::sleep(until_wake.min(left)).await;
         }
+    }
 
-        let waited_s = started.elapsed().as_secs();
-        self.keepalive_envelope(&covered, &changed_in_call, waited_s, max_s)
+    /// X4: true when the budget left is below the watch's tick reserve.
+    fn reserve_blocks(&self, watch: &WatchFile, budget_end: Instant) -> bool {
+        let reserve = tick_reserve(&watch.spec.inputs, matches!(watch.spec.fire, FireRule::Judge { .. }), self.config.judge_timeout);
+        budget_end.saturating_duration_since(Instant::now()) < reserve
     }
 
     /// `vigil wait`: like keepalive for one watch but with no 270 s ceiling:
@@ -1462,5 +1532,90 @@ mod tests {
         append_file(&path, "ERROR: x\n");
         let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
         assert_eq!(envelope.judge_status, JudgeStatus::Down);
+    }
+
+    // ---- code review round 1: C1, C6, C7 ----
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_unchanged_watch_cannot_starve_a_later_watchs_change_within_one_call() {
+        // why: code review C1: ticks ran one watch after another in id order,
+        //      each cut off at the shared budget. Watch `a` has an unchanged
+        //      19 s command, watch `b` a 15 s command whose text changed:
+        //      sequentially `b` starts at 19 s, is cut at 30 s and never
+        //      commits, on every call, forever. Covered watches must tick
+        //      concurrently inside the shared budget (each under its own
+        //      lock), so one max_s = 30 call fires `b`, and `b`'s tick is on
+        //      disk.
+        // proves: CLAIM(tick-progress)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:slow-a", "same");
+        env.reader.set_text("cmd:fast-b", "v1");
+        scripted_watch(&vigil, "a", vec![cmd("slow-a", Some(19.0))], 20).await;
+        let b = scripted_watch(&vigil, "b", vec![cmd("fast-b", Some(19.0))], 20).await;
+        env.reader.set_sleep("cmd:slow-a", Duration::from_secs(19));
+        env.reader.set_sleep("cmd:fast-b", Duration::from_secs(15));
+        env.reader.set_text("cmd:fast-b", "v2");
+
+        let started = Instant::now();
+        let envelope = vigil.keepalive(no_id(Some(30))).await.unwrap();
+        assert_eq!(envelope.watch_id, b, "the changed watch fires in the first call");
+        assert_eq!(envelope.status, WatchStatus::Fired);
+        assert!(started.elapsed() < Duration::from_secs(30), "returned before the budget ran out: {:?}", started.elapsed());
+        assert_eq!(env.vigil.store().load(&b).unwrap().tick, 1, "b's tick was committed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_that_returns_changed_output_after_the_deadline_expires_the_watch_instead_of_firing() {
+        // why: code review C6: a tick stamped its result with the time before
+        //      sensing, so a command that returned changed output 15 s later
+        //      fired a watch whose deadline was 10 s after creation; the
+        //      terminal state then blocked expiry. After awaited work the
+        //      wall clock is re-checked: past the deadline the watch is
+        //      persisted EXPIRED (finished_at = deadline_at, no events), not
+        //      fired (R5, V16).
+        // proves: CLAIM(deadline-expiry)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:late", "v1");
+        let mut request = change_request("w", std::path::Path::new("/unused"), 20);
+        request.inputs = vec![cmd("late", Some(19.0))];
+        request.deadline_s = Some(10);
+        let id = vigil.create(request).await.unwrap().watch_id;
+        env.reader.set_text("cmd:late", "v2");
+        env.reader.set_sleep("cmd:late", Duration::from_secs(15));
+
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!(envelope.status, WatchStatus::Expired);
+        assert!(envelope.events.is_empty(), "{:?}", envelope.events);
+        let file = env.vigil.store().load(&id).unwrap();
+        assert_eq!(file.status, WatchStatus::Expired, "persisted as expired, not fired");
+        assert_eq!(file.finished_at, Some(file.deadline_at));
+        assert!(file.events.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_is_reported_at_the_deadline_even_when_the_tick_reserve_stops_sensing() {
+        // why: code review C7: with a 19 s command (reserve 20 s) and a 30 s
+        //      call, from 11 s on no tick may start, and the old loop dropped
+        //      the watch's deadline wake with the skipped tick, so a deadline
+        //      at 15 s was reported only when the call ended at 30 s. Expiry
+        //      is independent of the reserve: the call must wake at the
+        //      deadline and return the expired envelope at about 15 s.
+        // proves: CLAIM(deadline-expiry)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:quiet", "same");
+        let mut request = change_request("w", std::path::Path::new("/unused"), 1);
+        request.inputs = vec![cmd("quiet", Some(19.0))];
+        request.deadline_s = Some(15);
+        let id = vigil.create(request).await.unwrap().watch_id;
+
+        let started = Instant::now();
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!(envelope.status, WatchStatus::Expired);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(17), "expired at the deadline, not at max_s: {elapsed:?}");
+        assert!((15..=16).contains(&envelope.waited_s.unwrap()), "{:?}", envelope.waited_s);
     }
 }
