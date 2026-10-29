@@ -98,9 +98,8 @@ and Codex has no equivalent (`FINDINGS.md` §2).
 3. **`vigil wait` (Claude Code, no re-trigger).** `vigil wait <id>` blocks
    with no 270 s ceiling until the watch fires, expires or is cancelled,
    prints the final envelope and exits (0 fired, 2 expired, 3 cancelled,
-   1 error). `--stream` prints one JSON line per new event, then the final
-   envelope. The agent runs it once as a background command; Claude Code
-   wakes the agent when it exits (or per line through its Monitor tool).
+   1 error). The agent runs it once as a background command; Claude Code
+   wakes the agent when it exits.
    Trade-off: no model calls while waiting, so the prompt cache goes cold
    after its TTL. Use `keepalive` to stay warm, `wait` for long waits where
    a cold cache is fine. Codex has no background wake, so it uses
@@ -375,3 +374,29 @@ server that returns canned answers.
 - D7: URL inputs are http only (no TLS stack, to avoid aws-lc-rs on 8 GB hosts).
 - D11: `vigil wait` added (delivery path 3) so Claude Code agents can wait with no re-trigger.
 - D8: the live hour-long test uses `change`/`condition`; Laya stays on host-c.
+
+## Resolved details (from the red phase, 2026-10-29)
+
+- R1 baseline: the first tick is due at once, counts as tick 1, and only
+  records hashes; it is never a change. `fire = "condition"` is evaluated on
+  every tick, including the first, changed or not (no model cost).
+- R2 `want`: only `port` (`open`/`closed`) and `process` (`running`/`exited`)
+  inputs take `want`.
+- R3 readings: `cmd` reads `exit=<code>\n<output>`; `url` reads
+  `HTTP <status>\n<body>`; `file` `tail_bytes` defaults to 4096; `timeout_s`
+  defaults to 10. A repeated identical read error is not a new change.
+- R4 keepalive with no id and no watches created by this process: a tool
+  error saying to pass `watch_id` or create a watch. Covering several
+  watches: one envelope whose watch fields (`status`, `tick`, `elapsed_s`,
+  `deadline_in_s`) describe the watch that ended the call, else the one with
+  the nearest deadline; `events` holds new events from all covered watches.
+- R5 `next`: `"call keepalive again"` (pending), `"act on events"` (fired),
+  `"watch ended; create a new watch if still needed"` (expired, cancelled).
+  Expiry runs no final tick and adds no event; `digest` is the last digest.
+- R6 digest cut keeps the newest end and appends `[digest cut]`.
+  `watch_status` does not mark events delivered.
+- R7 judge down across several changes: the pending change accumulates; the
+  next request carries all content changed since the last judged tick,
+  newest first, cut to `VIGIL_JUDGE_STATE_BYTES`.
+- R8 `vigil wait` has no `--stream`: under D1 a watch fires once, so a stream
+  would only ever print one event. Removed.
