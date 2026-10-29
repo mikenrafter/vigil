@@ -489,3 +489,36 @@ These override anything above that disagrees.
   4 cancelled.
 - W7 the persisted pending change is capped at 64 KiB per input, newest
   kept, with `[truncated]` when cut.
+
+## Spec review round 2 (Sol) — final decisions
+
+Round 2 was the last spec round; these are decisions, not open questions.
+
+- X1 (S8) a no-id envelope also lists every other covered watch that
+  finished in this return as `others: [{watch_id, status, event_ids}]`, so
+  an expired or cancelled secondary watch is visible. Their events are in
+  `events`; their digests are not repeated.
+- X2 (S12) bounds: persisted glob membership at most 1000 paths; an event
+  `summary` at most 200 bytes; so an envelope is at most digest limit +
+  16 inputs × 200 bytes per covered watch, plus fixed fields.
+- X3 (T4, supersedes the single-lock part of V4/V5) locks:
+  - `locks/<id>.lock` per watch, held across a tick's sensing and write and
+    across cancel. Lock files are never deleted while their watch file
+    exists; prune deletes a lock file only after deleting its watch file,
+    both while holding that watch's lock and the global lock.
+  - `$XDG_STATE_HOME/vigil/lock` (global) is held only for short namespace
+    operations: reserving an id at create, and prune. Never during sensing.
+  - create: take the watch lock, then the global lock to check the id and
+    write a placeholder, release the global lock, then read the baseline
+    under the watch lock with each input's timeout.
+- X4 (T5) no livelock: `timeout_s` is 0.1..=20 (supersedes 60 in V19);
+  inputs of one tick are read concurrently; a tick starts only if the call
+  has at least `max(input timeouts) + judge timeout + 1 s` left, so a tick
+  due at the start of any call (budget >= 30 s) always finishes. A due tick
+  runs first in each call.
+- X5 (S24, S25) test rules: the confinement test compares exact bytes of
+  everything outside `state-home/vigil`; the cross-process test counts real
+  evaluations (a `cmd` input that appends to a counter file) and expects 1.
+- X6 (T1-T3, T6, T7) the red tests follow W1 (`:0` suffix), W6 exit codes,
+  await MCP progress asynchronously, and test the W2/W3 floors and the W7
+  cap through the engine.
