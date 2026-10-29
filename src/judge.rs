@@ -136,9 +136,17 @@ impl JudgeRule {
     }
 }
 
-/// Build the `state` string: `prompt`, then each changed input's new content
-/// with the newest (last) lines first, cut to at most `limit_bytes` bytes on a
-/// UTF-8 boundary (SPEC "Tick logic" step 4).
+/// V15: the observation part of `state` is never smaller than this, however
+/// small `VIGIL_JUDGE_STATE_BYTES` is or however long the prompt is.
+pub const MIN_OBSERVATION_BYTES: usize = 1536;
+
+/// Build the `state` string (SPEC "Tick logic" step 4, V15): the prompt first
+/// (at most 1024 bytes, V12), then the observations. The observation budget is
+/// `max(limit_bytes - prompt.len(), MIN_OBSERVATION_BYTES)`; everything after
+/// the prompt, labels and separators included, fits in it, so the whole state
+/// is at most `prompt.len() + budget` bytes. The budget is split evenly
+/// (`budget / changed.len()`) across the changed inputs, each input's lines
+/// newest (last) first, each section cut on a UTF-8 boundary.
 pub fn build_state(prompt: &str, changed: &[ChangedInput], limit_bytes: usize) -> String {
     todo!()
 }
@@ -271,6 +279,14 @@ mod tests {
         ChangedInput { label: label.into(), text: text.into() }
     }
 
+    fn numbered(prefix: &str, n: usize) -> String {
+        (0..n).map(|i| format!("{prefix}-line-{i:04}\n")).collect()
+    }
+
+    fn kept_lines(state: &str, prefix: &str) -> usize {
+        state.matches(&format!("{prefix}-line-")).count()
+    }
+
     #[test]
     fn state_starts_with_the_prompt() {
         // why: SPEC step 4: "`state` is the prompt, then the changed inputs'
@@ -304,27 +320,102 @@ mod tests {
     #[test]
     fn state_cut_keeps_the_newest_lines_and_drops_the_oldest() {
         // why: when over budget the END of the state is cut; because newest is
-        //      first, line-199 must survive and line-000 must not.
+        //      first, line-199 must survive and line-000 must not. 200 lines
+        //      of "line-NNN\n" (9 bytes) = 1800 bytes > the 1536-byte
+        //      observation floor, so the cut is real even with limit 100.
         // proves: CLAIM(newest-first)
         let text: String = (0..200).map(|i| format!("line-{i:03}\n")).collect();
-        let state = build_state("P", &[changed("file:/x", &text)], 200);
-        assert!(state.len() <= 200);
+        let state = build_state("P", &[changed("file:/x", &text)], 100);
+        assert!(state.len() <= 1 + MIN_OBSERVATION_BYTES);
         assert!(state.contains("line-199"));
         assert!(!state.contains("line-000"));
     }
 
     #[test]
+    fn the_observation_budget_has_a_floor_of_1536_bytes() {
+        // why: V15 (S15): "(VIGIL_JUDGE_STATE_BYTES minus the prompt, at
+        //      least 1536)". With a 100-byte limit and prompt "P" (1 byte) the
+        //      observations still get 1536 bytes: the state is far longer than
+        //      100 yet at most 1 + 1536. Needs 4000 bytes of input so the
+        //      floor, not the input size, is what binds. NOTE (flagged in
+        //      .red-report.md): this means a configured limit below 1537 has
+        //      no effect.
+        // proves: CLAIM(judge-budget)
+        let input = [changed("file:/x", &numbered("n", 400))]; // 400 * 12 = 4800 bytes
+        let state = build_state("P", &input, 100);
+        assert!(state.len() > 1000, "floor not honoured: {} bytes", state.len());
+        assert!(state.len() <= 1 + MIN_OBSERVATION_BYTES, "{} bytes", state.len());
+    }
+
+    #[test]
+    fn a_maximal_prompt_still_leaves_room_for_observations() {
+        // why: V15 (S15: "a prompt occupying the entire state budget leaves
+        //      the judge no observations"). Prompt of 1024 bytes (the V12
+        //      maximum) with the default limit 2560: budget = max(2560-1024,
+        //      1536) = 1536, total <= 2560, and the newest line is present.
+        //      With a limit (1100) smaller than prompt + floor the floor wins:
+        //      budget 1536, total up to 2560, still more than the limit.
+        // proves: CLAIM(judge-budget)
+        let prompt = "p".repeat(1024);
+        let input = [changed("file:/x", &numbered("n", 400))];
+        let normal = build_state(&prompt, &input, 2560);
+        assert!(normal.starts_with(&prompt));
+        assert!(normal.len() <= 2560, "{} bytes", normal.len());
+        assert!(normal.contains("n-line-0399"), "newest observation must be present");
+        assert!(normal.len() >= 1024 + 1400, "observations were starved: {} bytes", normal.len());
+        let tight = build_state(&prompt, &input, 1100);
+        assert!(tight.len() <= 1024 + MIN_OBSERVATION_BYTES && tight.len() > 1100, "{} bytes", tight.len());
+        assert!(tight.contains("n-line-0399"));
+    }
+
+    #[test]
+    fn the_budget_is_split_evenly_across_changed_inputs_each_newest_first() {
+        // why: V15 (S15: "the first noisy input can consume the budget before
+        //      another input's relevant change"). Two inputs of 300 lines of
+        //      12 bytes each (3600 bytes, far over budget), prompt "P",
+        //      limit 2560: budget = 2559, share = 2559 / 2 = 1279 bytes per
+        //      input = at most 106 whole 12-byte lines each (1279 / 12), at
+        //      least ~100 after a label and a few separator bytes. The old
+        //      "first input eats everything" gives ~213 / 0. Both newest
+        //      lines are present, both oldest are not, and the shares differ
+        //      by at most 2 lines. Control: ONE noisy input keeps the whole
+        //      budget (>= 200 lines), so the split is what limits each here.
+        // proves: CLAIM(judge-budget)
+        let two = build_state(
+            "P",
+            &[changed("file:/a", &numbered("a", 300)), changed("file:/b", &numbered("b", 300))],
+            2560,
+        );
+        assert!(two.len() <= 2560, "{} bytes", two.len());
+        let (kept_a, kept_b) = (kept_lines(&two, "a"), kept_lines(&two, "b"));
+        assert!((95..=106).contains(&kept_a), "a kept {kept_a}");
+        assert!((95..=106).contains(&kept_b), "b kept {kept_b}");
+        assert!(kept_a.abs_diff(kept_b) <= 2, "{kept_a} vs {kept_b}");
+        for newest in ["a-line-0299", "b-line-0299"] {
+            assert!(two.contains(newest), "{newest} missing");
+        }
+        for oldest in ["a-line-0000", "b-line-0000"] {
+            assert!(!two.contains(oldest), "{oldest} should be cut");
+        }
+
+        let one = build_state("P", &[changed("file:/a", &numbered("a", 300))], 2560);
+        assert!(kept_lines(&one, "a") >= 200, "a lone input keeps the whole budget, kept {}", kept_lines(&one, "a"));
+    }
+
+    #[test]
     fn state_is_cut_to_the_byte_limit_on_a_utf8_boundary() {
-        // why: SPEC step 4: "cut to VIGIL_JUDGE_STATE_BYTES on a UTF-8
-        //      boundary". Oracle: the cut state is the longest prefix of the
-        //      uncut state that fits the limit and ends on a char boundary.
-        //      Sweeping limits 12..=40 over 3-byte chars hits every alignment.
+        // why: SPEC step 4: "cut ... on a UTF-8 boundary". Oracle: the cut
+        //      state is the longest prefix of the uncut state that fits the
+        //      total limit and ends on a char boundary. With prompt "P" the
+        //      observation budget is limit - 1 >= 1536 for limits 1540..=1547,
+        //      so the floor does not interfere; 3-byte chars make the limits
+        //      sweep every alignment. Input: 400 lines of "日日日\n" (10 bytes).
         // proves: CLAIM(utf8-cut)
-        let text = format!("{}\n", "日".repeat(30));
+        let text = "日日日\n".repeat(400);
         let input = [changed("file:/x", &text)];
         let uncut = build_state("P", &input, usize::MAX);
-        assert!(uncut.len() > 100);
-        for limit in 12..=40 {
+        assert!(uncut.len() > 3900);
+        for limit in 1540..=1547 {
             let cut = build_state("P", &input, limit);
             assert!(cut.len() <= limit, "limit {limit}: got {} bytes", cut.len());
             assert!(uncut.starts_with(&cut), "limit {limit}: cut must be a prefix of the uncut state");

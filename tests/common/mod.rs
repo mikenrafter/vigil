@@ -19,7 +19,7 @@ pub struct Sandbox {
 impl Sandbox {
     pub fn new() -> Sandbox {
         let sandbox = Sandbox { dir: tempfile::tempdir().unwrap() };
-        for sub in ["state-home", "home", "cwd", "inputs", "config"] {
+        for sub in ["state-home", "home", "cwd", "cwd2", "inputs", "config"] {
             std::fs::create_dir_all(sandbox.dir.path().join(sub)).unwrap();
         }
         sandbox
@@ -36,6 +36,10 @@ impl Sandbox {
     }
     pub fn cwd(&self) -> PathBuf {
         self.dir.path().join("cwd")
+    }
+    /// A second working directory (V11: resume from another directory).
+    pub fn cwd2(&self) -> PathBuf {
+        self.dir.path().join("cwd2")
     }
     pub fn input(&self, name: &str) -> PathBuf {
         self.dir.path().join("inputs").join(name)
@@ -60,6 +64,44 @@ impl Sandbox {
     pub fn run(&self, args: &[&str]) -> Output {
         self.command().args(args).output().unwrap()
     }
+    /// Like `command()` but started from `cwd`.
+    pub fn command_in(&self, cwd: &Path) -> Command {
+        let mut command = self.command();
+        command.current_dir(cwd);
+        command
+    }
+    /// Every file under the sandbox EXCEPT `state_root()` (exactly
+    /// `state-home/vigil`; siblings in `state-home` are still included, S24),
+    /// with its bytes.
+    pub fn snapshot_outside_state_root(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let root = self.state_root();
+        list_files(self.dir.path()).into_iter().filter(|(p, _)| !p.starts_with(&root)).collect()
+    }
+}
+
+/// Differences between two snapshots: new files, vanished files, and files
+/// whose bytes changed. `appended_to` is exempt only if its new bytes start
+/// with its old bytes (the known test-generated append).
+pub fn snapshot_diff(
+    before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    after: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    appended_to: &Path,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (path, bytes) in after {
+        match before.get(path) {
+            None => problems.push(format!("new file {}", path.display())),
+            Some(old) if old == bytes => {}
+            Some(old) if path == appended_to && bytes.starts_with(old) => {}
+            Some(_) => problems.push(format!("modified {}", path.display())),
+        }
+    }
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            problems.push(format!("removed {}", path.display()));
+        }
+    }
+    problems
 }
 
 pub fn stdout_json(output: &Output) -> serde_json::Value {

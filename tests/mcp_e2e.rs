@@ -51,18 +51,21 @@ fn watch_args(id: &str, path: &std::path::Path) -> serde_json::Value {
 
 #[tokio::test]
 async fn initialize_sends_short_instructions_that_teach_the_loop() {
-    // why: SPEC "Packaging": server `instructions` (sent at initialize) must
-    //      be under 512 characters and say: create a watch, then call
-    //      keepalive repeatedly until `next` says "act on events", so the
-    //      agent needs no skill.
+    // why: SPEC "Packaging" + V20 (S20): server `instructions` (sent at
+    //      initialize) must be under 512 characters and say: create a watch,
+    //      call keepalive repeatedly while `next` is exactly "call keepalive
+    //      again", and stop on anything else ("act on events", or the
+    //      watch-ended text), so the agent needs no skill and an expired watch
+    //      cannot loop forever.
     // proves: CLAIM(instructions)
     let sandbox = Sandbox::new();
     let (client, _) = connect(&sandbox).await;
     let instructions = client.peer_info().and_then(|info| info.instructions.clone()).expect("instructions present");
     assert!(instructions.chars().count() < 512, "{} chars", instructions.chars().count());
-    for needle in ["keepalive", "watch_create", "act on events"] {
+    for needle in ["keepalive", "watch_create", "call keepalive again", "act on events", "watch ended"] {
         assert!(instructions.contains(needle), "missing {needle:?} in {instructions:?}");
     }
+    assert!(instructions.to_lowercase().contains("stop"), "must say when to stop: {instructions:?}");
     client.cancel().await.unwrap();
 }
 
@@ -88,14 +91,16 @@ async fn exactly_the_five_spec_tools_are_listed_with_descriptions() {
 }
 
 #[tokio::test]
-async fn create_then_a_write_then_keepalive_returns_the_fired_envelope() {
+async fn create_then_one_write_then_keepalive_returns_the_fired_envelope() {
     // why: SPEC acceptance: the agent creates a watch, then calls only
-    //      keepalive and receives the failure line. Drives create ->
-    //      (file written by an appender) -> keepalive over real MCP and checks
-    //      the envelope: status fired, the line in events and digest, real
-    //      timestamps, ticks counting, session_ticks 1, next "act on events".
-    //      Must complete well inside 5 s.
-    // proves: CLAIM(early-return-on-fire)
+    //      keepalive and receives the failure line. V1 (S1): the baseline is
+    //      taken at create, so ONE write between create and the first
+    //      keepalive (no repeating appender, which used to hide the gap) is
+    //      seen on the very first tick (tick 1). Checks the envelope: status
+    //      fired, the line in events and digest, real timestamps,
+    //      session_ticks 1, watch_id (V8), event_id (V3), next "act on
+    //      events". Must complete well inside 5 s.
+    // proves: CLAIM(baseline-at-create)
     let sandbox = Sandbox::new();
     let input = sandbox.input("build.log");
     std::fs::write(&input, "boot\n").unwrap();
@@ -107,7 +112,11 @@ async fn create_then_a_write_then_keepalive_returns_the_fired_envelope() {
     assert_eq!(created["watch_id"], "build");
     assert_eq!(created["status"], "pending");
 
-    let _appender = Appender::start(&input, "ERROR: linking failed");
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&input).unwrap();
+        writeln!(file, "ERROR: linking failed").unwrap();
+    }
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(5), call(client.peer(), "keepalive", serde_json::json!({"watch_id": "build"})))
         .await
@@ -116,13 +125,15 @@ async fn create_then_a_write_then_keepalive_returns_the_fired_envelope() {
     assert_ne!(result.is_error, Some(true), "a fire is a normal result");
     let envelope = text_json(&result);
     assert_eq!(envelope["status"], "fired");
+    assert_eq!(envelope["watch_id"], "build");
     assert_eq!(envelope["next"], "act on events");
     assert_eq!(envelope["session_ticks"], 1);
-    assert!(envelope["tick"].as_u64().unwrap() >= 2, "baseline tick + a change tick");
+    assert_eq!(envelope["tick"], 1, "the write before the first call is seen by the first tick");
     assert!(envelope["now"].as_str().unwrap().ends_with('Z'));
     assert!(envelope["events"][0]["summary"].as_str().unwrap().contains("ERROR: linking failed"));
     assert!(envelope["digest"].as_str().unwrap().contains("ERROR: linking failed"));
     assert_eq!(envelope["events"][0]["watch_id"], "build");
+    assert_eq!(envelope["events"][0]["event_id"], "build:1");
     client.cancel().await.unwrap();
 }
 
@@ -151,6 +162,13 @@ async fn real_failures_set_is_error_and_a_judge_watch_needs_a_reachable_judge() 
     )
     .await;
     assert_eq!(judge.is_error, Some(true), "judge down at create time");
+    let https = call(
+        peer,
+        "watch_create",
+        serde_json::json!({"id": "tls", "inputs": [{"kind": "url", "url": "https://example.com/"}], "fire": "change"}),
+    )
+    .await;
+    assert_eq!(https.is_error, Some(true), "V19: https is a create-time error");
     let fine = call(peer, "watch_create", watch_args("fine", &input)).await;
     assert_ne!(fine.is_error, Some(true));
     let status = call(peer, "watch_status", serde_json::json!({"watch_id": "fine"})).await;
@@ -210,22 +228,24 @@ async fn a_killed_server_is_replaced_by_one_that_continues_the_same_watch() {
 }
 
 #[derive(Clone, Default)]
-struct ProgressRecorder(Arc<Mutex<Vec<f64>>>);
+struct ProgressRecorder(Arc<Mutex<Vec<(f64, Option<String>)>>>);
 
 impl ClientHandler for ProgressRecorder {
     async fn on_progress(&self, params: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
-        self.0.lock().unwrap().push(params.progress);
+        self.0.lock().unwrap().push((params.progress, params.message));
     }
 }
 
 #[tokio::test]
-async fn a_blocked_keepalive_emits_increasing_progress_notifications() {
-    // why: SPEC "Delivery" path 2 (best effort): while blocked, emit MCP
-    //      notifications/progress with the tick count. The rmcp client attaches
-    //      a progressToken itself (FINDINGS). Tick 1 happens at once and the
-    //      fire needs tick >= 2, so at least [1, 2] must arrive, strictly
-    //      increasing.
-    // proves: CLAIM(progress-ticks)
+async fn a_blocked_keepalive_emits_a_strictly_increasing_counter_with_the_watch_tick_in_the_message() {
+    // why: SPEC "Delivery" path 2 (best effort) + V18 (S18): while blocked,
+    //      emit MCP notifications/progress. `progress` is a call-local counter
+    //      that only increases (per-watch tick counts could go 10, 1, 11, 2),
+    //      and the watch id and its tick count ride in `message`. The watch
+    //      has no change at first, so the call spans several ticks; after the
+    //      first notification arrives ONE line is appended and the call fires.
+    //      The rmcp client attaches a progressToken itself (FINDINGS).
+    // proves: CLAIM(progress-counter)
     let sandbox = Sandbox::new();
     let input = sandbox.input("a.log");
     std::fs::write(&input, "boot\n").unwrap();
@@ -235,13 +255,30 @@ async fn a_blocked_keepalive_emits_increasing_progress_notifications() {
     }))
     .unwrap();
     let client = recorder.clone().serve(transport).await.unwrap();
-    call(client.peer(), "watch_create", watch_args("p", &input)).await;
-    let _appender = Appender::start(&input, "x");
-    let result = tokio::time::timeout(Duration::from_secs(5), call(client.peer(), "keepalive", serde_json::json!({"watch_id": "p"}))).await.unwrap();
+    call(client.peer(), "watch_create", watch_args("progwatch", &input)).await;
+    let blocked = {
+        let peer = client.peer().clone();
+        tokio::spawn(async move {
+            peer.call_tool(CallToolRequestParams::new("keepalive").with_arguments(args(serde_json::json!({"watch_id": "progwatch"}))))
+                .await
+                .unwrap()
+        })
+    };
+    assert!(wait_until(Duration::from_secs(3), || !recorder.0.lock().unwrap().is_empty()), "no progress arrived for tick 1");
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&input).unwrap();
+        writeln!(file, "x").unwrap();
+    }
+    let result = tokio::time::timeout(Duration::from_secs(5), blocked).await.unwrap().unwrap();
     assert_eq!(text_json(&result)["status"], "fired");
-    assert!(wait_until(Duration::from_secs(2), || recorder.0.lock().unwrap().len() >= 2), "no progress notifications arrived");
+    assert!(wait_until(Duration::from_secs(2), || recorder.0.lock().unwrap().len() >= 2), "fewer than two progress notifications arrived");
     let seen = recorder.0.lock().unwrap().clone();
-    assert_eq!(seen[0], 1.0);
-    assert!(seen.windows(2).all(|w| w[0] < w[1]), "progress must strictly increase: {seen:?}");
+    assert!(seen.windows(2).all(|w| w[0].0 < w[1].0), "progress must strictly increase: {seen:?}");
+    for (index, (_, message)) in seen.iter().enumerate() {
+        let message = message.as_deref().unwrap_or_default();
+        assert!(message.contains("progwatch"), "message names the watch: {message:?}");
+        assert!(message.contains(&(index + 1).to_string()), "message carries the watch tick {}: {message:?}", index + 1);
+    }
     client.cancel().await.unwrap();
 }

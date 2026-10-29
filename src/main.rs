@@ -30,14 +30,10 @@ enum Command {
         #[arg(long)]
         max_s: Option<u64>,
     },
-    /// Block with no ceiling until the watch finishes; print the final
-    /// envelope JSON. Exit 0 fired, 2 expired, 3 cancelled, 1 error.
-    /// With --stream, print one compact JSON line per new event first.
-    Wait {
-        id: String,
-        #[arg(long)]
-        stream: bool,
-    },
+    /// Block with no ceiling until the watch finishes; print ONE final
+    /// envelope JSON (all events in it; no streaming, R8/V21).
+    /// Exit 0 fired, 2 expired, 3 cancelled, 1 error.
+    Wait { id: String },
 }
 
 #[tokio::main]

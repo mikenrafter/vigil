@@ -4,11 +4,12 @@
 use crate::watch::WatchId;
 
 /// Why `watch_create` refused a request (SPEC "watch_create").
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CreateError {
     #[error("invalid watch id {0:?}: must match [A-Za-z0-9_-]{{1,64}}")]
     InvalidId(String),
-    #[error("a pending watch with id {0:?} already exists")]
+    /// V6: any id that still has a file (pending or finished) is taken.
+    #[error("a watch with id {0:?} already exists (pending or finished); use a fresh id")]
     DuplicateId(String),
     #[error("fire = judge requires both judge_questions and judge_rule")]
     MissingJudgeFields,
@@ -28,6 +29,27 @@ pub enum CreateError {
     ConditionNeedsWant,
     #[error("the judge is unreachable")]
     JudgeUnreachable,
+    /// V12: at most 16 inputs per watch.
+    #[error("a watch has at most 16 inputs, got {0}")]
+    TooManyInputs(usize),
+    /// V12: `prompt` is at most 1024 bytes.
+    #[error("prompt is at most 1024 bytes, got {0}")]
+    PromptTooLong(usize),
+    /// V19: judge probabilities and `min_confidence` must lie in 0..=1.
+    #[error("{field} must be within 0..=1, got {value}")]
+    ProbabilityOutOfRange { field: String, value: f64 },
+    /// V19: `deadline_s` must lie in 1..=604800.
+    #[error("deadline_s must be within 1..=604800, got {0}")]
+    DeadlineOutOfRange(u64),
+    /// V19: `cmd.argv` must be non-empty.
+    #[error("cmd.argv must not be empty")]
+    EmptyArgv,
+    /// V19/D7: URL inputs are http only.
+    #[error("only http URLs are supported, got {0:?}")]
+    UnsupportedUrlScheme(String),
+    /// V19: `timeout_s` must lie in 0.1..=60.
+    #[error("timeout_s must be within 0.1..=60, got {0}")]
+    TimeoutOutOfRange(f64),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -44,7 +66,7 @@ pub enum StoreError {
     Corrupt(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum VigilError {
     #[error(transparent)]
     Create(#[from] CreateError),

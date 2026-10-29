@@ -1,4 +1,5 @@
-//! Watch files under `<root>/watches/`, atomic writes, locks, pruning.
+//! Watch files under `<root>/watches/`, atomic writes, the one global lock,
+//! pruning.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -25,8 +26,12 @@ pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErr
     todo!()
 }
 
-/// Exclusive lock on `watches/<id>.lock`; released on drop.
-pub struct WatchLock {
+/// Exclusive `flock` on `<root>/lock`; released on drop. V4/V5: this is the
+/// only lock. Every mutation (create, tick, cancel, prune) holds it for its
+/// whole read-modify-write. The file is created on demand and NEVER deleted
+/// (deleting it would let a waiter hold the old inode while another process
+/// locks a new one).
+pub struct StoreLock {
     file: File,
 }
 
@@ -48,8 +53,9 @@ impl Store {
     pub fn watch_path(&self, id: &WatchId) -> PathBuf {
         self.watches_dir().join(format!("{}.json", id.as_str()))
     }
-    pub fn lock_path(&self, id: &WatchId) -> PathBuf {
-        self.watches_dir().join(format!("{}.lock", id.as_str()))
+    /// `<root>/lock`, the single global lock file (V5).
+    pub fn lock_path(&self) -> PathBuf {
+        self.root.join("lock")
     }
     /// Atomic save of one watch (creates `watches/` on demand).
     pub fn save(&self, watch: &WatchFile) -> Result<(), StoreError> {
@@ -62,16 +68,21 @@ impl Store {
     pub fn list(&self) -> Result<Vec<WatchFile>, StoreError> {
         todo!()
     }
-    /// Block until the exclusive lock is held.
-    pub fn lock(&self, id: &WatchId) -> Result<WatchLock, StoreError> {
+    /// Block until the global exclusive lock is held (creates the lock file
+    /// and the root on demand).
+    pub fn lock(&self) -> Result<StoreLock, StoreError> {
         todo!()
     }
     /// `Ok(None)` if another holder has it.
-    pub fn try_lock(&self, id: &WatchId) -> Result<Option<WatchLock>, StoreError> {
+    pub fn try_lock(&self) -> Result<Option<StoreLock>, StoreError> {
         todo!()
     }
-    /// Delete finished watches (and their lock files) whose `finished_at +
-    /// 7 days <= now`. Pending watches are never pruned. Returns deleted ids.
+    /// Delete watch files whose finish time + 7 days <= now (D4). The finish
+    /// time of a finished watch is `finished_at`; of an overdue pending watch
+    /// it is `deadline_at` (V16); a pending watch whose deadline is still in
+    /// the future is never deleted. The caller holds the lock (it is not taken
+    /// here, so `prune` can run inside another mutation). The global lock file
+    /// is never deleted. Returns the deleted ids.
     pub fn prune(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
         todo!()
     }
@@ -80,8 +91,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{at, change_request, judge_request, wid};
-    use crate::watch::{WatchSpec, WatchStatus};
+    use crate::testing::{at, blocked_flock_waiters, change_request, judge_request, wid};
+    use crate::watch::{Terminal, TerminalStatus, WatchSpec};
     use serde_json::Value;
 
     fn sample(id: &str) -> WatchFile {
@@ -89,12 +100,24 @@ mod tests {
         WatchFile::new(spec, at("2026-10-29T14:03:11Z"))
     }
 
-    fn finished(id: &str, status: WatchStatus, finished_at: Timestamp) -> WatchFile {
+    fn finished(id: &str, status: TerminalStatus, finished_at: Timestamp) -> WatchFile {
         let spec = WatchSpec::parse(change_request(id, Path::new("/tmp/x"), 20)).unwrap();
         let mut file = WatchFile::new(spec, finished_at.minus_secs(60));
-        file.status = status;
-        file.finished_at = Some(finished_at);
+        file.finish(Terminal { status, finished_at, events: vec![], digest: String::new() }).unwrap();
         file
+    }
+
+    /// A pending watch created `created_ago` seconds before `now` with the
+    /// default 3600 s deadline.
+    fn pending(id: &str, now: Timestamp, created_ago: u64) -> WatchFile {
+        let spec = WatchSpec::parse(change_request(id, Path::new("/tmp/x"), 20)).unwrap();
+        WatchFile::new(spec, now.minus_secs(created_ago))
+    }
+
+    fn lock_identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).unwrap();
+        (md.dev(), md.ino())
     }
 
     #[test]
@@ -133,9 +156,9 @@ mod tests {
     fn the_file_on_disk_uses_the_spec_field_names_and_literal_timestamps() {
         // why: parity with SPEC "State": `watches/<id>.json` holds the watch as
         //      created plus status, created_at, deadline_at (absolute UTC),
-        //      tick, last_tick_at, judge_strikes, events, delivered_through.
-        //      Read as raw JSON so a writer/reader that agree on a wrong name
-        //      cannot pass.
+        //      tick, last_tick_at, judge_strikes, events, last_digest, and (V3)
+        //      NO delivered_through. Read as raw JSON so a writer/reader that
+        //      agree on a wrong name cannot pass.
         // proves: CLAIM(watch-file-format)
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
@@ -151,7 +174,8 @@ mod tests {
         assert_eq!(raw["deadline_at"], "2026-10-29T15:03:11Z");
         assert_eq!(raw["tick"], 0);
         assert_eq!(raw["judge_strikes"], 0);
-        assert_eq!(raw["delivered_through"], 0);
+        assert!(raw.get("delivered_through").is_none(), "V3: delivered_through is gone");
+        assert_eq!(raw["last_digest"], "");
         assert!(raw["events"].as_array().unwrap().is_empty());
         assert_eq!(raw["judge_rule"]["noul_gte"], 0.8);
         assert_eq!(raw["inputs"][0]["kind"], "file");
@@ -249,41 +273,95 @@ mod tests {
     }
 
     #[test]
-    fn lock_is_exclusive_and_released_on_drop() {
-        // why: SPEC "State": a tick holds an exclusive lock on
-        //      `watches/<id>.lock`; a second holder must not get it until the first drops.
-        //      Positive control: after the drop the lock is available.
-        // proves: CLAIM(tick-lock)
+    fn lock_is_one_global_file_in_the_root_exclusive_and_released_on_drop() {
+        // why: V4/V5 (S4, S5): ONE lock for everything at `<root>/lock`
+        //      (not per-watch files). A second holder must not get it until the
+        //      first drops. Positive control: after the drop it is available.
+        // proves: CLAIM(global-lock)
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
-        let id = wid("w");
-        let first = store.lock(&id).unwrap();
-        assert!(store.try_lock(&id).unwrap().is_none(), "second holder must be refused");
-        assert!(dir.path().join("watches").join("w.lock").exists(), "lock file lives in watches/");
+        assert_eq!(store.lock_path(), dir.path().join("lock"));
+        let first = store.lock().unwrap();
+        assert!(store.try_lock().unwrap().is_none(), "second holder must be refused");
+        assert!(dir.path().join("lock").exists());
         drop(first);
-        assert!(store.try_lock(&id).unwrap().is_some(), "free after drop");
+        assert!(store.try_lock().unwrap().is_some(), "free after drop");
     }
 
     #[test]
-    fn blocking_lock_waits_for_the_holder() {
-        // why: the due-time recheck only works if the second ticker blocks and
-        //      then proceeds (SPEC "State"); it must not error out or spin.
-        // proves: CLAIM(tick-lock)
+    fn a_blocked_locker_is_visibly_waiting_then_gets_the_lock_only_after_release() {
+        // why: S25: the old test dropped the guard before the waiter could
+        //      have contended, so it proved nothing. Here the kernel's own
+        //      lock table (/proc/locks) must list the waiter as BLOCKED on the
+        //      lock file's inode while we hold it, the waiter must not have
+        //      acquired, and only after the drop does it acquire.
+        // proves: CLAIM(global-lock)
+        use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
-        let id = wid("w");
-        let guard = store.lock(&id).unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let guard = store.lock().unwrap();
+        let acquired = std::sync::Arc::new(AtomicBool::new(false));
         let waiter = {
-            let (store, id) = (store.clone(), id.clone());
+            let (store, acquired) = (store.clone(), acquired.clone());
             std::thread::spawn(move || {
-                let _held = store.lock(&id).unwrap();
-                sender.send(()).unwrap();
+                let _held = store.lock().unwrap();
+                acquired.store(true, Ordering::SeqCst);
             })
         };
+        let started = std::time::Instant::now();
+        let mut contended = false;
+        while started.elapsed() < std::time::Duration::from_secs(3) {
+            if !blocked_flock_waiters(&store.lock_path()).is_empty() {
+                contended = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(contended, "the waiter never showed up as blocked in /proc/locks");
+        assert!(!acquired.load(Ordering::SeqCst), "waiter acquired while the guard was held");
         drop(guard);
-        receiver.recv_timeout(std::time::Duration::from_secs(5)).expect("waiter never acquired the lock");
         waiter.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst), "waiter must acquire after the release");
+        assert!(blocked_flock_waiters(&store.lock_path()).is_empty(), "nobody left waiting");
+    }
+
+    #[test]
+    fn the_lock_file_is_never_deleted_by_prune_or_by_dropping_the_lock() {
+        // why: V5 (S5): deleting a lock file splits synchronization (a waiter
+        //      holds the old inode while another process locks a new one).
+        //      Same (dev, inode) after lock/unlock/prune cycles that DO delete
+        //      watch files. Positive control: prune really deleted something.
+        // proves: CLAIM(lock-never-deleted)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let now = at("2026-10-29T14:03:11Z");
+        store.save(&finished("old", TerminalStatus::Cancelled, now.minus_secs(30 * 24 * 3600))).unwrap();
+        drop(store.lock().unwrap());
+        let identity = lock_identity(&store.lock_path());
+        let guard = store.lock().unwrap();
+        let deleted = store.prune(now).unwrap();
+        drop(guard);
+        assert_eq!(deleted, vec![wid("old")], "control: prune deleted a watch");
+        assert!(store.lock_path().exists());
+        assert_eq!(lock_identity(&store.lock_path()), identity, "same inode after prune");
+        drop(store.lock().unwrap());
+        assert_eq!(lock_identity(&store.lock_path()), identity, "same inode after another lock cycle");
+    }
+
+    #[test]
+    fn no_per_watch_lock_files_are_ever_created() {
+        // why: V4/V5: the old `watches/<id>.lock` files are gone; saving and
+        //      locking leave only `<id>.json` under watches/ and `lock` in the root.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        store.save(&sample("a")).unwrap();
+        drop(store.lock().unwrap());
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("watches")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.json"]);
+        let mut root: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+        root.sort();
+        assert_eq!(root, vec!["lock", "watches"]);
     }
 
     #[test]
@@ -294,8 +372,9 @@ mod tests {
         let store = Store::new(dir.path());
         store.save(&sample("b")).unwrap();
         store.save(&sample("a")).unwrap();
-        let _lock = store.lock(&wid("a")).unwrap();
+        let _lock = store.lock().unwrap();
         std::fs::write(dir.path().join("watches").join("c.json.tmp"), "{ partial").unwrap();
+        std::fs::write(dir.path().join("watches").join("d.lock"), "").unwrap();
         let ids: Vec<String> = store.list().unwrap().iter().map(|w| w.spec.id.to_string()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -303,29 +382,53 @@ mod tests {
     #[test]
     fn prune_deletes_finished_watches_seven_days_after_they_finish() {
         // why: D4 / SPEC "State": finished watches are deleted 7 days after
-        //      they finish. Boundaries at +-1 s around 7 d = 604800 s; every
-        //      finished status counts; pending watches are never pruned, even
-        //      when ancient; the lock file goes with the watch.
+        //      they finish. Boundary 7 d = 604800 s: exactly 7 d is deleted
+        //      (`finished_at + 7d <= now`), 1 s short is kept; every finished
+        //      status counts.
         // proves: CLAIM(prune-7d)
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
         let now = at("2026-10-29T14:03:11Z");
         let seven_days = 7 * 24 * 3600;
-        store.save(&finished("fired-old", WatchStatus::Fired, now.minus_secs(seven_days + 1))).unwrap();
-        store.save(&finished("expired-old", WatchStatus::Expired, now.minus_secs(seven_days + 1))).unwrap();
-        store.save(&finished("cancelled-old", WatchStatus::Cancelled, now.minus_secs(8 * 24 * 3600))).unwrap();
-        store.save(&finished("fired-recent", WatchStatus::Fired, now.minus_secs(seven_days - 1))).unwrap();
-        let mut ancient_pending = sample("pending-ancient");
-        ancient_pending.created_at = now.minus_secs(30 * 24 * 3600);
-        store.save(&ancient_pending).unwrap();
-        drop(store.lock(&wid("fired-old")).unwrap());
+        store.save(&finished("fired-old", TerminalStatus::Fired, now.minus_secs(seven_days + 1))).unwrap();
+        store.save(&finished("expired-exact", TerminalStatus::Expired, now.minus_secs(seven_days))).unwrap();
+        store.save(&finished("cancelled-old", TerminalStatus::Cancelled, now.minus_secs(8 * 24 * 3600))).unwrap();
+        store.save(&finished("fired-recent", TerminalStatus::Fired, now.minus_secs(seven_days - 1))).unwrap();
 
         let mut deleted: Vec<String> = store.prune(now).unwrap().iter().map(|id| id.to_string()).collect();
         deleted.sort();
-        assert_eq!(deleted, vec!["cancelled-old", "expired-old", "fired-old"]);
+        assert_eq!(deleted, vec!["cancelled-old", "expired-exact", "fired-old"]);
+        let remaining: Vec<String> = store.list().unwrap().iter().map(|w| w.spec.id.to_string()).collect();
+        assert_eq!(remaining, vec!["fired-recent"]);
+    }
+
+    #[test]
+    fn prune_expires_overdue_pending_watches_using_the_deadline_as_the_finish_time() {
+        // why: V16 (S16): a pending watch past its absolute deadline counts as
+        //      expired with finished_at = deadline_at, so abandoned watches do
+        //      not live forever. created 8 days ago + 3600 s deadline = overdue
+        //      since 8 d - 1 h > 7 d -> deleted. Created 7 d + 1 h ago =
+        //      deadline exactly 7 d ago -> deleted (boundary inclusive);
+        //      7 d + 1 h - 1 s ago -> kept. A pending watch with its deadline
+        //      still ahead is never pruned, however long ago it was created
+        //      (7-day deadline created 6 d ago, control).
+        // proves: CLAIM(prune-overdue)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let now = at("2026-10-29T14:03:11Z");
+        let day = 24 * 3600;
+        store.save(&pending("abandoned", now, 8 * day)).unwrap();
+        store.save(&pending("boundary-in", now, 7 * day + 3600)).unwrap();
+        store.save(&pending("boundary-out", now, 7 * day + 3599)).unwrap();
+        let mut long_but_live = pending("live", now, 6 * day);
+        long_but_live.deadline_at = now.plus_secs(day);
+        store.save(&long_but_live).unwrap();
+
+        let mut deleted: Vec<String> = store.prune(now).unwrap().iter().map(|id| id.to_string()).collect();
+        deleted.sort();
+        assert_eq!(deleted, vec!["abandoned", "boundary-in"]);
         let mut remaining: Vec<String> = store.list().unwrap().iter().map(|w| w.spec.id.to_string()).collect();
         remaining.sort();
-        assert_eq!(remaining, vec!["fired-recent", "pending-ancient"]);
-        assert!(!dir.path().join("watches").join("fired-old.lock").exists(), "lock file removed with the watch");
+        assert_eq!(remaining, vec!["boundary-out", "live"]);
     }
 }

@@ -18,7 +18,16 @@ pub const MIN_INTERVAL_S: u64 = 1;
 pub const MAX_INTERVAL_S: u64 = 3600;
 pub const DEFAULT_INTERVAL_S: u64 = 20;
 pub const DEFAULT_DEADLINE_S: u64 = 3600;
-pub const MAX_EVENTS: usize = 50;
+/// V12: a watch has at most this many inputs (so at most 16 events per tick).
+pub const MAX_INPUTS: usize = 16;
+/// V12: `prompt` is at most this many bytes.
+pub const MAX_PROMPT_BYTES: usize = 1024;
+/// V19: `deadline_s` is 1..=604800 (7 days).
+pub const MIN_DEADLINE_S: u64 = 1;
+pub const MAX_DEADLINE_S: u64 = 604_800;
+/// V19: `cmd.timeout_s` is 0.1..=60.
+pub const MIN_TIMEOUT_S: f64 = 0.1;
+pub const MAX_TIMEOUT_S: f64 = 60.0;
 
 /// A validated watch id: `[A-Za-z0-9_-]{1,64}`. Parse, do not validate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -93,9 +102,14 @@ pub enum Input {
     },
     Cmd {
         argv: Vec<String>,
-        /// Seconds; fractions allowed. Default 10.
+        /// Seconds; fractions allowed. Default 10. V19: 0.1..=60.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_s: Option<f64>,
+        /// Working directory. V11: absent at the wire; `watch_create` stores
+        /// the creating process's cwd here (absolute) so a resume from another
+        /// directory runs the command in the same place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
     },
     Url {
         url: String,
@@ -186,9 +200,17 @@ pub struct WatchSpec {
 }
 
 impl WatchSpec {
-    /// Validate a raw request (SPEC "watch_create"). Does not touch disk, so
-    /// duplicate-id and judge-reachability checks live in `Vigil::create`.
+    /// Validate a raw request (SPEC "watch_create" + V12 + V19). Does not
+    /// touch disk, so duplicate-id and judge-reachability checks live in
+    /// `Vigil::create`.
     pub fn parse(request: CreateRequest) -> Result<WatchSpec, CreateError> {
+        todo!()
+    }
+
+    /// V11: resolve relative file paths, glob patterns and `cmd` working
+    /// directories against `cwd` (the creating process's cwd); a `cmd` without
+    /// a `cwd` gets `cwd`. Absolute values are left alone.
+    pub fn absolutize(self, cwd: &std::path::Path) -> WatchSpec {
         todo!()
     }
 }
@@ -217,15 +239,33 @@ pub enum JudgeStatus {
     Skipped,
 }
 
+/// V9: what identifies "the same file at the same place in time".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_secs: i64,
+    pub mtime_nanos: u32,
+}
+
 /// What `read_input` remembers between ticks, per input (same order as
 /// `WatchSpec::inputs`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InputState {
+    /// Non-file inputs: hash of the last reading (V9: files are tracked by
+    /// position, not hash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     /// File inputs: byte offset already reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
+    /// File inputs (V9): `(dev, inode, size, mtime)` at the last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileStamp>,
+    /// Process inputs (V17): `/proc/<pid>/stat` field 22 recorded at baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start: Option<u64>,
     /// Glob inputs: matches already seen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known: Vec<String>,
@@ -247,6 +287,10 @@ pub struct PendingChange {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
+    /// V3: stable across replays. `<watch_id>:<tick>` for the first event of a
+    /// tick; later events of the same tick append `:<n>` (n = 1, 2, ...), see
+    /// `Event::make_id`.
+    pub event_id: String,
     pub tick: u64,
     pub watch_id: String,
     pub input: String,
@@ -254,6 +298,47 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge: Option<BTreeMap<String, Answer>>,
 }
+
+impl Event {
+    /// V3 id of the `index`-th (0-based) event emitted at `tick`.
+    pub fn make_id(watch_id: &str, tick: u64, index: usize) -> String {
+        todo!()
+    }
+}
+
+/// How a watch ended (V3/V4). `Pending` is deliberately not representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStatus {
+    Fired,
+    Expired,
+    Cancelled,
+}
+
+impl From<TerminalStatus> for WatchStatus {
+    fn from(status: TerminalStatus) -> WatchStatus {
+        match status {
+            TerminalStatus::Fired => WatchStatus::Fired,
+            TerminalStatus::Expired => WatchStatus::Expired,
+            TerminalStatus::Cancelled => WatchStatus::Cancelled,
+        }
+    }
+}
+
+/// The terminal result of a watch (V3). Stored once by `WatchFile::finish`,
+/// replayed unchanged forever after.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Terminal {
+    pub status: TerminalStatus,
+    pub finished_at: Timestamp,
+    pub events: Vec<Event>,
+    pub digest: String,
+}
+
+/// `WatchFile::finish` on a watch that already has a terminal result (V4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("watch already finished as {0:?}")]
+pub struct AlreadyFinished(pub WatchStatus);
 
 /// The persisted watch (`watches/<id>.json`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,11 +358,10 @@ pub struct WatchFile {
     pub judge_status: JudgeStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_change: Option<PendingChange>,
-    /// At most `MAX_EVENTS`, oldest dropped first.
+    /// V3: the terminal events only (empty while pending, empty for expired
+    /// and cancelled). There is no `delivered_through`.
     pub events: Vec<Event>,
-    /// Highest event tick already returned to the agent.
-    pub delivered_through: u64,
-    /// Digest of the last change, shown at expiry.
+    /// Last observed change; the terminal digest (V14).
     pub last_digest: String,
 }
 
@@ -286,8 +370,13 @@ impl WatchFile {
     pub fn new(spec: WatchSpec, now: Timestamp) -> WatchFile {
         todo!()
     }
-    /// Append, keeping only the newest `MAX_EVENTS`.
-    pub fn push_event(&mut self, event: Event) {
+    /// V3/V4: store the terminal result. Succeeds exactly once; afterwards the
+    /// watch is immutable and this returns `Err` without touching anything.
+    pub fn finish(&mut self, terminal: Terminal) -> Result<(), AlreadyFinished> {
+        todo!()
+    }
+    /// V16: a pending watch whose `deadline_at` is at or before `now`.
+    pub fn is_overdue(&self, now: Timestamp) -> bool {
         todo!()
     }
 }
@@ -564,7 +653,7 @@ mod tests {
         assert_eq!(Input::Url { url: "http://h/x".into() }.label(), "url:http://h/x");
         assert_eq!(Input::Port { host: "127.0.0.1".into(), port: 5432, want: None }.label(), "port:127.0.0.1:5432");
         assert_eq!(Input::Process { pid: 1234, want: None }.label(), "process:1234");
-        assert!(Input::Cmd { argv: vec!["systemctl".into(), "is-active".into()], timeout_s: None }
+        assert!(Input::Cmd { argv: vec!["systemctl".into(), "is-active".into()], timeout_s: None, cwd: None }
             .label()
             .starts_with("cmd:systemctl is-active"));
     }
@@ -587,20 +676,263 @@ mod tests {
         assert_eq!(file.tick, 0);
         assert_eq!(file.last_tick_at, None);
         assert!(file.events.is_empty());
-        assert_eq!(file.delivered_through, 0);
+        assert!(file.finished_at.is_none() && file.pending_change.is_none());
+        assert_eq!(file.input_states.len(), 0, "baseline is recorded by Vigil::create (V1), not by the constructor");
+    }
+
+    // ---- V3 / V4: terminal result is set once ----
+
+    fn terminal(status: TerminalStatus, at_s: &str, tick: u64, summary: &str) -> Terminal {
+        Terminal {
+            status,
+            finished_at: at(at_s),
+            events: vec![Event {
+                event_id: format!("w:{tick}"),
+                tick,
+                watch_id: "w".into(),
+                input: "file:/tmp/x".into(),
+                summary: summary.into(),
+                judge: None,
+            }],
+            digest: summary.into(),
+        }
     }
 
     #[test]
-    fn events_are_capped_to_the_newest_fifty() {
-        // why: SPEC "State": "the events list (last 50)". Push 60 (ticks
-        //      1..=60): 50 remain and the oldest kept is tick 11.
+    fn finish_stores_the_terminal_result_once_and_refuses_a_second() {
+        // why: V3/V4 (S3, S4): terminal states are immutable. The first result
+        //      stored wins; a later fire/expire/cancel returns Err and leaves
+        //      status, finished_at, events and digest exactly as stored.
+        //      Positive control: the first call changes the file.
+        // proves: CLAIM(terminal-immutable)
         let spec = WatchSpec::parse(change_request("w", Path::new("/tmp/x"), 20)).unwrap();
         let mut file = WatchFile::new(spec, at("2026-10-29T14:03:11Z"));
-        for tick in 1..=60 {
-            file.push_event(Event { tick, watch_id: "w".into(), input: "file:/tmp/x".into(), summary: "s".into(), judge: None });
+        file.finish(terminal(TerminalStatus::Fired, "2026-10-29T14:04:00Z", 3, "first")).unwrap();
+        assert_eq!(file.status, WatchStatus::Fired);
+        assert_eq!(file.finished_at, Some(at("2026-10-29T14:04:00Z")));
+        assert_eq!(file.events.len(), 1);
+        assert_eq!(file.last_digest, "first");
+
+        let before = file.clone();
+        for later in [TerminalStatus::Cancelled, TerminalStatus::Expired, TerminalStatus::Fired] {
+            let outcome = file.finish(terminal(later, "2026-10-29T14:09:00Z", 9, "second"));
+            assert_eq!(outcome, Err(AlreadyFinished(WatchStatus::Fired)), "{later:?} must be refused");
+            assert_eq!(file, before, "{later:?} must not change anything");
         }
-        assert_eq!(file.events.len(), 50);
-        assert_eq!(file.events.first().unwrap().tick, 11);
-        assert_eq!(file.events.last().unwrap().tick, 60);
+    }
+
+    #[test]
+    fn event_ids_are_watch_id_colon_tick_with_a_suffix_for_later_events_of_one_tick() {
+        // why: V3: events carry a stable `event_id` of `<watch_id>:<tick>`.
+        //      Two inputs changing in one tick would collide, so the default
+        //      taken (see .red-report.md) suffixes the 2nd and later event of a
+        //      tick with `:<n>`. The first stays exactly `<watch_id>:<tick>`.
+        // proves: CLAIM(event-id)
+        assert_eq!(Event::make_id("build", 17, 0), "build:17");
+        assert_eq!(Event::make_id("build", 17, 1), "build:17:1");
+        assert_eq!(Event::make_id("build", 17, 2), "build:17:2");
+        assert_ne!(Event::make_id("build", 17, 1), Event::make_id("build", 18, 0));
+    }
+
+    #[test]
+    fn an_overdue_pending_watch_is_detected_at_the_deadline_inclusive() {
+        // why: V16: a pending watch past its deadline counts as expired.
+        //      deadline_at = created + 3600 s; 1 s before is not overdue, the
+        //      deadline instant itself is (matches "deadline passed: yes or
+        //      no" with `deadline_at <= now`).
+        let spec = WatchSpec::parse(change_request("w", Path::new("/tmp/x"), 20)).unwrap();
+        let file = WatchFile::new(spec, at("2026-10-29T14:03:11Z"));
+        assert!(!file.is_overdue(at("2026-10-29T15:03:10Z")));
+        assert!(file.is_overdue(at("2026-10-29T15:03:11Z")));
+        assert!(file.is_overdue(at("2026-11-29T15:03:11Z")));
+        let mut done = file.clone();
+        done.finish(terminal(TerminalStatus::Cancelled, "2026-10-29T14:04:00Z", 1, "x")).unwrap();
+        assert!(!done.is_overdue(at("2027-01-01T00:00:00Z")), "a finished watch is not 'overdue pending'");
+    }
+
+    // ---- V19: create-time validation ----
+
+    fn with_rule(test: RuleTest, min_confidence: f64) -> CreateRequest {
+        let mut req = judge_req();
+        req.judge_rule = Some(JudgeRule { question: "failed".into(), test, min_confidence });
+        req
+    }
+
+    #[test]
+    fn noul_probability_must_lie_in_0_to_1_inclusive() {
+        // why: V19 (S19): judge probabilities in 0..=1. Boundaries 0 and 1
+        //      pass; just outside, NaN and infinities are errors, not clamps.
+        // proves: CLAIM(validation)
+        for ok in [0.0, 0.5, 1.0] {
+            assert!(WatchSpec::parse(with_rule(RuleTest::NoulGte(ok), 0.0)).is_ok(), "{ok} should pass");
+        }
+        for bad in [-0.0001, 1.0001, 2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                matches!(WatchSpec::parse(with_rule(RuleTest::NoulGte(bad), 0.0)), Err(CreateError::ProbabilityOutOfRange { .. })),
+                "noul_gte {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn min_confidence_must_lie_in_0_to_1_inclusive_for_every_rule_kind() {
+        // why: V19: `min_confidence` in 0..=1, checked for noul, choice and
+        //      score rules alike (score_gte itself is not a probability).
+        // proves: CLAIM(validation)
+        let tests = [RuleTest::NoulGte(0.5), RuleTest::ChoiceIn(vec!["a".into()]), RuleTest::ScoreGte(2.0)];
+        for test in &tests {
+            let kind = test.question_type();
+            let build = |min_confidence: f64| {
+                let mut req = with_rule(test.clone(), min_confidence);
+                req.judge_questions = Some(json!({"failed": {"type": kind, "instructions": "?"}}).as_object().unwrap().clone());
+                req
+            };
+            for ok in [0.0, 1.0] {
+                assert!(WatchSpec::parse(build(ok)).is_ok(), "{kind} min_confidence {ok}");
+            }
+            for bad in [-0.01, 1.01, f64::NAN] {
+                assert!(
+                    matches!(WatchSpec::parse(build(bad)), Err(CreateError::ProbabilityOutOfRange { .. })),
+                    "{kind} min_confidence {bad} must be rejected"
+                );
+            }
+        }
+        // score_gte is a level, not a probability: 7.5 is fine.
+        let mut req = with_rule(RuleTest::ScoreGte(7.5), 0.0);
+        req.judge_questions = Some(json!({"failed": {"type": "score", "instructions": "?"}}).as_object().unwrap().clone());
+        assert!(WatchSpec::parse(req).is_ok());
+    }
+
+    #[test]
+    fn deadline_s_is_one_second_to_seven_days_and_overflow_is_an_error() {
+        // why: V19 (S19): deadline_s 1..=604800 (7 days = 7*24*3600). 0 and
+        //      604801 are errors, so is u64::MAX (would overflow the absolute
+        //      deadline_at), never a panic or a clamp.
+        // proves: CLAIM(validation)
+        let with_deadline = |d: u64| {
+            let mut req = change_request("w", Path::new("/tmp/x"), 20);
+            req.deadline_s = Some(d);
+            WatchSpec::parse(req)
+        };
+        assert_eq!(with_deadline(1).unwrap().deadline_s, 1);
+        assert_eq!(with_deadline(604_800).unwrap().deadline_s, 604_800);
+        for bad in [0, 604_801, u64::MAX] {
+            assert_eq!(with_deadline(bad), Err(CreateError::DeadlineOutOfRange(bad)), "deadline_s {bad}");
+        }
+    }
+
+    #[test]
+    fn cmd_argv_must_not_be_empty() {
+        // why: V19: `cmd.argv` non-empty (an empty argv has no program to run).
+        //      Control: one element is fine.
+        // proves: CLAIM(validation)
+        let cmd = |argv: Vec<String>| {
+            let mut req = change_request("w", Path::new("/tmp/x"), 20);
+            req.inputs = vec![Input::Cmd { argv, timeout_s: None, cwd: None }];
+            WatchSpec::parse(req)
+        };
+        assert_eq!(cmd(vec![]), Err(CreateError::EmptyArgv));
+        assert!(cmd(vec!["true".into()]).is_ok());
+    }
+
+    #[test]
+    fn url_inputs_must_be_http_https_and_other_schemes_are_errors() {
+        // why: V19/D7 (S19): http only (no TLS stack on 8 GB hosts). https,
+        //      ftp, file and scheme-less strings are errors naming the offender;
+        //      Positive control: http (any case of the scheme) is accepted.
+        // proves: CLAIM(validation)
+        let url = |u: &str| {
+            let mut req = change_request("w", Path::new("/tmp/x"), 20);
+            req.inputs = vec![Input::Url { url: u.into() }];
+            WatchSpec::parse(req)
+        };
+        assert!(url("http://localhost:8080/health").is_ok());
+        assert!(url("HTTP://localhost/").is_ok());
+        for bad in ["https://example.com/", "ftp://example.com/", "file:///etc/passwd", "localhost:8080", ""] {
+            assert!(
+                matches!(url(bad), Err(CreateError::UnsupportedUrlScheme(ref got)) if got == bad),
+                "{bad:?} must be rejected as an unsupported scheme, got {:?}",
+                url(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_timeout_s_must_lie_in_a_tenth_of_a_second_to_a_minute() {
+        // why: V19: timeout_s 0.1..=60, boundaries inclusive; NaN, negative
+        //      and zero are errors (an unbounded or zero wait is unsafe).
+        // proves: CLAIM(validation)
+        let cmd = |t: Option<f64>| {
+            let mut req = change_request("w", Path::new("/tmp/x"), 20);
+            req.inputs = vec![Input::Cmd { argv: vec!["true".into()], timeout_s: t, cwd: None }];
+            WatchSpec::parse(req)
+        };
+        for ok in [None, Some(0.1), Some(10.0), Some(60.0)] {
+            assert!(cmd(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [0.0, 0.05, -1.0, 60.5, 3600.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(cmd(Some(bad)), Err(CreateError::TimeoutOutOfRange(_))), "timeout_s {bad}");
+        }
+    }
+
+    // ---- V12: size limits ----
+
+    #[test]
+    fn a_watch_has_at_most_sixteen_inputs() {
+        // why: V12 (S12): 16 inputs ok, 17 is an error carrying the count.
+        // proves: CLAIM(limits)
+        let with_inputs = |n: usize| {
+            let mut req = change_request("w", Path::new("/tmp/x"), 20);
+            req.inputs = (0..n).map(|i| Input::File { path: format!("/tmp/f{i}").into(), tail_bytes: None }).collect();
+            WatchSpec::parse(req)
+        };
+        assert!(with_inputs(16).is_ok());
+        assert_eq!(with_inputs(17), Err(CreateError::TooManyInputs(17)));
+        assert_eq!(with_inputs(1000), Err(CreateError::TooManyInputs(1000)));
+    }
+
+    #[test]
+    fn prompt_is_at_most_1024_bytes_not_chars() {
+        // why: V12 (S12/S15): the prompt is bounded in BYTES so the judge
+        //      state keeps room for observations. 1024 ASCII bytes pass, 1025
+        //      fail; 341 x "日" = 1023 bytes pass, 342 x "日" = 1026 bytes fail
+        //      although both are far below 1024 chars.
+        // proves: CLAIM(limits)
+        let with_prompt = |p: String| {
+            let mut req = change_request("w", Path::new("/tmp/x"), 20);
+            req.prompt = p;
+            WatchSpec::parse(req)
+        };
+        assert!(with_prompt("a".repeat(1024)).is_ok());
+        assert_eq!(with_prompt("a".repeat(1025)), Err(CreateError::PromptTooLong(1025)));
+        assert!(with_prompt("日".repeat(341)).is_ok());
+        assert_eq!(with_prompt("日".repeat(342)), Err(CreateError::PromptTooLong(1026)));
+    }
+
+    // ---- V11: relative paths resolve against the creating cwd ----
+
+    #[test]
+    fn absolutize_resolves_relative_paths_globs_and_cmd_cwd_against_the_creator_cwd() {
+        // why: V11 (S11): relative paths, glob patterns and the cmd working
+        //      directory are resolved against the CREATING process's cwd and
+        //      stored absolute, so resuming from another directory means the
+        //      same thing. Absolute values and a given absolute cmd cwd are
+        //      untouched (positive controls); a relative cmd cwd joins.
+        // proves: CLAIM(creator-cwd)
+        let mut req = change_request("w", Path::new("rel/build.log"), 20);
+        req.inputs.push(Input::Glob { pattern: "out/*.txt".into(), report: GlobReport::Created });
+        req.inputs.push(Input::Glob { pattern: "/abs/*.txt".into(), report: GlobReport::Created });
+        req.inputs.push(Input::File { path: "/abs/keep.log".into(), tail_bytes: Some(10) });
+        req.inputs.push(Input::Cmd { argv: vec!["pwd".into()], timeout_s: None, cwd: None });
+        req.inputs.push(Input::Cmd { argv: vec!["pwd".into()], timeout_s: None, cwd: Some("/already/abs".into()) });
+        req.inputs.push(Input::Cmd { argv: vec!["pwd".into()], timeout_s: None, cwd: Some("sub".into()) });
+        let spec = WatchSpec::parse(req).unwrap().absolutize(Path::new("/work/a"));
+        assert_eq!(spec.inputs[0], Input::File { path: "/work/a/rel/build.log".into(), tail_bytes: None });
+        assert_eq!(spec.inputs[1], Input::Glob { pattern: "/work/a/out/*.txt".into(), report: GlobReport::Created });
+        assert_eq!(spec.inputs[2], Input::Glob { pattern: "/abs/*.txt".into(), report: GlobReport::Created });
+        assert_eq!(spec.inputs[3], Input::File { path: "/abs/keep.log".into(), tail_bytes: Some(10) });
+        assert_eq!(spec.inputs[4], Input::Cmd { argv: vec!["pwd".into()], timeout_s: None, cwd: Some("/work/a".into()) });
+        assert_eq!(spec.inputs[5], Input::Cmd { argv: vec!["pwd".into()], timeout_s: None, cwd: Some("/already/abs".into()) });
+        assert_eq!(spec.inputs[6], Input::Cmd { argv: vec!["pwd".into()], timeout_s: None, cwd: Some("/work/a/sub".into()) });
     }
 }
