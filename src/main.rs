@@ -106,7 +106,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        // Phase 3.
-        Command::Mcp => todo!("phase 3: the stdio MCP server"),
+        Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil)).await,
     }
 }

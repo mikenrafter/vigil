@@ -81,7 +81,34 @@ impl HttpJudge {
 
 impl Judge for HttpJudge {
     fn predict<'a>(&'a self, request: &'a JudgeRequest) -> BoxFuture<'a, Result<Answers, JudgeError>> {
-        Box::pin(async move { todo!() })
+        Box::pin(async move {
+            let url = format!("{}/v1/predict", self.base_url.trim_end_matches('/'));
+            let client = reqwest::Client::builder()
+                .timeout(self.predict_timeout)
+                .pool_max_idle_per_host(0)
+                .build()
+                .map_err(|error| JudgeError::Unreachable(error.to_string()))?;
+            let failed = |error: reqwest::Error| {
+                if error.is_timeout() {
+                    JudgeError::Timeout
+                } else {
+                    JudgeError::Unreachable(error.to_string())
+                }
+            };
+            let response = client.post(url).json(request).send().await.map_err(failed)?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(JudgeError::Status(status.as_u16()));
+            }
+            let body = response.bytes().await.map_err(failed)?;
+            #[derive(Deserialize)]
+            struct Response {
+                answers: Answers,
+            }
+            serde_json::from_slice::<Response>(&body)
+                .map(|response| response.answers)
+                .map_err(|error| JudgeError::Malformed(error.to_string()))
+        })
     }
     fn healthy(&self) -> BoxFuture<'_, bool> {
         Box::pin(async move {
@@ -118,12 +145,39 @@ impl RuleTest {
 
 /// `{"question", "noul_gte" | "choice_in" | "score_gte", "min_confidence"?}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawRule")]
 pub struct JudgeRule {
     pub question: String,
     #[serde(flatten)]
     pub test: RuleTest,
     #[serde(default)]
     pub min_confidence: f64,
+}
+
+/// The wire form: exactly one of the three test fields must be present.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRule {
+    question: String,
+    noul_gte: Option<f64>,
+    choice_in: Option<Vec<String>>,
+    score_gte: Option<f64>,
+    #[serde(default)]
+    min_confidence: f64,
+}
+
+impl TryFrom<RawRule> for JudgeRule {
+    type Error = String;
+    fn try_from(raw: RawRule) -> Result<JudgeRule, String> {
+        let test = match (raw.noul_gte, raw.choice_in, raw.score_gte) {
+            (Some(p), None, None) => RuleTest::NoulGte(p),
+            (None, Some(labels), None) => RuleTest::ChoiceIn(labels),
+            (None, None, Some(n)) => RuleTest::ScoreGte(n),
+            (None, None, None) => return Err("judge_rule needs one of noul_gte, choice_in, score_gte".into()),
+            _ => return Err("judge_rule takes exactly one of noul_gte, choice_in, score_gte".into()),
+        };
+        Ok(JudgeRule { question: raw.question, test, min_confidence: raw.min_confidence })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -138,7 +192,15 @@ impl JudgeRule {
     /// Does the judge's answer satisfy the rule? A missing or wrongly typed
     /// answer is an error (the caller treats it as a judge failure).
     pub fn evaluate(&self, answers: &Answers) -> Result<bool, RuleError> {
-        todo!()
+        let answer = answers.get(&self.question).ok_or_else(|| RuleError::MissingAnswer(self.question.clone()))?;
+        let wrong = || RuleError::WrongAnswerType(self.question.clone());
+        let passes = match (&self.test, answer) {
+            (RuleTest::NoulGte(p), Answer::Noul { noul, .. }) => noul >= p,
+            (RuleTest::ChoiceIn(labels), Answer::Choice { choice, .. }) => labels.contains(choice),
+            (RuleTest::ScoreGte(n), Answer::Score { score, .. }) => score >= n,
+            _ => return Err(wrong()),
+        };
+        Ok(passes && answer.confidence() >= self.min_confidence)
     }
 }
 
@@ -154,7 +216,25 @@ pub const MIN_OBSERVATION_BYTES: usize = 1536;
 /// (`budget / changed.len()`) across the changed inputs, each input's lines
 /// newest (last) first, each section cut on a UTF-8 boundary.
 pub fn build_state(prompt: &str, changed: &[ChangedInput], limit_bytes: usize) -> String {
-    todo!()
+    let mut state = prompt.to_string();
+    if changed.is_empty() {
+        return state;
+    }
+    let budget = limit_bytes.saturating_sub(prompt.len()).max(MIN_OBSERVATION_BYTES);
+    let share = budget / changed.len();
+    for input in changed {
+        let mut section = format!("\n{}:", input.label);
+        for line in input.text.lines().rev() {
+            section.push('\n');
+            section.push_str(line);
+        }
+        let mut end = section.len().min(share);
+        while !section.is_char_boundary(end) {
+            end -= 1;
+        }
+        state.push_str(&section[..end]);
+    }
+    state
 }
 
 #[cfg(test)]

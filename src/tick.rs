@@ -3,9 +3,10 @@
 use crate::clock::Timestamp;
 use crate::engine::{expired_if_overdue, Vigil};
 use crate::error::VigilError;
-use crate::inputs::Reading;
+use crate::inputs::{Reading, TRUNCATED_MARKER};
+use crate::judge::{build_state, Answers, JudgeRequest};
 use crate::watch::{
-    ChangedInput, Event, FireRule, Input, InputState, Terminal, TerminalStatus, WatchFile, WatchId, WatchStatus,
+    ChangedInput, Event, FireRule, Input, InputState, JudgeStatus, PendingChange, Terminal, TerminalStatus, WatchFile, WatchId, WatchStatus,
     MAX_SUMMARY_BYTES,
 };
 
@@ -127,7 +128,97 @@ impl Vigil {
         changed: &[ChangedInput],
         now: Timestamp,
     ) -> Result<Vec<Event>, VigilError> {
-        todo!("phase 2: judge request, rule evaluation, strikes (SPEC 'Tick logic' 4-5, 'Failure rules')")
+        let FireRule::Judge { judge_questions, judge_rule } = watch.spec.fire.clone() else {
+            return Ok(Vec::new());
+        };
+        // R7: everything changed since the last judged tick, oldest first.
+        let pending = merge_pending(watch.pending_change.take(), changed);
+        let request = JudgeRequest {
+            state: build_state(&watch.spec.prompt, &pending, self.config.judge_state_bytes),
+            questions: judge_questions.0.clone(),
+        };
+        let verdict = match self.judge.predict(&request).await {
+            Ok(answers) => judge_rule.evaluate(&answers).map(|matched| (matched, answers)).map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        match verdict {
+            Ok((matched, answers)) => {
+                watch.judge_strikes = 0;
+                watch.judge_status = JudgeStatus::Ok;
+                // A judged change is consumed, whether or not it matched.
+                if !matched {
+                    return Ok(Vec::new());
+                }
+                watch.last_digest = digest_of(&pending);
+                Ok(vec![judge_event(watch, tick, &pending, None, Some(answers))])
+            }
+            Err(_) => {
+                watch.judge_strikes += 1;
+                watch.judge_status = JudgeStatus::Down;
+                if watch.judge_strikes < MAX_JUDGE_STRIKES {
+                    watch.pending_change = Some(PendingChange { changed: pending });
+                    return Ok(Vec::new());
+                }
+                watch.last_digest = digest_of(&pending);
+                Ok(vec![judge_event(watch, tick, &pending, Some("judge unavailable; raw change attached"), None)])
+            }
+        }
+    }
+}
+
+/// SPEC "Failure rules": the third consecutive judge failure fires.
+const MAX_JUDGE_STRIKES: u32 = 3;
+
+/// W7: the most one input's persisted pending change may hold.
+const MAX_PENDING_BYTES_PER_INPUT: usize = 64 * 1024;
+
+/// R7 + W7: append `changed` (newer) to `pending` (older), one entry per
+/// input label, and keep the newest `MAX_PENDING_BYTES_PER_INPUT` of each.
+fn merge_pending(pending: Option<PendingChange>, changed: &[ChangedInput]) -> Vec<ChangedInput> {
+    let mut merged: Vec<ChangedInput> = pending.map(|p| p.changed).unwrap_or_default();
+    for input in changed {
+        match merged.iter_mut().find(|existing| existing.label == input.label) {
+            Some(existing) => {
+                if !existing.text.is_empty() && !existing.text.ends_with('\n') {
+                    existing.text.push('\n');
+                }
+                existing.text.push_str(&input.text);
+            }
+            None => merged.push(input.clone()),
+        }
+    }
+    for input in &mut merged {
+        if input.text.len() > MAX_PENDING_BYTES_PER_INPUT {
+            let mut start = input.text.len() - MAX_PENDING_BYTES_PER_INPUT;
+            while !input.text.is_char_boundary(start) {
+                start += 1;
+            }
+            input.text = format!("{TRUNCATED_MARKER}\n{}", &input.text[start..]);
+        }
+    }
+    merged
+}
+
+/// The single event of a judge-fired tick (W1: `:0`). `summary` overrides the
+/// default, the newest line of each judged input (X2: at most 200 bytes).
+fn judge_event(watch: &WatchFile, tick: u64, judged: &[ChangedInput], summary: Option<&str>, answers: Option<Answers>) -> Event {
+    let summary = summary.map(str::to_string).unwrap_or_else(|| {
+        let lines: Vec<String> = judged
+            .iter()
+            .map(|input| match watch.spec.inputs.iter().find(|spec| spec.label() == input.label) {
+                Some(spec) => summarize(spec, &input.text),
+                None => cap_bytes(input.text.trim(), MAX_SUMMARY_BYTES),
+            })
+            .collect();
+        cap_bytes(&lines.join(" | "), MAX_SUMMARY_BYTES)
+    });
+    Event {
+        event_id: Event::make_id(watch.spec.id.as_str(), tick, 0),
+        tick,
+        watch_id: watch.spec.id.to_string(),
+        input: judged.iter().map(|input| input.label.as_str()).collect::<Vec<_>>().join(", "),
+        summary,
+        judge: answers,
     }
 }
 

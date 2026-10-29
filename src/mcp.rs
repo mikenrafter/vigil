@@ -1,20 +1,221 @@
 //! stdio MCP front: five tools over `Vigil`.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
+use rmcp::{
+    ErrorData, Peer, RoleServer, ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolResult, ContentBlock, MetaObject, ProgressNotificationParam, ProtocolVersion, RequestMetaObject,
+        ServerCapabilities, ServerConfig,
+    },
+    schemars, tool, tool_handler, tool_router,
+    transport::stdio,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::mpsc;
+
 use crate::engine::Vigil;
+use crate::error::VigilError;
+use crate::keepalive::{KeepaliveRequest, ProgressSink, ProgressUpdate};
+use crate::watch::{CreateRequest, WatchId};
 
 /// Server `instructions`: under 512 characters; says to create a watch, then
 /// call `keepalive` repeatedly, and (V20) to stop calling when `next` is not
 /// exactly "call keepalive again" ("act on events" means act on them; the
 /// ended text means create a new watch only if still needed).
 pub fn server_instructions() -> String {
-    todo!()
+    "vigil keeps your turn open while a cheap judge watches things. Call watch_create to say what to watch, \
+     then call keepalive again and again. Read `next` in each result. While it is exactly \"call keepalive again\", \
+     call keepalive again. Otherwise stop calling it: \"act on events\" means act on the events; \
+     \"watch ended; create a new watch if still needed\" means the watch expired or was cancelled. \
+     watch_status, watch_list and watch_cancel inspect or end watches."
+        .to_string()
 }
 
 /// Serve on stdin/stdout until the client disconnects.
 pub async fn serve_stdio(vigil: Arc<Vigil>) -> anyhow::Result<()> {
-    todo!()
+    let service = VigilServer::new(vigil).serve(stdio()).await?;
+    service.waiting().await?;
+    Ok(())
+}
+
+/// `watch_create` arguments: the spec's watch object. Nested parts stay loose
+/// here and are checked by `CreateRequest`, so a bad one is a tool error with
+/// vigil's own message, not a protocol error.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateArgs {
+    /// Optional stable id, `[A-Za-z0-9_-]{1,64}`; generated when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// What the judge should look for (at most 1024 bytes).
+    #[serde(default)]
+    pub prompt: String,
+    /// Inputs: {kind: file|glob|cmd|url|port|process, ...} (at most 16).
+    pub inputs: Vec<Value>,
+    /// Seconds between ticks, clamped to 1..=3600 (default 20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_s: Option<u64>,
+    /// Seconds until the watch expires, 1..=604800 (default 3600).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_s: Option<u64>,
+    /// "judge", "change" or "condition".
+    pub fire: String,
+    /// fire = judge: Laya questions keyed by id, types noul, choice, score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge_questions: Option<Value>,
+    /// fire = judge: {question, noul_gte | choice_in | score_gte, min_confidence?}.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge_rule: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KeepaliveArgs {
+    /// Watch to cover; without it, the watches this server created.
+    pub watch_id: Option<String>,
+    /// Seconds to block, clamped to 30..=270 (default 270).
+    pub max_s: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WatchIdArgs {
+    pub watch_id: String,
+}
+
+/// V18: forwards each tick as a progress notification. `progress` is the
+/// call-local counter; the watch and its tick ride in the message.
+struct ChannelProgress(mpsc::UnboundedSender<ProgressUpdate>);
+
+impl ProgressSink for ChannelProgress {
+    fn progress(&self, update: &ProgressUpdate) {
+        let _ = self.0.send(update.clone());
+    }
+}
+
+#[derive(Clone)]
+pub struct VigilServer {
+    vigil: Arc<Vigil>,
+    tool_router: ToolRouter<Self>,
+}
+
+/// Claude Code defers MCP tools unless they say otherwise; the agent must
+/// always see `keepalive`.
+fn always_load() -> MetaObject {
+    let mut meta = MetaObject::new();
+    meta.0.insert("anthropic/alwaysLoad".into(), Value::Bool(true));
+    meta
+}
+
+fn text_result(failed: bool, text: String) -> CallToolResult {
+    let content = vec![ContentBlock::text(text)];
+    if failed { CallToolResult::error(content) } else { CallToolResult::success(content) }
+}
+
+/// A JSON text block for success; `isError` with the message for a failure.
+fn reply<T: Serialize>(outcome: Result<T, VigilError>) -> CallToolResult {
+    match outcome {
+        Ok(value) => match serde_json::to_string(&value) {
+            Ok(text) => text_result(false, text),
+            Err(error) => text_result(true, format!("cannot encode the result: {error}")),
+        },
+        Err(VigilError::NothingToCover) => {
+            text_result(true, "no watches to cover: pass watch_id, or call watch_create first".to_string())
+        }
+        Err(error) => text_result(true, error.to_string()),
+    }
+}
+
+fn parse_id(raw: &str) -> Result<WatchId, VigilError> {
+    Ok(WatchId::parse(raw)?)
+}
+
+#[tool_router]
+impl VigilServer {
+    pub fn new(vigil: Arc<Vigil>) -> VigilServer {
+        VigilServer { vigil, tool_router: Self::tool_router() }
+    }
+
+    #[tool(description = "Create a watch: inputs to sense, an interval, a deadline, and a fire rule (judge, change or condition). No tick runs until keepalive.")]
+    async fn watch_create(&self, Parameters(args): Parameters<CreateArgs>) -> Result<CallToolResult, ErrorData> {
+        let request = serde_json::to_value(&args)
+            .and_then(serde_json::from_value::<CreateRequest>)
+            .map_err(|error| format!("invalid watch: {error}"));
+        Ok(match request {
+            Ok(request) => reply(self.vigil.create(request).await),
+            Err(message) => text_result(true, message),
+        })
+    }
+
+    #[tool(
+        description = "Block up to max_s (30-270, default 270) while watches tick; return when one fires or ends. Call again while next is \"call keepalive again\".",
+        meta = always_load()
+    )]
+    async fn keepalive(
+        &self,
+        Parameters(args): Parameters<KeepaliveArgs>,
+        meta: RequestMetaObject,
+        peer: Peer<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let watch_id = match args.watch_id.as_deref().map(parse_id).transpose() {
+            Ok(id) => id,
+            Err(error) => return Ok(reply::<()>(Err(error))),
+        };
+        let request = KeepaliveRequest { watch_id, max_s: args.max_s };
+        let (sender, mut updates) = mpsc::unbounded_channel::<ProgressUpdate>();
+        let token = meta.get_progress_token();
+        let forward = async {
+            while let Some(update) = updates.recv().await {
+                if let Some(token) = &token {
+                    let notice = ProgressNotificationParam::new(token.clone(), update.progress as f64)
+                        .with_message(format!("{} tick {}", update.watch_id, update.tick));
+                    let _ = peer.notify_progress(notice).await;
+                }
+            }
+        };
+        let run = async { self.vigil.keepalive_with_progress(request, &ChannelProgress(sender)).await };
+        // The sink (and its sender) is dropped when `run` ends, which ends
+        // `forward` after it has flushed what was queued.
+        let (outcome, ()) = tokio::join!(run, forward);
+        Ok(reply(outcome))
+    }
+
+    #[tool(description = "Non-blocking: the current envelope of one watch, plus judge reachability. Does not tick.")]
+    async fn watch_status(&self, Parameters(args): Parameters<WatchIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(match parse_id(&args.watch_id) {
+            Ok(id) => reply(self.vigil.status(&id).await),
+            Err(error) => reply::<()>(Err(error)),
+        })
+    }
+
+    #[tool(description = "List every watch (any session) with status, tick and deadline.")]
+    async fn watch_list(&self) -> Result<CallToolResult, ErrorData> {
+        Ok(reply(self.vigil.list().await))
+    }
+
+    #[tool(description = "Cancel a pending watch. A watch that already finished returns its stored result unchanged.")]
+    async fn watch_cancel(&self, Parameters(args): Parameters<WatchIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(match parse_id(&args.watch_id) {
+            Ok(id) => reply(self.vigil.cancel(&id).await),
+            Err(error) => reply::<()>(Err(error)),
+        })
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for VigilServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(server_instructions())
+            .with_protocol_version(ProtocolVersion::V_2025_11_25)
+    }
+
+    // Claude Code does not register a server that negotiates 2026-07-28
+    // (FINDINGS section 2), so never offer it.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
+    }
 }
 
 #[cfg(test)]
