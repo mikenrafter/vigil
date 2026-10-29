@@ -78,9 +78,10 @@ spike (phase 0).
 
 ## Delivery: how the agent gets context without re-arming
 
-Two paths. The first is required. A third (channel push) is out of scope:
-it needs something sensing while the agent is idle, which the stateless
-design does not have.
+Path 1 is required. Channel push (an MCP server starting a turn on its
+own) is out of scope: Claude Code loads custom channel servers only behind
+`--dangerously-load-development-channels`, drops refused events silently,
+and Codex has no equivalent (`FINDINGS.md` §2).
 
 1. **Blocking `keepalive` result (required).** The call ticks in-process
    up to `max_s` or until the watch fires, then returns the envelope below.
@@ -94,6 +95,16 @@ design does not have.
    `notifications/progress` with the tick count. Clients that honour
    `resetTimeoutOnProgress` stay alive longer. Claude Code's behaviour here
    is disputed in the sources found, so never depend on it.
+3. **`vigil wait` (Claude Code, no re-trigger).** `vigil wait <id>` blocks
+   with no 270 s ceiling until the watch fires, expires or is cancelled,
+   prints the final envelope and exits (0 fired, 2 expired, 3 cancelled,
+   1 error). `--stream` prints one JSON line per new event, then the final
+   envelope. The agent runs it once as a background command; Claude Code
+   wakes the agent when it exits (or per line through its Monitor tool).
+   Trade-off: no model calls while waiting, so the prompt cache goes cold
+   after its TTL. Use `keepalive` to stay warm, `wait` for long waits where
+   a cold cache is fine. Codex has no background wake, so it uses
+   `keepalive` only.
 
 ### Interval and long deadlines
 
@@ -362,4 +373,5 @@ server that returns canned answers.
 - D6: Claude Code gets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=280000` through
   agent-integration, so `keepalive` stays one round trip.
 - D7: URL inputs are http only (no TLS stack, to avoid aws-lc-rs on 8 GB hosts).
+- D11: `vigil wait` added (delivery path 3) so Claude Code agents can wait with no re-trigger.
 - D8: the live hour-long test uses `change`/`condition`; Laya stays on host-c.
