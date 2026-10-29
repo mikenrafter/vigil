@@ -1,7 +1,6 @@
 //! `vigil` CLI. Reads the environment here, at the edge, and hands explicit
 //! values (state root, config) to the library.
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -110,7 +109,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 Some(raw) => raw,
                 None => {
                     let mut raw = String::new();
-                    std::io::stdin().read_to_string(&mut raw)?;
+                    // C14: async, so the signal branches stay live while stdin is idle.
+                    tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut raw).await?;
                     raw
                 }
             };

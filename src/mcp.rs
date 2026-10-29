@@ -116,9 +116,10 @@ where
 {
     let call_end = tokio::time::Instant::now() + std::time::Duration::from_secs(crate::keepalive::clamp_max_s(request.max_s));
     let (sender, mut updates) = mpsc::unbounded_channel::<ProgressUpdate>();
+    let mut cancel = std::pin::pin!(cancel);
     let outcome = {
         let sink = ChannelProgress(sender);
-        let run = vigil.keepalive_cancellable(request, &sink, cancel);
+        let run = vigil.keepalive_uncommitted(request, &sink, &mut cancel);
         let forward = async {
             while let Some(update) = updates.recv().await {
                 notify(update).await;
@@ -133,13 +134,31 @@ where
     };
     // The sender went with `run`; what is queued can still be sent, briefly.
     let flush = PROGRESS_FLUSH.min(call_end.saturating_duration_since(tokio::time::Instant::now()));
-    let _ = tokio::time::timeout(flush, async {
-        while let Some(update) = updates.recv().await {
-            notify(update).await;
-        }
-    })
-    .await;
-    outcome
+    // C2: the results count as returned only once the flush is over and no
+    // cancel has arrived; a cancel during the flush makes the transport
+    // discard the response, so the results must stay for the next call.
+    let done = outcome?;
+    let cancelled_in_flush = tokio::select! {
+        biased;
+        () = &mut cancel, if done.is_some() => true,
+        _ = tokio::time::timeout(flush, async {
+            while let Some(update) = updates.recv().await {
+                notify(update).await;
+            }
+        }) => false,
+    };
+    let Some((envelope, delivery)) = done else { return Ok(None) };
+    let cancelled = cancelled_in_flush
+        || tokio::select! {
+            biased;
+            () = &mut cancel => true,
+            () = std::future::ready(()) => false,
+        };
+    if cancelled {
+        return Ok(None);
+    }
+    vigil.commit_delivery(delivery);
+    Ok(Some(envelope))
 }
 
 fn cancelled_result() -> CallToolResult {
@@ -324,5 +343,34 @@ mod tests {
             .expect("not cancelled");
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
         assert_eq!(envelope.status, crate::watch::WatchStatus::Pending);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_the_progress_flush_keeps_the_result_for_the_next_call() {
+        // why: code review C2 (still open after round 1): terminal ids were
+        //      marked returned when the engine finished, before the progress
+        //      flush. A cancel arriving during the flush makes the transport
+        //      discard the response, and the following no-id keepalive then
+        //      found nothing to cover. The watch fires at once; its progress
+        //      notice cannot be delivered (the flush runs its full 250 ms);
+        //      the cancel lands 100 ms in. That call is cancelled; the next
+        //      one must still return the fired result.
+        // proves: CLAIM(call-budget)
+        use crate::testing::*;
+        let env = Env::with_clock(std::sync::Arc::new(TokioClock::new(spec_instant())));
+        let path = env.input_path("w.log");
+        write_file(&path, "old\n");
+        env.vigil.create(change_request("w", &path, 20)).await.unwrap();
+        append_file(&path, "new\n");
+        let cancel = async { tokio::time::sleep(std::time::Duration::from_millis(100)).await };
+        let first = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30) }, cancel, |_update| std::future::pending::<()>())
+            .await
+            .unwrap();
+        assert!(first.is_none(), "the call was cancelled");
+        let second = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30) }, std::future::pending::<()>(), |_update| std::future::ready(()))
+            .await
+            .expect("the result was marked returned by the cancelled call")
+            .expect("not cancelled");
+        assert_eq!(second.status, crate::watch::WatchStatus::Fired);
     }
 }

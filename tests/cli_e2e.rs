@@ -812,3 +812,42 @@ async fn a_busy_global_lock_never_stops_housekeeping_from_letting_a_command_fini
     assert!(sandbox.run(&["list"]).status.success());
     assert!(sandbox.watch_file("stale").is_none(), "control: pruned once the lock is free");
 }
+
+// ---- code review round 2: C14 ----
+
+#[test]
+fn sigterm_to_vigil_create_waiting_on_stdin_exits_143() {
+    // why: code review C14: `vigil create` read stdin with a blocking read on
+    //      the task that polls the signal branches, so SIGINT/SIGTERM were
+    //      ignored until stdin closed. Stdin is held open and silent; the
+    //      signal must end the process with 143 inside 2 s.
+    // proves: CLAIM(signal-cleanup)
+    let sandbox = Sandbox::new();
+    let mut child = piped({
+        let mut command = sandbox.command();
+        command.arg("create").stdin(Stdio::piped());
+        command
+    });
+    wait_for_exec(&child);
+    // Signal first only once the handler is installed (SIGTERM = bit 14 of
+    // SigCgt); before that the default action kills the process.
+    let handled = || {
+        std::fs::read_to_string(format!("/proc/{}/status", child.id())).is_ok_and(|status| {
+            status.lines().find_map(|line| line.strip_prefix("SigCgt:")).and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok()).is_some_and(|mask| mask & (1 << 14) != 0)
+        })
+    };
+    assert!(wait_until(Duration::from_secs(3), handled), "vigil never installed its SIGTERM handler");
+    // ... and only once some thread is parked in a pipe read (stdin): a
+    // signal that lands earlier is seen by the runtime before the read starts.
+    let reading_stdin = || {
+        std::fs::read_dir(format!("/proc/{}/task", child.id())).is_ok_and(|tasks| {
+            tasks.flatten().any(|task| std::fs::read_to_string(task.path().join("wchan")).is_ok_and(|wchan| wchan.trim() == "anon_pipe_read"))
+        })
+    };
+    assert!(wait_until(Duration::from_secs(3), reading_stdin), "vigil never blocked reading stdin");
+    let held_open = child.stdin.take().unwrap();
+    send_signal("-TERM", child.id());
+    let output = finish_within(child, Duration::from_secs(2));
+    drop(held_open);
+    assert_eq!(output.status.code(), Some(143), "{:?}", output.status);
+}

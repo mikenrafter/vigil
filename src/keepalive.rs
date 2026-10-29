@@ -79,31 +79,45 @@ pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
 }
 
 /// Poll `futures` together and hand each output to `on_done` as soon as it is
-/// ready (completion order, ties by position). Stops at the first `Err`,
-/// dropping what is still pending. Used so that one slow tick never holds
-/// back another's result or its commit (C1).
+/// ready (completion order, ties by position). `on_done` returns `Ok(true)`
+/// to stop: the completions that are already ready are still collected, then
+/// what is unfinished is dropped (C12). Stops at the first `Err`, dropping
+/// what is still pending. Used so that one slow tick never holds back
+/// another's result or its commit (C1).
 async fn for_each_completed<F, E>(
     futures: impl IntoIterator<Item = F>,
-    mut on_done: impl FnMut(F::Output) -> Result<(), E>,
+    mut on_done: impl FnMut(F::Output) -> Result<bool, E>,
 ) -> Result<(), E>
 where
     F: std::future::Future,
 {
     let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut stopping = false;
     std::future::poll_fn(|cx| {
-        let mut index = 0;
-        while index < pending.len() {
-            match pending[index].as_mut().poll(cx) {
-                std::task::Poll::Ready(output) => {
-                    drop(pending.remove(index));
-                    if let Err(error) = on_done(output) {
-                        return std::task::Poll::Ready(Err(error));
+        loop {
+            let mut index = 0;
+            let mut completed_any = false;
+            while index < pending.len() {
+                match pending[index].as_mut().poll(cx) {
+                    std::task::Poll::Ready(output) => {
+                        drop(pending.remove(index));
+                        completed_any = true;
+                        match on_done(output) {
+                            Err(error) => return std::task::Poll::Ready(Err(error)),
+                            Ok(stop) => stopping |= stop,
+                        }
                     }
+                    std::task::Poll::Pending => index += 1,
                 }
-                std::task::Poll::Pending => index += 1,
             }
+            if pending.is_empty() || (stopping && !completed_any) {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            if !stopping {
+                return std::task::Poll::Pending;
+            }
+            // Stopping: one more pass to pick up what the last completion readied.
         }
-        if pending.is_empty() { std::task::Poll::Ready(Ok(())) } else { std::task::Poll::Pending }
     })
     .await
 }
@@ -145,6 +159,20 @@ impl crate::engine::Vigil {
         progress: &dyn ProgressSink,
         cancel: impl std::future::Future<Output = ()>,
     ) -> Result<Option<Envelope>, VigilError> {
+        Ok(self.keepalive_uncommitted(request, progress, cancel).await?.map(|(envelope, delivery)| {
+            self.commit_delivery(delivery);
+            envelope
+        }))
+    }
+
+    /// `keepalive_cancellable` that leaves the results unmarked: the caller
+    /// must `commit_delivery` once the envelope is actually handed over (C2).
+    pub async fn keepalive_uncommitted(
+        &self,
+        request: KeepaliveRequest,
+        progress: &dyn ProgressSink,
+        cancel: impl std::future::Future<Output = ()>,
+    ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
         let max_s = clamp_max_s(request.max_s);
         let started = Instant::now();
         let budget_end = started + Duration::from_secs(max_s);
@@ -189,16 +217,19 @@ impl crate::engine::Vigil {
             let ticks = round.into_iter().map(|id| async move {
                 (id, tokio::time::timeout_at(budget_end, self.tick_report_until(id, Some(budget_end))).await)
             });
-            for_each_completed(ticks, |(id, outcome)| -> Result<(), VigilError> {
-                let Ok(report) = outcome else { return Ok(()) };
+            // C12: once a covered watch has a terminal result the round stops
+            // waiting for unfinished ticks (they write nothing, C5).
+            for_each_completed(ticks, |(id, outcome)| -> Result<bool, VigilError> {
+                let Ok(report) = outcome else { return Ok(false) };
                 let report = report?;
                 if report.outcome == TickOutcome::Ticked {
                     ticks_in_call += 1;
                     changed_in_call.extend(report.changed);
-                    let tick = self.load_watch(id)?.tick;
-                    progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick });
+                    let watch = self.load_watch(id)?;
+                    progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick: watch.tick });
+                    return Ok(watch.status.is_finished());
                 }
-                Ok(())
+                Ok(matches!(report.outcome, TickOutcome::Finished(_)))
             })
             .await?;
             first_pass = false;
@@ -282,7 +313,7 @@ impl crate::engine::Vigil {
         changed_in_call: &[ChangedInput],
         waited_s: u64,
         max_s: u64,
-    ) -> Result<Envelope, VigilError> {
+    ) -> Result<(Envelope, Delivery), VigilError> {
         let now = self.clock.now();
         let mut watches: Vec<WatchFile> =
             covered.iter().map(|id| self.load_watch(id).map(|watch| expired_if_overdue(watch, now))).collect::<Result<_, _>>()?;
@@ -310,12 +341,10 @@ impl crate::engine::Vigil {
             .collect();
         let delivered: Vec<WatchId> = finished.iter().map(|watch| watch.spec.id.clone()).collect();
 
-        {
-            let mut session = self.session.lock().expect("session mutex poisoned");
-            session.session_ticks += 1;
-            session.returned.extend(delivered);
-        }
         let mut envelope = self.envelope_for(&primary, now);
+        // Not yet recorded: the caller commits once the envelope is really
+        // handed over (C2). The count shown already includes this return.
+        envelope.session_ticks += 1;
         envelope.waited_s = Some(waited_s);
         envelope.max_s = Some(max_s);
         envelope.events = events;
@@ -324,9 +353,21 @@ impl crate::engine::Vigil {
             envelope.digest = cut_digest(&digest_of(changed_in_call), self.config.digest_max_bytes);
         }
         watches.clear();
-        Ok(envelope)
+        Ok((envelope, Delivery(delivered)))
+    }
+
+    /// Record that a call's envelope reached the caller (V7): its terminal
+    /// results will not be returned again and `session_ticks` counts it.
+    pub fn commit_delivery(&self, delivery: Delivery) {
+        let mut session = self.session.lock().expect("session mutex poisoned");
+        session.session_ticks += 1;
+        session.returned.extend(delivery.0);
     }
 }
+
+/// The terminal results an envelope carries, not yet marked returned (C2).
+#[must_use = "an uncommitted delivery leaves its results to be returned again"]
+pub struct Delivery(Vec<WatchId>);
 
 #[cfg(test)]
 mod tests {
@@ -1617,5 +1658,78 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(17), "expired at the deadline, not at max_s: {elapsed:?}");
         assert!((15..=16).contains(&envelope.waited_s.unwrap()), "{:?}", envelope.waited_s);
+    }
+
+    // ---- code review round 2: C12, C13 ----
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_lock_on_a_secondary_watch_cannot_delay_a_ready_result() {
+        // why: code review C12: a round waited for every due tick after one had
+        //      fired, so when watch `b`'s lock was held by another process the
+        //      fired result of `a` was withheld until max_s. V8 needs no wait
+        //      for unfinished watches: once a covered watch has a terminal
+        //      result, ready completions are collected, unfinished ticks are
+        //      dropped (they write nothing, C5) and the call returns. `a`
+        //      changes and fires at once; `b`'s lock is held for the whole
+        //      call; a 270 s call must return at once with `a` primary and
+        //      `b` untouched.
+        // proves: CLAIM(call-budget)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:a", "v1");
+        env.reader.set_text("cmd:b", "same");
+        let a = scripted_watch(&vigil, "a", vec![cmd("a", Some(19.0))], 20).await;
+        let b = scripted_watch(&vigil, "b", vec![cmd("b", Some(19.0))], 20).await;
+        env.reader.set_text("cmd:a", "v2");
+        let before = std::fs::read(vigil.store().watch_path(&b)).unwrap();
+        let guard = env.vigil.store().lock_watch(&b).unwrap();
+
+        let started = Instant::now();
+        let envelope = vigil.keepalive(no_id(Some(270))).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(30), "the ready result waited {:?}", started.elapsed());
+        assert_eq!((envelope.watch_id, envelope.status), (a, WatchStatus::Fired));
+        drop(guard);
+        assert_eq!(std::fs::read(vigil.store().watch_path(&b)).unwrap(), before, "the unfinished tick wrote nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_earlier_finisher_is_primary_when_two_ticks_fire_in_one_call() {
+        // why: code review C13: with concurrent ticks `finished_at` was the
+        //      time before sensing, so a watch whose tick took 19 s tied with
+        //      one that took 1 s and won on id. V8: primary is the
+        //      earliest-finished. `a` takes 19 s, `b` 1 s, both changed.
+        // proves: CLAIM(tick-progress)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:slow-a", "v1");
+        env.reader.set_text("cmd:fast-b", "v1");
+        scripted_watch(&vigil, "a", vec![cmd("slow-a", Some(19.0))], 20).await;
+        let b = scripted_watch(&vigil, "b", vec![cmd("fast-b", Some(19.0))], 20).await;
+        env.reader.set_text("cmd:slow-a", "v2");
+        env.reader.set_text("cmd:fast-b", "v2");
+        env.reader.set_sleep("cmd:slow-a", Duration::from_secs(19));
+        env.reader.set_sleep("cmd:fast-b", Duration::from_secs(1));
+
+        let envelope = vigil.keepalive(no_id(Some(30))).await.unwrap();
+        assert_eq!((envelope.watch_id, envelope.status), (b, WatchStatus::Fired));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fired_watch_is_stamped_with_the_time_sensing_finished() {
+        // why: code review C13 at the tick: `finished_at` is when the result
+        //      was reached, after the 15 s read, not when the tick began.
+        // proves: CLAIM(tick-progress)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:slow", "v1");
+        let id = scripted_watch(&vigil, "w", vec![cmd("slow", Some(19.0))], 20).await;
+        env.reader.set_text("cmd:slow", "v2");
+        env.reader.set_sleep("cmd:slow", Duration::from_secs(15));
+        let begun = env.vigil.store().load(&id).unwrap().created_at;
+
+        env.vigil.tick_due(&id).await.unwrap();
+        let file = env.vigil.store().load(&id).unwrap();
+        assert_eq!(file.status, WatchStatus::Fired);
+        assert_eq!(file.finished_at, Some(begun.plus_secs(15)));
     }
 }

@@ -135,7 +135,7 @@ impl Vigil {
         if !fired_events.is_empty() {
             let terminal = Terminal {
                 status: TerminalStatus::Fired,
-                finished_at: now,
+                finished_at: after,
                 events: fired_events,
                 digest: watch.last_digest.clone(),
             };
