@@ -55,6 +55,8 @@ pub struct CreateArgs {
     #[serde(default)]
     pub prompt: String,
     /// Inputs: {kind: file|glob|cmd|url|port|process, ...} (at most 16).
+    /// Typed as objects so clients do not send each input as a JSON string.
+    #[schemars(with = "Vec<serde_json::Map<String, Value>>")]
     pub inputs: Vec<Value>,
     /// Seconds between ticks, clamped to 1..=3600 (default 20).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,9 +68,11 @@ pub struct CreateArgs {
     pub fire: String,
     /// fire = judge: Laya questions keyed by id, types noul, choice, score.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Map<String, Value>>")]
     pub judge_questions: Option<Value>,
     /// fire = judge: {question, noul_gte | choice_in | score_gte, min_confidence?}.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Map<String, Value>>")]
     pub judge_rule: Option<Value>,
 }
 

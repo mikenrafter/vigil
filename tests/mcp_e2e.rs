@@ -91,6 +91,24 @@ async fn exactly_the_five_spec_tools_are_listed_with_descriptions() {
 }
 
 #[tokio::test]
+async fn watch_create_declares_its_inputs_and_judge_fields_as_objects() {
+    // why: with an untyped `items` schema, Codex (gpt-6-luna) sent each input
+    //      as a JSON-encoded string and the call failed (host-b smoke run).
+    // proves: CLAIM(create-schema-objects)
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let create = tools.iter().find(|t| t.name == "watch_create").unwrap();
+    let schema = serde_json::Value::Object((*create.input_schema).clone());
+    let properties = &schema["properties"];
+    assert_eq!(properties["inputs"]["items"]["type"], "object", "{schema}");
+    for field in ["judge_questions", "judge_rule"] {
+        assert!(properties[field].to_string().contains("\"object\""), "{field}: {}", properties[field]);
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn create_then_one_write_then_keepalive_returns_the_fired_envelope() {
     // why: SPEC acceptance: the agent creates a watch, then calls only
     //      keepalive and receives the failure line. V1 (S1): the baseline is
