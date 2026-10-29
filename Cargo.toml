@@ -1,0 +1,34 @@
+[package]
+name = "vigil"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "MCP server that keeps an agent's turn open while a cheap judge watches things"
+
+[lib]
+name = "vigil"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vigil"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "=3.8.0", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "io-std", "process", "net", "sync", "fs", "signal"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+schemars = "1.2.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+sha2 = "0.11.1"
+glob = "0.3.4"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+clap = { version = "4.6.7", features = ["derive"] }
+tempfile = "3.27.0"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+rmcp = { version = "=3.8.0", features = ["client", "transport-child-process"] }
+# test-util: paused/advanced virtual time for the keepalive loop tests.
+tokio = { version = "1.54.1", features = ["test-util", "rt-multi-thread", "macros", "time", "process", "net", "io-util", "sync", "fs"] }
