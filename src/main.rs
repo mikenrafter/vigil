@@ -32,7 +32,8 @@ enum Command {
     },
     /// Block with no ceiling until the watch finishes; print ONE final
     /// envelope JSON (all events in it; no streaming, R8/V21).
-    /// Exit 0 fired, 2 expired, 3 cancelled, 1 error.
+    ///
+    /// Exit codes: 0 fired, 1 error, 2 usage, 3 expired, 4 cancelled.
     Wait { id: String },
 }
 

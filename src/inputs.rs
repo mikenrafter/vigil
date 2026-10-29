@@ -36,6 +36,9 @@ pub const DEFAULT_TAIL_BYTES: u64 = 4096;
 pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 /// V12: a glob reports at most this many matches.
 pub const MAX_GLOB_MATCHES: usize = 1000;
+/// X2: a glob input persists at most this many paths in `InputState::known`
+/// (the same bound as the reported matches).
+pub const MAX_KNOWN_GLOB_PATHS: usize = 1000;
 pub const TRUNCATED_MARKER: &str = "[truncated]";
 pub const DEFAULT_CMD_TIMEOUT_S: f64 = 10.0;
 
@@ -62,6 +65,26 @@ pub fn parse_proc_stat(line: &str) -> Option<ProcStat> {
 /// `running` or `exited`. glob text lists newly created matches, one per line.
 pub async fn read_input(input: &Input, previous: &InputState) -> Reading {
     todo!()
+}
+
+/// The seam the engine reads inputs through (create's baseline and every
+/// tick). Production uses `SystemReader`; tests plug in
+/// `testing::ScriptedReader` to make a read take a chosen amount of virtual
+/// time or wait on a gate (X3, X4), which real files, commands and sockets
+/// cannot do under paused tokio time. The engine, not the reader, enforces
+/// the call budget (V2): a reader that overruns must be cut off.
+pub trait InputReader: Send + Sync {
+    fn read<'a>(&'a self, input: &'a Input, previous: &'a InputState) -> crate::judge::BoxFuture<'a, Reading>;
+}
+
+/// Production reader: `read_input`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemReader;
+
+impl InputReader for SystemReader {
+    fn read<'a>(&'a self, input: &'a Input, previous: &'a InputState) -> crate::judge::BoxFuture<'a, Reading> {
+        Box::pin(read_input(input, previous))
+    }
 }
 
 #[cfg(test)]
@@ -415,6 +438,75 @@ mod tests {
         let few = read_input(&input2, &base2.state).await;
         assert_eq!(few.text.lines().filter(|l| l.contains("f-")).count(), 3);
         assert!(!few.text.contains(TRUNCATED_MARKER));
+    }
+
+    #[tokio::test]
+    async fn a_glob_persists_at_most_1000_known_paths_whatever_the_directory_holds() {
+        // why: X2 (S12): the V12 cap bounded what a glob REPORTS but not what
+        //      it PERSISTS, so a directory of 100k files grew the watch file
+        //      without bound. `InputState::known` holds at most 1000 paths,
+        //      both after a baseline of 1500 pre-existing files and after a
+        //      read that finds 1100 new files on top of 200 known ones.
+        //      Controls: the baseline of 1500 existing files is not a change,
+        //      and a small directory persists all of its (3) paths, so the
+        //      cap is not a "persist nothing".
+        // proves: CLAIM(glob-state-cap)
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..1500 {
+            write_file(&dir.path().join(format!("f-{i:04}.txt")), "");
+        }
+        let input = Input::Glob { pattern: format!("{}/*.txt", dir.path().display()), report: GlobReport::Created };
+        let baseline = read_input(&input, &InputState::default()).await;
+        assert!(!baseline.changed, "a baseline is never a change");
+        assert!(baseline.state.known.len() <= MAX_KNOWN_GLOB_PATHS, "persisted {} paths", baseline.state.known.len());
+        assert!(!baseline.state.known.is_empty(), "control: the cap keeps a membership, it does not drop it");
+
+        let dir2 = tempfile::tempdir().unwrap();
+        for i in 0..200 {
+            write_file(&dir2.path().join(format!("a-{i:04}.txt")), "");
+        }
+        let input2 = Input::Glob { pattern: format!("{}/*.txt", dir2.path().display()), report: GlobReport::Created };
+        let base2 = read_input(&input2, &InputState::default()).await;
+        assert_eq!(base2.state.known.len(), 200, "under the cap everything is remembered");
+        for i in 0..1100 {
+            write_file(&dir2.path().join(format!("b-{i:04}.txt")), "");
+        }
+        let grown = read_input(&input2, &base2.state).await;
+        assert!(grown.changed);
+        assert!(grown.state.known.len() <= MAX_KNOWN_GLOB_PATHS, "persisted {} paths", grown.state.known.len());
+
+        let dir3 = tempfile::tempdir().unwrap();
+        for i in 0..3 {
+            write_file(&dir3.path().join(format!("c-{i}.txt")), "");
+        }
+        let input3 = Input::Glob { pattern: format!("{}/*.txt", dir3.path().display()), report: GlobReport::Created };
+        assert_eq!(read_input(&input3, &InputState::default()).await.state.known.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_quiet_directory_over_the_membership_cap_is_not_a_change_on_every_read_and_new_files_still_report() {
+        // why: X2 (default taken, flagged in .red-report.md): capping the
+        //      persisted membership at 1000 must not turn a quiet 1500-file
+        //      directory into a change on every tick (the paths past the cap
+        //      would look "created" each time, firing every change watch at
+        //      once). Two consecutive reads of the unchanged directory report
+        //      nothing; a genuinely new file is then reported by name.
+        // proves: CLAIM(glob-state-cap)
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..1500 {
+            write_file(&dir.path().join(format!("f-{i:04}.txt")), "");
+        }
+        let input = Input::Glob { pattern: format!("{}/*.txt", dir.path().display()), report: GlobReport::Created };
+        let baseline = read_input(&input, &InputState::default()).await;
+        let first = read_input(&input, &baseline.state).await;
+        assert!(!first.changed, "quiet directory reported as changed: {:?}", first.text.lines().take(3).collect::<Vec<_>>());
+        let second = read_input(&input, &first.state).await;
+        assert!(!second.changed);
+
+        write_file(&dir.path().join("new-arrival.txt"), "");
+        let arrived = read_input(&input, &second.state).await;
+        assert!(arrived.changed);
+        assert!(arrived.text.contains("new-arrival.txt"), "{:?}", arrived.text.lines().take(3).collect::<Vec<_>>());
     }
 
     // ---- cmd ----

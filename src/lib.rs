@@ -22,7 +22,7 @@ pub mod watch;
 pub use clock::{Clock, SystemClock, Timestamp};
 pub use config::Config;
 pub use engine::Vigil;
-pub use envelope::{Envelope, Next};
+pub use envelope::{Envelope, Next, OtherWatch};
 pub use error::{CreateError, StoreError, VigilError};
 pub use judge::{Answer, Answers, Judge, JudgeError, JudgeRequest, JudgeRule, RuleTest};
 pub use keepalive::{KeepaliveRequest, ProgressSink};

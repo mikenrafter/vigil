@@ -11,6 +11,7 @@ use crate::clock::{Clock, Timestamp};
 use crate::config::Config;
 use crate::envelope::Envelope;
 use crate::error::VigilError;
+use crate::inputs::{InputReader, SystemReader};
 use crate::judge::Judge;
 use crate::store::Store;
 use crate::watch::{CreateRequest, WatchId, WatchStatus};
@@ -56,6 +57,8 @@ pub struct Vigil {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) judge: Arc<dyn Judge>,
     pub(crate) config: Config,
+    /// Every input read goes through this (create's baseline and each tick).
+    pub(crate) reader: Arc<dyn InputReader>,
     /// V11: relative inputs resolve against this at `create`.
     pub(crate) cwd: PathBuf,
     pub(crate) session: Mutex<Session>,
@@ -69,6 +72,7 @@ impl Vigil {
             clock,
             judge,
             config,
+            reader: Arc::new(SystemReader),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             session: Mutex::new(Session::default()),
         }
@@ -77,6 +81,12 @@ impl Vigil {
     /// Override the working directory used to resolve relative inputs (V11).
     pub fn with_cwd(mut self, cwd: PathBuf) -> Vigil {
         self.cwd = cwd;
+        self
+    }
+
+    /// Replace the input reader (tests: `testing::ScriptedReader`).
+    pub fn with_reader(mut self, reader: Arc<dyn InputReader>) -> Vigil {
+        self.reader = reader;
         self
     }
 
@@ -89,11 +99,15 @@ impl Vigil {
     }
 
     /// `watch_create`. Validates (V12, V19), resolves relative inputs against
-    /// the cwd (V11), rejects an id that still has a file (V6), (for fire =
-    /// judge) checks the judge is reachable, records the BASELINE of every
-    /// input (V1: so a change between create and the first `keepalive` is a
-    /// change), and writes the file, all under the global lock (V4). No tick
-    /// runs (`tick` stays 0). Also prunes.
+    /// the cwd (V11), (for fire = judge) checks the judge is reachable, and
+    /// (X3) takes the watch's lock, then the GLOBAL lock only long enough to
+    /// reject an id that still has a file (V6) and to write a placeholder
+    /// that reserves it, then releases the global lock and records the
+    /// BASELINE of every input under the watch lock alone (V1: so a change
+    /// between create and the first `keepalive` is a change), each read going
+    /// through `self.reader`, and writes the file. The global lock is never
+    /// held while inputs are read, so another create or any tick of another
+    /// watch proceeds meanwhile. No tick runs (`tick` stays 0). Also prunes.
     pub async fn create(&self, request: CreateRequest) -> Result<Created, VigilError> {
         todo!()
     }
@@ -117,6 +131,7 @@ impl Vigil {
     }
 
     /// Delete finished watches older than 7 days; returns deleted ids.
+    /// Takes the locks itself (`Store::prune`).
     pub fn prune(&self) -> Result<Vec<WatchId>, VigilError> {
         todo!()
     }
@@ -130,6 +145,7 @@ mod tests {
     use crate::testing::*;
     use crate::tick::TickOutcome;
     use crate::watch::{FireKind, Input, WatchStatus};
+    use std::time::Duration;
 
     fn fixture() -> (Arc<ManualClock>, Env) {
         let clock = Arc::new(ManualClock::new(spec_instant()));
@@ -275,7 +291,14 @@ mod tests {
         let mut too_many = change_request("ok", &env.input_path("a"), 20);
         too_many.inputs = (0..17).map(|i| Input::File { path: format!("/tmp/f{i}").into(), tail_bytes: None }).collect();
         assert_eq!(env.vigil.create(too_many).await, Err(VigilError::Create(CreateError::TooManyInputs(17))));
+        let mut slow_cmd = change_request("ok", &env.input_path("a"), 20);
+        slow_cmd.inputs = vec![Input::Cmd { argv: vec!["true".into()], timeout_s: Some(21.0), cwd: None }];
+        assert!(
+            matches!(env.vigil.create(slow_cmd).await, Err(VigilError::Create(CreateError::TimeoutOutOfRange(_)))),
+            "X4: timeout_s above 20 is a create-time error"
+        );
         assert!(json_files(&env).is_empty());
+        assert!(!env.root().join("locks").join("ok.lock").exists(), "validation happens before any lock is taken");
     }
 
     #[tokio::test]
@@ -443,7 +466,7 @@ mod tests {
     async fn status_replays_a_terminal_result_with_event_ids_unchanged() {
         // why: V3 (S3): the terminal result is stored once and replayed on
         //      every watch_status; events carry the stable `event_id`
-        //      `<watch_id>:<tick>`. Two status calls from two processes at
+        //      `<watch_id>:<tick>:<n>` (W1: the first is `:0`). Two status calls from two processes at
         //      different times return identical events and digest. Control:
         //      a pending watch's status has no events.
         // proves: CLAIM(terminal-replay)
@@ -459,7 +482,7 @@ mod tests {
         let second = env.another_process().status(&id).await.unwrap().envelope;
         assert_eq!(first.status, WatchStatus::Fired);
         assert_eq!(first.events.len(), 1);
-        assert_eq!(first.events[0].event_id, "w:1");
+        assert_eq!(first.events[0].event_id, "w:1:0");
         assert_eq!(first.events, second.events);
         assert_eq!(first.digest, second.digest);
         assert!(first.digest.contains("ERROR: boom"));
@@ -494,10 +517,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_also_removes_abandoned_pending_watches_but_never_the_lock_file() {
-        // why: V16 (S16) + V5 (S5): a pending watch nobody ever called again
-        //      (created 20 days ago, deadline 1 h later) is pruned through the
-        //      real create/prune path, and the global lock file stays.
+    async fn prune_also_removes_abandoned_pending_watches_and_their_lock_files_but_never_the_global_lock() {
+        // why: V16 (S16) + V5 (S5) + X3: a pending watch nobody ever called
+        //      again (created 20 days ago, deadline 1 h later) is pruned
+        //      through the real create/prune path together with its
+        //      `locks/<id>.lock`, and the global lock file stays. Control: the
+        //      per-watch lock file existed before the prune (create takes it),
+        //      so its absence afterwards is a deletion, not an omission.
         // proves: CLAIM(prune-overdue)
         let (clock, env) = fixture();
         let path = env.input_path("a.log");
@@ -505,9 +531,11 @@ mod tests {
         clock.set(now.minus_secs(20 * 24 * 3600));
         env.vigil.create(change_request("abandoned", &path, 20)).await.unwrap();
         clock.set(now);
+        assert!(env.root().join("locks").join("abandoned.lock").exists(), "control: create took the watch lock");
         assert_eq!(env.vigil.prune().unwrap(), vec![wid("abandoned")]);
         assert!(json_files(&env).is_empty());
-        assert!(env.root().join("lock").exists(), "the lock file is never deleted");
+        assert!(!env.root().join("locks").join("abandoned.lock").exists(), "X3: the lock file goes with its watch");
+        assert!(env.root().join("lock").exists(), "the global lock file is never deleted");
     }
 
     #[tokio::test]
@@ -523,5 +551,70 @@ mod tests {
         clock.set(now);
         assert!(env.vigil.list().await.unwrap().is_empty());
         assert!(json_files(&env).is_empty());
+    }
+
+    // ---- X3: create does not hold the global lock while reading baselines ----
+
+    fn gated_cmd(name: &str) -> Input {
+        Input::Cmd { argv: vec![name.into()], timeout_s: Some(20.0), cwd: None }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_does_not_hold_the_global_lock_while_it_reads_baselines() {
+        // why: X3 (T4): the old design did all baseline I/O under the one
+        //      global lock, so a create whose input hung blocked every other
+        //      create, tick and cancel for minutes. Now create takes the watch
+        //      lock, then the global lock only to check the id and write a
+        //      placeholder, and reads the baseline under the watch lock alone.
+        //      Proof, with create A parked inside its baseline read (a gate,
+        //      no sleeps): (1) the global lock is free, (2) a second create
+        //      "B" completes within 2 s, (3) A's watch lock is held. Then A's
+        //      gate opens and A completes with its baseline recorded, and a
+        //      second create of A's id, started while A was still reading,
+        //      ends as a DuplicateId (V6: whether it waited on A's watch lock
+        //      or saw the reserved id at once is the implementation's choice;
+        //      it must not create a second watch or hang).
+        // proves: CLAIM(create-lock-scope)
+        let (_clock, env) = fixture();
+        let gate = Gate::closed();
+        env.reader.set_gate("cmd:slow-a", Some(gate.clone()));
+        let path = env.input_path("b.log");
+        write_file(&path, "b\n");
+        let mut request_a = change_request("a", &path, 20);
+        request_a.inputs = vec![gated_cmd("slow-a")];
+
+        let vigil = Arc::new(env.another_process());
+        let create_a = tokio::spawn({
+            let vigil = vigil.clone();
+            let request = request_a.clone();
+            async move { vigil.create(request).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), env.reader.wait_started("cmd:slow-a", 1)).await.expect("create A never reached its baseline read");
+
+        let store = env.vigil.store();
+        let global = store.try_lock().unwrap();
+        assert!(global.is_some(), "the global lock is held while create A reads its baseline");
+        drop(global);
+        let created_b = tokio::time::timeout(Duration::from_secs(2), env.vigil.create(change_request("b", &path, 20)))
+            .await
+            .expect("create B blocked behind create A's baseline read");
+        assert_eq!(created_b.unwrap().watch_id.as_str(), "b");
+        let duplicate_a = tokio::spawn({
+            let vigil = Arc::new(env.another_process());
+            let request = request_a.clone();
+            async move { vigil.create(request).await }
+        });
+        assert!(store.try_lock_watch(&wid("a")).unwrap().is_none(), "A's watch lock is held across its baseline");
+        assert!(!create_a.is_finished());
+
+        gate.open();
+        let duplicate = tokio::time::timeout(Duration::from_secs(5), duplicate_a).await.expect("duplicate create hung").unwrap();
+        assert_eq!(duplicate, Err(VigilError::Create(CreateError::DuplicateId("a".into()))), "the id is reserved before the baseline is read");
+        let created_a = tokio::time::timeout(Duration::from_secs(5), create_a).await.unwrap().unwrap().unwrap();
+        assert_eq!(created_a.watch_id.as_str(), "a");
+        let file = store.load(&wid("a")).unwrap();
+        assert_eq!((file.tick, file.input_states.len()), (0, 1));
+        assert!(file.input_states[0].hash.is_some(), "the baseline of A's input was recorded");
+        assert!(store.try_lock_watch(&wid("a")).unwrap().is_some(), "A's watch lock is released after create");
     }
 }

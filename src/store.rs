@@ -1,5 +1,5 @@
-//! Watch files under `<root>/watches/`, atomic writes, the one global lock,
-//! pruning.
+//! Watch files under `<root>/watches/`, atomic writes, the per-watch locks
+//! under `<root>/locks/`, the short global namespace lock, pruning (X3).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -26,11 +26,18 @@ pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErr
     todo!()
 }
 
-/// Exclusive `flock` on `<root>/lock`; released on drop. V4/V5: this is the
-/// only lock. Every mutation (create, tick, cancel, prune) holds it for its
-/// whole read-modify-write. The file is created on demand and NEVER deleted
-/// (deleting it would let a waiter hold the old inode while another process
-/// locks a new one).
+/// Exclusive `flock`, released on drop. Two kinds (X3, superseding the
+/// single-lock rule of V4/V5):
+///
+/// * per-watch, `<root>/locks/<id>.lock`: held across a tick's sensing and
+///   write and across cancel (and across create's baseline reads);
+/// * global, `<root>/lock`: held only for short namespace operations
+///   (reserving an id at create, prune), NEVER during sensing.
+///
+/// Lock order is watch lock first, then global lock. Lock files are created
+/// on demand and are never deleted while their watch file exists (deleting
+/// one would let a waiter hold the old inode while another process locks a
+/// new one); prune deletes a lock file only after deleting its watch file.
 pub struct StoreLock {
     file: File,
 }
@@ -53,9 +60,17 @@ impl Store {
     pub fn watch_path(&self, id: &WatchId) -> PathBuf {
         self.watches_dir().join(format!("{}.json", id.as_str()))
     }
-    /// `<root>/lock`, the single global lock file (V5).
+    /// `<root>/lock`, the global namespace lock file (X3).
     pub fn lock_path(&self) -> PathBuf {
         self.root.join("lock")
+    }
+    /// `<root>/locks/`, the per-watch lock files (X3).
+    pub fn locks_dir(&self) -> PathBuf {
+        self.root.join("locks")
+    }
+    /// `<root>/locks/<id>.lock` (X3).
+    pub fn watch_lock_path(&self, id: &WatchId) -> PathBuf {
+        self.locks_dir().join(format!("{}.lock", id.as_str()))
     }
     /// Atomic save of one watch (creates `watches/` on demand).
     pub fn save(&self, watch: &WatchFile) -> Result<(), StoreError> {
@@ -68,21 +83,35 @@ impl Store {
     pub fn list(&self) -> Result<Vec<WatchFile>, StoreError> {
         todo!()
     }
-    /// Block until the global exclusive lock is held (creates the lock file
-    /// and the root on demand).
+    /// Block until the GLOBAL exclusive lock is held (creates the lock file
+    /// and the root on demand). Short namespace operations only (X3).
     pub fn lock(&self) -> Result<StoreLock, StoreError> {
         todo!()
     }
-    /// `Ok(None)` if another holder has it.
+    /// `Ok(None)` if another holder has the global lock.
     pub fn try_lock(&self) -> Result<Option<StoreLock>, StoreError> {
+        todo!()
+    }
+    /// Block until the exclusive lock of watch `id` is held (creates
+    /// `locks/` and `locks/<id>.lock` on demand). Independent of the global
+    /// lock and of every other watch's lock (X3).
+    pub fn lock_watch(&self, id: &WatchId) -> Result<StoreLock, StoreError> {
+        todo!()
+    }
+    /// `Ok(None)` if another holder has watch `id`'s lock.
+    pub fn try_lock_watch(&self, id: &WatchId) -> Result<Option<StoreLock>, StoreError> {
         todo!()
     }
     /// Delete watch files whose finish time + 7 days <= now (D4). The finish
     /// time of a finished watch is `finished_at`; of an overdue pending watch
     /// it is `deadline_at` (V16); a pending watch whose deadline is still in
-    /// the future is never deleted. The caller holds the lock (it is not taken
-    /// here, so `prune` can run inside another mutation). The global lock file
-    /// is never deleted. Returns the deleted ids.
+    /// the future is never deleted. X3: prune takes the locks itself (the
+    /// caller must hold none of them): per candidate, its watch lock, then
+    /// the global lock, re-checks the candidate under both, deletes the watch
+    /// file, THEN that watch's lock file, and releases. A candidate whose
+    /// watch lock is held by someone else is skipped or waited for (either is
+    /// allowed) but never deleted while held. The global lock file is never
+    /// deleted. Returns the deleted ids.
     pub fn prune(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
         todo!()
     }
@@ -91,7 +120,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{at, blocked_flock_waiters, change_request, judge_request, wid};
+    use crate::testing::{at, blocked_flock_waiters, change_request, judge_request, wid, DeletionLog};
     use crate::watch::{Terminal, TerminalStatus, WatchSpec};
     use serde_json::Value;
 
@@ -273,10 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn lock_is_one_global_file_in_the_root_exclusive_and_released_on_drop() {
-        // why: V4/V5 (S4, S5): ONE lock for everything at `<root>/lock`
-        //      (not per-watch files). A second holder must not get it until the
-        //      first drops. Positive control: after the drop it is available.
+    fn the_global_lock_is_root_lock_exclusive_and_released_on_drop() {
+        // why: X3: the global namespace lock stays at `<root>/lock` (it guards
+        //      id reservation and prune, nothing else). A second holder must
+        //      not get it until the first drops. Positive control: after the
+        //      drop it is available.
         // proves: CLAIM(global-lock)
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
@@ -286,6 +316,72 @@ mod tests {
         assert!(dir.path().join("lock").exists());
         drop(first);
         assert!(store.try_lock().unwrap().is_some(), "free after drop");
+    }
+
+    #[test]
+    fn watch_locks_are_per_id_files_in_locks_dir_independent_of_each_other_and_of_the_global_lock() {
+        // why: X3 (T4), replacing "one lock for everything": each watch has
+        //      `locks/<id>.lock`. Holding watch a refuses a second holder of a
+        //      but not of b, and neither it nor the global lock blocks the
+        //      other: a tick of b (or a create) must never wait behind a's
+        //      sensing. Literal paths; positive control: each lock is
+        //      available again after its holder drops.
+        // proves: CLAIM(per-watch-lock)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let (a, b) = (wid("a"), wid("b"));
+        assert_eq!(store.locks_dir(), dir.path().join("locks"));
+        assert_eq!(store.watch_lock_path(&a), dir.path().join("locks").join("a.lock"));
+
+        let held_a = store.lock_watch(&a).unwrap();
+        assert!(store.watch_lock_path(&a).is_file(), "created on demand");
+        assert!(store.try_lock_watch(&a).unwrap().is_none(), "same watch: refused");
+        let held_b = store.try_lock_watch(&b).unwrap().expect("another watch's lock is independent");
+        let held_global = store.try_lock().unwrap().expect("the global lock is independent of watch locks");
+        assert!(store.try_lock_watch(&b).unwrap().is_none());
+        assert!(store.try_lock().unwrap().is_none());
+        drop((held_b, held_global));
+        assert!(store.try_lock_watch(&b).unwrap().is_some(), "free after drop");
+        assert!(store.try_lock().unwrap().is_some(), "free after drop");
+        drop(held_a);
+        assert!(store.try_lock_watch(&a).unwrap().is_some(), "free after drop");
+    }
+
+    #[test]
+    fn a_blocked_watch_locker_is_visibly_waiting_then_gets_the_lock_only_after_release() {
+        // why: X3 + S25 for the new lock kind: /proc/locks must list the waiter
+        //      as BLOCKED on `locks/w.lock` while the guard is held, it must
+        //      not have acquired, and only the drop lets it in. Mirrors the
+        //      global-lock test so a lock_watch that silently returns without
+        //      flock-ing (or polls without blocking forever) is caught.
+        // proves: CLAIM(per-watch-lock)
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let id = wid("w");
+        let guard = store.lock_watch(&id).unwrap();
+        let acquired = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (store, id, acquired) = (store.clone(), id.clone(), acquired.clone());
+            std::thread::spawn(move || {
+                let _held = store.lock_watch(&id).unwrap();
+                acquired.store(true, Ordering::SeqCst);
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut contended = false;
+        while started.elapsed() < std::time::Duration::from_secs(3) {
+            if !blocked_flock_waiters(&store.watch_lock_path(&id)).is_empty() {
+                contended = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(contended, "the waiter never showed up as blocked in /proc/locks");
+        assert!(!acquired.load(Ordering::SeqCst));
+        drop(guard);
+        waiter.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -326,53 +422,77 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_file_is_never_deleted_by_prune_or_by_dropping_the_lock() {
-        // why: V5 (S5): deleting a lock file splits synchronization (a waiter
-        //      holds the old inode while another process locks a new one).
-        //      Same (dev, inode) after lock/unlock/prune cycles that DO delete
-        //      watch files. Positive control: prune really deleted something.
+    fn lock_files_are_never_deleted_by_dropping_a_lock_or_while_their_watch_exists() {
+        // why: V5 as kept by X3: deleting a lock file splits synchronization (a
+        //      waiter holds the old inode while another process locks a new
+        //      one). The global lock keeps its inode across lock/unlock and
+        //      prune cycles that DO delete other watches; a SURVIVING watch's
+        //      lock file keeps its inode too ("never deleted while their watch
+        //      file exists"). Positive control: prune really deleted
+        //      something. (Prune takes the locks itself, X3, so the test holds
+        //      none while calling it.)
         // proves: CLAIM(lock-never-deleted)
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
         let now = at("2026-10-29T14:03:11Z");
         store.save(&finished("old", TerminalStatus::Cancelled, now.minus_secs(30 * 24 * 3600))).unwrap();
+        store.save(&finished("kept", TerminalStatus::Cancelled, now.minus_secs(60))).unwrap();
         drop(store.lock().unwrap());
-        let identity = lock_identity(&store.lock_path());
-        let guard = store.lock().unwrap();
+        drop(store.lock_watch(&wid("old")).unwrap());
+        drop(store.lock_watch(&wid("kept")).unwrap());
+        let global = lock_identity(&store.lock_path());
+        let kept = lock_identity(&store.watch_lock_path(&wid("kept")));
+
         let deleted = store.prune(now).unwrap();
-        drop(guard);
         assert_eq!(deleted, vec![wid("old")], "control: prune deleted a watch");
         assert!(store.lock_path().exists());
-        assert_eq!(lock_identity(&store.lock_path()), identity, "same inode after prune");
+        assert_eq!(lock_identity(&store.lock_path()), global, "same inode after prune");
+        assert_eq!(lock_identity(&store.watch_lock_path(&wid("kept"))), kept, "a surviving watch keeps its lock file");
         drop(store.lock().unwrap());
-        assert_eq!(lock_identity(&store.lock_path()), identity, "same inode after another lock cycle");
+        drop(store.lock_watch(&wid("kept")).unwrap());
+        assert_eq!(lock_identity(&store.lock_path()), global, "same inode after another lock cycle");
+        assert_eq!(lock_identity(&store.watch_lock_path(&wid("kept"))), kept);
     }
 
     #[test]
-    fn no_per_watch_lock_files_are_ever_created() {
-        // why: V4/V5: the old `watches/<id>.lock` files are gone; saving and
-        //      locking leave only `<id>.json` under watches/ and `lock` in the root.
+    fn lock_files_exist_only_where_a_lock_was_taken_and_saving_creates_none() {
+        // why: X3 replaces "no per-watch lock files are ever created" (which
+        //      asserted the opposite of the new design). Saving a watch leaves
+        //      only `watches/<id>.json`; taking the watch lock adds exactly
+        //      `locks/<id>.lock`; taking the global lock adds exactly `lock`.
+        //      Nothing else (no `.lock` beside the json, no `.tmp`).
+        // proves: CLAIM(per-watch-lock)
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
+        let names = |sub: &str| -> Vec<String> {
+            let mut out: Vec<String> = match std::fs::read_dir(dir.path().join(sub)) {
+                Ok(entries) => entries.map(|e| e.unwrap().file_name().to_string_lossy().into()).collect(),
+                Err(_) => vec![],
+            };
+            out.sort();
+            out
+        };
         store.save(&sample("a")).unwrap();
+        assert_eq!(names("watches"), vec!["a.json"]);
+        assert_eq!(names(""), vec!["watches"], "saving creates no lock file");
+        drop(store.lock_watch(&wid("a")).unwrap());
+        assert_eq!(names("locks"), vec!["a.lock"]);
+        assert_eq!(names("watches"), vec!["a.json"], "no lock file beside the json");
         drop(store.lock().unwrap());
-        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("watches")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
-        names.sort();
-        assert_eq!(names, vec!["a.json"]);
-        let mut root: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
-        root.sort();
-        assert_eq!(root, vec!["lock", "watches"]);
+        assert_eq!(names(""), vec!["lock", "locks", "watches"]);
     }
 
     #[test]
     fn list_returns_watches_in_id_order_and_ignores_lock_and_tmp_files() {
-        // why: lock files and crashed `.tmp` files share the directory and
-        //      must not be parsed as watches.
+        // why: crashed `.tmp` files and stray `.lock` files in watches/, and
+        //      the real lock files under `locks/` and `lock` (X3), must never be
+        //      parsed as watches.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
         store.save(&sample("b")).unwrap();
         store.save(&sample("a")).unwrap();
         let _lock = store.lock().unwrap();
+        let _watch_lock = store.lock_watch(&wid("a")).unwrap();
         std::fs::write(dir.path().join("watches").join("c.json.tmp"), "{ partial").unwrap();
         std::fs::write(dir.path().join("watches").join("d.lock"), "").unwrap();
         let ids: Vec<String> = store.list().unwrap().iter().map(|w| w.spec.id.to_string()).collect();
@@ -430,5 +550,103 @@ mod tests {
         let mut remaining: Vec<String> = store.list().unwrap().iter().map(|w| w.spec.id.to_string()).collect();
         remaining.sort();
         assert_eq!(remaining, vec!["boundary-out", "live"]);
+    }
+
+    #[test]
+    fn prune_deletes_a_watchs_lock_file_only_after_its_watch_file() {
+        // why: X3: "prune deletes a lock file only after deleting its watch
+        //      file". The reverse order opens a window where the lock file is
+        //      gone while the watch still exists, so another process can create
+        //      and lock a NEW lock file and tick the watch concurrently with a
+        //      holder of the old one. One inotify instance watches both
+        //      directories, so the kernel's own event order is the oracle (no
+        //      sampling). Three old watches with lock files, one old watch that
+        //      never had a lock file, one survivor. Controls: every old
+        //      watch's json deletion is seen (the probe works), the three lock
+        //      files are seen deleted too (prune removes them, X3), the
+        //      survivor produces no event, and the lock-less watch only its
+        //      json.
+        // proves: CLAIM(prune-lock-order)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let now = at("2026-10-29T14:03:11Z");
+        for id in ["o1", "o2", "o3", "nolock"] {
+            store.save(&finished(id, TerminalStatus::Cancelled, now.minus_secs(30 * 24 * 3600))).unwrap();
+        }
+        store.save(&finished("keep", TerminalStatus::Cancelled, now.minus_secs(60))).unwrap();
+        for id in ["o1", "o2", "o3", "keep"] {
+            drop(store.lock_watch(&wid(id)).unwrap());
+        }
+        let log = DeletionLog::start(&[("watches", &store.watches_dir()), ("locks", &store.locks_dir())]);
+
+        let mut deleted: Vec<String> = store.prune(now).unwrap().iter().map(|id| id.to_string()).collect();
+        deleted.sort();
+        assert_eq!(deleted, vec!["nolock", "o1", "o2", "o3"]);
+        let events = log.drain();
+        let position = |name: &str| events.iter().position(|e| e == name);
+        for id in ["o1", "o2", "o3"] {
+            let (json, lock) = (position(&format!("watches/{id}.json")), position(&format!("locks/{id}.lock")));
+            assert!(json.is_some() && lock.is_some(), "{id}: both files must be deleted, events {events:?}");
+            assert!(json < lock, "{id}: the lock file was deleted before its watch file: {events:?}");
+        }
+        assert!(position("watches/nolock.json").is_some(), "{events:?}");
+        assert!(!events.iter().any(|e| e.contains("keep")), "the survivor and its lock file are untouched: {events:?}");
+        assert!(store.watch_lock_path(&wid("keep")).exists() && store.watch_path(&wid("keep")).exists());
+        assert!(!store.watch_lock_path(&wid("o1")).exists());
+    }
+
+    #[test]
+    fn prune_never_deletes_a_watch_whose_lock_another_holder_has() {
+        // why: X3: prune deletes "while holding that watch's lock". A tick or
+        //      cancel in flight holds that lock; deleting the watch file under
+        //      it would lose the tick's write or resurrect the file. With the
+        //      lock held by this test, a prune in another thread must leave
+        //      both files in place for 300 ms (it may wait or skip: either is
+        //      allowed). After the release a prune finishes the job: both files
+        //      are gone (positive control: the watch really was prunable).
+        // proves: CLAIM(prune-lock-order)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let now = at("2026-10-29T14:03:11Z");
+        let id = wid("busy");
+        store.save(&finished("busy", TerminalStatus::Cancelled, now.minus_secs(30 * 24 * 3600))).unwrap();
+        let guard = store.lock_watch(&id).unwrap();
+        let pruner = {
+            let store = store.clone();
+            std::thread::spawn(move || store.prune(now).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(store.watch_path(&id).exists(), "watch file deleted while its lock was held");
+        assert!(store.watch_lock_path(&id).exists(), "lock file deleted while it was held");
+        drop(guard);
+        pruner.join().unwrap();
+        store.prune(now).unwrap();
+        assert!(!store.watch_path(&id).exists() && !store.watch_lock_path(&id).exists(), "control: prunable once the lock is free");
+    }
+
+    #[test]
+    fn prune_needs_the_global_lock_to_delete_anything() {
+        // why: X3: prune is a namespace operation done under the global lock
+        //      (so it cannot interleave with create's id reservation: a
+        //      create that checked "id free" must not see its placeholder
+        //      pruned). With the global lock held by this test, a prune in
+        //      another thread deletes nothing for 300 ms; after the release
+        //      the old watch is gone (control).
+        // proves: CLAIM(prune-lock-order)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let now = at("2026-10-29T14:03:11Z");
+        store.save(&finished("old", TerminalStatus::Cancelled, now.minus_secs(30 * 24 * 3600))).unwrap();
+        let guard = store.lock().unwrap();
+        let pruner = {
+            let store = store.clone();
+            std::thread::spawn(move || store.prune(now).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(store.watch_path(&wid("old")).exists(), "pruned without the global lock");
+        drop(guard);
+        pruner.join().unwrap();
+        store.prune(now).unwrap();
+        assert!(!store.watch_path(&wid("old")).exists(), "control: prunable once the lock is free");
     }
 }

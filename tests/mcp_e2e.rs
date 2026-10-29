@@ -98,8 +98,8 @@ async fn create_then_one_write_then_keepalive_returns_the_fired_envelope() {
     //      keepalive (no repeating appender, which used to hide the gap) is
     //      seen on the very first tick (tick 1). Checks the envelope: status
     //      fired, the line in events and digest, real timestamps,
-    //      session_ticks 1, watch_id (V8), event_id (V3), next "act on
-    //      events". Must complete well inside 5 s.
+    //      session_ticks 1, watch_id (V8), event_id (V3, W1: `build:1:0`),
+    //      next "act on events". Must complete well inside 5 s.
     // proves: CLAIM(baseline-at-create)
     let sandbox = Sandbox::new();
     let input = sandbox.input("build.log");
@@ -133,7 +133,7 @@ async fn create_then_one_write_then_keepalive_returns_the_fired_envelope() {
     assert!(envelope["events"][0]["summary"].as_str().unwrap().contains("ERROR: linking failed"));
     assert!(envelope["digest"].as_str().unwrap().contains("ERROR: linking failed"));
     assert_eq!(envelope["events"][0]["watch_id"], "build");
-    assert_eq!(envelope["events"][0]["event_id"], "build:1");
+    assert_eq!(envelope["events"][0]["event_id"], "build:1:0", "W1: ids are <watch>:<tick>:<n>, n from 0");
     client.cancel().await.unwrap();
 }
 
@@ -202,7 +202,7 @@ async fn a_killed_server_is_replaced_by_one_that_continues_the_same_watch() {
         })
     };
     assert!(
-        wait_until(Duration::from_secs(5), || sandbox.watch_file("w").is_some_and(|w| w["tick"].as_u64() >= Some(3))),
+        wait_until_async(Duration::from_secs(5), || sandbox.watch_file("w").is_some_and(|w| w["tick"].as_u64() >= Some(3))).await,
         "server A never reached tick 3"
     );
     let before = sandbox.watch_file("w").unwrap();
@@ -227,16 +227,29 @@ async fn a_killed_server_is_replaced_by_one_that_continues_the_same_watch() {
     client_b.cancel().await.unwrap();
 }
 
-#[derive(Clone, Default)]
-struct ProgressRecorder(Arc<Mutex<Vec<(f64, Option<String>)>>>);
+/// Records every progress notification and forwards it on an async channel,
+/// so a test can AWAIT the next one (with a timeout) instead of polling.
+#[derive(Clone)]
+struct ProgressRecorder {
+    seen: Arc<Mutex<Vec<(f64, Option<String>)>>>,
+    tx: tokio::sync::mpsc::UnboundedSender<(f64, Option<String>)>,
+}
 
-impl ClientHandler for ProgressRecorder {
-    async fn on_progress(&self, params: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
-        self.0.lock().unwrap().push((params.progress, params.message));
+impl ProgressRecorder {
+    fn new() -> (ProgressRecorder, tokio::sync::mpsc::UnboundedReceiver<(f64, Option<String>)>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (ProgressRecorder { seen: Arc::new(Mutex::new(Vec::new())), tx }, rx)
     }
 }
 
-#[tokio::test]
+impl ClientHandler for ProgressRecorder {
+    async fn on_progress(&self, params: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
+        self.seen.lock().unwrap().push((params.progress, params.message.clone()));
+        let _ = self.tx.send((params.progress, params.message));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blocked_keepalive_emits_a_strictly_increasing_counter_with_the_watch_tick_in_the_message() {
     // why: SPEC "Delivery" path 2 (best effort) + V18 (S18): while blocked,
     //      emit MCP notifications/progress. `progress` is a call-local counter
@@ -245,11 +258,17 @@ async fn a_blocked_keepalive_emits_a_strictly_increasing_counter_with_the_watch_
     //      has no change at first, so the call spans several ticks; after the
     //      first notification arrives ONE line is appended and the call fires.
     //      The rmcp client attaches a progressToken itself (FINDINGS).
+    //      T3: the round-2 test blocked the test's own (single-thread) runtime
+    //      in `wait_until` right after spawning the request, so the task that
+    //      sends the request and the handler that receives the notification
+    //      could not run and a correct server failed. Now the runtime is
+    //      multi-thread AND every wait is an `await` on an async channel with
+    //      a timeout; nothing in this test blocks a worker thread.
     // proves: CLAIM(progress-counter)
     let sandbox = Sandbox::new();
     let input = sandbox.input("a.log");
     std::fs::write(&input, "boot\n").unwrap();
-    let recorder = ProgressRecorder::default();
+    let (recorder, mut notifications) = ProgressRecorder::new();
     let transport = TokioChildProcess::new(sandbox.tokio_command().configure(|c| {
         c.arg("mcp");
     }))
@@ -264,16 +283,25 @@ async fn a_blocked_keepalive_emits_a_strictly_increasing_counter_with_the_watch_
                 .unwrap()
         })
     };
-    assert!(wait_until(Duration::from_secs(3), || !recorder.0.lock().unwrap().is_empty()), "no progress arrived for tick 1");
+    let first = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+        .await
+        .expect("no progress arrived for tick 1")
+        .expect("notification channel closed");
+    assert!(first.1.as_deref().unwrap_or_default().contains("progwatch"), "{first:?}");
     {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().append(true).open(&input).unwrap();
         writeln!(file, "x").unwrap();
     }
-    let result = tokio::time::timeout(Duration::from_secs(5), blocked).await.unwrap().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), blocked).await.expect("keepalive did not return after the write").unwrap();
     assert_eq!(text_json(&result)["status"], "fired");
-    assert!(wait_until(Duration::from_secs(2), || recorder.0.lock().unwrap().len() >= 2), "fewer than two progress notifications arrived");
-    let seen = recorder.0.lock().unwrap().clone();
+    let second = tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+        .await
+        .expect("fewer than two progress notifications arrived")
+        .expect("notification channel closed");
+    assert!(second.0 > first.0, "progress must increase: {first:?} then {second:?}");
+
+    let seen = recorder.seen.lock().unwrap().clone();
     assert!(seen.windows(2).all(|w| w[0].0 < w[1].0), "progress must strictly increase: {seen:?}");
     for (index, (_, message)) in seen.iter().enumerate() {
         let message = message.as_deref().unwrap_or_default();

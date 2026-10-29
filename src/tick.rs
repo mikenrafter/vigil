@@ -18,9 +18,13 @@ pub enum TickOutcome {
 impl Vigil {
     /// Run the watch's tick if `last_tick_at + interval_s` is due (the first
     /// tick is due immediately, and compares against the baseline recorded at
-    /// `create`, V1). Takes the global lock (V4), re-reads the watch under it
-    /// and repeats the due/terminal checks; a finished watch is returned as
-    /// is (V3). Rewrites the watch file atomically at the end.
+    /// `create`, V1). Takes the WATCH's lock (X3: `locks/<id>.lock`, held
+    /// across sensing and the write; never the global lock), re-reads the
+    /// watch under it and repeats the due/terminal checks; a finished watch is
+    /// returned as is (V3). Reads all inputs of the tick concurrently through
+    /// `Vigil::reader` (X4). Caps every event `summary` at 200 bytes (X2) and
+    /// the persisted pending change at 64 KiB per input (W7). Rewrites the
+    /// watch file atomically at the end.
     pub async fn tick_due(&self, id: &WatchId) -> Result<TickOutcome, VigilError> {
         todo!()
     }
@@ -169,7 +173,8 @@ mod tests {
     #[tokio::test]
     async fn change_watch_fires_on_the_first_change_and_attaches_it() {
         // why: SPEC fire = "change": fire on any input change, no model call.
-        //      Event carries tick (2), the stable event_id "build:2" (V3),
+        //      Event carries tick (2), the stable event_id "build:2:0" (V3, W1:
+        //      always `<watch>:<tick>:<n>`, n from 0),
         //      watch id, input label and the changed line as summary; the
         //      watch is finished (D1) and stops ticking.
         // proves: CLAIM(fire-change)
@@ -183,7 +188,7 @@ mod tests {
         assert_eq!(file.events.len(), 1);
         let event = &file.events[0];
         assert_eq!(event.tick, 2);
-        assert_eq!(event.event_id, "build:2");
+        assert_eq!(event.event_id, "build:2:0");
         assert_eq!(event.watch_id, "build");
         assert_eq!(event.input, format!("file:{}", path.display()));
         assert!(event.summary.contains("ERROR: linking failed"), "{:?}", event.summary);
@@ -198,10 +203,11 @@ mod tests {
 
     #[tokio::test]
     async fn events_of_one_tick_get_distinct_stable_ids_in_input_order() {
-        // why: V3 (S3) + the contradiction flagged in .red-report.md: the
-        //      id `<watch_id>:<tick>` alone collides when two inputs change in
-        //      one tick. Default: first `w:1`, second `w:1:1`. Both inputs are
-        //      appended after create, so tick 1 yields both, in input order.
+        // why: V3 (S3) + W1 (T1): the id is always `<watch_id>:<tick>:<n>`, n
+        //      from 0, so two inputs changing in one tick are `w:1:0` and
+        //      `w:1:1` (the round-2 default `w:1` / `w:1:1` is gone). Both
+        //      inputs are appended after create, so tick 1 yields both, in
+        //      input order.
         // proves: CLAIM(event-id)
         let f = fixture();
         let (first, second) = (f.env.input_path("first.log"), f.env.input_path("second.log"));
@@ -215,7 +221,7 @@ mod tests {
         f.tick(&id).await;
         let events = f.load(&id).events;
         assert_eq!(events.len(), 2);
-        assert_eq!((events[0].event_id.as_str(), events[1].event_id.as_str()), ("w:1", "w:1:1"));
+        assert_eq!((events[0].event_id.as_str(), events[1].event_id.as_str()), ("w:1:0", "w:1:1"));
         assert!(events[0].summary.contains("first-new") && events[1].summary.contains("second-new"));
     }
 
@@ -536,7 +542,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_ticks_in_one_test_process_produce_exactly_one_tick() {
         // why: SPEC "State": two sessions on one watch must not double-tick;
-        //      the global lock plus a due-time recheck under it make the
+        //      the watch lock (X3) plus a due-time recheck under it make the
         //      losers return NotDue. 8 racers across 2 Vigil objects, twice.
         //      S25 caveat: both objects live in ONE OS process, so this alone
         //      could pass with a process-local mutex; the cross-PROCESS proof
@@ -572,17 +578,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_tick_waits_for_the_global_lock_and_proceeds_after_it_is_released() {
-        // why: V4/V5 (S25): every mutation holds the global lock. While
-        //      another holder has it, tick_due must not complete and must
-        //      write nothing; after the release it completes with the tick
+    async fn a_tick_waits_for_its_watch_lock_and_proceeds_after_it_is_released() {
+        // why: X3 (was V4/V5 "global lock"): a tick holds ITS WATCH'S lock
+        //      (`locks/<id>.lock`) across sensing and write. While another
+        //      holder has it, tick_due must not complete and must write
+        //      nothing; after the release it completes with the tick
         //      recorded. Contention is shown by contrast, not assumed: the
         //      SAME call on an unlocked watch finishes inside the 300 ms
-        //      window (control), the locked one does not. (How the wait is
-        //      implemented, blocking flock or polling, is the implementer's
-        //      choice, so /proc/locks is not consulted here; the store test
-        //      does that for `Store::lock`.) Multi-thread so a blocking flock
-        //      inside the tick cannot freeze this test.
+        //      window (control), the locked one does not. (Blocking flock or
+        //      polling is the implementer's choice, so /proc/locks is not
+        //      consulted here; the store test does that for the lock types.)
+        //      Multi-thread so a blocking flock inside the tick cannot freeze
+        //      this test.
         // proves: CLAIM(tick-lock)
         let f = fixture();
         let (id, _) = f.baselined_change_watch("w").await;
@@ -593,7 +600,7 @@ mod tests {
         let uncontended = tokio::time::timeout(window, f.env.another_process().tick_due(&control)).await;
         assert_eq!(uncontended.expect("control: an unlocked tick completes quickly").unwrap(), TickOutcome::Ticked);
 
-        let guard = f.env.vigil.store().lock().unwrap();
+        let guard = f.env.vigil.store().lock_watch(&id).unwrap();
         let before = std::fs::read(f.env.vigil.store().watch_path(&id)).unwrap();
         let vigil = Arc::new(f.env.another_process());
         let tick = tokio::spawn({
@@ -601,11 +608,125 @@ mod tests {
             async move { vigil.tick_due(&id).await.unwrap() }
         });
         tokio::time::sleep(window).await;
-        assert!(!tick.is_finished(), "tick completed while the lock was held");
+        assert!(!tick.is_finished(), "tick completed while its watch lock was held");
         assert_eq!(std::fs::read(f.env.vigil.store().watch_path(&id)).unwrap(), before, "nothing written under contention");
         drop(guard);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), tick).await.expect("tick must proceed after release").unwrap(), TickOutcome::Ticked);
         assert_eq!(f.load(&id).tick, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tick_does_not_need_the_global_lock_and_other_watches_locks_do_not_block_it() {
+        // why: X3 (T4): the global lock is held only for namespace operations
+        //      (id reservation, prune), "never during sensing", and a watch's
+        //      tick takes only its own watch lock. Holding the global lock AND
+        //      another watch's lock must not delay this watch's tick: it
+        //      completes inside 2 s (the old single global lock would hang it).
+        //      Positive control: holding THIS watch's own lock does block it
+        //      (previous test), so the lock being held is a real obstacle.
+        // proves: CLAIM(per-watch-lock)
+        let f = fixture();
+        let (id, _) = f.baselined_change_watch("w").await;
+        let (other, _) = f.baselined_change_watch("other").await;
+        f.clock.advance_secs(20);
+        let store = f.env.vigil.store();
+        let _global = store.lock().unwrap();
+        let _others_lock = store.lock_watch(&other).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), f.env.another_process().tick_due(&id))
+            .await
+            .expect("a tick of w blocked behind the global lock or another watch's lock");
+        assert_eq!(outcome.unwrap(), TickOutcome::Ticked);
+        assert_eq!(f.load(&id).tick, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_input_on_watch_a_does_not_block_a_tick_of_watch_b() {
+        // why: X3 (T4), the headline: sensing for watch A (a cmd that hangs on
+        //      a gate here) must not stop watch B from ticking, listing,
+        //      cancelling or creating, which the single global lock forbade.
+        //      Sequence: A's tick is parked INSIDE its input read (the reader
+        //      reports it started; no sleeps decide this). Then B's tick must
+        //      finish within 2 s while A is still sensing (A's task is not
+        //      finished and A's file still says tick 0), `list` and a cancel of
+        //      a third watch must not block either, and the global lock is
+        //      free. Finally the gate opens and A completes its own tick.
+        // proves: CLAIM(per-watch-lock)
+        let f = fixture();
+        let slow = Input::Cmd { argv: vec!["slow-a".into()], timeout_s: Some(20.0), cwd: None };
+        let mut request_a = change_request("a", Path::new("/unused"), 20);
+        request_a.inputs = vec![slow];
+        f.env.reader.set_text("cmd:slow-a", "base");
+        let a = f.create(request_a).await;
+        let (b, b_path) = f.baselined_change_watch("b").await;
+        let (c, _) = f.baselined_change_watch("c").await;
+        append_file(&b_path, "b changed\n");
+        f.clock.advance_secs(20);
+
+        let gate = Gate::closed();
+        f.env.reader.set_gate("cmd:slow-a", Some(gate.clone()));
+        f.env.reader.set_text("cmd:slow-a", "a-changed");
+        let started_before = f.env.reader.started_count("cmd:slow-a");
+        let a_task = tokio::spawn({
+            let (vigil, a) = (Arc::new(f.env.another_process()), a.clone());
+            async move { vigil.tick_due(&a).await.unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), f.env.reader.wait_started("cmd:slow-a", started_before + 1)).await.expect("A's tick never reached its input read");
+
+        let b_outcome = tokio::time::timeout(Duration::from_secs(2), f.env.another_process().tick_due(&b))
+            .await
+            .expect("B's tick blocked behind A's sensing");
+        assert_eq!(b_outcome.unwrap(), TickOutcome::Ticked);
+        assert_eq!(f.load(&b).status, WatchStatus::Fired, "B really ticked and saw its change");
+        assert!(!a_task.is_finished(), "A must still be sensing while B finished");
+        assert_eq!(f.load(&a).tick, 0, "A has written nothing yet");
+        let listed = tokio::time::timeout(Duration::from_secs(2), f.env.another_process().list()).await.expect("list blocked behind A's sensing").unwrap();
+        assert_eq!(listed.len(), 3);
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), f.env.another_process().cancel(&c)).await.expect("cancel of C blocked behind A's sensing").unwrap();
+        assert_eq!(cancelled.status, WatchStatus::Cancelled);
+        assert!(f.env.vigil.store().try_lock().unwrap().is_some(), "the global lock is not held during sensing");
+
+        gate.open();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), a_task).await.unwrap().unwrap(), TickOutcome::Ticked);
+        let file = f.load(&a);
+        assert_eq!((file.tick, file.status), (1, WatchStatus::Fired), "A finished its own tick: the change it read fired it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancel_of_watch_a_waits_for_a_tick_in_flight_on_a_and_both_agree() {
+        // why: X3: the watch lock is "held across a tick's sensing and write
+        //      and across cancel". A tick parked in its read holds A's lock, so
+        //      a cancel of A must wait (not interleave, not lose the tick's
+        //      result): it stays pending while the gate is closed; once the
+        //      gate opens the tick fires A (the read changed), and the cancel
+        //      then finds the fired result and returns it unchanged (V4).
+        // proves: CLAIM(per-watch-lock)
+        let f = fixture();
+        let mut request = change_request("a", Path::new("/unused"), 20);
+        request.inputs = vec![Input::Cmd { argv: vec!["slow-a".into()], timeout_s: Some(20.0), cwd: None }];
+        f.env.reader.set_text("cmd:slow-a", "base");
+        let a = f.create(request).await;
+        let gate = Gate::closed();
+        f.env.reader.set_gate("cmd:slow-a", Some(gate.clone()));
+        f.env.reader.set_text("cmd:slow-a", "changed");
+        let before = f.env.reader.started_count("cmd:slow-a");
+        let tick = tokio::spawn({
+            let (vigil, a) = (Arc::new(f.env.another_process()), a.clone());
+            async move { vigil.tick_due(&a).await.unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), f.env.reader.wait_started("cmd:slow-a", before + 1)).await.unwrap();
+        let cancel = tokio::spawn({
+            let (vigil, a) = (Arc::new(f.env.another_process()), a.clone());
+            async move { vigil.cancel(&a).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!cancel.is_finished(), "cancel interleaved with a tick that holds the watch lock");
+        assert_eq!(f.load(&a).status, WatchStatus::Pending);
+
+        gate.open();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), tick).await.unwrap().unwrap(), TickOutcome::Ticked);
+        let envelope = tokio::time::timeout(Duration::from_secs(5), cancel).await.unwrap().unwrap();
+        assert_eq!(envelope.status, WatchStatus::Fired, "the tick won; cancel returns the stored result");
+        assert_eq!(envelope.events, f.load(&a).events);
     }
 
     // ---- no judge call without a change ----
@@ -836,7 +957,7 @@ mod tests {
         assert_eq!(file.events[0].summary, "judge unavailable; raw change attached");
         assert!(file.events[0].judge.is_none());
         assert_eq!(file.events[0].tick, 4);
-        assert_eq!(file.events[0].event_id, "w:4");
+        assert_eq!(file.events[0].event_id, "w:4:0", "W1: even a lone event carries :0");
         assert!(file.last_digest.contains("ERROR: raw line"), "raw change attached");
         assert_eq!(f.env.vigil.status(&id).await.unwrap().envelope.judge_status, JudgeStatus::Down);
     }
@@ -900,13 +1021,161 @@ mod tests {
         assert!(state.contains("entry-0499"));
     }
 
+    // ---- W2 (T6): the judge state floor through the engine ----
+
+    #[tokio::test]
+    async fn a_below_floor_judge_state_env_value_gives_an_effective_limit_of_2560_through_the_engine() {
+        // why: W2 + T6: the old tests used limits >= 4000 or the helper's own
+        //      1536 floor, so they passed without the config clamp. Here the
+        //      Config comes from the ENVIRONMENT path (`from_lookup`) with
+        //      VIGIL_JUDGE_STATE_BYTES=100 and the real engine builds the
+        //      state from 4096 bytes of new log (tail_bytes default). Without
+        //      the clamp the helper's own floor gives 53 (prompt) + 1536 =
+        //      1589 bytes at most; with it the limit is 2560. So the state
+        //      must be longer than 2410 (2560 minus 150 for label and
+        //      separators, which count inside the budget) and at most 2560.
+        //      Above-floor override: 3000 gives (2850, 3000]. The newest line
+        //      is kept in both.
+        // proves: CLAIM(config-floors)
+        for (raw, floor, ceiling) in [("100", 2410usize, 2560usize), ("3000", 2850, 3000)] {
+            let config = crate::config::Config::from_lookup(|name| (name == "VIGIL_JUDGE_STATE_BYTES").then(|| raw.to_string()));
+            let clock = Arc::new(ManualClock::new(spec_instant()));
+            let env = Env::with_clock_and_config(clock.clone(), config);
+            let path = env.input_path("big.log");
+            write_file(&path, "old\n");
+            let id = env.vigil.create(judge_request("w", &path, 20)).await.unwrap().watch_id;
+            env.judge.set_fallback(Ok(noul_answers("failed", 0.0, 1.0)));
+            let big: String = (0..500).map(|i| format!("entry-{i:04}\n")).collect(); // 6000 bytes, the last 4096 are read
+            append_file(&path, &big);
+            env.vigil.tick_due(&id).await.unwrap();
+            let state = &env.judge.requests()[0].state;
+            assert!(state.len() <= ceiling, "VIGIL_JUDGE_STATE_BYTES={raw}: {} bytes exceed {ceiling}", state.len());
+            assert!(state.len() > floor, "VIGIL_JUDGE_STATE_BYTES={raw}: only {} bytes, the effective limit is {ceiling}", state.len());
+            assert!(state.contains("entry-0499"), "newest line kept");
+        }
+    }
+
+    // ---- W7 (T7): the persisted pending change is bounded ----
+
+    #[tokio::test]
+    async fn a_pending_change_over_64_kib_is_cut_to_the_newest_content_across_failures_and_a_restart() {
+        // why: W7 + T7: "the persisted pending change is capped at 64 KiB per
+        //      input, newest kept, [truncated] when cut". The outage test
+        //      (3.2 KB + 1.5 KB) never got near the cap, so unlimited
+        //      accumulation passed. Here ONE input gets two 40800-byte
+        //      appends (3400 lines of 12 bytes each; tail_bytes 1 MB so the
+        //      file reader keeps all of each) during two judge failures:
+        //      2 x 40800 = 81600 > 65536 bytes pending. Then a NEW process
+        //      recovers. Arithmetic: 81600 - 65536 = 16064 oldest bytes must
+        //      go = about the first 1339 alpha lines; beta (40800) is kept
+        //      whole. Persisted after the second failure: one changed entry of
+        //      at most 65536 + 12 (marker) + 1 bytes that says [truncated],
+        //      holds the newest line (beta-03399) and the oldest kept beta
+        //      line (beta-00000) and the newest alpha line (alpha-03399), and
+        //      NOT alpha-00000. The recovery request (default 2560-byte limit)
+        //      carries the newest content first, identical to the request
+        //      before the restart, and the answer fires and clears the pending
+        //      change and the strikes.
+        // proves: CLAIM(pending-cap)
+        let f = fixture();
+        let path = f.env.input_path("w7.log");
+        write_file(&path, "old\n");
+        let mut request = judge_request("w", &path, 20);
+        request.inputs = vec![Input::File { path: path.clone(), tail_bytes: Some(1_000_000) }];
+        let id = f.create(request).await;
+        assert_eq!(f.tick(&id).await, TickOutcome::Ticked);
+        f.env.judge.push(Err(JudgeError::Timeout));
+        f.env.judge.push(Err(JudgeError::Status(500)));
+        f.env.judge.push(Ok(noul_answers("failed", 0.95, 0.9)));
+        let lines = |prefix: &str| -> String { (0..3400).map(|i| format!("{prefix}-{i:05}\n")).collect() };
+        assert_eq!(lines("alpha").len(), 40_800, "arithmetic of the test: 3400 x 12 bytes");
+
+        append_file(&path, &lines("alpha"));
+        f.next_tick(&id, 20).await;
+        append_file(&path, &lines("beta"));
+        f.next_tick(&id, 20).await;
+
+        let file = f.load(&id);
+        assert_eq!((file.status, file.judge_strikes), (WatchStatus::Pending, 2), "precondition: two failures, still pending");
+        let pending = file.pending_change.expect("the change is retained");
+        assert_eq!(pending.changed.len(), 1, "one input, one persisted entry: {:?}", pending.changed.iter().map(|c| &c.label).collect::<Vec<_>>());
+        let text = &pending.changed[0].text;
+        assert!(text.len() <= 64 * 1024 + crate::inputs::TRUNCATED_MARKER.len() + 1, "persisted {} bytes", text.len());
+        assert!(text.contains(crate::inputs::TRUNCATED_MARKER), "a cut must say so");
+        assert!(text.contains("beta-03399") && text.contains("beta-00000"), "the newest content is kept whole");
+        assert!(text.contains("alpha-03399"), "the newest of the older content is kept");
+        assert!(!text.contains("alpha-00000"), "the oldest content is what is dropped");
+
+        let second_process = f.env.another_process();
+        f.clock.advance_secs(20);
+        assert_eq!(second_process.tick_due(&id).await.unwrap(), TickOutcome::Ticked);
+        let requests = f.env.judge.requests();
+        assert_eq!(requests.len(), 3);
+        for (index, request) in requests.iter().enumerate().skip(1) {
+            let state = &request.state;
+            assert!(state.len() <= 2560, "request {index}: {} bytes", state.len());
+            assert!(state.starts_with("Tell me if the build log shows a failure or finishes."));
+            assert!(state.contains("beta-03399"), "request {index}: newest content first");
+            assert!(!state.contains("alpha-00000") && !state.contains("beta-00000"), "request {index}: cut to the budget");
+        }
+        assert_eq!(requests[1].state, requests[2].state, "the restart does not change what is asked");
+        let after = f.load(&id);
+        assert_eq!((after.status, after.judge_strikes), (WatchStatus::Fired, 0));
+        assert!(after.pending_change.is_none());
+        assert_eq!(after.events[0].judge, Some(noul_answers("failed", 0.95, 0.9)));
+    }
+
+    // ---- X2: event summaries are bounded ----
+
+    #[tokio::test]
+    async fn an_event_summary_is_at_most_200_bytes_for_change_and_judge_events_and_short_lines_are_not_cut() {
+        // why: X2 (S12): "an event summary at most 200 bytes" so an envelope
+        //      is bounded by the digest limit + 16 x 200 + fixed fields.
+        //      Change events: a 5000-byte ASCII line and a 3000 x "é" line
+        //      (6000 bytes, cut on a UTF-8 boundary: the String type would
+        //      panic on a mid-character slice) each give a summary of at most
+        //      200 bytes that still carries content (>= 100 of the line's
+        //      characters, so an over-eager cap fails). Judge event: same
+        //      bound. Control: a 100-byte line is not cut at all (it fits even if the
+        //      summary also carries the input label).
+        // proves: CLAIM(summary-cap)
+        let f = fixture();
+        let cases: Vec<(&str, String, usize)> = vec![
+            ("ascii", format!("{}\n", "y".repeat(5000)), 100),
+            ("accents", format!("{}\n", "é".repeat(3000)), 40),
+            ("short", format!("{}\n", "z".repeat(100)), 100),
+        ];
+        for (name, line, min_kept) in cases {
+            let path = f.env.input_path(&format!("{name}.log"));
+            write_file(&path, "old\n");
+            let id = f.create(change_request(name, &path, 20)).await;
+            append_file(&path, &line);
+            f.tick(&id).await;
+            let events = f.load(&id).events;
+            assert_eq!(events.len(), 1, "{name}");
+            let summary = &events[0].summary;
+            assert!(summary.len() <= 200, "{name}: summary is {} bytes", summary.len());
+            let marker_char = line.chars().next().unwrap();
+            assert!(summary.chars().filter(|c| *c == marker_char).count() >= min_kept, "{name}: summary lost its content: {summary:?}");
+        }
+        let (id, path) = f.baselined_judge_watch("judged").await;
+        f.env.judge.push(Ok(noul_answers("failed", 0.99, 0.9)));
+        append_file(&path, &format!("{}\n", "j".repeat(5000)));
+        f.next_tick(&id, 20).await;
+        let events = f.load(&id).events;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].summary.len() <= 200, "judge event summary is {} bytes", events[0].summary.len());
+        assert!(events[0].summary.contains("jjjj"));
+    }
+
     // ---- confinement ----
 
     #[tokio::test]
-    async fn a_full_lifecycle_writes_only_the_lock_and_json_files_under_the_state_root() {
+    async fn a_full_lifecycle_writes_only_lock_and_json_files_under_the_state_root() {
         // why: SPEC non-goals/"State": nothing is written outside
-        //      `$XDG_STATE_HOME/vigil/`, and no `.tmp` is left behind. V5: the
-        //      only non-json file is the single `lock` in the root. Scans the
+        //      `$XDG_STATE_HOME/vigil/`, and no `.tmp` is left behind. X3: the
+        //      only non-json files are the global `lock` in the root and one
+        //      `locks/<id>.lock` per existing watch. Scans the
         //      whole tempdir (state root + input dir + a would-be HOME) after
         //      create, ticks, fire, cancel and prune. Positive control: the
         //      scan finds the watch file and detects a stray file we plant.
@@ -931,11 +1200,17 @@ mod tests {
             }
             assert!(file.starts_with(&state), "stray file outside the state root: {}", file.display());
             let relative = file.strip_prefix(&state).unwrap().to_string_lossy().to_string();
-            let allowed = relative == "lock" || (relative.starts_with("watches/") && relative.ends_with(".json"));
+            let allowed = relative == "lock"
+                || (relative.starts_with("watches/") && relative.ends_with(".json"))
+                || (relative.starts_with("locks/") && relative.ends_with(".lock"));
             assert!(allowed, "unexpected file under the state root: {relative}");
+            if let Some(id) = relative.strip_prefix("locks/").and_then(|r| r.strip_suffix(".lock")) {
+                assert!(state.join("watches").join(format!("{id}.json")).exists(), "orphan lock file {relative}: its watch file is gone");
+            }
         }
         assert!(files.iter().any(|p| p.ends_with("watches/fired.json")), "control: scan sees the watch file");
-        assert!(files.iter().any(|p| p == &state.join("lock")), "control: the single global lock file exists");
+        assert!(files.iter().any(|p| p == &state.join("lock")), "control: the global lock file exists");
+        assert!(files.iter().any(|p| p == &state.join("locks").join("fired.lock")), "control: the watch lock file exists");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), input_snapshot, "watched input was not modified");
         assert!(list_files(&home).is_empty());
 

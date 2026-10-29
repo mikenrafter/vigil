@@ -13,7 +13,9 @@ use chrono::{DateTime, Utc};
 
 use crate::clock::{Clock, Timestamp};
 use crate::config::Config;
+use crate::inputs::{read_input, InputReader, Reading};
 use crate::judge::{Answer, Answers, BoxFuture, Judge, JudgeError, JudgeRequest};
+use crate::watch::{Input, InputState};
 
 /// `2026-10-29T14:03:11Z`, the instant used in the SPEC envelope example.
 pub fn spec_instant() -> Timestamp {
@@ -146,6 +148,214 @@ impl Judge for ScriptedJudge {
     }
     fn healthy(&self) -> BoxFuture<'_, bool> {
         Box::pin(async move { self.0.lock().unwrap().healthy })
+    }
+}
+
+/// A gate a scripted read waits on: closed until `open()`. Lets a test hold
+/// one watch's sensing "in flight" for exactly as long as it wants, with no
+/// sleeps and no dependence on tokio's (paused) time (X3).
+#[derive(Clone)]
+pub struct Gate(Arc<tokio::sync::Semaphore>);
+
+impl Gate {
+    pub fn closed() -> Gate {
+        Gate(Arc::new(tokio::sync::Semaphore::new(0)))
+    }
+    /// Let every current and future waiter through.
+    pub fn open(&self) {
+        self.0.add_permits(1 << 20);
+    }
+    async fn pass(&self) {
+        self.0.acquire().await.expect("gate semaphore is never closed").forget();
+    }
+}
+
+/// One read the `ScriptedReader` served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRecord {
+    pub label: String,
+    /// Tokio time (virtual under `start_paused`) when the read began.
+    pub started: tokio::time::Instant,
+    /// `None` while the read is still in flight (or was dropped mid-way).
+    pub finished: Option<tokio::time::Instant>,
+}
+
+#[derive(Default)]
+struct ReaderScript {
+    text: Option<String>,
+    sleep: Duration,
+    gate: Option<Gate>,
+}
+
+#[derive(Default)]
+struct ReaderState {
+    scripts: std::collections::HashMap<String, ReaderScript>,
+    reads: Vec<ReadRecord>,
+}
+
+/// An `InputReader` for tests (X3, X4). A label with a script (`set_text`,
+/// `set_sleep`, `set_gate`) is served by the script: wait for its gate, sleep
+/// its (tokio, so possibly virtual) duration, then report its text; the
+/// reading is `changed` when the text differs from the previous reading's
+/// stored text (the first read of an input is a baseline, never a change).
+/// Only `cmd` inputs can be scripted, keyed `cmd:<argv joined by spaces>`;
+/// every other input (and every unscripted `cmd`) goes to the real
+/// `read_input`, so file inputs still behave like files.
+pub struct ScriptedReader {
+    state: Mutex<ReaderState>,
+    started: tokio::sync::Notify,
+}
+
+impl ScriptedReader {
+    pub fn new() -> ScriptedReader {
+        ScriptedReader { state: Mutex::new(ReaderState::default()), started: tokio::sync::Notify::new() }
+    }
+    /// What the input with `label` reads (and so whether it changed).
+    pub fn set_text(&self, label: &str, text: &str) {
+        self.state.lock().unwrap().scripts.entry(label.to_string()).or_default().text = Some(text.to_string());
+    }
+    /// How long each read of `label` takes (tokio time).
+    pub fn set_sleep(&self, label: &str, sleep: Duration) {
+        self.state.lock().unwrap().scripts.entry(label.to_string()).or_default().sleep = sleep;
+    }
+    /// Reads of `label` wait for this gate before anything else.
+    pub fn set_gate(&self, label: &str, gate: Option<Gate>) {
+        self.state.lock().unwrap().scripts.entry(label.to_string()).or_default().gate = gate;
+    }
+    /// Every scripted read so far, in start order.
+    pub fn reads(&self) -> Vec<ReadRecord> {
+        self.state.lock().unwrap().reads.clone()
+    }
+    /// Reads of `label` started so far.
+    pub fn started_count(&self, label: &str) -> usize {
+        self.state.lock().unwrap().reads.iter().filter(|r| r.label == label).count()
+    }
+    /// Wait until at least `count` reads of `label` have started.
+    pub async fn wait_started(&self, label: &str, count: usize) {
+        loop {
+            let notified = self.started.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.started_count(label) >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The script key of an input: `cmd:<argv joined by spaces>`, the same text
+/// `Input::label()` gives a `cmd` input. Only `cmd` inputs can be scripted;
+/// the key is computed here so the fixture works before `label()` does.
+fn script_key(input: &Input) -> Option<String> {
+    match input {
+        Input::Cmd { argv, .. } => Some(format!("cmd:{}", argv.join(" "))),
+        _ => None,
+    }
+}
+
+impl InputReader for ScriptedReader {
+    fn read<'a>(&'a self, input: &'a Input, previous: &'a InputState) -> BoxFuture<'a, Reading> {
+        Box::pin(async move {
+            let Some(label) = script_key(input) else {
+                return read_input(input, previous).await;
+            };
+            let script = {
+                let mut state = self.state.lock().unwrap();
+                match state.scripts.get(&label) {
+                    None => None,
+                    Some(script) => {
+                        let copy = (script.text.clone(), script.sleep, script.gate.clone());
+                        let index = state.reads.len();
+                        state.reads.push(ReadRecord { label: label.clone(), started: tokio::time::Instant::now(), finished: None });
+                        Some((copy, index))
+                    }
+                }
+            };
+            let Some(((text, sleep, gate), index)) = script else {
+                return read_input(input, previous).await;
+            };
+            self.started.notify_waiters();
+            if let Some(gate) = gate {
+                gate.pass().await;
+            }
+            if !sleep.is_zero() {
+                tokio::time::sleep(sleep).await;
+            }
+            let text = text.unwrap_or_else(|| "ok".to_string());
+            let changed = previous.hash.as_ref().is_some_and(|h| *h != text);
+            let mut state = InputState::default();
+            state.hash = Some(text.clone());
+            self.state.lock().unwrap().reads[index].finished = Some(tokio::time::Instant::now());
+            Reading { label, text, changed, is_error: false, want_met: None, state }
+        })
+    }
+}
+
+/// Deletion events (inotify `IN_DELETE`) in the exact order the kernel saw
+/// them across several directories, from ONE inotify instance. This is how a
+/// test proves "A was deleted before B" (X3 prune ordering) without sampling.
+pub struct DeletionLog {
+    fd: i32,
+    dirs: std::collections::HashMap<i32, String>,
+}
+
+unsafe extern "C" {
+    fn inotify_init1(flags: i32) -> i32;
+    fn inotify_add_watch(fd: i32, path: *const std::ffi::c_char, mask: u32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn close(fd: i32) -> i32;
+}
+
+impl DeletionLog {
+    const IN_DELETE: u32 = 0x200;
+    const IN_NONBLOCK: i32 = 0o4000;
+    const IN_CLOEXEC: i32 = 0o2000000;
+
+    /// Watch each `(label, directory)` for deletions. Directories must exist.
+    pub fn start(dirs: &[(&str, &Path)]) -> DeletionLog {
+        use std::os::unix::ffi::OsStrExt;
+        let fd = unsafe { inotify_init1(Self::IN_NONBLOCK | Self::IN_CLOEXEC) };
+        assert!(fd >= 0, "inotify_init1 failed: {}", std::io::Error::last_os_error());
+        let mut map = std::collections::HashMap::new();
+        for (label, dir) in dirs {
+            let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            let wd = unsafe { inotify_add_watch(fd, c.as_ptr(), Self::IN_DELETE) };
+            assert!(wd >= 0, "inotify_add_watch({}) failed: {}", dir.display(), std::io::Error::last_os_error());
+            map.insert(wd, label.to_string());
+        }
+        DeletionLog { fd, dirs: map }
+    }
+
+    /// Everything deleted since `start` (or the previous `drain`), as
+    /// `"<label>/<file name>"`, oldest first.
+    pub fn drain(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe { read(self.fd, buf.as_mut_ptr(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut offset = 0usize;
+            while offset + 16 <= n as usize {
+                let wd = i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap());
+                let len = u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap()) as usize;
+                let name_bytes = &buf[offset + 16..offset + 16 + len];
+                let name = String::from_utf8_lossy(name_bytes.split(|b| *b == 0).next().unwrap_or(&[])).to_string();
+                if let Some(label) = self.dirs.get(&wd) {
+                    out.push(format!("{label}/{name}"));
+                }
+                offset += 16 + len;
+            }
+        }
+        out
+    }
+}
+
+impl Drop for DeletionLog {
+    fn drop(&mut self) {
+        unsafe { close(self.fd) };
     }
 }
 
@@ -306,7 +516,7 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::Vigil;
 use crate::judge::{JudgeRule, RuleTest};
-use crate::watch::{CreateRequest, FireKind, Input, WatchId};
+use crate::watch::{CreateRequest, FireKind, WatchId};
 
 pub fn wid(raw: &str) -> WatchId {
     WatchId::parse(raw).unwrap()
@@ -317,6 +527,9 @@ pub fn wid(raw: &str) -> WatchId {
 pub struct Env {
     pub dir: tempfile::TempDir,
     pub judge: Arc<ScriptedJudge>,
+    /// Shared by `vigil` and every `another_process()`; unscripted labels fall
+    /// through to the real `read_input`.
+    pub reader: Arc<ScriptedReader>,
     pub clock: Arc<dyn Clock>,
     pub config: Config,
     pub vigil: Vigil,
@@ -329,8 +542,9 @@ impl Env {
     pub fn with_clock_and_config(clock: Arc<dyn Clock>, config: Config) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let judge = Arc::new(ScriptedJudge::new());
-        let vigil = Vigil::new(dir.path().join("state"), clock.clone(), judge.clone(), config.clone());
-        Env { dir, judge, clock, config, vigil }
+        let reader = Arc::new(ScriptedReader::new());
+        let vigil = Vigil::new(dir.path().join("state"), clock.clone(), judge.clone(), config.clone()).with_reader(reader.clone());
+        Env { dir, judge, reader, clock, config, vigil }
     }
     pub fn root(&self) -> PathBuf {
         self.dir.path().join("state")
@@ -339,11 +553,11 @@ impl Env {
     pub fn input_path(&self, name: &str) -> PathBuf {
         self.dir.path().join("inputs").join(name)
     }
-    /// A second `Vigil` over the same root, clock, judge AND configuration:
-    /// a second process. (S22: it used to fall back to `default_config()`,
-    /// silently discarding the Env's limits.)
+    /// A second `Vigil` over the same root, clock, judge, reader AND
+    /// configuration: a second process. (S22: it used to fall back to
+    /// `default_config()`, silently discarding the Env's limits.)
     pub fn another_process(&self) -> Vigil {
-        Vigil::new(self.root(), self.clock.clone(), self.judge.clone(), self.config.clone())
+        Vigil::new(self.root(), self.clock.clone(), self.judge.clone(), self.config.clone()).with_reader(self.reader.clone())
     }
     /// Like `another_process`, started from the working directory `cwd`
     /// (V11: relative inputs resolve against the creating process's cwd).
@@ -457,6 +671,70 @@ mod tests {
         assert_eq!(env.another_process().config(), &config);
         assert_eq!(env.another_process_in(Path::new("/tmp")).config(), &config);
         assert_ne!(&config, &default_config(), "the custom config must differ from the defaults for this test to mean anything");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_reader_sleeps_virtual_time_reports_text_changes_and_records_reads() {
+        // why: X3/X4 fixture control. Every X4 timing claim (a 15 s input, two
+        //      10 s inputs finishing together) rests on this reader taking
+        //      exactly the scripted virtual time and on `changed` meaning
+        //      "text differs from the stored text" (baseline never a change).
+        let reader = ScriptedReader::new();
+        let input = Input::Cmd { argv: vec!["fake".into()], timeout_s: Some(20.0), cwd: None };
+        reader.set_text("cmd:fake", "v1");
+        reader.set_sleep("cmd:fake", Duration::from_secs(15));
+        let started = tokio::time::Instant::now();
+        let baseline = reader.read(&input, &InputState::default()).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(15));
+        assert!(!baseline.changed, "the first read of an input is a baseline");
+        let same = reader.read(&input, &baseline.state).await;
+        assert!(!same.changed);
+        reader.set_text("cmd:fake", "v2");
+        let changed = reader.read(&input, &same.state).await;
+        assert!(changed.changed && changed.text == "v2");
+        let records = reader.reads();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].finished.unwrap() - records[0].started, Duration::from_secs(15));
+
+    }
+
+    #[tokio::test]
+    async fn scripted_reader_gate_holds_a_read_until_opened() {
+        // why: X3 fixture control: "A is still sensing" is proven by a gate,
+        //      not by a sleep. The read must not finish before `open()` and
+        //      must finish after; `wait_started` must observe the start.
+        let reader = Arc::new(ScriptedReader::new());
+        let gate = Gate::closed();
+        reader.set_gate("cmd:held", Some(gate.clone()));
+        let input = Input::Cmd { argv: vec!["held".into()], timeout_s: None, cwd: None };
+        let task = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.read(&input, &InputState::default()).await.text }
+        });
+        tokio::time::timeout(Duration::from_secs(2), reader.wait_started("cmd:held", 1)).await.expect("read never started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "read finished while its gate was closed");
+        gate.open();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap(), "ok");
+    }
+
+    #[test]
+    fn deletion_log_reports_deletions_in_the_order_the_kernel_saw_them_across_directories() {
+        // why: X3 fixture control: the prune-ordering test trusts this probe.
+        //      Delete b/second.x BEFORE a/first.x although a < b: the log must
+        //      say so, name each directory by its label, and ignore creations.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("first.x"), "").unwrap();
+        std::fs::write(b.join("second.x"), "").unwrap();
+        let log = DeletionLog::start(&[("a", &a), ("b", &b)]);
+        std::fs::write(a.join("created-after.x"), "").unwrap();
+        std::fs::remove_file(b.join("second.x")).unwrap();
+        std::fs::remove_file(a.join("first.x")).unwrap();
+        assert_eq!(log.drain(), vec!["b/second.x".to_string(), "a/first.x".to_string()]);
+        assert!(log.drain().is_empty(), "drain consumes");
     }
 
     #[test]

@@ -22,6 +22,19 @@ pub enum Next {
     WatchEnded,
 }
 
+/// X1: a covered watch other than the primary that finished in this return,
+/// so an expired or cancelled secondary watch is visible even though it adds
+/// no events. Its events are in `Envelope::events`; its digest is not
+/// repeated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OtherWatch {
+    pub watch_id: WatchId,
+    pub status: WatchStatus,
+    /// `event_id`s of this watch's terminal events (empty for expired and
+    /// cancelled).
+    pub event_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     /// V8: the watch every watch field below describes.
@@ -42,6 +55,10 @@ pub struct Envelope {
     pub digest: String,
     pub judge_status: JudgeStatus,
     pub next: Next,
+    /// X1: only on a no-id return where other covered watches finished too;
+    /// absent from the wire otherwise (a quiet envelope stays small).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<OtherWatch>,
 }
 
 /// Cut `digest` so the WHOLE result, `DIGEST_CUT_MARKER` included, is at most
@@ -74,6 +91,7 @@ mod tests {
             digest: String::new(),
             judge_status: JudgeStatus::Skipped,
             next: Next::CallKeepaliveAgain,
+            others: vec![],
         }
     }
 
@@ -198,5 +216,33 @@ mod tests {
         // proves: CLAIM(quiet-envelope-small)
         let text = serde_json::to_string(&quiet(Some(270))).unwrap();
         assert!(text.len() < 400, "{} bytes: {text}", text.len());
+    }
+
+    #[test]
+    fn others_has_exactly_the_x1_wire_shape_and_is_absent_when_empty() {
+        // why: X1: `others: [{watch_id, status, event_ids}]`, literal field
+        //      names and the lowercase status strings, parsed from a literal
+        //      (not derived from the serializer) so a rename on either side
+        //      fails. It must also be ABSENT from the wire when empty, or every
+        //      quiet envelope grows (see the size test below and the exact-keys
+        //      test above, which does not list it).
+        // proves: CLAIM(envelope-others)
+        let literal = json!({"watch_id": "d-exp", "status": "expired", "event_ids": []});
+        let parsed: OtherWatch = serde_json::from_value(literal.clone()).unwrap();
+        assert_eq!((parsed.watch_id.as_str(), parsed.status, parsed.event_ids.len()), ("d-exp", WatchStatus::Expired, 0));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), literal);
+        let fired: OtherWatch = serde_json::from_value(json!({"watch_id": "b", "status": "fired", "event_ids": ["b:3:0", "b:3:1"]})).unwrap();
+        assert_eq!(fired.event_ids, vec!["b:3:0".to_string(), "b:3:1".to_string()]);
+
+        let mut envelope = quiet(Some(270));
+        assert!(serde_json::to_value(&envelope).unwrap().get("others").is_none());
+        envelope.others = vec![parsed.clone(), fired];
+        let wire = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(wire["others"][0], literal);
+        assert_eq!(wire["others"].as_array().unwrap().len(), 2);
+        let back: Envelope = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, envelope);
+        let without: Envelope = serde_json::from_value(serde_json::to_value(quiet(None)).unwrap()).unwrap();
+        assert!(without.others.is_empty(), "a missing `others` reads as empty");
     }
 }

@@ -79,26 +79,27 @@ impl Sandbox {
     }
 }
 
-/// Differences between two snapshots: new files, vanished files, and files
-/// whose bytes changed. `appended_to` is exempt only if its new bytes start
-/// with its old bytes (the known test-generated append).
+/// Differences between two snapshots, compared by exact bytes (X5, S24).
+/// `expected` maps every path that is ALLOWED to differ to the exact bytes it
+/// must hold afterwards (a file the test itself appended to, or created):
+/// anything else, an unexpected append included, must be byte-identical to
+/// `before`. Reports new files, vanished files and files whose bytes differ
+/// from what was expected.
 pub fn snapshot_diff(
     before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
     after: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
-    appended_to: &Path,
+    expected: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
 ) -> Vec<String> {
+    let paths: std::collections::BTreeSet<&PathBuf> = before.keys().chain(after.keys()).chain(expected.keys()).collect();
     let mut problems = Vec::new();
-    for (path, bytes) in after {
-        match before.get(path) {
-            None => problems.push(format!("new file {}", path.display())),
-            Some(old) if old == bytes => {}
-            Some(old) if path == appended_to && bytes.starts_with(old) => {}
-            Some(_) => problems.push(format!("modified {}", path.display())),
-        }
-    }
-    for path in before.keys() {
-        if !after.contains_key(path) {
-            problems.push(format!("removed {}", path.display()));
+    for path in paths {
+        let want = expected.get(path).or_else(|| before.get(path));
+        match (want, after.get(path)) {
+            (None, None) => {}
+            (Some(w), Some(a)) if w == a => {}
+            (None, Some(_)) => problems.push(format!("new file {}", path.display())),
+            (Some(_), None) => problems.push(format!("removed {}", path.display())),
+            (Some(w), Some(a)) => problems.push(format!("modified {} ({} bytes expected, {} found)", path.display(), w.len(), a.len())),
         }
     }
     problems
@@ -141,8 +142,23 @@ impl Drop for Appender {
     }
 }
 
+/// Async twin of `wait_until`: polls with `tokio::time::sleep`, so it never
+/// blocks the runtime thread (T3: a blocking wait on a current-thread runtime
+/// keeps the task that would satisfy the condition from running).
+pub async fn wait_until_async(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
 /// Poll `check` every 50 ms for up to `limit`; real time, used only to wait
-/// for another process to reach a state.
+/// for another process to reach a state. BLOCKS the calling thread: use
+/// `wait_until_async` inside async tests.
 pub fn wait_until(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
     let started = Instant::now();
     while started.elapsed() < limit {

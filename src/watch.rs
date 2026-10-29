@@ -25,9 +25,16 @@ pub const MAX_PROMPT_BYTES: usize = 1024;
 /// V19: `deadline_s` is 1..=604800 (7 days).
 pub const MIN_DEADLINE_S: u64 = 1;
 pub const MAX_DEADLINE_S: u64 = 604_800;
-/// V19: `cmd.timeout_s` is 0.1..=60.
+/// V19 + X4: `cmd.timeout_s` is 0.1..=20 (X4 lowered the ceiling from 60 so a
+/// tick due at the start of a >= 30 s call always has room to finish).
 pub const MIN_TIMEOUT_S: f64 = 0.1;
-pub const MAX_TIMEOUT_S: f64 = 60.0;
+pub const MAX_TIMEOUT_S: f64 = 20.0;
+/// X2: an event `summary` is at most this many bytes (cut on a UTF-8
+/// boundary).
+pub const MAX_SUMMARY_BYTES: usize = 200;
+/// W7: the persisted pending change keeps at most this many bytes of text per
+/// input (newest kept, `[truncated]` when cut).
+pub const MAX_PENDING_BYTES_PER_INPUT: usize = 64 * 1024;
 
 /// A validated watch id: `[A-Za-z0-9_-]{1,64}`. Parse, do not validate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -102,7 +109,7 @@ pub enum Input {
     },
     Cmd {
         argv: Vec<String>,
-        /// Seconds; fractions allowed. Default 10. V19: 0.1..=60.
+        /// Seconds; fractions allowed. Default 10. V19 + X4: 0.1..=20.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_s: Option<f64>,
         /// Working directory. V11: absent at the wire; `watch_create` stores
@@ -136,6 +143,13 @@ impl Input {
     }
     /// Does this input carry a `want` (used by fire = condition)?
     pub fn has_want(&self) -> bool {
+        todo!()
+    }
+    /// The longest this input can keep one read waiting (X4 tick reserve):
+    /// `cmd` its `timeout_s` (default 10 s); `url` and `port` 10 s (the
+    /// reader's fixed timeout); `file`, `glob` and `process` read local state
+    /// without waiting, so `Duration::ZERO`.
+    pub fn read_timeout(&self) -> std::time::Duration {
         todo!()
     }
 }
@@ -266,7 +280,8 @@ pub struct InputState {
     /// Process inputs (V17): `/proc/<pid>/stat` field 22 recorded at baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proc_start: Option<u64>,
-    /// Glob inputs: matches already seen.
+    /// Glob inputs: matches already seen. X2: at most
+    /// `inputs::MAX_KNOWN_GLOB_PATHS` (1000) paths are persisted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known: Vec<String>,
 }
@@ -279,7 +294,9 @@ pub struct ChangedInput {
 }
 
 /// A change not yet resolved by a judge answer. Survives ticks and restarts
-/// (SPEC "Failure rules": a pending change counts as a change).
+/// (SPEC "Failure rules": a pending change counts as a change). W7: the text
+/// of each `ChangedInput` is persisted at most `MAX_PENDING_BYTES_PER_INPUT`
+/// (+ the `[truncated]` marker) bytes: newest kept, oldest dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PendingChange {
     pub changed: Vec<ChangedInput>,
@@ -287,8 +304,8 @@ pub struct PendingChange {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
-    /// V3: stable across replays. `<watch_id>:<tick>` for the first event of a
-    /// tick; later events of the same tick append `:<n>` (n = 1, 2, ...), see
+    /// V3 + W1: stable across replays, always `<watch_id>:<tick>:<n>` with n
+    /// counting from 0 within the tick (the first event is `:0`), see
     /// `Event::make_id`.
     pub event_id: String,
     pub tick: u64,
@@ -300,7 +317,8 @@ pub struct Event {
 }
 
 impl Event {
-    /// V3 id of the `index`-th (0-based) event emitted at `tick`.
+    /// V3 + W1 id of the `index`-th (0-based) event emitted at `tick`:
+    /// `<watch_id>:<tick>:<index>`, so index 0 is `build:17:0`.
     pub fn make_id(watch_id: &str, tick: u64, index: usize) -> String {
         todo!()
     }
@@ -359,7 +377,8 @@ pub struct WatchFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_change: Option<PendingChange>,
     /// V3: the terminal events only (empty while pending, empty for expired
-    /// and cancelled). There is no `delivered_through`.
+    /// and cancelled). There is no `delivered_through`. Each event's
+    /// `summary` is at most `MAX_SUMMARY_BYTES` (X2).
     pub events: Vec<Event>,
     /// Last observed change; the terminal digest (V14).
     pub last_digest: String,
@@ -687,7 +706,7 @@ mod tests {
             status,
             finished_at: at(at_s),
             events: vec![Event {
-                event_id: format!("w:{tick}"),
+                event_id: Event::make_id("w", tick, 0),
                 tick,
                 watch_id: "w".into(),
                 input: "file:/tmp/x".into(),
@@ -722,15 +741,22 @@ mod tests {
     }
 
     #[test]
-    fn event_ids_are_watch_id_colon_tick_with_a_suffix_for_later_events_of_one_tick() {
-        // why: V3: events carry a stable `event_id` of `<watch_id>:<tick>`.
-        //      Two inputs changing in one tick would collide, so the default
-        //      taken (see .red-report.md) suffixes the 2nd and later event of a
-        //      tick with `:<n>`. The first stays exactly `<watch_id>:<tick>`.
+    fn event_ids_are_always_watch_id_colon_tick_colon_n_counting_from_zero() {
+        // why: V3 + W1 (T1): `event_id` is ALWAYS `<watch_id>:<tick>:<n>`,
+        //      n counting from 0 within the tick, so two inputs changing in one
+        //      tick get distinct ids and the shape never depends on how many
+        //      events a tick has. The first event is `:0`, NOT the bare
+        //      `<watch_id>:<tick>` of the round-2 default. Literals, not
+        //      derived from the function. Ids stay distinct across ticks and
+        //      across n (":1:10" vs ":11:0" would collide only without the
+        //      colons).
         // proves: CLAIM(event-id)
-        assert_eq!(Event::make_id("build", 17, 0), "build:17");
+        assert_eq!(Event::make_id("build", 17, 0), "build:17:0");
         assert_eq!(Event::make_id("build", 17, 1), "build:17:1");
         assert_eq!(Event::make_id("build", 17, 2), "build:17:2");
+        assert_eq!(Event::make_id("w", 1, 10), "w:1:10");
+        assert_eq!(Event::make_id("w", 11, 0), "w:11:0");
+        assert_ne!(Event::make_id("w", 1, 10), Event::make_id("w", 11, 0));
         assert_ne!(Event::make_id("build", 17, 1), Event::make_id("build", 18, 0));
     }
 
@@ -858,21 +884,45 @@ mod tests {
     }
 
     #[test]
-    fn cmd_timeout_s_must_lie_in_a_tenth_of_a_second_to_a_minute() {
-        // why: V19: timeout_s 0.1..=60, boundaries inclusive; NaN, negative
-        //      and zero are errors (an unbounded or zero wait is unsafe).
-        // proves: CLAIM(validation)
+    fn cmd_timeout_s_must_lie_in_a_tenth_of_a_second_to_twenty_seconds() {
+        // why: V19 as changed by X4 (T5): timeout_s 0.1..=20 (was 60), both
+        //      boundaries inclusive. With a 60 s timeout a valid command could
+        //      outlast every >= 30 s keepalive call and, with whole-tick
+        //      rollback, never let a tick finish. 20.5, 21, 30 and the old
+        //      ceiling 60 are errors now; NaN, infinity, negative and zero stay
+        //      errors (an unbounded or zero wait is unsafe).
+        // proves: CLAIM(timeout-ceiling)
         let cmd = |t: Option<f64>| {
             let mut req = change_request("w", Path::new("/tmp/x"), 20);
             req.inputs = vec![Input::Cmd { argv: vec!["true".into()], timeout_s: t, cwd: None }];
             WatchSpec::parse(req)
         };
-        for ok in [None, Some(0.1), Some(10.0), Some(60.0)] {
+        for ok in [None, Some(0.1), Some(10.0), Some(19.9), Some(20.0)] {
             assert!(cmd(ok).is_ok(), "{ok:?}");
         }
-        for bad in [0.0, 0.05, -1.0, 60.5, 3600.0, f64::NAN, f64::INFINITY] {
+        for bad in [0.0, 0.05, -1.0, 20.1, 20.5, 21.0, 30.0, 60.0, 60.5, 3600.0, f64::NAN, f64::INFINITY] {
             assert!(matches!(cmd(Some(bad)), Err(CreateError::TimeoutOutOfRange(_))), "timeout_s {bad}");
         }
+    }
+
+    #[test]
+    fn read_timeout_is_what_an_input_can_keep_a_read_waiting() {
+        // why: X4 (T5): the tick reserve is built from "max(input timeouts)".
+        //      cmd: its timeout_s, default 10 (R3); url and port: the reader's
+        //      fixed 10 s (DEFAULT_CMD_TIMEOUT_S applies to all waiting
+        //      inputs, default taken); file, glob and process read local state
+        //      and never wait. Literal durations, boundary 20 s included.
+        // proves: CLAIM(tick-reserve)
+        use std::time::Duration;
+        let cmd = |t: Option<f64>| Input::Cmd { argv: vec!["x".into()], timeout_s: t, cwd: None };
+        assert_eq!(cmd(None).read_timeout(), Duration::from_secs(10));
+        assert_eq!(cmd(Some(20.0)).read_timeout(), Duration::from_secs(20));
+        assert_eq!(cmd(Some(0.5)).read_timeout(), Duration::from_millis(500));
+        assert_eq!(Input::Url { url: "http://127.0.0.1:1/".into() }.read_timeout(), Duration::from_secs(10));
+        assert_eq!(Input::Port { host: "127.0.0.1".into(), port: 1, want: None }.read_timeout(), Duration::from_secs(10));
+        assert_eq!(Input::File { path: "/tmp/x".into(), tail_bytes: None }.read_timeout(), Duration::ZERO);
+        assert_eq!(Input::Glob { pattern: "/tmp/*".into(), report: GlobReport::Created }.read_timeout(), Duration::ZERO);
+        assert_eq!(Input::Process { pid: 1, want: None }.read_timeout(), Duration::ZERO);
     }
 
     // ---- V12: size limits ----

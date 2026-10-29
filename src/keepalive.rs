@@ -13,6 +13,18 @@ pub fn clamp_max_s(requested: Option<u64>) -> u64 {
     todo!()
 }
 
+/// X4: a tick is started inside a call only if the call has at least this
+/// much budget left: `max(read_timeout of every input) + judge_timeout (only
+/// for fire = judge, the only kind that calls the judge) + 1 s`. Default
+/// taken: what the watch can actually spend, so file/glob/process inputs and
+/// change/condition watches reserve only the 1 s slack (a literal reading
+/// would add the judge timeout and 10 s to every watch). Exception: the tick
+/// that is due when a call starts runs regardless (a call is >= 30 s, so it
+/// always finishes unless a lock wait ate the budget, V2).
+pub fn tick_reserve(inputs: &[crate::watch::Input], fire_is_judge: bool, judge_timeout: std::time::Duration) -> std::time::Duration {
+    todo!()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct KeepaliveRequest {
     #[serde(default)]
@@ -45,8 +57,9 @@ impl ProgressSink for NoProgress {
     fn progress(&self, _update: &ProgressUpdate) {}
 }
 
-/// Process exit code of `vigil wait`: fired 0, expired 2, cancelled 3.
-/// (1 is reserved for errors; a still-pending envelope has no code.)
+/// Process exit code of `vigil wait` (W6): fired 0, expired 3, cancelled 4.
+/// 1 is an error and 2 a usage error (clap); neither is returned here, and a
+/// still-pending envelope has no code.
 pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
     todo!()
 }
@@ -169,19 +182,26 @@ mod tests {
             digest: String::new(),
             judge_status: JudgeStatus::Skipped,
             next: Next::ActOnEvents,
+            others: vec![],
         }
     }
 
     #[test]
-    fn wait_exit_codes_are_0_fired_2_expired_3_cancelled() {
-        // why: coordinator scope addition: `vigil wait` exits 0 fired, 2
-        //      expired, 3 cancelled (1 is for errors, so never returned here);
-        //      a still-pending envelope has no exit code.
+    fn wait_exit_codes_are_0_fired_3_expired_4_cancelled() {
+        // why: W6 (T2): `vigil wait` exits 0 fired, 1 error, 2 usage (clap),
+        //      3 expired, 4 cancelled. The round-2 mapping (2 expired, 3
+        //      cancelled) made an expired watch indistinguishable from a
+        //      usage error. 1 and 2 are never returned here (an error and a
+        //      usage error have no envelope); a still-pending envelope has no
+        //      exit code. No status may map to 1 or 2.
         // proves: CLAIM(wait-exit-codes)
         assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Fired)), Some(0));
-        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Expired)), Some(2));
-        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Cancelled)), Some(3));
+        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Expired)), Some(3));
+        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Cancelled)), Some(4));
         assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Pending)), None);
+        for status in [WatchStatus::Fired, WatchStatus::Expired, WatchStatus::Cancelled] {
+            assert!(!matches!(wait_exit_code(&envelope_with(status)), Some(1 | 2)), "{status:?} must not collide with error (1) or usage (2)");
+        }
     }
 
     // ---- blocking window (V26) ----
@@ -261,7 +281,7 @@ mod tests {
         assert_eq!(envelope.next, Next::ActOnEvents);
         assert_eq!(envelope.events.len(), 1);
         assert_eq!(envelope.events[0].watch_id, "build");
-        assert_eq!(envelope.events[0].event_id, "build:4");
+        assert_eq!(envelope.events[0].event_id, "build:4:0");
         assert!(envelope.events[0].summary.contains("ERROR: linking failed"));
         assert!(envelope.digest.contains("ERROR: linking failed"));
     }
@@ -275,7 +295,7 @@ mod tests {
         //      least once, so a lost reply is recoverable. Fire at tick 2,
         //      then: keepalive (same process), keepalive (new process, later),
         //      wait, status. Every one returns the identical events (incl.
-        //      event_id "w:2"), digest, status, tick and next, instantly.
+        //      event_id "w:2:0", W1), digest, status, tick and next, instantly.
         //      The old `events_are_returned_once` demanded EMPTY events on the
         //      second call, which loses the event if the first reply was lost.
         // proves: CLAIM(terminal-replay)
@@ -289,7 +309,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
         append_file(&path, "boom\n");
         let first = call.await.unwrap();
-        assert_eq!((first.status, first.events.len(), first.events[0].event_id.as_str()), (WatchStatus::Fired, 1, "w:2"));
+        assert_eq!((first.status, first.events.len(), first.events[0].event_id.as_str()), (WatchStatus::Fired, 1, "w:2:0"));
 
         tokio::time::advance(Duration::from_secs(1000)).await;
         let restarted = process(&env);
@@ -468,7 +488,7 @@ mod tests {
         assert_eq!((envelope.status, envelope.next), (WatchStatus::Fired, Next::ActOnEvents));
         let mut ids: Vec<&str> = envelope.events.iter().map(|e| e.event_id.as_str()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["a-second:1", "z-first:1"]);
+        assert_eq!(ids, vec!["a-second:1:0", "z-first:1:0"]);
         assert_eq!(a.keepalive(no_id(None)).await.unwrap_err(), VigilError::NothingToCover, "both results were returned");
     }
 
@@ -591,8 +611,14 @@ mod tests {
 
     // ---- V14 / V27: digests ----
 
+    /// Default config, except a 2 s judge timeout: under X4 a tick starts only
+    /// with `judge timeout + 1 s` of budget left, so the default 10 s would
+    /// stop the 24 s tick of a 30 s window in the digest test (6 s left < 11
+    /// s). The tests that use this are about digests, not the reserve.
     fn judged_no_fire() -> crate::config::Config {
-        default_config()
+        let mut config = default_config();
+        config.judge_timeout = Duration::from_secs(2);
+        config
     }
 
     #[tokio::test(start_paused = true)]
@@ -683,46 +709,191 @@ mod tests {
         assert!(!whole.digest.contains(DIGEST_CUT_MARKER));
     }
 
-    // ---- V2: one call budget ----
+    // ---- X1: several covered watches finishing in one return ----
 
-    #[tokio::test]
-    async fn a_slow_cmd_cannot_push_a_call_past_max_s_and_the_aborted_tick_writes_nothing() {
-        // why: V2 (S2, blocker): the 270 s ceiling did not constrain input
-        //      reads. The cmd input sleeps 100 s (own timeout 60 s, above the
-        //      30 s budget) once a marker file exists. The call must return at
-        //      exactly max_s = 30 s (virtual, monotonic), pending, and the
-        //      aborted tick must write NOTHING: the watch file is byte-for-byte
-        //      what it was (tick 0, no last_tick_at), so the appended line is
-        //      not consumed. After the marker is removed the next call sees
-        //      the change and fires. Real create/baseline, paused budgeted
-        //      call (a child process cannot run under auto-advance).
+    #[tokio::test(start_paused = true)]
+    async fn a_no_id_return_lists_every_other_finished_watch_in_others_including_expired_and_cancelled_ones() {
+        // why: X1 (S8): R4/V7/V8 returned the events of all covered finished
+        //      watches but an EXPIRED or CANCELLED secondary watch has no
+        //      event, so it vanished (and counted as returned). Now the
+        //      envelope also carries `others: [{watch_id, status, event_ids}]`
+        //      for every other covered watch that finished in this return.
+        //      Five own watches: "z-fired" fires at +5 s (the primary: the
+        //      earliest finished, V8, although it sorts last by id),
+        //      "b-fired2" fires at +10 s, "c-canc" is cancelled at +10 s,
+        //      "d-exp" (deadline 100 s) is overdue at the call (+200 s), and
+        //      "e-pend" is still pending. Expected: the primary is z-fired;
+        //      `events` holds both fired watches' events (ids z-fired:1:0 and
+        //      b-fired2:1:0); `others` lists b-fired2 (fired, its event id),
+        //      c-canc (cancelled, no ids) and d-exp (expired, no ids), in any
+        //      order, and NOT the primary and NOT the pending watch; the digest
+        //      is the primary's only ("their digests are not repeated").
+        //      Afterwards the finished ones are not returned again (the next
+        //      no-id call is about e-pend alone, with no `others` on the
+        //      wire), and an explicit id still replays an expired one.
+        // proves: CLAIM(envelope-others)
+        let env = paused_env();
+        let (a, b) = (process(&env), process(&env));
+        let (primary, primary_path) = quiet_watch(&env, &a, "z-fired", 20, 3600).await;
+        let (second, second_path) = quiet_watch(&env, &a, "b-fired2", 20, 3600).await;
+        let (cancelled, _) = quiet_watch(&env, &a, "c-canc", 20, 3600).await;
+        let (expired, _) = quiet_watch(&env, &a, "d-exp", 20, 100).await;
+        quiet_watch(&env, &a, "e-pend", 20, 3600).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        append_file(&primary_path, "primary fired line\n");
+        b.tick_due(&primary).await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        append_file(&second_path, "secondary fired line\n");
+        b.tick_due(&second).await.unwrap();
+        b.cancel(&cancelled).await.unwrap();
+        tokio::time::advance(Duration::from_secs(190)).await;
+
+        let started = Instant::now();
+        let envelope = a.keepalive(no_id(Some(30))).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO, "finished results are returned at once");
+        assert_eq!((envelope.watch_id.as_str(), envelope.status, envelope.next), ("z-fired", WatchStatus::Fired, Next::ActOnEvents));
+        let mut event_ids: Vec<&str> = envelope.events.iter().map(|e| e.event_id.as_str()).collect();
+        event_ids.sort();
+        assert_eq!(event_ids, vec!["b-fired2:1:0", "z-fired:1:0"], "the events of both fired watches");
+        let mut others = envelope.others.clone();
+        others.sort_by(|x, y| x.watch_id.cmp(&y.watch_id));
+        let summary: Vec<(&str, WatchStatus, Vec<&str>)> =
+            others.iter().map(|o| (o.watch_id.as_str(), o.status, o.event_ids.iter().map(|i| i.as_str()).collect())).collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("b-fired2", WatchStatus::Fired, vec!["b-fired2:1:0"]),
+                ("c-canc", WatchStatus::Cancelled, vec![]),
+                ("d-exp", WatchStatus::Expired, vec![]),
+            ]
+        );
+        assert!(envelope.digest.contains("primary fired line") && !envelope.digest.contains("secondary fired line"), "{:?}", envelope.digest);
+        let wire = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(wire["others"].as_array().unwrap().len(), 3);
+        assert_eq!(wire["others"][0].as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+            ["event_ids", "status", "watch_id"].iter().map(|k| k.to_string()).collect());
+
+        let after = a.keepalive(no_id(Some(30))).await.unwrap();
+        assert_eq!((after.watch_id.as_str(), after.status), ("e-pend", WatchStatus::Pending), "only the pending watch is still covered");
+        assert!(serde_json::to_value(&after).unwrap().get("others").is_none(), "no `others` key when nothing else finished");
+        let replay = a.keepalive(by_id(&expired, None)).await.unwrap();
+        assert_eq!((replay.status, replay.events.len()), (WatchStatus::Expired, 0));
+    }
+
+    // ---- W3 (T6) and X2: bounds through the engine ----
+
+    #[tokio::test(start_paused = true)]
+    async fn a_below_floor_digest_env_value_gives_an_effective_limit_of_64_through_the_engine() {
+        // why: W3 + T6: digest tests used limits >= 64 only, so they passed
+        //      without the clamp. Config comes from the ENVIRONMENT path with
+        //      VIGIL_DIGEST_MAX_BYTES=10 (and 1): unclamped, the digest of a
+        //      6 KB change is at most 10 (or 1) bytes; with the 64-byte floor
+        //      it is between 41 and 64 bytes, ends with the marker and keeps
+        //      the newest line. Above-floor override: 200 gives (150, 200].
+        // proves: CLAIM(config-floors)
+        for (raw, floor, ceiling) in [("10", 40usize, 64usize), ("1", 40, 64), ("200", 150, 200)] {
+            let config = crate::config::Config::from_lookup(|name| (name == "VIGIL_DIGEST_MAX_BYTES").then(|| raw.to_string()));
+            let env = paused_env_with(config);
+            let vigil = process(&env);
+            let (id, path) = quiet_watch(&env, &vigil, "w", 20, 3600).await;
+            append_file(&path, &format!("{}LAST-LINE\n", numbered("noise", 400)));
+            let envelope = vigil.keepalive(by_id(&id, None)).await.unwrap();
+            assert_eq!(envelope.status, WatchStatus::Fired);
+            let digest = &envelope.digest;
+            assert!(digest.len() <= ceiling, "VIGIL_DIGEST_MAX_BYTES={raw}: {} bytes exceed {ceiling}: {digest:?}", digest.len());
+            assert!(digest.len() > floor, "VIGIL_DIGEST_MAX_BYTES={raw}: only {} bytes, the effective limit is {ceiling}: {digest:?}", digest.len());
+            assert!(digest.ends_with(DIGEST_CUT_MARKER) && digest.contains("LAST-LINE"), "{digest:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_envelope_with_sixteen_changed_inputs_stays_within_digest_limit_plus_sixteen_summaries_plus_fixed_fields() {
+        // why: X2 (S12): "an envelope is at most digest limit + 16 inputs x
+        //      200 bytes per covered watch, plus fixed fields". 16 file inputs
+        //      each get a 3000-byte line in one tick, so 16 events. Bound
+        //      derivation: digest <= limit; each summary <= 200; each event's
+        //      other fields (event_id, tick, watch_id, the `file:/tmp/...`
+        //      label, JSON punctuation) < 300 bytes; envelope fixed fields
+        //      (watch_id, timestamps, counters, next, judge_status) < 1024
+        //      bytes. For limit 256: 256 + 3200 + 4800 + 1024 = 9280 bytes;
+        //      for the default 8192: 17216 bytes. Unbounded summaries alone
+        //      would be 16 x 3000 = 48000 bytes. Each summary and the digest
+        //      are also asserted individually.
+        // proves: CLAIM(envelope-bound)
+        for limit in [256usize, 8192] {
+            let mut config = default_config();
+            config.digest_max_bytes = limit;
+            let env = paused_env_with(config);
+            let vigil = process(&env);
+            let paths: Vec<_> = (0..16).map(|i| env.input_path(&format!("in-{i:02}.log"))).collect();
+            for path in &paths {
+                write_file(path, "old\n");
+            }
+            let mut request = change_request("w", &paths[0], 20);
+            request.inputs = paths.iter().map(|p| Input::File { path: p.clone(), tail_bytes: None }).collect();
+            let id = vigil.create(request).await.unwrap().watch_id;
+            for path in &paths {
+                append_file(path, &format!("{}\n", "x".repeat(3000)));
+            }
+            let envelope = vigil.keepalive(by_id(&id, None)).await.unwrap();
+            assert_eq!((envelope.status, envelope.events.len()), (WatchStatus::Fired, 16));
+            for event in &envelope.events {
+                assert!(event.summary.len() <= 200, "limit {limit}: summary of {} bytes", event.summary.len());
+            }
+            assert!(envelope.digest.len() <= limit, "limit {limit}: digest of {} bytes", envelope.digest.len());
+            let wire = serde_json::to_string(&envelope).unwrap();
+            let bound = limit + 16 * 200 + 16 * 300 + 1024;
+            assert!(wire.len() <= bound, "limit {limit}: envelope is {} bytes, bound {bound}", wire.len());
+        }
+    }
+
+    // ---- V2 + X4: one call budget, and progress under it ----
+
+    fn cmd(name: &str, timeout_s: Option<f64>) -> Input {
+        Input::Cmd { argv: vec![name.into()], timeout_s, cwd: None }
+    }
+
+    /// A watch whose inputs are scripted `cmd` inputs (see `ScriptedReader`).
+    async fn scripted_watch(vigil: &Vigil, id: &str, inputs: Vec<Input>, interval_s: u64) -> crate::watch::WatchId {
+        let mut request = change_request(id, std::path::Path::new("/unused"), interval_s);
+        request.inputs = inputs;
+        vigil.create(request).await.unwrap().watch_id
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_overruns_the_budget_is_cut_off_at_max_s_and_the_aborted_tick_writes_nothing() {
+        // why: V2 (S2, blocker) at the engine level, rebuilt for X4: the engine
+        //      itself must cap a read at the budget left even when the reader
+        //      ignores its own timeout (a hung syscall, a bug). Real commands
+        //      can no longer overrun a 30 s call (timeout_s <= 20 and a tick
+        //      starts only with the reserve left), so the overrun is scripted:
+        //      the reader takes 100 s. The tick is due at the start of the
+        //      call (so it runs, X4), is cut off at exactly max_s = 30 (virtual,
+        //      monotonic), and writes NOTHING: the watch file is byte-for-byte
+        //      what it was (tick 0, no last_tick_at), so the line appended
+        //      before the call is not consumed. After the reader recovers the
+        //      next call sees the change and fires.
         // proves: CLAIM(call-budget)
         let env = paused_env();
         let vigil = process(&env);
         let path = env.input_path("w.log");
-        let marker = env.input_path("slow.marker");
         write_file(&path, "old\n");
+        env.reader.set_text("cmd:overrun", "v1");
         let mut request = change_request("w", &path, 20);
-        request.inputs.push(Input::Cmd {
-            argv: vec!["sh".into(), "-c".into(), format!("if [ -e '{}' ]; then sleep 100; fi; echo ok", marker.display())],
-            timeout_s: Some(60.0),
-            cwd: None,
-        });
+        request.inputs.push(cmd("overrun", Some(20.0)));
         let id = vigil.create(request).await.unwrap().watch_id;
-        write_file(&marker, "");
+        env.reader.set_sleep("cmd:overrun", Duration::from_secs(100));
         append_file(&path, "ERROR: appended before the slow call\n");
         let before = std::fs::read(vigil.store().watch_path(&id)).unwrap();
 
-        tokio::time::pause();
         let started = Instant::now();
         let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
         assert_eq!(started.elapsed(), Duration::from_secs(30), "the call must end exactly at max_s");
-        tokio::time::resume();
         assert_eq!(envelope.status, WatchStatus::Pending);
         assert_eq!((envelope.waited_s, envelope.max_s), (Some(30), Some(30)));
         assert_eq!(std::fs::read(vigil.store().watch_path(&id)).unwrap(), before, "an aborted tick writes nothing");
 
-        std::fs::remove_file(&marker).unwrap();
+        env.reader.set_sleep("cmd:overrun", Duration::ZERO);
         let next = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
         assert_eq!(next.status, WatchStatus::Fired, "the change was not consumed by the aborted tick");
         assert!(next.digest.contains("appended before the slow call"));
@@ -730,73 +901,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hanging_url_cannot_push_a_call_past_max_s_and_the_aborted_tick_writes_nothing() {
-        // why: V2 (S2): same contract for a url input whose server accepts and
-        //      never answers. The URL's own timeout (10 s) is shorter than the
-        //      30 s window, so the tick that starts at t=25 (interval 25) has
-        //      only 5 s of budget left: the read must be capped at the budget
-        //      left, the call must end at 30 s with nothing written, and the
-        //      appended line must still fire on the next call. Tick 1 runs in
-        //      real time before the pause (real sockets).
-        // proves: CLAIM(call-budget)
+    async fn a_hanging_real_cmd_ends_as_a_timeout_reading_inside_the_call_and_the_tick_completes() {
+        // why: X4 (T5): the round-2 design rolled back the WHOLE tick when a
+        //      slow command outlived the call, so a command that always hangs
+        //      (here: `sleep 100` once a marker exists, timeout_s 20 = the new
+        //      ceiling) could never let a tick finish or a durable change
+        //      fire. Now the 20 s timeout fires INSIDE the 30 s call: the read
+        //      becomes an error reading (a change, R3), the tick completes and
+        //      is written, and the watch fires on it at about 20 s. Real
+        //      create/baseline (marker absent), paused budgeted call: a child
+        //      that never exits is exactly the case that behaves under
+        //      auto-advance (the timeout timer is the next event).
+        // proves: CLAIM(tick-progress)
+        let env = paused_env();
+        let vigil = process(&env);
+        let marker = env.input_path("hang.marker");
+        write_file(&env.input_path("seed"), "");
+        let mut request = change_request("w", &env.input_path("seed"), 20);
+        request.inputs = vec![Input::Cmd {
+            argv: vec!["sh".into(), "-c".into(), format!("if [ -e '{}' ]; then sleep 100; fi; echo ok", marker.display())],
+            timeout_s: Some(20.0),
+            cwd: None,
+        }];
+        let id = vigil.create(request).await.unwrap().watch_id;
+        write_file(&marker, "");
+
+        tokio::time::pause();
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        tokio::time::resume();
+        assert_eq!(envelope.status, WatchStatus::Fired, "the timeout reading is a change and the tick completed");
+        let waited = envelope.waited_s.unwrap();
+        assert!((20..=22).contains(&waited), "fired at the 20 s timeout, not the 30 s budget: waited {waited}");
+        assert!(envelope.events[0].input.starts_with("cmd:"), "{:?}", envelope.events[0]);
+        assert!(envelope.digest.contains("timeout"), "{:?}", envelope.digest);
+        assert_eq!(env.vigil.store().load(&id).unwrap().tick, 1, "the tick was written");
+    }
+
+    #[tokio::test]
+    async fn a_hanging_url_ends_as_a_timeout_reading_after_its_own_timeout_and_the_tick_completes() {
+        // why: X4 (T5) for url inputs, replacing the V2 test that expected an
+        //      aborted tick: the url reader's own 10 s timeout is shorter than
+        //      any call, the read becomes an error reading, the tick completes
+        //      and writes, and the watch fires on that change at about 10 s.
+        //      The server answers at create (real sockets, baseline) and then
+        //      accepts without ever replying; the budgeted call is paused.
+        // proves: CLAIM(tick-progress)
         let server = FakeHttpServer::start(Behavior::Respond { status: 200, body: "ok".into() });
         let env = paused_env();
         let vigil = process(&env);
-        let path = env.input_path("w.log");
-        write_file(&path, "old\n");
-        let mut request = change_request("w", &path, 25);
-        request.inputs.push(Input::Url { url: format!("{}/health", server.url()) });
+        write_file(&env.input_path("seed"), "");
+        let mut request = change_request("w", &env.input_path("seed"), 20);
+        request.inputs = vec![Input::Url { url: format!("{}/health", server.url()) }];
         let id = vigil.create(request).await.unwrap().watch_id;
-        assert_eq!(vigil.tick_due(&id).await.unwrap(), crate::tick::TickOutcome::Ticked);
-        append_file(&path, "ERROR: appended after tick 1\n");
         server.set_behavior(Behavior::Hang);
-        let before = std::fs::read(vigil.store().watch_path(&id)).unwrap();
 
         tokio::time::pause();
-        let started = Instant::now();
         let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
-        assert_eq!(started.elapsed(), Duration::from_secs(30));
         tokio::time::resume();
-        assert_eq!(envelope.status, WatchStatus::Pending);
-        assert_eq!(std::fs::read(vigil.store().watch_path(&id)).unwrap(), before, "an aborted tick writes nothing");
-
-        server.set_behavior(Behavior::Respond { status: 200, body: "ok".into() });
-        let next = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
-        assert_eq!(next.status, WatchStatus::Fired);
-        assert!(next.digest.contains("appended after tick 1"));
+        assert_eq!(envelope.status, WatchStatus::Fired);
+        let waited = envelope.waited_s.unwrap();
+        assert!((10..=12).contains(&waited), "fired at the url's 10 s timeout: waited {waited}");
+        assert!(envelope.events[0].input.starts_with("url:"), "{:?}", envelope.events[0]);
+        assert_eq!(env.vigil.store().load(&id).unwrap().tick, 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_slow_judge_is_capped_at_the_budget_left_and_the_change_is_asked_again_next_call() {
-        // why: V2 (S2): the judge request (10 s by default) is "capped at the
-        //      budget left". judge_timeout is set to 25 s so only the budget
-        //      can stop it: interval 20, change written at t=5, the tick at
-        //      t=20 asks a judge that answers after 100 s with 10 s of budget
-        //      left. The call ends at exactly 30 s, pending; the aborted tick
-        //      wrote nothing (tick 1, no strike, no pending_change, judge
-        //      status untouched). The next call asks again (2nd request, same
-        //      line) and fires on the answer.
+        // why: V2 (S2): the judge request is "capped at the budget left", kept
+        //      under X4. judge_timeout is 60 s so only the budget can stop it,
+        //      which makes the tick's reserve (60 + 1 s) larger than any call:
+        //      the tick still runs because it is DUE when the call starts ("a
+        //      due tick runs first"). The change is written before the call,
+        //      the judge answers after 100 s. The call ends at exactly 30 s,
+        //      pending; the aborted tick wrote nothing (tick 0, no strike, no
+        //      pending_change, judge status untouched). The next call asks
+        //      again (2nd request, same line) and fires on the answer.
         // proves: CLAIM(call-budget)
         let mut config = default_config();
-        config.judge_timeout = Duration::from_secs(25);
+        config.judge_timeout = Duration::from_secs(60);
         let env = paused_env_with(config);
         let vigil = process(&env);
         let path = env.input_path("j.log");
         write_file(&path, "old\n");
         let id = vigil.create(judge_request("j", &path, 20)).await.unwrap().watch_id;
         env.judge.push_delayed(Duration::from_secs(100), Ok(noul_answers("failed", 0.99, 0.9)));
-        let call = {
-            let (vigil, id) = (vigil.clone(), id.clone());
-            tokio::spawn(async move { vigil.keepalive(by_id(&id, Some(30))).await.unwrap() })
-        };
-        let started = Instant::now();
-        tokio::time::sleep(Duration::from_secs(5)).await;
         append_file(&path, "ERROR: slow judge case\n");
-        let envelope = call.await.unwrap();
+
+        let started = Instant::now();
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
         assert_eq!(started.elapsed(), Duration::from_secs(30));
         assert_eq!(envelope.status, WatchStatus::Pending);
         let file = env.vigil.store().load(&id).unwrap();
-        assert_eq!((file.tick, file.judge_strikes), (1, 0), "aborted tick 2 wrote nothing");
+        assert_eq!((file.tick, file.judge_strikes), (0, 0), "the aborted tick wrote nothing");
         assert!(file.pending_change.is_none());
         assert_eq!(env.judge.call_count(), 1);
 
@@ -808,22 +1004,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn waiting_for_the_lock_counts_against_the_budget() {
-        // why: V2 (S2): "Waiting for it counts against the call budget". The
-        //      global lock is held by the test for the whole first call: the
-        //      call must give up at exactly max_s = 30 s with a pending
-        //      envelope and write nothing (it could not even tick), instead of
-        //      blocking until the holder lets go. NOTE for the implementer:
-        //      this runs on a current-thread runtime, so the lock wait must
-        //      not block the thread (poll try_lock or spawn_blocking). After
-        //      the release the change fires.
+    async fn waiting_for_the_watch_lock_counts_against_the_budget() {
+        // why: V2 (S2): "Waiting for it counts against the call budget", now
+        //      for the watch's own lock (X3): another holder (a tick or cancel
+        //      in a different process) has `locks/w.lock` for the whole first
+        //      call: the call must give up at exactly max_s = 30 s with a
+        //      pending envelope and write nothing (it could not even tick),
+        //      instead of blocking until the holder lets go. NOTE for the
+        //      implementer: this runs on a current-thread runtime, so the lock
+        //      wait must not block the thread (poll try_lock or
+        //      spawn_blocking). After the release the change fires.
         // proves: CLAIM(call-budget)
         let env = paused_env();
         let vigil = process(&env);
         let (id, path) = quiet_watch(&env, &vigil, "w", 20, 3600).await;
         append_file(&path, "ERROR: behind the lock\n");
         let before = std::fs::read(vigil.store().watch_path(&id)).unwrap();
-        let guard = env.vigil.store().lock().unwrap();
+        let guard = env.vigil.store().lock_watch(&id).unwrap();
 
         let started = Instant::now();
         let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
@@ -834,6 +1031,158 @@ mod tests {
 
         let next = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
         assert_eq!(next.status, WatchStatus::Fired);
+    }
+
+    #[test]
+    fn the_tick_reserve_is_max_input_timeout_plus_judge_timeout_for_judge_watches_plus_one_second() {
+        // why: X4 (T5): "a tick starts only if the call has at least
+        //      max(input timeouts) + judge timeout + 1 s left". Literal
+        //      durations; the derivation is in each row. Default taken
+        //      (flagged): the judge timeout counts only for fire = judge and
+        //      inputs that never wait (file, glob, process) count 0, i.e. only
+        //      what the tick can actually spend is reserved.
+        // proves: CLAIM(tick-reserve)
+        use std::time::Duration as D;
+        let ten = D::from_secs(10);
+        let file = || Input::File { path: "/tmp/x".into(), tail_bytes: None };
+        let glob = || Input::Glob { pattern: "/tmp/*".into(), report: crate::watch::GlobReport::Created };
+        let proc = || Input::Process { pid: 1, want: None };
+        let url = || Input::Url { url: "http://127.0.0.1:1/".into() };
+        let rows: Vec<(Vec<Input>, bool, D, D, &str)> = vec![
+            (vec![file()], false, ten, D::from_secs(1), "0 + 0 + 1"),
+            (vec![file(), glob(), proc()], false, ten, D::from_secs(1), "local inputs wait 0"),
+            (vec![cmd("x", None)], false, ten, D::from_secs(11), "cmd default 10 + 1"),
+            (vec![cmd("x", Some(20.0))], false, ten, D::from_secs(21), "20 + 1"),
+            (vec![cmd("x", Some(20.0))], true, ten, D::from_secs(31), "20 + 10 + 1"),
+            (vec![cmd("x", Some(0.5)), url()], false, ten, D::from_secs(11), "max(0.5, 10) + 1"),
+            (vec![file()], true, ten, D::from_secs(11), "0 + 10 + 1"),
+            (vec![file()], true, D::from_secs(2), D::from_secs(3), "0 + 2 + 1"),
+            (vec![cmd("a", Some(5.0)), cmd("b", Some(20.0)), file()], true, ten, D::from_secs(31), "max(5, 20, 0) + 10 + 1"),
+            (vec![cmd("x", Some(0.1))], false, ten, D::from_millis(1100), "0.1 + 1"),
+        ];
+        for (inputs, judge, judge_timeout, expected, derivation) in rows {
+            assert_eq!(tick_reserve(&inputs, judge, judge_timeout), expected, "{derivation}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_starts_only_while_the_budget_left_covers_the_reserve_boundary_inclusive() {
+        // why: X4 (T5): "a tick is not started when the remaining budget is
+        //      under max(input timeouts)+judge timeout+1 s". Interval 1, reads
+        //      take no time. With timeout_s 20 the reserve is 21 s, so in a
+        //      30 s call a tick may start while 30 - t >= 21, i.e. t = 0..=9:
+        //      EXACTLY 10 ticks (the tick at t = 9 has exactly 21 s left and
+        //      starts: inclusive; t = 10 has 20 and does not). With the default
+        //      10 s timeout the reserve is 11 s: t = 0..=19, 20 ticks. The call
+        //      still lasts the whole 30 s either way (it waits out max_s, V26).
+        // proves: CLAIM(tick-reserve)
+        for (timeout_s, expected_ticks) in [(Some(20.0), 10u64), (None, 20)] {
+            let env = paused_env();
+            let vigil = process(&env);
+            env.reader.set_text("cmd:quiet", "same");
+            let id = scripted_watch(&vigil, "w", vec![cmd("quiet", timeout_s)], 1).await;
+            let started = Instant::now();
+            let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+            assert_eq!(started.elapsed(), Duration::from_secs(30), "timeout_s {timeout_s:?}");
+            assert_eq!(envelope.status, WatchStatus::Pending);
+            assert_eq!(envelope.tick, expected_ticks, "timeout_s {timeout_s:?}: ticks start at t = 0..={}", 30 - (timeout_s.unwrap_or(10.0) as u64 + 1));
+            assert_eq!(env.vigil.store().load(&id).unwrap().tick, expected_ticks);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_due_tick_runs_first_in_a_call_even_when_the_reserve_exceeds_the_budget_and_progress_continues_across_calls() {
+        // why: X4 (T5) "a due tick runs first in each call", which is what
+        //      makes progress possible when reserve > budget: a judge watch on
+        //      a timeout_s 20 command has reserve 20 + 10 + 1 = 31 s, more
+        //      than the 30 s minimum call (a flagged contradiction: "always
+        //      finishes" needs this exception). Call 1: the tick is due at the
+        //      start, so it runs (quiet) although 31 > 30; the next tick (due
+        //      at t = 20, 10 s left) must NOT start. Call 2 starts with a due
+        //      tick again, runs it first, sees the change and fires: the watch
+        //      cannot livelock. Without the exception no tick would ever run.
+        // proves: CLAIM(tick-progress)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:j", "v1");
+        let mut request = judge_request("w", std::path::Path::new("/unused"), 20);
+        request.inputs = vec![cmd("j", Some(20.0))];
+        let id = vigil.create(request).await.unwrap().watch_id;
+
+        let first = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!((first.status, first.tick), (WatchStatus::Pending, 1), "the due tick ran; the one at t=20 (10 s left < 31) did not");
+        assert_eq!(env.judge.call_count(), 0, "nothing changed, so no judge call");
+
+        env.reader.set_text("cmd:j", "v2");
+        env.judge.push(Ok(noul_answers("failed", 0.99, 0.9)));
+        let started = Instant::now();
+        let second = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO, "the due tick ran at once, first");
+        assert_eq!((second.status, second.tick), (WatchStatus::Fired, 2));
+        assert_eq!(env.judge.call_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_15_s_cmd_with_timeout_20_completes_and_fires_across_repeated_30_s_calls() {
+        // why: X4 / T5 exactly: Sol's counterexample was a command that takes
+        //      longer than the budget allows being restarted and discarded on
+        //      every max_s = 30 call, so even a durable change never fires. A
+        //      cmd that takes 15 s (virtual: scripted, no real waits) with
+        //      timeout_s 20 (reserve 21 s) and interval 1: call 1 runs the due
+        //      tick (15 s, quiet, WRITTEN: file tick 1), does not start another
+        //      (15 s left < 21), and returns pending at 30 s. The command's
+        //      output then changes; call 2 runs the due tick first, it takes
+        //      15 s again, and the watch fires at tick 2 with waited_s 15.
+        //      Under rollback-everything semantics tick 1 would not persist.
+        // proves: CLAIM(tick-progress)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:slow", "v1");
+        let id = scripted_watch(&vigil, "w", vec![cmd("slow", Some(20.0))], 1).await;
+        env.reader.set_sleep("cmd:slow", Duration::from_secs(15));
+
+        let started = Instant::now();
+        let first = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        assert_eq!((first.status, first.tick, first.waited_s), (WatchStatus::Pending, 1, Some(30)));
+        assert_eq!(env.vigil.store().load(&id).unwrap().tick, 1, "the 15 s tick was completed and persisted");
+        assert_eq!(env.reader.started_count("cmd:slow"), 2, "the create baseline and exactly one tick read: no restart, no second tick");
+
+        env.reader.set_text("cmd:slow", "v2");
+        let second = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!((second.status, second.tick), (WatchStatus::Fired, 2));
+        assert_eq!(second.waited_s, Some(15), "the due tick ran first and took its 15 s");
+        assert_eq!(second.next, Next::ActOnEvents);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_inputs_of_one_tick_are_read_concurrently() {
+        // why: X4 (T5): "inputs of one tick are read concurrently" (otherwise
+        //      16 inputs at 20 s each could never fit any call). Two inputs
+        //      that each take 10 s of virtual time must finish the tick in
+        //      10 s, not 20: the call returns (fired: both changed) at exactly
+        //      t = 10 s, the reader's own records show both reads starting at
+        //      the same instant and ending 10 s later, and both events are
+        //      there in input order (`:1:0`, `:1:1`).
+        // proves: CLAIM(concurrent-reads)
+        let env = paused_env();
+        let vigil = process(&env);
+        env.reader.set_text("cmd:ra", "a1");
+        env.reader.set_text("cmd:rb", "b1");
+        let id = scripted_watch(&vigil, "w", vec![cmd("ra", None), cmd("rb", None)], 20).await;
+        env.reader.set_text("cmd:ra", "a2");
+        env.reader.set_text("cmd:rb", "b2");
+        env.reader.set_sleep("cmd:ra", Duration::from_secs(10));
+        env.reader.set_sleep("cmd:rb", Duration::from_secs(10));
+
+        let started = Instant::now();
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(10), "sequential reads would take 20 s");
+        assert_eq!(envelope.status, WatchStatus::Fired);
+        assert_eq!(envelope.events.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(), vec!["w:1:0", "w:1:1"]);
+        let tick_reads: Vec<_> = env.reader.reads().into_iter().filter(|r| r.finished.is_some_and(|f| f - r.started == Duration::from_secs(10))).collect();
+        assert_eq!(tick_reads.len(), 2, "both reads took 10 s: {:?}", env.reader.reads());
+        assert_eq!(tick_reads[0].started, tick_reads[1].started, "the two reads overlapped completely");
     }
 
     // ---- wait ----
@@ -862,7 +1211,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wait_returns_expired_at_the_deadline() {
-        // why: coordinator scope addition: wait ends on expiry too (exit 2).
+        // why: coordinator scope addition: wait ends on expiry too (exit 3, W6).
         //      Deadline 500 s, interval 20.
         let env = paused_env();
         let vigil = process(&env);
@@ -871,13 +1220,13 @@ mod tests {
         let envelope = vigil.wait(&id).await.unwrap();
         assert_eq!(started.elapsed(), Duration::from_secs(500));
         assert_eq!(envelope.status, WatchStatus::Expired);
-        assert_eq!(wait_exit_code(&envelope), Some(2));
+        assert_eq!(wait_exit_code(&envelope), Some(3));
     }
 
     #[tokio::test(start_paused = true)]
     async fn wait_returns_cancelled_within_one_interval_of_the_cancel() {
         // why: coordinator scope addition: wait ends when the watch is
-        //      cancelled (exit 3), noticed on a tick: cancel at t=100 s with
+        //      cancelled (exit 4, W6), noticed on a tick: cancel at t=100 s with
         //      20 s ticks is seen no later than t=120 s.
         let env = paused_env();
         let vigil = process(&env);
@@ -891,7 +1240,7 @@ mod tests {
         let envelope = call.await.unwrap();
         assert_eq!(envelope.status, WatchStatus::Cancelled);
         assert!((100..=120).contains(&envelope.elapsed_s), "elapsed {}", envelope.elapsed_s);
-        assert_eq!(wait_exit_code(&envelope), Some(3));
+        assert_eq!(wait_exit_code(&envelope), Some(4));
     }
 
     #[tokio::test(start_paused = true)]
