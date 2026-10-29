@@ -98,7 +98,7 @@ and Codex has no equivalent (`FINDINGS.md` §2).
    is disputed in the sources found, so never depend on it.
 3. **`vigil wait` (Claude Code, no re-trigger).** `vigil wait <id>` blocks
    with no 270 s ceiling until the watch fires, expires or is cancelled,
-   prints the final envelope and exits (0 fired, 2 expired, 3 cancelled,
+   prints the final envelope and exits (0 fired, 3 expired, 4 cancelled, 2 usage,
    1 error). The agent runs it once as a background command; Claude Code
    wakes the agent when it exits.
    Trade-off: no model calls while waiting, so the prompt cache goes cold
@@ -472,3 +472,20 @@ These override anything above that disagrees.
   `[digest cut]` marker.
 - V28: live-client checks (FINDINGS "Still unverified") are an acceptance
   gate, run on host-b before calling the clients compatible.
+
+## Red-phase follow-ups (after round 1)
+
+- W1 `event_id` is always `<watch_id>:<tick>:<n>`, n counting from 0 within
+  the tick, so two inputs changing in one tick get distinct ids.
+- W2 `VIGIL_JUDGE_STATE_BYTES` is clamped to at least 2560 (1024 prompt +
+  1536 observations), so total judge state never exceeds the setting.
+- W3 `VIGIL_DIGEST_MAX_BYTES` is clamped to at least 64, so the
+  `[digest cut]` marker always fits.
+- W4 when a capture limit cuts a file's new bytes, the oldest are skipped
+  and the newest kept; the offset moves to the end.
+- W5 a cancel that arrives after `deadline_at` finds the watch expired
+  (`finished_at = deadline_at`) and returns that.
+- W6 `vigil wait` exit codes: 0 fired, 1 error, 2 usage (clap), 3 expired,
+  4 cancelled.
+- W7 the persisted pending change is capped at 64 KiB per input, newest
+  kept, with `[truncated]` when cut.
