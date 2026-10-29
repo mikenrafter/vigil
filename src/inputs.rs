@@ -11,7 +11,14 @@
 //! group and the whole group is SIGKILLed and reaped on timeout and when the
 //! read future is dropped (V13).
 
-use crate::watch::{Input, InputState};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::watch::{FileStamp, GlobReport, Input, InputState, PortWant, ProcessWant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
@@ -56,7 +63,17 @@ pub struct ProcStat {
 /// spaces and parentheses, so fields are counted after the LAST `)`.
 /// `None` for anything that is not a complete stat line.
 pub fn parse_proc_stat(line: &str) -> Option<ProcStat> {
-    todo!()
+    let after_comm = &line[line.rfind(')')? + 1..];
+    let mut fields = after_comm.split_whitespace();
+    // `fields` starts at field 3 (state); field 22 is therefore index 19.
+    let state_field = fields.next()?;
+    let mut state_chars = state_field.chars();
+    let state = state_chars.next()?;
+    if state_chars.next().is_some() {
+        return None;
+    }
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some(ProcStat { state, start_time })
 }
 
 /// Read one input. cmd text is `exit=<code>\n<stdout><stderr>`; on timeout the
@@ -64,7 +81,412 @@ pub fn parse_proc_stat(line: &str) -> Option<ProcStat> {
 /// `HTTP <status>\n<body>`. port text is `open` or `closed`. process text is
 /// `running` or `exited`. glob text lists newly created matches, one per line.
 pub async fn read_input(input: &Input, previous: &InputState) -> Reading {
-    todo!()
+    let label = input.label();
+    match input {
+        Input::File { path, tail_bytes } => read_file(label, path, *tail_bytes, previous),
+        Input::Glob { pattern, report } => read_glob(label, pattern, *report, previous),
+        Input::Cmd { argv, timeout_s, cwd } => {
+            let observed = observe_cmd(argv, *timeout_s, cwd.as_deref()).await;
+            settle(label, previous, observed, None)
+        }
+        Input::Url { url } => settle(label, previous, observe_url(url).await, None),
+        Input::Port { host, port, want } => {
+            let open = observe_port(host, *port).await;
+            let observed = Observed {
+                text: if open { "open" } else { "closed" }.to_string(),
+                is_error: false,
+                want_met: want.map(|want| (want == PortWant::Open) == open),
+            };
+            settle(label, previous, observed, None)
+        }
+        Input::Process { pid, want } => {
+            let (observed, proc_start) = observe_process(*pid, *want, previous);
+            settle(label, previous, observed, Some(proc_start))
+        }
+    }
+}
+
+/// What one non-file read saw, before change detection.
+struct Observed {
+    text: String,
+    is_error: bool,
+    want_met: Option<bool>,
+}
+
+impl Observed {
+    fn error(text: String) -> Observed {
+        Observed { text, is_error: true, want_met: None }
+    }
+}
+
+fn hash_hex(text: &str) -> String {
+    Sha256::digest(text.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The first read of an input (default state) is a baseline, never a change.
+fn is_baseline(previous: &InputState) -> bool {
+    previous == &InputState::default()
+}
+
+/// Change detection for inputs tracked by the hash of their reading (V9:
+/// everything except files). `proc_start` is `Some` for process inputs.
+fn settle(label: String, previous: &InputState, observed: Observed, proc_start: Option<Option<u64>>) -> Reading {
+    let hash = hash_hex(&observed.text);
+    let changed = !is_baseline(previous) && previous.hash.as_deref() != Some(hash.as_str());
+    let mut state = InputState { hash: Some(hash), ..previous.clone() };
+    if let Some(start) = proc_start {
+        state.proc_start = start;
+    }
+    Reading {
+        label,
+        text: observed.text,
+        changed,
+        is_error: observed.is_error,
+        want_met: observed.want_met,
+        state,
+    }
+}
+
+// ---- file (V9, V12, W4) ----
+
+fn read_file(label: String, path: &Path, tail_bytes: Option<u64>, previous: &InputState) -> Reading {
+    match read_file_position(path, tail_bytes, previous) {
+        Ok((text, state)) => {
+            let changed = !is_baseline(previous) && !text.is_empty();
+            Reading { label, text, changed, is_error: false, want_met: None, state }
+        }
+        Err(error) => {
+            let text = format!("cannot read {}: {error}", path.display());
+            let hash = hash_hex(&text);
+            let changed = !is_baseline(previous) && previous.hash.as_deref() != Some(hash.as_str());
+            // A missing file has no position: a later reappearance reads from 0.
+            let state = InputState { hash: Some(hash), ..InputState::default() };
+            Reading { label, text, changed, is_error: true, want_met: None, state }
+        }
+    }
+}
+
+fn read_file_position(
+    path: &Path,
+    tail_bytes: Option<u64>,
+    previous: &InputState,
+) -> std::io::Result<(String, InputState)> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let stamp = FileStamp {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        size: metadata.len(),
+        mtime_secs: metadata.mtime(),
+        mtime_nanos: u32::try_from(metadata.mtime_nsec()).unwrap_or(0),
+    };
+
+    let baseline = is_baseline(previous);
+    // V9: where reading starts. A replaced, shrunk or rewritten file restarts
+    // at 0; a plain append continues at the stored offset.
+    let start = match (&previous.file, previous.offset) {
+        _ if baseline => stamp.size,
+        (Some(old), Some(offset)) => {
+            let replaced = (old.dev, old.ino) != (stamp.dev, stamp.ino);
+            let shrunk = stamp.size < old.size;
+            let rewritten = stamp.size == old.size && (old.mtime_secs, old.mtime_nanos) != (stamp.mtime_secs, stamp.mtime_nanos);
+            if replaced || shrunk || rewritten { 0 } else { offset.min(stamp.size) }
+        }
+        _ => 0, // recovered from a read error: everything is new
+    };
+
+    let new_len = stamp.size - start;
+    let tail = tail_bytes.unwrap_or(DEFAULT_TAIL_BYTES);
+    let keep = new_len.min(tail).min(MAX_CAPTURE_BYTES as u64);
+    // The capture limit (not `tail_bytes`) cut the content: say so (V12).
+    let truncated = tail >= MAX_CAPTURE_BYTES as u64 && new_len > MAX_CAPTURE_BYTES as u64;
+    let mut bytes = vec![0u8; keep as usize];
+    // W4: the oldest new bytes are skipped, the newest kept.
+    file.seek(SeekFrom::Start(stamp.size - keep))?;
+    file.read_exact(&mut bytes)?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text = format!("{TRUNCATED_MARKER}\n{text}");
+    }
+    let state = InputState { offset: Some(stamp.size), file: Some(stamp), ..InputState::default() };
+    Ok((if baseline { String::new() } else { text }, state))
+}
+
+// ---- glob (V12, X2) ----
+
+fn read_glob(label: String, pattern: &str, report: GlobReport, previous: &InputState) -> Reading {
+    let GlobReport::Created = report;
+    let paths = match glob::glob(pattern) {
+        Ok(paths) => paths,
+        Err(error) => {
+            let observed = Observed::error(format!("bad glob {pattern}: {error}"));
+            return settle(label, previous, observed, None);
+        }
+    };
+    let mut matches: Vec<String> = paths.filter_map(Result::ok).map(|path| path.display().to_string()).collect();
+    matches.sort();
+    matches.dedup();
+
+    let membership_hash = hash_hex(&matches.join("\n"));
+    // X2: only the first MAX_KNOWN_GLOB_PATHS (sorted) paths are persisted. The
+    // hash of the whole listing keeps a quiet, larger directory quiet.
+    let known: Vec<String> = matches.iter().take(MAX_KNOWN_GLOB_PATHS).cloned().collect();
+    let state = InputState { hash: Some(membership_hash.clone()), known, ..InputState::default() };
+
+    let unchanged_listing = previous.hash.as_deref() == Some(membership_hash.as_str());
+    if is_baseline(previous) || unchanged_listing {
+        return Reading { label, text: String::new(), changed: false, is_error: false, want_met: None, state };
+    }
+    let remembered: std::collections::HashSet<&String> = previous.known.iter().collect();
+    let created: Vec<&String> = matches.iter().filter(|path| !remembered.contains(path)).collect();
+    let mut text = created.iter().take(MAX_GLOB_MATCHES).map(|path| path.as_str()).collect::<Vec<_>>().join("\n");
+    if created.len() > MAX_GLOB_MATCHES {
+        text.push_str(&format!("\n{TRUNCATED_MARKER}"));
+    }
+    Reading { label, text, changed: !created.is_empty(), is_error: false, want_met: None, state }
+}
+
+// ---- cmd (V12, V13) ----
+
+mod sys {
+    unsafe extern "C" {
+        pub fn setsid() -> i32;
+        pub fn kill(pid: i32, signal: i32) -> i32;
+    }
+    pub const SIGKILL: i32 = 9;
+}
+
+/// SIGKILL a whole process group. Errors (group already gone) are ignored.
+fn kill_group(pgid: i32) {
+    // SAFETY: kill(2) takes plain integers; a negative pid addresses the
+    // group `pgid`, which the child created for itself with setsid.
+    unsafe { sys::kill(-pgid, sys::SIGKILL) };
+}
+
+/// Kills the child's process group when the read future is dropped (V13).
+struct GroupKillOnDrop {
+    pgid: i32,
+    armed: bool,
+}
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_group(self.pgid);
+        }
+    }
+}
+
+/// After the group leader exits, wait this long for output still in the pipes
+/// before the rest of the group is killed.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+/// stdout+stderr combined, at most `MAX_CAPTURE_BYTES` (V12).
+#[derive(Default)]
+struct Capture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl Capture {
+    fn push(&mut self, data: &[u8]) {
+        let room = MAX_CAPTURE_BYTES - self.bytes.len();
+        self.bytes.extend_from_slice(&data[..data.len().min(room)]);
+        self.truncated |= data.len() > room;
+    }
+}
+
+/// Reap a leader that was just SIGKILLed. Polls `try_wait` with short
+/// blocking sleeps instead of awaiting the exit: a SIGKILL takes effect in
+/// well under a millisecond, and awaiting real process I/O here would let a
+/// paused or busy tokio clock run ahead of the reap (a timed-out read must
+/// return before the surrounding call's budget timer fires).
+fn reap_killed(child: &mut tokio::process::Child) {
+    for _ in 0..2000 {
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Ok(Some(_)) | Err(_) => return,
+        }
+    }
+}
+
+async fn read_chunk<R: AsyncRead + Unpin>(stream: &mut R, buffer: &mut [u8]) -> usize {
+    stream.read(buffer).await.unwrap_or(0)
+}
+
+async fn observe_cmd(argv: &[String], timeout_s: Option<f64>, cwd: Option<&Path>) -> Observed {
+    let Some((program, args)) = argv.split_first() else {
+        return Observed::error("cannot run an empty command".to_string());
+    };
+    let limit = Duration::from_secs_f64(timeout_s.unwrap_or(DEFAULT_CMD_TIMEOUT_S));
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    // SAFETY: the closure runs between fork and exec and only calls setsid(2),
+    // which is async-signal-safe.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if sys::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Observed::error(format!("cannot run {program}: {error}")),
+    };
+    // The child is its own session and group leader, so pgid == pid.
+    let pgid = child.id().and_then(|pid| i32::try_from(pid).ok()).unwrap_or(0);
+    let mut guard = GroupKillOnDrop { pgid, armed: pgid > 0 };
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Observed::error(format!("cannot capture output of {program}"));
+    };
+
+    let mut capture = Capture::default();
+    let mut exit = None;
+    let run = async {
+        let (mut out_buf, mut err_buf) = ([0u8; 8192], [0u8; 8192]);
+        let (mut out_open, mut err_open) = (true, true);
+        let mut drain_until = None;
+        loop {
+            if exit.is_some() && !out_open && !err_open {
+                break;
+            }
+            tokio::select! {
+                status = child.wait(), if exit.is_none() => {
+                    exit = Some(status);
+                    drain_until = Some(tokio::time::Instant::now() + OUTPUT_DRAIN_GRACE);
+                }
+                n = read_chunk(&mut stdout, &mut out_buf), if out_open => match n {
+                    0 => out_open = false,
+                    n => capture.push(&out_buf[..n]),
+                },
+                n = read_chunk(&mut stderr, &mut err_buf), if err_open => match n {
+                    0 => err_open = false,
+                    n => capture.push(&err_buf[..n]),
+                },
+                () = tokio::time::sleep_until(drain_until.unwrap_or_else(tokio::time::Instant::now)), if drain_until.is_some() => break,
+            }
+        }
+    };
+    let finished = tokio::time::timeout(limit, run).await.is_ok();
+    // Descendants that outlive the leader or hold the pipes die with the group.
+    kill_group(pgid);
+    guard.armed = false;
+    if !finished {
+        reap_killed(&mut child);
+        return Observed::error(format!("timeout after {}s", limit.as_secs_f64()));
+    }
+    let code = match exit {
+        Some(Ok(status)) => match status.code() {
+            Some(code) => code.to_string(),
+            None => {
+                use std::os::unix::process::ExitStatusExt;
+                format!("signal-{}", status.signal().unwrap_or(0))
+            }
+        },
+        Some(Err(error)) => return Observed::error(format!("cannot wait for {program}: {error}")),
+        None => return Observed::error(format!("{program} did not exit")),
+    };
+    let mut text = format!("exit={code}\n{}", String::from_utf8_lossy(&capture.bytes));
+    if capture.truncated {
+        text.push_str(&format!("\n{TRUNCATED_MARKER}"));
+    }
+    Observed { text, is_error: false, want_met: None }
+}
+
+// ---- url (V12, V19/D7) ----
+
+async fn observe_url(url: &str) -> Observed {
+    let timeout = Duration::from_secs_f64(DEFAULT_CMD_TIMEOUT_S);
+    // D7: no TLS stack, so a redirect to https is an error, not a hop.
+    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.url().scheme() == "https" {
+            attempt.error("redirect to https is not supported (no TLS)")
+        } else if attempt.previous().len() >= 5 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    });
+    let client = match reqwest::Client::builder().timeout(timeout).redirect(redirects).pool_max_idle_per_host(0).build() {
+        Ok(client) => client,
+        Err(error) => return Observed::error(format!("cannot build http client: {}", error_chain(&error))),
+    };
+    let mut response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(error) => return Observed::error(format!("GET {url} failed: {}", error_chain(&error))),
+    };
+    let status = response.status().as_u16();
+    let mut capture = Capture::default();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                capture.push(&chunk);
+                if capture.truncated {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => return Observed::error(format!("GET {url} failed: {}", error_chain(&error))),
+        }
+    }
+    let mut text = format!("HTTP {status}\n{}", String::from_utf8_lossy(&capture.bytes));
+    if capture.truncated {
+        text.push_str(&format!("\n{TRUNCATED_MARKER}"));
+    }
+    Observed { text, is_error: false, want_met: None }
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    text
+}
+
+// ---- port ----
+
+async fn observe_port(host: &str, port: u16) -> bool {
+    let timeout = Duration::from_secs_f64(DEFAULT_CMD_TIMEOUT_S);
+    matches!(tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port))).await, Ok(Ok(_)))
+}
+
+// ---- process (V17) ----
+
+/// Returns the observation and the start time to persist.
+fn observe_process(pid: u32, want: Option<ProcessWant>, previous: &InputState) -> (Observed, Option<u64>) {
+    let current = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|line| parse_proc_stat(&line));
+    let (running, proc_start) = if is_baseline(previous) {
+        // V17: record the identity of the process we are watching.
+        (current.is_some_and(|stat| stat.state != 'Z'), current.map(|stat| stat.start_time))
+    } else {
+        let same_process = current.is_some_and(|stat| previous.proc_start == Some(stat.start_time));
+        (same_process && current.is_some_and(|stat| stat.state != 'Z'), previous.proc_start)
+    };
+    let observed = Observed {
+        text: if running { "running" } else { "exited" }.to_string(),
+        is_error: false,
+        want_met: want.map(|want| (want == ProcessWant::Running) == running),
+    };
+    (observed, proc_start)
 }
 
 /// The seam the engine reads inputs through (create's baseline and every
@@ -670,7 +1092,8 @@ mod tests {
         let script = "head -c 40000 /dev/zero | tr '\\0' x; head -c 40000 /dev/zero | tr '\\0' y >&2";
         let reading = read_input(&sh(script, None), &InputState::default()).await;
         assert!(reading.text.starts_with("exit=0\n"), "{:?}", &reading.text[..20]);
-        let kept = reading.text.chars().filter(|c| *c == 'x' || *c == 'y').count();
+        let output = reading.text.strip_prefix("exit=0\n").unwrap();
+        let kept = output.chars().filter(|c| *c == 'x' || *c == 'y').count();
         assert_eq!(kept, MAX_CAPTURE_BYTES);
         assert!(reading.text.contains(TRUNCATED_MARKER));
         let small = read_input(&sh("echo ok", None), &InputState::default()).await;

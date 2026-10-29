@@ -16,14 +16,60 @@ pub const PRUNE_AFTER_SECS: u64 = 7 * 24 * 3600;
 /// `$XDG_STATE_HOME/vigil`, else `$HOME/.local/state/vigil`. An empty
 /// variable counts as unset (XDG Base Directory spec). `None` if neither.
 pub fn state_root(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    todo!()
+    fn non_empty(value: Option<&str>) -> Option<&str> {
+        value.filter(|text| !text.is_empty())
+    }
+    match (non_empty(xdg_state_home), non_empty(home)) {
+        (Some(xdg), _) => Some(Path::new(xdg).join("vigil")),
+        (None, Some(home)) => Some(Path::new(home).join(".local/state/vigil")),
+        (None, None) => None,
+    }
+}
+
+fn io_error(error: std::io::Error) -> StoreError {
+    StoreError::Io(error.to_string())
 }
 
 /// Serialize `value` to JSON, write `<path>.tmp` beside it, fsync, rename over
 /// `path`. On any failure `path` keeps its previous content and no `.tmp`
 /// remains. (SPEC "State": writes are atomic.)
 pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
-    todo!()
+    use std::io::Write;
+    // Serialize first: a failing value never creates a `.tmp`.
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| StoreError::Serialize(error.to_string()))?;
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let written = (|| {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io_error(error));
+    }
+    Ok(())
+}
+
+/// Which lock file a [`StoreLock`] guards; decides whether X8 applies.
+fn open_lock_file(path: &Path) -> Result<File, StoreError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).map_err(io_error)
+}
+
+/// X8: is the locked descriptor still the file the path names? False if the
+/// path is gone or now names another inode (prune deleted the lock file while
+/// we waited).
+fn is_same_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
 }
 
 /// Exclusive `flock`, released on drop. Two kinds (X3, superseding the
@@ -74,33 +120,74 @@ impl Store {
     }
     /// Atomic save of one watch (creates `watches/` on demand).
     pub fn save(&self, watch: &WatchFile) -> Result<(), StoreError> {
-        todo!()
+        std::fs::create_dir_all(self.watches_dir()).map_err(io_error)?;
+        write_atomic(&self.watch_path(&watch.spec.id), watch)
     }
     pub fn load(&self, id: &WatchId) -> Result<WatchFile, StoreError> {
-        todo!()
+        let bytes = std::fs::read(self.watch_path(id)).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => StoreError::NotFound(id.as_str().to_string()),
+            _ => io_error(error),
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| StoreError::Corrupt(format!("{id}: {error}")))
     }
     /// Every readable watch file, in id order.
     pub fn list(&self) -> Result<Vec<WatchFile>, StoreError> {
-        todo!()
+        let entries = match std::fs::read_dir(self.watches_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(io_error(error)),
+        };
+        let mut watches: Vec<WatchFile> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+            .collect();
+        watches.sort_by(|a: &WatchFile, b| a.spec.id.cmp(&b.spec.id));
+        Ok(watches)
     }
     /// Block until the GLOBAL exclusive lock is held (creates the lock file
     /// and the root on demand). Short namespace operations only (X3).
     pub fn lock(&self) -> Result<StoreLock, StoreError> {
-        todo!()
+        let file = open_lock_file(&self.lock_path())?;
+        file.lock().map_err(io_error)?;
+        Ok(StoreLock { file })
     }
     /// `Ok(None)` if another holder has the global lock.
     pub fn try_lock(&self) -> Result<Option<StoreLock>, StoreError> {
-        todo!()
+        let file = open_lock_file(&self.lock_path())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(StoreLock { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(io_error(error)),
+        }
     }
     /// Block until the exclusive lock of watch `id` is held (creates
     /// `locks/` and `locks/<id>.lock` on demand). Independent of the global
     /// lock and of every other watch's lock (X3).
     pub fn lock_watch(&self, id: &WatchId) -> Result<StoreLock, StoreError> {
-        todo!()
+        let path = self.watch_lock_path(id);
+        loop {
+            let file = open_lock_file(&path)?;
+            file.lock().map_err(io_error)?;
+            if is_same_file(&file, &path) {
+                return Ok(StoreLock { file });
+            }
+            // X8: the lock file was replaced while we waited; lock the new one.
+        }
     }
     /// `Ok(None)` if another holder has watch `id`'s lock.
     pub fn try_lock_watch(&self, id: &WatchId) -> Result<Option<StoreLock>, StoreError> {
-        todo!()
+        let path = self.watch_lock_path(id);
+        loop {
+            let file = open_lock_file(&path)?;
+            match file.try_lock() {
+                Ok(()) if is_same_file(&file, &path) => return Ok(Some(StoreLock { file })),
+                Ok(()) => continue, // X8: replaced under us; try the new file.
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => return Err(io_error(error)),
+            }
+        }
     }
     /// Delete watch files whose finish time + 7 days <= now (D4). The finish
     /// time of a finished watch is `finished_at`; of an overdue pending watch
@@ -113,7 +200,48 @@ impl Store {
     /// allowed) but never deleted while held. The global lock file is never
     /// deleted. Returns the deleted ids.
     pub fn prune(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
-        todo!()
+        let mut deleted = Vec::new();
+        for candidate in self.list()? {
+            if !is_prunable(&candidate, now) {
+                continue;
+            }
+            let id = candidate.spec.id;
+            // Lock order: watch lock, then global lock. A busy watch (a tick
+            // or cancel in flight) is skipped, never waited for.
+            let Some(_watch_lock) = self.try_lock_watch(&id)? else {
+                continue;
+            };
+            let _global_lock = self.lock()?;
+            // Re-check under both locks: the file may have changed since list().
+            match self.load(&id) {
+                Ok(current) if is_prunable(&current, now) => {}
+                _ => continue,
+            }
+            remove_if_present(&self.watch_path(&id))?;
+            remove_if_present(&self.watch_lock_path(&id))?;
+            deleted.push(id);
+        }
+        Ok(deleted)
+    }
+}
+
+/// D4/V16: a finished watch, or a pending one past its deadline, is prunable
+/// once its finish time (`finished_at`, else `deadline_at`) is 7 days old.
+fn is_prunable(watch: &WatchFile, now: Timestamp) -> bool {
+    let finished_at = if watch.status.is_finished() {
+        watch.finished_at.unwrap_or(watch.deadline_at)
+    } else if watch.is_overdue(now) {
+        watch.deadline_at
+    } else {
+        return false;
+    };
+    finished_at.plus_secs(PRUNE_AFTER_SECS) <= now
+}
+
+fn remove_if_present(path: &Path) -> Result<(), StoreError> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_error(error)),
+        _ => Ok(()),
     }
 }
 

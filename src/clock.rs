@@ -24,13 +24,17 @@ impl Timestamp {
 
 impl Serialize for Timestamp {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        todo!("serialize as RFC 3339 `Z`, whole seconds")
+        let text = self.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        serializer.serialize_str(&text)
     }
 }
 
 impl<'de> Deserialize<'de> for Timestamp {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        todo!("parse RFC 3339")
+        let text = String::deserialize(deserializer)?;
+        DateTime::parse_from_rfc3339(&text)
+            .map(|parsed| Timestamp(parsed.with_timezone(&Utc)))
+            .map_err(serde::de::Error::custom)
     }
 }
 

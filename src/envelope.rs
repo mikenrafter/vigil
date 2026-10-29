@@ -67,7 +67,23 @@ pub struct Envelope {
 /// the marker (R6). When `max_bytes` is smaller than the marker there is no
 /// room to say so: the result still obeys the bound (see `.red-report.md`).
 pub fn cut_digest(digest: &str, max_bytes: usize) -> String {
-    todo!()
+    if digest.len() <= max_bytes {
+        return digest.to_string();
+    }
+    if max_bytes < DIGEST_CUT_MARKER.len() {
+        // No room to say so; the bound still holds (ASCII, so any prefix is valid).
+        return DIGEST_CUT_MARKER[..max_bytes].to_string();
+    }
+    // Content, a newline separator, then the marker, all inside max_bytes.
+    let room = max_bytes - DIGEST_CUT_MARKER.len();
+    if room < 2 {
+        return DIGEST_CUT_MARKER.to_string();
+    }
+    let mut start = digest.len() - (room - 1);
+    while !digest.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{}\n{DIGEST_CUT_MARKER}", &digest[start..])
 }
 
 #[cfg(test)]

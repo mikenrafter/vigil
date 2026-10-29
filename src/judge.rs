@@ -84,7 +84,13 @@ impl Judge for HttpJudge {
         Box::pin(async move { todo!() })
     }
     fn healthy(&self) -> BoxFuture<'_, bool> {
-        Box::pin(async move { todo!() })
+        Box::pin(async move {
+            let url = format!("{}/health", self.base_url.trim_end_matches('/'));
+            let Ok(client) = reqwest::Client::builder().timeout(self.health_timeout).pool_max_idle_per_host(0).build() else {
+                return false;
+            };
+            matches!(client.get(url).send().await, Ok(response) if response.status().is_success())
+        })
     }
 }
 

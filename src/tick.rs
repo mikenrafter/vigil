@@ -1,8 +1,13 @@
 //! One evaluation round of one watch (SPEC "Tick logic").
 
-use crate::engine::Vigil;
+use crate::clock::Timestamp;
+use crate::engine::{expired_if_overdue, Vigil};
 use crate::error::VigilError;
-use crate::watch::{WatchId, WatchStatus};
+use crate::inputs::Reading;
+use crate::watch::{
+    ChangedInput, Event, FireRule, Input, InputState, Terminal, TerminalStatus, WatchFile, WatchId, WatchStatus,
+    MAX_SUMMARY_BYTES,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickOutcome {
@@ -13,6 +18,21 @@ pub enum TickOutcome {
     /// The watch is finished (fired, expired, cancelled), possibly just now
     /// because the deadline passed.
     Finished(WatchStatus),
+}
+
+/// What one `tick_report` call did, for callers (the keepalive loop) that
+/// need more than the outcome: the content that changed during the tick, in
+/// input order, for the call-local digest (V14).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TickReport {
+    pub outcome: TickOutcome,
+    pub changed: Vec<ChangedInput>,
+}
+
+impl TickReport {
+    fn without_changes(outcome: TickOutcome) -> TickReport {
+        TickReport { outcome, changed: Vec::new() }
+    }
 }
 
 impl Vigil {
@@ -26,8 +46,173 @@ impl Vigil {
     /// the persisted pending change at 64 KiB per input (W7). Rewrites the
     /// watch file atomically at the end.
     pub async fn tick_due(&self, id: &WatchId) -> Result<TickOutcome, VigilError> {
-        todo!()
+        Ok(self.tick_report(id).await?.outcome)
     }
+
+    /// `tick_due` plus the content the tick found changed.
+    pub async fn tick_report(&self, id: &WatchId) -> Result<TickReport, VigilError> {
+        let (_lock, mut watch) = self.lock_and_load(id).await?;
+        let now = self.clock.now();
+
+        if watch.status.is_finished() {
+            return Ok(TickReport::without_changes(TickOutcome::Finished(watch.status)));
+        }
+        if watch.is_overdue(now) {
+            // R5: expiry runs no final tick and adds no event.
+            let expired = expired_if_overdue(watch, now);
+            self.store.save(&expired)?;
+            return Ok(TickReport::without_changes(TickOutcome::Finished(expired.status)));
+        }
+        if !is_due(&watch, now) {
+            return Ok(TickReport::without_changes(TickOutcome::NotDue));
+        }
+
+        // A placeholder left by a create that died before its baseline has
+        // fewer states than inputs; the missing ones start as baselines.
+        let mut states = watch.input_states.clone();
+        states.resize(watch.spec.inputs.len(), InputState::default());
+        let readings = self.read_all(&watch.spec.inputs, &states).await;
+
+        let tick = watch.tick + 1;
+        let changed: Vec<ChangedInput> = readings
+            .iter()
+            .filter(|reading| reading.changed)
+            .map(|reading| ChangedInput { label: reading.label.clone(), text: reading.text.clone() })
+            .collect();
+        if !changed.is_empty() {
+            watch.last_digest = digest_of(&changed);
+        }
+
+        let fired_events = match &watch.spec.fire {
+            FireRule::Change => change_events(&watch, tick, &readings),
+            FireRule::Condition => condition_events(&mut watch, tick, &readings),
+            FireRule::Judge { .. } => {
+                if changed.is_empty() && watch.pending_change.is_none() {
+                    Vec::new()
+                } else {
+                    self.judge_step(&mut watch, tick, &changed, now).await?
+                }
+            }
+        };
+
+        watch.tick = tick;
+        watch.last_tick_at = Some(now);
+        watch.input_states = readings.into_iter().map(|reading| reading.state).collect();
+        if !fired_events.is_empty() {
+            let terminal = Terminal {
+                status: TerminalStatus::Fired,
+                finished_at: now,
+                events: fired_events,
+                digest: watch.last_digest.clone(),
+            };
+            watch.finish(terminal).expect("a pending watch accepts its terminal result");
+        }
+        self.store.save(&watch)?;
+        Ok(TickReport { outcome: TickOutcome::Ticked, changed })
+    }
+
+    /// PHASE 2 SEAM (judge). Called by `tick_report` for `fire = judge` only
+    /// when something changed this tick (`changed`) or an earlier change is
+    /// still pending (`watch.pending_change`). It owns everything judge
+    /// related: merging `changed` into `watch.pending_change` (R7, W7 cap),
+    /// building the request (`judge::build_state`), calling `self.judge`,
+    /// evaluating the rule, and updating `watch.judge_strikes` /
+    /// `watch.judge_status` / `watch.pending_change`. It returns the events
+    /// the tick fires with (empty: do not fire). `tick_report` already set
+    /// `watch.last_digest` and persists the watch afterwards; do not save here.
+    async fn judge_step(
+        &self,
+        watch: &mut WatchFile,
+        tick: u64,
+        changed: &[ChangedInput],
+        now: Timestamp,
+    ) -> Result<Vec<Event>, VigilError> {
+        todo!("phase 2: judge request, rule evaluation, strikes (SPEC 'Tick logic' 4-5, 'Failure rules')")
+    }
+}
+
+/// D3: the first tick is due at once; later ones at `last_tick_at + interval_s`.
+pub(crate) fn is_due(watch: &WatchFile, now: Timestamp) -> bool {
+    match watch.last_tick_at {
+        None => true,
+        Some(last) => now >= last.plus_secs(watch.spec.interval_s),
+    }
+}
+
+/// The changed content as the agent reads it in a digest: each input's label
+/// and its new text.
+pub(crate) fn digest_of(changed: &[ChangedInput]) -> String {
+    changed
+        .iter()
+        .map(|input| format!("{}:\n{}", input.label, input.text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// fire = change: every changed input is an event, in input order (W1).
+fn change_events(watch: &WatchFile, tick: u64, readings: &[Reading]) -> Vec<Event> {
+    let changed_inputs = watch.spec.inputs.iter().zip(readings).filter(|(_, reading)| reading.changed);
+    changed_inputs
+        .enumerate()
+        .map(|(index, (input, reading))| Event {
+            event_id: Event::make_id(watch.spec.id.as_str(), tick, index),
+            tick,
+            watch_id: watch.spec.id.to_string(),
+            input: reading.label.clone(),
+            summary: summarize(input, &reading.text),
+            judge: None,
+        })
+        .collect()
+}
+
+/// fire = condition (R1): evaluated on every tick, changed or not. Fires when
+/// every input that has a `want` reports it met; one event names them all.
+fn condition_events(watch: &mut WatchFile, tick: u64, readings: &[Reading]) -> Vec<Event> {
+    let wanted: Vec<&Reading> = watch
+        .spec
+        .inputs
+        .iter()
+        .zip(readings)
+        .filter(|(input, _)| input.has_want())
+        .map(|(_, reading)| reading)
+        .collect();
+    if wanted.is_empty() || !wanted.iter().all(|reading| reading.want_met == Some(true)) {
+        return Vec::new();
+    }
+    let met: Vec<ChangedInput> =
+        wanted.iter().map(|reading| ChangedInput { label: reading.label.clone(), text: reading.text.clone() }).collect();
+    watch.last_digest = digest_of(&met);
+    let labels = met.iter().map(|input| input.label.as_str()).collect::<Vec<_>>().join(", ");
+    let summary = met.iter().map(|input| format!("{} {}", input.label, input.text)).collect::<Vec<_>>().join("; ");
+    vec![Event {
+        event_id: Event::make_id(watch.spec.id.as_str(), tick, 0),
+        tick,
+        watch_id: watch.spec.id.to_string(),
+        input: labels,
+        summary: cap_bytes(&format!("condition met: {summary}"), MAX_SUMMARY_BYTES),
+        judge: None,
+    }]
+}
+
+/// X2: a one-line event summary of at most `MAX_SUMMARY_BYTES`. A file's
+/// summary is its newest non-empty line; other inputs read as short
+/// multi-line observations (`exit=1`, `HTTP 503`, ...) and are joined.
+pub(crate) fn summarize(input: &Input, text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let summary = match input {
+        Input::File { .. } => lines.next_back().unwrap_or_default().to_string(),
+        _ => lines.collect::<Vec<_>>().join(" | "),
+    };
+    cap_bytes(&summary, MAX_SUMMARY_BYTES)
+}
+
+/// `text` cut to at most `max_bytes`, on a UTF-8 boundary.
+pub(crate) fn cap_bytes(text: &str, max_bytes: usize) -> String {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 #[cfg(test)]
@@ -652,7 +837,7 @@ mod tests {
         //      free. Finally the gate opens and A completes its own tick.
         // proves: CLAIM(per-watch-lock)
         let f = fixture();
-        let slow = Input::Cmd { argv: vec!["slow-a".into()], timeout_s: Some(20.0), cwd: None };
+        let slow = Input::Cmd { argv: vec!["slow-a".into()], timeout_s: Some(19.0), cwd: None };
         let mut request_a = change_request("a", Path::new("/unused"), 20);
         request_a.inputs = vec![slow];
         f.env.reader.set_text("cmd:slow-a", "base");
@@ -702,7 +887,7 @@ mod tests {
         // proves: CLAIM(per-watch-lock)
         let f = fixture();
         let mut request = change_request("a", Path::new("/unused"), 20);
-        request.inputs = vec![Input::Cmd { argv: vec!["slow-a".into()], timeout_s: Some(20.0), cwd: None }];
+        request.inputs = vec![Input::Cmd { argv: vec!["slow-a".into()], timeout_s: Some(19.0), cwd: None }];
         f.env.reader.set_text("cmd:slow-a", "base");
         let a = f.create(request).await;
         let gate = Gate::closed();

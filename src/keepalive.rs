@@ -1,8 +1,15 @@
 //! The blocking `keepalive` call and the `wait` variant.
 
-use crate::envelope::Envelope;
+use std::time::Duration;
+
+use tokio::time::Instant;
+
+use crate::clock::Timestamp;
+use crate::engine::expired_if_overdue;
+use crate::envelope::{cut_digest, Envelope, OtherWatch};
 use crate::error::VigilError;
-use crate::watch::WatchId;
+use crate::tick::{digest_of, is_due, TickOutcome};
+use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId, WatchStatus};
 
 pub const MIN_MAX_S: u64 = 30;
 pub const MAX_MAX_S: u64 = 270;
@@ -10,7 +17,7 @@ pub const DEFAULT_MAX_S: u64 = 270;
 
 /// Clamp the agent's `max_s` to 30..=270 (absent = 270). Never rejects.
 pub fn clamp_max_s(requested: Option<u64>) -> u64 {
-    todo!()
+    requested.map_or(DEFAULT_MAX_S, |seconds| seconds.clamp(MIN_MAX_S, MAX_MAX_S))
 }
 
 /// X4: a tick is started inside a call only if the call has at least this
@@ -22,7 +29,9 @@ pub fn clamp_max_s(requested: Option<u64>) -> u64 {
 /// that is due when a call starts runs regardless (a call is >= 30 s, so it
 /// always finishes unless a lock wait ate the budget, V2).
 pub fn tick_reserve(inputs: &[crate::watch::Input], fire_is_judge: bool, judge_timeout: std::time::Duration) -> std::time::Duration {
-    todo!()
+    let slowest_read = inputs.iter().map(Input::read_timeout).max().unwrap_or(Duration::ZERO);
+    let judge = if fire_is_judge { judge_timeout } else { Duration::ZERO };
+    slowest_read + judge + Duration::from_secs(1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -61,7 +70,12 @@ impl ProgressSink for NoProgress {
 /// 1 is an error and 2 a usage error (clap); neither is returned here, and a
 /// still-pending envelope has no code.
 pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
-    todo!()
+    match envelope.status {
+        WatchStatus::Fired => Some(0),
+        WatchStatus::Expired => Some(3),
+        WatchStatus::Cancelled => Some(4),
+        WatchStatus::Pending => None,
+    }
 }
 
 impl crate::engine::Vigil {
@@ -86,14 +100,161 @@ impl crate::engine::Vigil {
         request: KeepaliveRequest,
         progress: &dyn ProgressSink,
     ) -> Result<Envelope, VigilError> {
-        todo!()
+        let max_s = clamp_max_s(request.max_s);
+        let started = Instant::now();
+        let budget_end = started + Duration::from_secs(max_s);
+        let covered = self.covered_ids(request.watch_id.as_ref())?;
+
+        let mut changed_in_call: Vec<ChangedInput> = Vec::new();
+        let mut ticks_in_call = 0u64;
+        let mut first_pass = true;
+        'call: loop {
+            let now = self.clock.now();
+            let mut any_finished = false;
+            let mut next_wake: Option<Timestamp> = None;
+            for id in &covered {
+                let mut watch = self.load_watch(id)?;
+                if watch.status.is_finished() {
+                    any_finished = true;
+                    continue;
+                }
+                if watch.is_overdue(now) || is_due(&watch, now) {
+                    let reserve = tick_reserve(
+                        &watch.spec.inputs,
+                        matches!(watch.spec.fire, FireRule::Judge { .. }),
+                        self.config.judge_timeout,
+                    );
+                    // X4: the tick due when the call starts runs regardless.
+                    if !first_pass && budget_end.saturating_duration_since(Instant::now()) < reserve {
+                        continue;
+                    }
+                    // V2: a tick that cannot finish in the budget is dropped
+                    // before it writes anything.
+                    let Ok(report) = tokio::time::timeout_at(budget_end, self.tick_report(id)).await else {
+                        break 'call;
+                    };
+                    let report = report?;
+                    watch = self.load_watch(id)?;
+                    if report.outcome == TickOutcome::Ticked {
+                        ticks_in_call += 1;
+                        changed_in_call.extend(report.changed);
+                        progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick: watch.tick });
+                    }
+                    if watch.status.is_finished() {
+                        any_finished = true;
+                        continue;
+                    }
+                }
+                let due_at = watch.last_tick_at.map_or(now, |last| last.plus_secs(watch.spec.interval_s));
+                let wake = due_at.min(watch.deadline_at);
+                next_wake = Some(next_wake.map_or(wake, |current| current.min(wake)));
+            }
+            first_pass = false;
+            if any_finished {
+                break;
+            }
+            let left = budget_end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            // Sleep to the next tick or deadline, or to the end of the budget.
+            let until_wake = next_wake
+                .map(|wake| (wake.0 - self.clock.now().0).to_std().unwrap_or(Duration::ZERO))
+                .unwrap_or(left);
+            tokio::time::sleep(until_wake.min(left)).await;
+        }
+
+        let waited_s = started.elapsed().as_secs();
+        self.keepalive_envelope(&covered, &changed_in_call, waited_s, max_s)
     }
 
     /// `vigil wait`: like keepalive for one watch but with no 270 s ceiling:
     /// returns only when the watch is finished, with ONE final envelope that
     /// holds the whole event batch (no streaming, R8/V21).
     pub async fn wait(&self, id: &WatchId) -> Result<Envelope, VigilError> {
-        todo!()
+        loop {
+            let mut envelope = self.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(MAX_MAX_S) }).await?;
+            if envelope.status.is_finished() {
+                envelope.waited_s = None;
+                envelope.max_s = None;
+                return Ok(envelope);
+            }
+        }
+    }
+
+    /// The watches a call covers. With an id: that watch (`NotFound` if it
+    /// does not exist). Without: this process's pending watches and its
+    /// finished watches whose result it has not yet returned (V7, D2).
+    fn covered_ids(&self, requested: Option<&WatchId>) -> Result<Vec<WatchId>, VigilError> {
+        if let Some(id) = requested {
+            self.load_watch(id)?;
+            return Ok(vec![id.clone()]);
+        }
+        let session = self.session.lock().expect("session mutex poisoned");
+        let covered: Vec<WatchId> = session
+            .created
+            .iter()
+            .filter(|id| !session.returned.contains(*id))
+            .filter(|id| self.store.load(id).is_ok())
+            .cloned()
+            .collect();
+        if covered.is_empty() {
+            return Err(VigilError::NothingToCover);
+        }
+        Ok(covered)
+    }
+
+    /// Build the return value of a call (V8, V14, X1) and record what it
+    /// delivered.
+    fn keepalive_envelope(
+        &self,
+        covered: &[WatchId],
+        changed_in_call: &[ChangedInput],
+        waited_s: u64,
+        max_s: u64,
+    ) -> Result<Envelope, VigilError> {
+        let now = self.clock.now();
+        let mut watches: Vec<WatchFile> =
+            covered.iter().map(|id| self.load_watch(id).map(|watch| expired_if_overdue(watch, now))).collect::<Result<_, _>>()?;
+        // V8: earliest finished first, ties by id; else the nearest deadline.
+        let mut finished: Vec<&WatchFile> = watches.iter().filter(|watch| watch.status.is_finished()).collect();
+        finished.sort_by(|a, b| (a.finished_at, &a.spec.id).cmp(&(b.finished_at, &b.spec.id)));
+        let primary = match finished.first() {
+            Some(first) => (*first).clone(),
+            None => watches
+                .iter()
+                .min_by(|a, b| (a.deadline_at, &a.spec.id).cmp(&(b.deadline_at, &b.spec.id)))
+                .expect("a call covers at least one watch")
+                .clone(),
+        };
+
+        let events: Vec<Event> = finished.iter().flat_map(|watch| watch.events.clone()).collect();
+        let others: Vec<OtherWatch> = finished
+            .iter()
+            .filter(|watch| watch.spec.id != primary.spec.id)
+            .map(|watch| OtherWatch {
+                watch_id: watch.spec.id.clone(),
+                status: watch.status,
+                event_ids: watch.events.iter().map(|event| event.event_id.clone()).collect(),
+            })
+            .collect();
+        let delivered: Vec<WatchId> = finished.iter().map(|watch| watch.spec.id.clone()).collect();
+
+        {
+            let mut session = self.session.lock().expect("session mutex poisoned");
+            session.session_ticks += 1;
+            session.returned.extend(delivered);
+        }
+        let mut envelope = self.envelope_for(&primary, now);
+        envelope.waited_s = Some(waited_s);
+        envelope.max_s = Some(max_s);
+        envelope.events = events;
+        envelope.others = others;
+        if !primary.status.is_finished() {
+            envelope.digest = cut_digest(&digest_of(changed_in_call), self.config.digest_max_bytes);
+        }
+        watches.clear();
+        Ok(envelope)
     }
 }
 
@@ -880,7 +1041,7 @@ mod tests {
         write_file(&path, "old\n");
         env.reader.set_text("cmd:overrun", "v1");
         let mut request = change_request("w", &path, 20);
-        request.inputs.push(cmd("overrun", Some(20.0)));
+        request.inputs.push(cmd("overrun", Some(19.0)));
         let id = vigil.create(request).await.unwrap().watch_id;
         env.reader.set_sleep("cmd:overrun", Duration::from_secs(100));
         append_file(&path, "ERROR: appended before the slow call\n");
@@ -904,9 +1065,9 @@ mod tests {
     async fn a_hanging_real_cmd_ends_as_a_timeout_reading_inside_the_call_and_the_tick_completes() {
         // why: X4 (T5): the round-2 design rolled back the WHOLE tick when a
         //      slow command outlived the call, so a command that always hangs
-        //      (here: `sleep 100` once a marker exists, timeout_s 20 = the new
+        //      (here: `sleep 100` once a marker exists, timeout_s 19 = the X7
         //      ceiling) could never let a tick finish or a durable change
-        //      fire. Now the 20 s timeout fires INSIDE the 30 s call: the read
+        //      fire. Now the 19 s timeout fires INSIDE the 30 s call: the read
         //      becomes an error reading (a change, R3), the tick completes and
         //      is written, and the watch fires on it at about 20 s. Real
         //      create/baseline (marker absent), paused budgeted call: a child
@@ -920,7 +1081,7 @@ mod tests {
         let mut request = change_request("w", &env.input_path("seed"), 20);
         request.inputs = vec![Input::Cmd {
             argv: vec!["sh".into(), "-c".into(), format!("if [ -e '{}' ]; then sleep 100; fi; echo ok", marker.display())],
-            timeout_s: Some(20.0),
+            timeout_s: Some(19.0),
             cwd: None,
         }];
         let id = vigil.create(request).await.unwrap().watch_id;
@@ -931,7 +1092,7 @@ mod tests {
         tokio::time::resume();
         assert_eq!(envelope.status, WatchStatus::Fired, "the timeout reading is a change and the tick completed");
         let waited = envelope.waited_s.unwrap();
-        assert!((20..=22).contains(&waited), "fired at the 20 s timeout, not the 30 s budget: waited {waited}");
+        assert!((19..=21).contains(&waited), "fired at the 19 s timeout, not the 30 s budget: waited {waited}");
         assert!(envelope.events[0].input.starts_with("cmd:"), "{:?}", envelope.events[0]);
         assert!(envelope.digest.contains("timeout"), "{:?}", envelope.digest);
         assert_eq!(env.vigil.store().load(&id).unwrap().tick, 1, "the tick was written");
@@ -1052,12 +1213,12 @@ mod tests {
             (vec![file()], false, ten, D::from_secs(1), "0 + 0 + 1"),
             (vec![file(), glob(), proc()], false, ten, D::from_secs(1), "local inputs wait 0"),
             (vec![cmd("x", None)], false, ten, D::from_secs(11), "cmd default 10 + 1"),
-            (vec![cmd("x", Some(20.0))], false, ten, D::from_secs(21), "20 + 1"),
-            (vec![cmd("x", Some(20.0))], true, ten, D::from_secs(31), "20 + 10 + 1"),
+            (vec![cmd("x", Some(19.0))], false, ten, D::from_secs(20), "19 + 1"),
+            (vec![cmd("x", Some(19.0))], true, ten, D::from_secs(30), "19 + 10 + 1"),
             (vec![cmd("x", Some(0.5)), url()], false, ten, D::from_secs(11), "max(0.5, 10) + 1"),
             (vec![file()], true, ten, D::from_secs(11), "0 + 10 + 1"),
             (vec![file()], true, D::from_secs(2), D::from_secs(3), "0 + 2 + 1"),
-            (vec![cmd("a", Some(5.0)), cmd("b", Some(20.0)), file()], true, ten, D::from_secs(31), "max(5, 20, 0) + 10 + 1"),
+            (vec![cmd("a", Some(5.0)), cmd("b", Some(19.0)), file()], true, ten, D::from_secs(30), "max(5, 19, 0) + 10 + 1"),
             (vec![cmd("x", Some(0.1))], false, ten, D::from_millis(1100), "0.1 + 1"),
         ];
         for (inputs, judge, judge_timeout, expected, derivation) in rows {
@@ -1069,14 +1230,14 @@ mod tests {
     async fn a_tick_starts_only_while_the_budget_left_covers_the_reserve_boundary_inclusive() {
         // why: X4 (T5): "a tick is not started when the remaining budget is
         //      under max(input timeouts)+judge timeout+1 s". Interval 1, reads
-        //      take no time. With timeout_s 20 the reserve is 21 s, so in a
-        //      30 s call a tick may start while 30 - t >= 21, i.e. t = 0..=9:
-        //      EXACTLY 10 ticks (the tick at t = 9 has exactly 21 s left and
-        //      starts: inclusive; t = 10 has 20 and does not). With the default
+        //      take no time. With timeout_s 19 (X7) the reserve is 20 s, so in a
+        //      30 s call a tick may start while 30 - t >= 20, i.e. t = 0..=10:
+        //      EXACTLY 11 ticks (the tick at t = 10 has exactly 20 s left and
+        //      starts: inclusive; t = 11 has 19 and does not). With the default
         //      10 s timeout the reserve is 11 s: t = 0..=19, 20 ticks. The call
         //      still lasts the whole 30 s either way (it waits out max_s, V26).
         // proves: CLAIM(tick-reserve)
-        for (timeout_s, expected_ticks) in [(Some(20.0), 10u64), (None, 20)] {
+        for (timeout_s, expected_ticks) in [(Some(19.0), 11u64), (None, 20)] {
             let env = paused_env();
             let vigil = process(&env);
             env.reader.set_text("cmd:quiet", "same");
@@ -1094,9 +1255,9 @@ mod tests {
     async fn a_due_tick_runs_first_in_a_call_even_when_the_reserve_exceeds_the_budget_and_progress_continues_across_calls() {
         // why: X4 (T5) "a due tick runs first in each call", which is what
         //      makes progress possible when reserve > budget: a judge watch on
-        //      a timeout_s 20 command has reserve 20 + 10 + 1 = 31 s, more
-        //      than the 30 s minimum call (a flagged contradiction: "always
-        //      finishes" needs this exception). Call 1: the tick is due at the
+        //      a timeout_s 19 (X7) command has reserve 19 + 10 + 1 = 30 s, equal
+        //      to the 30 s minimum call (X7 removed the round-2 contradiction;
+        //      the exemption is kept for lock waits that ate the budget). Call 1: the tick is due at the
         //      start, so it runs (quiet) although 31 > 30; the next tick (due
         //      at t = 20, 10 s left) must NOT start. Call 2 starts with a due
         //      tick again, runs it first, sees the change and fires: the watch
@@ -1106,11 +1267,11 @@ mod tests {
         let vigil = process(&env);
         env.reader.set_text("cmd:j", "v1");
         let mut request = judge_request("w", std::path::Path::new("/unused"), 20);
-        request.inputs = vec![cmd("j", Some(20.0))];
+        request.inputs = vec![cmd("j", Some(19.0))];
         let id = vigil.create(request).await.unwrap().watch_id;
 
         let first = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
-        assert_eq!((first.status, first.tick), (WatchStatus::Pending, 1), "the due tick ran; the one at t=20 (10 s left < 31) did not");
+        assert_eq!((first.status, first.tick), (WatchStatus::Pending, 1), "the due tick ran; the one at t=20 (10 s left < 30) did not");
         assert_eq!(env.judge.call_count(), 0, "nothing changed, so no judge call");
 
         env.reader.set_text("cmd:j", "v2");
@@ -1128,9 +1289,9 @@ mod tests {
         //      longer than the budget allows being restarted and discarded on
         //      every max_s = 30 call, so even a durable change never fires. A
         //      cmd that takes 15 s (virtual: scripted, no real waits) with
-        //      timeout_s 20 (reserve 21 s) and interval 1: call 1 runs the due
+        //      timeout_s 19 (reserve 20 s) and interval 1: call 1 runs the due
         //      tick (15 s, quiet, WRITTEN: file tick 1), does not start another
-        //      (15 s left < 21), and returns pending at 30 s. The command's
+        //      (15 s left < 20), and returns pending at 30 s. The command's
         //      output then changes; call 2 runs the due tick first, it takes
         //      15 s again, and the watch fires at tick 2 with waited_s 15.
         //      Under rollback-everything semantics tick 1 would not persist.
@@ -1138,7 +1299,7 @@ mod tests {
         let env = paused_env();
         let vigil = process(&env);
         env.reader.set_text("cmd:slow", "v1");
-        let id = scripted_watch(&vigil, "w", vec![cmd("slow", Some(20.0))], 1).await;
+        let id = scripted_watch(&vigil, "w", vec![cmd("slow", Some(19.0))], 1).await;
         env.reader.set_sleep("cmd:slow", Duration::from_secs(15));
 
         let started = Instant::now();

@@ -47,8 +47,8 @@ pub enum CreateError {
     /// V19/D7: URL inputs are http only.
     #[error("only http URLs are supported, got {0:?}")]
     UnsupportedUrlScheme(String),
-    /// V19 + X4: `timeout_s` must lie in 0.1..=20.
-    #[error("timeout_s must be within 0.1..=20, got {0}")]
+    /// V19 + X7: `timeout_s` must lie in 0.1..=19.
+    #[error("timeout_s must be within 0.1..=19, got {0}")]
     TimeoutOutOfRange(f64),
     #[error(transparent)]
     Store(#[from] StoreError),

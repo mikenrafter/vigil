@@ -35,7 +35,18 @@ impl Config {
     /// `MIN_JUDGE_STATE_BYTES` / `MIN_DIGEST_MAX_BYTES` are raised to them
     /// (W2, W3). Values above the floors are taken as given.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Config {
-        todo!()
+        let number = |name: &str, default: usize, floor: usize| {
+            lookup(name)
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .map_or(default, |value| value.max(floor))
+        };
+        Config {
+            judge_url: lookup("VIGIL_JUDGE_URL").unwrap_or_else(|| DEFAULT_JUDGE_URL.to_string()),
+            judge_state_bytes: number("VIGIL_JUDGE_STATE_BYTES", DEFAULT_JUDGE_STATE_BYTES, MIN_JUDGE_STATE_BYTES),
+            digest_max_bytes: number("VIGIL_DIGEST_MAX_BYTES", DEFAULT_DIGEST_MAX_BYTES, MIN_DIGEST_MAX_BYTES),
+            judge_timeout: Duration::from_secs(10),
+            health_timeout: Duration::from_secs(2),
+        }
     }
 }
 

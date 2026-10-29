@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 
 use crate::clock::Timestamp;
 use crate::error::CreateError;
-use crate::judge::{Answer, JudgeRule};
+use crate::judge::{Answer, JudgeRule, RuleTest};
 
 pub const MIN_INTERVAL_S: u64 = 1;
 pub const MAX_INTERVAL_S: u64 = 3600;
@@ -25,10 +25,13 @@ pub const MAX_PROMPT_BYTES: usize = 1024;
 /// V19: `deadline_s` is 1..=604800 (7 days).
 pub const MIN_DEADLINE_S: u64 = 1;
 pub const MAX_DEADLINE_S: u64 = 604_800;
-/// V19 + X4: `cmd.timeout_s` is 0.1..=20 (X4 lowered the ceiling from 60 so a
-/// tick due at the start of a >= 30 s call always has room to finish).
+/// V19 + X4 + X7: `cmd.timeout_s` is 0.1..=19 (X7: worst tick reserve is
+/// 19 + 10 judge + 1 = 30 s, which fits the smallest call).
 pub const MIN_TIMEOUT_S: f64 = 0.1;
-pub const MAX_TIMEOUT_S: f64 = 20.0;
+/// R3: a `cmd` without `timeout_s`, and every `url` / `port` read, waits at
+/// most this long.
+pub const DEFAULT_TIMEOUT_S: f64 = 10.0;
+pub const MAX_TIMEOUT_S: f64 = 19.0;
 /// X2: an event `summary` is at most this many bytes (cut on a UTF-8
 /// boundary).
 pub const MAX_SUMMARY_BYTES: usize = 200;
@@ -43,11 +46,24 @@ pub struct WatchId(String);
 
 impl WatchId {
     pub fn parse(raw: &str) -> Result<WatchId, CreateError> {
-        todo!()
+        let valid = (1..=64).contains(&raw.len())
+            && raw.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        if valid {
+            Ok(WatchId(raw.to_string()))
+        } else {
+            Err(CreateError::InvalidId(raw.to_string()))
+        }
     }
     /// A fresh, valid id. Two calls never return the same id.
     pub fn generate() -> WatchId {
-        todo!()
+        // CLAIM(generated-ids-distinct): the counter is unique within a
+        // process; wall-clock nanoseconds and the pid separate processes.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        WatchId(format!("w-{nanos:x}-{:x}-{count:x}", std::process::id()))
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -62,7 +78,8 @@ impl std::fmt::Display for WatchId {
 
 impl<'de> Deserialize<'de> for WatchId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        todo!("deserialize a string, then WatchId::parse")
+        let raw = String::deserialize(deserializer)?;
+        WatchId::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -139,18 +156,34 @@ impl Input {
     /// `glob:<pattern>`, `cmd:<argv joined by spaces>`, `url:<url>`,
     /// `port:<host>:<port>`, `process:<pid>`.
     pub fn label(&self) -> String {
-        todo!()
+        match self {
+            Input::File { path, .. } => format!("file:{}", path.display()),
+            Input::Glob { pattern, .. } => format!("glob:{pattern}"),
+            Input::Cmd { argv, .. } => format!("cmd:{}", argv.join(" ")),
+            Input::Url { url } => format!("url:{url}"),
+            Input::Port { host, port, .. } => format!("port:{host}:{port}"),
+            Input::Process { pid, .. } => format!("process:{pid}"),
+        }
     }
     /// Does this input carry a `want` (used by fire = condition)?
     pub fn has_want(&self) -> bool {
-        todo!()
+        match self {
+            Input::Port { want, .. } => want.is_some(),
+            Input::Process { want, .. } => want.is_some(),
+            _ => false,
+        }
     }
     /// The longest this input can keep one read waiting (X4 tick reserve):
     /// `cmd` its `timeout_s` (default 10 s); `url` and `port` 10 s (the
     /// reader's fixed timeout); `file`, `glob` and `process` read local state
     /// without waiting, so `Duration::ZERO`.
     pub fn read_timeout(&self) -> std::time::Duration {
-        todo!()
+        let default = std::time::Duration::from_secs_f64(DEFAULT_TIMEOUT_S);
+        match self {
+            Input::Cmd { timeout_s, .. } => timeout_s.map_or(default, std::time::Duration::from_secs_f64),
+            Input::Url { .. } | Input::Port { .. } => default,
+            Input::File { .. } | Input::Glob { .. } | Input::Process { .. } => std::time::Duration::ZERO,
+        }
     }
 }
 
@@ -199,6 +232,57 @@ pub enum FireRule {
     Condition,
 }
 
+fn validate_input(input: &Input) -> Result<(), CreateError> {
+    match input {
+        Input::Cmd { argv, timeout_s, .. } => {
+            if argv.is_empty() {
+                return Err(CreateError::EmptyArgv);
+            }
+            if let Some(timeout) = *timeout_s
+                && !(MIN_TIMEOUT_S..=MAX_TIMEOUT_S).contains(&timeout)
+            {
+                return Err(CreateError::TimeoutOutOfRange(timeout));
+            }
+        }
+        Input::Url { url } => {
+            let is_http = url.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
+            if !is_http {
+                return Err(CreateError::UnsupportedUrlScheme(url.clone()));
+            }
+        }
+        Input::File { .. } | Input::Glob { .. } | Input::Port { .. } | Input::Process { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_judge(questions: &Map<String, Value>, rule: &JudgeRule) -> Result<(), CreateError> {
+    if questions.is_empty() {
+        return Err(CreateError::EmptyQuestions);
+    }
+    let Some(question) = questions.get(&rule.question) else {
+        return Err(CreateError::UnknownRuleQuestion(rule.question.clone()));
+    };
+    let question_type = question.get("type").and_then(Value::as_str);
+    if question_type != Some(rule.test.question_type()) {
+        return Err(CreateError::RuleKindMismatch {
+            question: rule.question.clone(),
+            question_type: question_type.map(str::to_string),
+            rule_kind: rule.test.question_type().to_string(),
+        });
+    }
+    let in_unit_range = |field: &str, value: f64| {
+        if (0.0..=1.0).contains(&value) {
+            Ok(())
+        } else {
+            Err(CreateError::ProbabilityOutOfRange { field: field.to_string(), value })
+        }
+    };
+    if let RuleTest::NoulGte(probability) = rule.test {
+        in_unit_range("judge_rule.noul_gte", probability)?;
+    }
+    in_unit_range("judge_rule.min_confidence", rule.min_confidence)
+}
+
 /// A checked watch definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchSpec {
@@ -218,14 +302,70 @@ impl WatchSpec {
     /// touch disk, so duplicate-id and judge-reachability checks live in
     /// `Vigil::create`.
     pub fn parse(request: CreateRequest) -> Result<WatchSpec, CreateError> {
-        todo!()
+        let id = match request.id.as_deref() {
+            Some(raw) => WatchId::parse(raw)?,
+            None => WatchId::generate(),
+        };
+        if request.inputs.len() > MAX_INPUTS {
+            return Err(CreateError::TooManyInputs(request.inputs.len()));
+        }
+        if request.prompt.len() > MAX_PROMPT_BYTES {
+            return Err(CreateError::PromptTooLong(request.prompt.len()));
+        }
+        let deadline_s = request.deadline_s.unwrap_or(DEFAULT_DEADLINE_S);
+        if !(MIN_DEADLINE_S..=MAX_DEADLINE_S).contains(&deadline_s) {
+            return Err(CreateError::DeadlineOutOfRange(deadline_s));
+        }
+        let interval_s = request.interval_s.unwrap_or(DEFAULT_INTERVAL_S).clamp(MIN_INTERVAL_S, MAX_INTERVAL_S);
+        for input in &request.inputs {
+            validate_input(input)?;
+        }
+        let fire = match request.fire {
+            FireKind::Judge => {
+                let (Some(questions), Some(rule)) = (request.judge_questions, request.judge_rule) else {
+                    return Err(CreateError::MissingJudgeFields);
+                };
+                validate_judge(&questions, &rule)?;
+                FireRule::Judge { judge_questions: JudgeQuestions(questions), judge_rule: rule }
+            }
+            FireKind::Change | FireKind::Condition => {
+                if request.judge_questions.is_some() || request.judge_rule.is_some() {
+                    return Err(CreateError::UnexpectedJudgeFields);
+                }
+                if request.fire == FireKind::Change {
+                    FireRule::Change
+                } else {
+                    if !request.inputs.iter().any(Input::has_want) {
+                        return Err(CreateError::ConditionNeedsWant);
+                    }
+                    FireRule::Condition
+                }
+            }
+        };
+        Ok(WatchSpec { id, prompt: request.prompt, inputs: request.inputs, interval_s, deadline_s, fire })
     }
 
     /// V11: resolve relative file paths, glob patterns and `cmd` working
     /// directories against `cwd` (the creating process's cwd); a `cmd` without
     /// a `cwd` gets `cwd`. Absolute values are left alone.
-    pub fn absolutize(self, cwd: &std::path::Path) -> WatchSpec {
-        todo!()
+    pub fn absolutize(mut self, cwd: &std::path::Path) -> WatchSpec {
+        for input in &mut self.inputs {
+            match input {
+                Input::File { path, .. } => *path = cwd.join(&*path),
+                Input::Glob { pattern, .. } => {
+                    // `Path::join` keeps an absolute right-hand side as is.
+                    *pattern = cwd.join(&*pattern).to_string_lossy().into_owned();
+                }
+                Input::Cmd { cwd: command_cwd, .. } => {
+                    *command_cwd = Some(match command_cwd.take() {
+                        Some(given) => cwd.join(given),
+                        None => cwd.to_path_buf(),
+                    });
+                }
+                Input::Url { .. } | Input::Port { .. } | Input::Process { .. } => {}
+            }
+        }
+        self
     }
 }
 
@@ -320,7 +460,7 @@ impl Event {
     /// V3 + W1 id of the `index`-th (0-based) event emitted at `tick`:
     /// `<watch_id>:<tick>:<index>`, so index 0 is `build:17:0`.
     pub fn make_id(watch_id: &str, tick: u64, index: usize) -> String {
-        todo!()
+        format!("{watch_id}:{tick}:{index}")
     }
 }
 
@@ -387,16 +527,38 @@ pub struct WatchFile {
 impl WatchFile {
     /// A new pending watch: tick 0, `deadline_at = now + spec.deadline_s`.
     pub fn new(spec: WatchSpec, now: Timestamp) -> WatchFile {
-        todo!()
+        WatchFile {
+            deadline_at: now.plus_secs(spec.deadline_s),
+            spec,
+            status: WatchStatus::Pending,
+            created_at: now,
+            finished_at: None,
+            tick: 0,
+            last_tick_at: None,
+            input_states: Vec::new(),
+            judge_strikes: 0,
+            judge_status: JudgeStatus::default(),
+            pending_change: None,
+            events: Vec::new(),
+            last_digest: String::new(),
+        }
     }
     /// V3/V4: store the terminal result. Succeeds exactly once; afterwards the
     /// watch is immutable and this returns `Err` without touching anything.
     pub fn finish(&mut self, terminal: Terminal) -> Result<(), AlreadyFinished> {
-        todo!()
+        if self.status.is_finished() {
+            return Err(AlreadyFinished(self.status));
+        }
+        self.status = terminal.status.into();
+        self.finished_at = Some(terminal.finished_at);
+        self.events = terminal.events;
+        self.last_digest = terminal.digest;
+        self.pending_change = None;
+        Ok(())
     }
     /// V16: a pending watch whose `deadline_at` is at or before `now`.
     pub fn is_overdue(&self, now: Timestamp) -> bool {
-        todo!()
+        self.status == WatchStatus::Pending && self.deadline_at <= now
     }
 }
 
@@ -897,10 +1059,10 @@ mod tests {
             req.inputs = vec![Input::Cmd { argv: vec!["true".into()], timeout_s: t, cwd: None }];
             WatchSpec::parse(req)
         };
-        for ok in [None, Some(0.1), Some(10.0), Some(19.9), Some(20.0)] {
+        for ok in [None, Some(0.1), Some(10.0), Some(18.9), Some(19.0)] {
             assert!(cmd(ok).is_ok(), "{ok:?}");
         }
-        for bad in [0.0, 0.05, -1.0, 20.1, 20.5, 21.0, 30.0, 60.0, 60.5, 3600.0, f64::NAN, f64::INFINITY] {
+        for bad in [0.0, 0.05, -1.0, 19.1, 20.0, 20.5, 21.0, 30.0, 60.0, 60.5, 3600.0, f64::NAN, f64::INFINITY] {
             assert!(matches!(cmd(Some(bad)), Err(CreateError::TimeoutOutOfRange(_))), "timeout_s {bad}");
         }
     }
@@ -916,7 +1078,7 @@ mod tests {
         use std::time::Duration;
         let cmd = |t: Option<f64>| Input::Cmd { argv: vec!["x".into()], timeout_s: t, cwd: None };
         assert_eq!(cmd(None).read_timeout(), Duration::from_secs(10));
-        assert_eq!(cmd(Some(20.0)).read_timeout(), Duration::from_secs(20));
+        assert_eq!(cmd(Some(19.0)).read_timeout(), Duration::from_secs(19));
         assert_eq!(cmd(Some(0.5)).read_timeout(), Duration::from_millis(500));
         assert_eq!(Input::Url { url: "http://127.0.0.1:1/".into() }.read_timeout(), Duration::from_secs(10));
         assert_eq!(Input::Port { host: "127.0.0.1".into(), port: 1, want: None }.read_timeout(), Duration::from_secs(10));

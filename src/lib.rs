@@ -3,7 +3,7 @@
 //!
 //! RED phase: every public item below is a stub. Types and signatures are the
 //! contract the tests compile against; bodies are `todo!()` unless trivial.
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code, unused_variables)] // phase 2-3 stubs remain
 
 pub mod clock;
 pub mod config;

@@ -9,12 +9,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Timestamp};
 use crate::config::Config;
-use crate::envelope::Envelope;
-use crate::error::VigilError;
-use crate::inputs::{InputReader, SystemReader};
+use crate::envelope::{cut_digest, Envelope, Next};
+use crate::error::{CreateError, StoreError, VigilError};
+use crate::inputs::{InputReader, Reading, SystemReader};
 use crate::judge::Judge;
-use crate::store::Store;
-use crate::watch::{CreateRequest, WatchId, WatchStatus};
+use crate::store::{Store, StoreLock};
+use crate::watch::{
+    CreateRequest, FireRule, Input, InputState, Terminal, TerminalStatus, WatchFile, WatchId, WatchSpec, WatchStatus,
+};
+
+/// How often a contended lock is retried. Polling (not a blocking `flock`)
+/// keeps the waiting future cancellable: a dropped call leaves no thread
+/// parked on a lock it would later take and release.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Created {
@@ -107,34 +114,203 @@ impl Vigil {
     /// between create and the first `keepalive` is a change), each read going
     /// through `self.reader`, and writes the file. The global lock is never
     /// held while inputs are read, so another create or any tick of another
-    /// watch proceeds meanwhile. No tick runs (`tick` stays 0). Also prunes.
+    /// watch proceeds meanwhile. No tick runs (`tick` stays 0). Does not prune
+    /// (the binary prunes on every run, `list` prunes too).
     pub async fn create(&self, request: CreateRequest) -> Result<Created, VigilError> {
-        todo!()
+        let spec = WatchSpec::parse(request)?.absolutize(&self.cwd);
+        if matches!(spec.fire, FireRule::Judge { .. }) && !self.judge.healthy().await {
+            return Err(CreateError::JudgeUnreachable.into());
+        }
+        let id = spec.id.clone();
+        let _watch_lock = self.lock_watch(&id).await?;
+        let mut watch = WatchFile::new(spec, self.clock.now());
+        {
+            // X3: the global lock only covers the id check and the placeholder
+            // write that reserves the id; the baseline is read after it is gone.
+            let _global = self.lock_global().await?;
+            if self.store.watch_path(&id).exists() {
+                return Err(CreateError::DuplicateId(id.to_string()).into());
+            }
+            self.store.save(&watch)?;
+        }
+        // V1: the baseline of every input is recorded now, not at the first tick.
+        let baseline = vec![InputState::default(); watch.spec.inputs.len()];
+        let readings = self.read_all(&watch.spec.inputs, &baseline).await;
+        watch.input_states = readings.into_iter().map(|reading| reading.state).collect();
+        self.store.save(&watch)?;
+
+        self.session.lock().expect("session mutex poisoned").created.insert(id.clone());
+        Ok(Created {
+            watch_id: id,
+            status: watch.status,
+            created_at: watch.created_at,
+            deadline_at: watch.deadline_at,
+        })
     }
 
     /// `watch_status`: non-blocking, does not tick. For a finished (or overdue,
     /// V16) watch it replays the stored terminal result (V3).
     pub async fn status(&self, id: &WatchId) -> Result<StatusReport, VigilError> {
-        todo!()
+        let now = self.clock.now();
+        let watch = expired_if_overdue(self.load_watch(id)?, now);
+        let envelope = self.envelope_for(&watch, now);
+        Ok(StatusReport { envelope, judge_reachable: self.judge.healthy().await })
     }
 
     /// `watch_list`: every watch in the state root, any session. Prunes.
     pub async fn list(&self) -> Result<Vec<WatchSummary>, VigilError> {
-        todo!()
+        // Pruning is housekeeping; a failure to prune must not hide the list.
+        let _ = self.prune();
+        let now = self.clock.now();
+        Ok(self
+            .store
+            .list()?
+            .into_iter()
+            .map(|watch| expired_if_overdue(watch, now))
+            .map(|watch| WatchSummary {
+                id: watch.spec.id,
+                status: watch.status,
+                tick: watch.tick,
+                created_at: watch.created_at,
+                deadline_at: watch.deadline_at,
+            })
+            .collect())
     }
 
     /// `watch_cancel`. Cancel on an already finished watch returns the stored
     /// result unchanged (V4). A pending watch past its deadline is already
     /// expired (V16) and cancel returns that.
     pub async fn cancel(&self, id: &WatchId) -> Result<Envelope, VigilError> {
-        todo!()
+        let (_lock, mut watch) = self.lock_and_load(id).await?;
+        let now = self.clock.now();
+        if watch.is_overdue(now) {
+            // W5: the deadline passed before the cancel arrived; expiry wins.
+            watch = expired_if_overdue(watch, now);
+            self.store.save(&watch)?;
+        } else if !watch.status.is_finished() {
+            let terminal = Terminal {
+                status: TerminalStatus::Cancelled,
+                finished_at: now,
+                events: Vec::new(),
+                digest: watch.last_digest.clone(),
+            };
+            watch.finish(terminal).expect("a pending watch accepts its terminal result");
+            self.store.save(&watch)?;
+        }
+        Ok(self.envelope_for(&watch, now))
     }
 
     /// Delete finished watches older than 7 days; returns deleted ids.
     /// Takes the locks itself (`Store::prune`).
     pub fn prune(&self) -> Result<Vec<WatchId>, VigilError> {
-        todo!()
+        Ok(self.store.prune(self.clock.now())?)
     }
+
+    /// Load a watch, naming the id in `NotFound`.
+    pub(crate) fn load_watch(&self, id: &WatchId) -> Result<WatchFile, VigilError> {
+        self.store.load(id).map_err(|error| match error {
+            StoreError::NotFound(_) => VigilError::not_found(id),
+            other => other.into(),
+        })
+    }
+
+    /// The watch's lock (X3), polled so the wait can be cancelled.
+    pub(crate) async fn lock_watch(&self, id: &WatchId) -> Result<StoreLock, VigilError> {
+        loop {
+            if let Some(lock) = self.store.try_lock_watch(id)? {
+                return Ok(lock);
+            }
+            tokio::time::sleep(LOCK_POLL).await;
+        }
+    }
+
+    async fn lock_global(&self) -> Result<StoreLock, VigilError> {
+        loop {
+            if let Some(lock) = self.store.try_lock()? {
+                return Ok(lock);
+            }
+            tokio::time::sleep(LOCK_POLL).await;
+        }
+    }
+
+    /// Take an existing watch's lock and read it under the lock. An unknown
+    /// id fails before any lock file is created; a watch pruned while we
+    /// waited is `NotFound` and its recreated lock file is removed again.
+    pub(crate) async fn lock_and_load(&self, id: &WatchId) -> Result<(StoreLock, WatchFile), VigilError> {
+        self.load_watch(id)?;
+        let lock = self.lock_watch(id).await?;
+        match self.load_watch(id) {
+            Ok(watch) => Ok((lock, watch)),
+            Err(error) => {
+                let _ = std::fs::remove_file(self.store.watch_lock_path(id));
+                Err(error)
+            }
+        }
+    }
+
+    /// Read every input at once through the reader seam (X4); readings come
+    /// back in input order. `previous` has one state per input.
+    pub(crate) async fn read_all(&self, inputs: &[Input], previous: &[InputState]) -> Vec<Reading> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, (input, state)) in inputs.iter().zip(previous).enumerate() {
+            let (reader, input, state) = (self.reader.clone(), input.clone(), state.clone());
+            tasks.spawn(async move { (index, reader.read(&input, &state).await) });
+        }
+        let mut readings: Vec<Option<Reading>> = (0..inputs.len()).map(|_| None).collect();
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((index, reading)) => readings[index] = Some(reading),
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => panic!("input read task was cancelled: {error}"),
+            }
+        }
+        readings.into_iter().map(|reading| reading.expect("every spawned read reports back")).collect()
+    }
+
+    /// The envelope describing `watch` as of `now` (V8). Non-blocking: no
+    /// `waited_s` / `max_s`. A terminal envelope carries the stored events
+    /// and `last_digest` cut to the configured bound (V14, V27); a pending
+    /// one has no digest (V14: that is built per blocking call).
+    pub(crate) fn envelope_for(&self, watch: &WatchFile, now: Timestamp) -> Envelope {
+        let end = watch.finished_at.unwrap_or(now);
+        let terminal = watch.status.is_finished();
+        Envelope {
+            watch_id: watch.spec.id.clone(),
+            status: watch.status,
+            now,
+            tick: watch.tick,
+            session_ticks: self.session.lock().expect("session mutex poisoned").session_ticks,
+            elapsed_s: end.secs_since(watch.created_at).max(0) as u64,
+            deadline_in_s: watch.deadline_at.secs_since(end).max(0) as u64,
+            waited_s: None,
+            max_s: None,
+            events: watch.events.clone(),
+            digest: if terminal { cut_digest(&watch.last_digest, self.config.digest_max_bytes) } else { String::new() },
+            judge_status: watch.judge_status,
+            next: match watch.status {
+                WatchStatus::Pending => Next::CallKeepaliveAgain,
+                WatchStatus::Fired => Next::ActOnEvents,
+                WatchStatus::Expired | WatchStatus::Cancelled => Next::WatchEnded,
+            },
+            others: Vec::new(),
+        }
+    }
+}
+
+/// V16: a pending watch past its deadline reads as expired, finished at the
+/// deadline, whether or not anything ever ticked it. Other watches pass
+/// through unchanged.
+pub(crate) fn expired_if_overdue(mut watch: WatchFile, now: Timestamp) -> WatchFile {
+    if watch.is_overdue(now) {
+        let terminal = Terminal {
+            status: TerminalStatus::Expired,
+            finished_at: watch.deadline_at,
+            events: Vec::new(),
+            digest: watch.last_digest.clone(),
+        };
+        watch.finish(terminal).expect("an overdue watch is pending, so it accepts a terminal result");
+    }
+    watch
 }
 
 #[cfg(test)]
@@ -295,7 +471,7 @@ mod tests {
         slow_cmd.inputs = vec![Input::Cmd { argv: vec!["true".into()], timeout_s: Some(21.0), cwd: None }];
         assert!(
             matches!(env.vigil.create(slow_cmd).await, Err(VigilError::Create(CreateError::TimeoutOutOfRange(_)))),
-            "X4: timeout_s above 20 is a create-time error"
+            "X7: timeout_s above 19 is a create-time error"
         );
         assert!(json_files(&env).is_empty());
         assert!(!env.root().join("locks").join("ok.lock").exists(), "validation happens before any lock is taken");
@@ -556,7 +732,7 @@ mod tests {
     // ---- X3: create does not hold the global lock while reading baselines ----
 
     fn gated_cmd(name: &str) -> Input {
-        Input::Cmd { argv: vec![name.into()], timeout_s: Some(20.0), cwd: None }
+        Input::Cmd { argv: vec![name.into()], timeout_s: Some(19.0), cwd: None }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
