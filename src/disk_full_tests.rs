@@ -1,5 +1,6 @@
 //! Engine-level tests for surviving a full disk (specs/disk-full.md, claims
-//! DF1-DF6). Cross-cutting on purpose: one scenario drives the store, the tick,
+//! DF1-DF7, with the amendments DF1a, DF3a, DF3b, DF4a, DF5a, DF5b of
+//! "Amendments after red"). Cross-cutting on purpose: one scenario drives the store, the tick,
 //! `keepalive`, `create`, `cancel` and the envelope together, so it lives in
 //! one module instead of being split across four. Store-only claims are tested
 //! beside the store (`store.rs`), the seam beside the seam (`fault.rs`), and
@@ -8,7 +9,9 @@
 //! The expected wire shapes are copied from the spec, not from any code:
 //!
 //! * failed write:  `"persist": {"ok": false, "kind": "disk_full" | "io",
-//!   "error": "<message>", "path": "<file>", "redelivery": true}` (DF2, DF3);
+//!   "error": "<message>", "path": "<file>"}` plus `"redelivery": true` only
+//!   when the envelope has events or a terminal status that was not saved
+//!   (DF2, DF3a);
 //! * reserve used:  `"persist": {"ok": true, "used_reserve": true,
 //!   "kind": "disk_full"}` (DF4);
 //! * clean write:   no `persist` field at all (DF2).
@@ -106,19 +109,37 @@ fn persist_of(envelope: &Value) -> &Value {
     envelope.get("persist").unwrap_or_else(|| panic!("the envelope has no `persist` field: {envelope}"))
 }
 
-/// The failed-write note, field by field against the spec (DF2, DF3).
-fn assert_failed_persist(envelope: &Value, kind: &str, os_text: &str, file: &Path) {
+/// The failed-write note, field by field against the spec (DF2, DF3a). The
+/// key `redelivery` is `true` when something is at risk (the envelope has
+/// events, or a terminal status that was not saved) and ABSENT otherwise.
+fn assert_failed_persist(envelope: &Value, kind: &str, os_text: &str, file: &Path, redelivery: bool) {
     let persist = persist_of(envelope);
     let object = persist.as_object().unwrap_or_else(|| panic!("persist is not an object: {persist}"));
     let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
     keys.sort();
-    assert_eq!(keys, ["error", "kind", "ok", "path", "redelivery"], "{persist}");
+    if redelivery {
+        assert_eq!(keys, ["error", "kind", "ok", "path", "redelivery"], "{persist}");
+        assert_eq!(persist["redelivery"], true, "{persist}");
+    } else {
+        assert_eq!(keys, ["error", "kind", "ok", "path"], "nothing is at risk, so no `redelivery` key: {persist}");
+    }
     assert_eq!(persist["ok"], false, "{persist}");
     assert_eq!(persist["kind"], kind, "{persist}");
-    assert_eq!(persist["redelivery"], true, "{persist}");
     assert_eq!(persist["path"], file.to_str().unwrap(), "{persist}");
     let error = persist["error"].as_str().unwrap_or_else(|| panic!("error is not a string: {persist}"));
     assert!(error.contains(os_text), "error {error:?} should carry the OS message {os_text:?}");
+}
+
+/// A quiet `cmd` watch "q" (interval 20 s, deadline 3600 s) whose probe
+/// always answers `ok`: its ticks find nothing, and every tick is one scripted
+/// read of `cmd:probe`, which makes ticks countable. The probe's 1 s read
+/// timeout keeps the tick reserve (X4: slowest read + 1 s = 2 s) small, so a
+/// healthy call ticks again as soon as the next interval is due.
+async fn quiet_probe_watch(env: &Env) -> WatchId {
+    env.reader.set_text("cmd:probe", "ok");
+    let mut request = change_request("q", Path::new("/unused"), 20);
+    request.inputs = vec![crate::watch::Input::Cmd { argv: vec!["probe".into()], timeout_s: Some(1.0), cwd: None }];
+    env.vigil.create(request).await.unwrap().watch_id
 }
 
 fn identity(path: &Path) -> (u64, u64) {
@@ -210,12 +231,14 @@ fn a_tick_whose_save_fails_returns_the_same_envelope_a_healthy_tick_returns() {
 
 #[test]
 fn the_failed_save_is_described_in_persist_with_the_kind_the_errno_decides() {
-    // why: DF2: `persist = {ok:false, kind, error, path, redelivery:true}`;
-    //      `kind` is `disk_full` for ENOSPC (28) and EDQUOT (122), `io` for
-    //      anything else. The OS texts are glibc's strerror, written out here
-    //      (not produced by the code under test). `path` is the watch file.
+    // why: DF2: `persist = {ok:false, kind, error, path}`; `kind` is
+    //      `disk_full` for ENOSPC (28) and EDQUOT (122), `io` for anything
+    //      else. The OS texts are glibc's strerror, written out here (not
+    //      produced by the code under test). `path` is the watch file.
     //      Reserve creation fails too, so a disk_full write really is lost.
-    // proves: CLAIM(DF2), CLAIM(DF3)
+    //      The tick fires an event that is not saved, so DF3a says
+    //      `redelivery: true`.
+    // proves: CLAIM(DF2), CLAIM(DF3a)
     let table = [
         (28, "disk_full", "No space left on device"),
         (122, "disk_full", "Disk quota exceeded"),
@@ -227,7 +250,7 @@ fn the_failed_save_is_described_in_persist_with_the_kind_the_errno_decides() {
             let fixture = Fixture::new().await;
             let (vigil, _) = fixture.faulted(disk_stays_full(errno));
             let envelope = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.unwrap_or_else(|e| panic!("errno {errno}: {e}")));
-            assert_failed_persist(&envelope, kind, os_text, &fixture.watch_file());
+            assert_failed_persist(&envelope, kind, os_text, &fixture.watch_file(), true);
         });
     }
 }
@@ -258,24 +281,27 @@ fn a_clean_write_adds_no_persist_field_to_any_envelope() {
 }
 
 #[test]
-fn a_quiet_tick_that_cannot_save_returns_pending_with_persist_and_does_not_spin() {
-    // why: DF1/DF2 for the common case, a tick that found nothing. The save
-    //      still fails, so the persisted `last_tick_at` never advances and the
-    //      watch looks due again at once: a naive loop re-ticks forever (and
-    //      hammers a full disk). The call must come back (the watchdog fails a
-    //      spin) as `pending` / "call keepalive again" with persist.ok = false,
-    //      and must not read more often than a healthy call would: a 30 s call
-    //      at interval 20 reads at t=0 and t=20, plus the baseline read at
-    //      create = 3 reads at most; at least 2 (the baseline and tick 1),
-    //      else nothing was sensed. Which of "return at once" or "keep ticking
-    //      in memory" is chosen is left to the implementation.
-    // proves: CLAIM(DF1), CLAIM(DF2)
+fn a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again() {
+    // why: DF1/DF2 + DF1a for the common case, a tick that found nothing. The
+    //      save fails, so the persisted `last_tick_at` never advances and the
+    //      watch looks due again at once. DF1a: "A tick whose save failed ends
+    //      the call and returns its envelope (no in-memory re-ticking, no
+    //      spin)". A 30 s call at interval 20 would tick at t=0 and t=20, so
+    //      the healthy twin below reads 3 times (the baseline at create + two
+    //      ticks); the faulted call must read exactly 2 (baseline + the one
+    //      tick), must not have waited (`waited_s` 0 on paused time), and must
+    //      say pending / "call keepalive again" with persist.ok = false. DF3a:
+    //      nothing is at risk (no events, status not terminal), so the
+    //      `redelivery` key is absent. The watchdog fails a spin.
+    // proves: CLAIM(DF1), CLAIM(DF1a), CLAIM(DF2), CLAIM(DF3a)
     scenario(|| async {
+        let healthy = paused_env();
+        let healthy_id = quiet_probe_watch(&healthy).await;
+        healthy.another_process().keepalive(by_id(&healthy_id, Some(30))).await.unwrap();
+        assert_eq!(healthy.reader.started_count("cmd:probe"), 3, "control: a healthy 30 s call ticks at t=0 and t=20 after the baseline");
+
         let env = paused_env();
-        env.reader.set_text("cmd:probe", "ok");
-        let mut request = change_request("q", Path::new("/unused"), 20);
-        request.inputs = vec![crate::watch::Input::Cmd { argv: vec!["probe".into()], timeout_s: None, cwd: None }];
-        let id = env.vigil.create(request).await.unwrap().watch_id;
+        let id = quiet_probe_watch(&env).await;
         let plan = FaultPlan::from_rules(disk_stays_full(28));
         let vigil = env.another_process().with_write_faults(plan);
 
@@ -283,10 +309,42 @@ fn a_quiet_tick_that_cannot_save_returns_pending_with_persist_and_does_not_spin(
         let wire = wire(&envelope);
 
         assert_eq!((envelope.status, envelope.next), (WatchStatus::Pending, Next::CallKeepaliveAgain));
-        assert_eq!(persist_of(&wire)["ok"], false);
-        assert_eq!(persist_of(&wire)["kind"], "disk_full");
-        let reads = env.reader.started_count("cmd:probe");
-        assert!((2..=3).contains(&reads), "{reads} reads: baseline + at most the ticks at t=0 and t=20");
+        assert_failed_persist(&wire, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), false);
+        assert_eq!(env.reader.started_count("cmd:probe"), 2, "baseline + one tick: a tick whose save failed ends the call");
+        assert_eq!(envelope.waited_s, Some(0), "the call returned without sleeping toward the next tick");
+    });
+}
+
+#[test]
+fn wait_sleeps_one_interval_after_a_pending_envelope_that_could_not_be_saved() {
+    // why: DF1a: "`vigil wait`, after a pending envelope with persist.ok =
+    //      false, sleeps one interval before calling again." `wait` loops
+    //      `keepalive` until the watch finishes; a failed save ends each call
+    //      at once and leaves the watch due, so without the sleep `wait` calls
+    //      again in a hot loop (the watchdog fails that) and hammers a full
+    //      disk. Quiet watch, interval 20 s, every write fails. `wait` runs
+    //      for 50 s of virtual time, then is stopped: it must still be
+    //      running (the watch is not finished). Ticks are scripted reads of
+    //      `cmd:probe`: the baseline at create (t=0) and ticks at t=0, 20, 40
+    //      (hand-derived: one call per interval, 0 + 20 k < 50 for k = 0..2),
+    //      and each read started exactly that long after the first, so the
+    //      sleep is one interval, not "some sleep". Each call saved (tried
+    //      to) once, so at least 3 attempts to write a watch file.
+    // proves: CLAIM(DF1a)
+    scenario(|| async {
+        let env = paused_env();
+        let id = quiet_probe_watch(&env).await;
+        let plan = FaultPlan::from_rules(disk_stays_full(28));
+        let vigil = env.another_process().with_write_faults(plan.clone());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(50), vigil.wait(&id)).await;
+
+        assert!(outcome.is_err(), "the watch cannot finish within 50 s, so wait must still be running: {outcome:?}");
+        assert!(plan.attempts(WriteKind::Watch) >= 3, "precondition: each of the 3 calls tried to save and failed, got {}", plan.attempts(WriteKind::Watch));
+        let reads = env.reader.reads();
+        let starts: Vec<_> = reads.iter().filter(|read| read.label == "cmd:probe").map(|read| read.started).collect();
+        let offsets: Vec<u64> = starts.iter().map(|start| start.duration_since(starts[0]).as_secs()).collect();
+        assert_eq!(offsets, [0, 0, 20, 40], "baseline, then one tick per 20 s interval");
     });
 }
 
@@ -386,6 +444,104 @@ fn a_no_id_keepalive_does_not_count_an_unsaved_result_as_returned() {
     });
 }
 
+#[test]
+fn a_redelivery_covers_everything_since_the_last_saved_baseline_when_the_input_kept_changing() {
+    // why: DF3b: "Redelivered events are those since the last saved baseline:
+    //      the unsaved ones plus anything newer." The failed tick did not move
+    //      the baseline, so when the input grows again before the next call,
+    //      the redelivery is NOT the lost event verbatim: it reports the
+    //      change from the saved baseline ("old") to now. Oracle: a twin world
+    //      in which both lines were appended before one healthy tick; the
+    //      redelivery must equal it (modulo the sandbox path). Hand-derived
+    //      checks: tick 1 / event "w:1:0" (the baseline did not move, so the
+    //      tick number did not either), and the event differs from the lost
+    //      one, which proves the input really was re-read.
+    // proves: CLAIM(DF3b), CLAIM(DF3)
+    scenario(|| async {
+        let twin = Fixture::new().await;
+        append_file(&twin.env.input_path("w.log"), "bang\n");
+        let oracle = twin.env.another_process().keepalive(by_id(&twin.id, None)).await.unwrap();
+        assert_eq!(oracle.events.len(), 1, "oracle: one event for the whole change");
+
+        let fixture = Fixture::new().await;
+        let (vigil, _) = fixture.faulted(vec![rule(WriteKind::Watch, 28, When::Range { first: 1, last: Some(2) })]);
+        let lost = vigil.keepalive(by_id(&fixture.id, None)).await.expect("first call");
+        assert_eq!(persist_of(&wire(&lost))["ok"], false, "precondition: the first save failed");
+        assert_eq!(lost.events.len(), 1);
+
+        append_file(&fixture.env.input_path("w.log"), "bang\n");
+        let again = vigil.keepalive(by_id(&fixture.id, None)).await.expect("second call");
+
+        assert_ne!(again.events, lost.events, "the input changed again, so the redelivery is not the lost event verbatim");
+        assert_eq!(again.events.len(), 1, "once per envelope");
+        assert_eq!((again.status, again.tick, again.events[0].event_id.as_str()), (WatchStatus::Fired, 1, "w:1:0"));
+        assert!(wire(&again).get("persist").is_none(), "this write succeeded: {}", wire(&again));
+        let mut got = wire(&again);
+        let mut want = wire(&oracle);
+        // `persist` is the note under test; `session_ticks` counts calls made by
+        // THIS process (the faulted one answered twice, the twin once).
+        for value in [&mut got, &mut want] {
+            let object = value.as_object_mut().unwrap();
+            object.remove("persist");
+            object.remove("session_ticks");
+        }
+        let got_text = got.to_string().replace(fixture.env.dir.path().to_str().unwrap(), "<dir>");
+        let want_text = want.to_string().replace(twin.env.dir.path().to_str().unwrap(), "<dir>");
+        assert_eq!(got_text, want_text, "the redelivery must equal one healthy tick over the whole change since the saved baseline");
+        let stored: Value = serde_json::from_slice(&fixture.watch_bytes()).unwrap();
+        assert_eq!((stored["status"].as_str(), stored["tick"].as_u64()), (Some("fired"), Some(1)));
+    });
+}
+
+#[test]
+fn redelivery_is_flagged_exactly_when_events_or_a_terminal_status_are_at_risk() {
+    // why: DF3a: "`redelivery: true` only when something is at risk: the
+    //      envelope has events, or a terminal status (fired/expired/cancelled)
+    //      that was not saved. Otherwise the field is absent." Four unsaved
+    //      envelopes on a full disk, one per row:
+    //        fired     - one event "boom"                     -> true
+    //        expired   - deadline 30 s passed, no events      -> true (terminal)
+    //        cancelled - cancel that cannot be saved          -> true (terminal)
+    //        pending   - a quiet tick, nothing to lose        -> ABSENT
+    //      The absent row is the control that the flag is not just always on.
+    // proves: CLAIM(DF3a)
+    scenario(|| async {
+        let fired = Fixture::new().await;
+        let (vigil, _) = fired.faulted(disk_stays_full(28));
+        let envelope = wire(&vigil.keepalive(by_id(&fired.id, None)).await.unwrap());
+        assert_eq!(envelope["status"], "fired");
+        assert_eq!(envelope["events"].as_array().map(Vec::len), Some(1));
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &fired.watch_file(), true);
+
+        let expired_env = paused_env();
+        write_file(&expired_env.input_path("e.log"), "old\n");
+        let mut request = change_request("e", &expired_env.input_path("e.log"), 20);
+        request.deadline_s = Some(30);
+        let id = expired_env.vigil.create(request).await.unwrap().watch_id;
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        let vigil = expired_env.another_process().with_write_faults(FaultPlan::from_rules(disk_stays_full(28)));
+        let envelope = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+        assert_eq!(envelope["status"], "expired");
+        assert_eq!(envelope["events"].as_array().map(Vec::len), Some(0), "expiry carries no events");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &expired_env.root().join("watches").join("e.json"), true);
+
+        let cancelled = Fixture::new().await;
+        let (vigil, _) = cancelled.faulted(disk_stays_full(28));
+        let envelope = wire(&vigil.cancel(&cancelled.id).await.unwrap());
+        assert_eq!(envelope["status"], "cancelled");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &cancelled.watch_file(), true);
+
+        let quiet = paused_env();
+        write_file(&quiet.input_path("q.log"), "old\n");
+        let id = quiet.vigil.create(change_request("q", &quiet.input_path("q.log"), 20)).await.unwrap().watch_id;
+        let vigil = quiet.another_process().with_write_faults(FaultPlan::from_rules(disk_stays_full(28)));
+        let envelope = wire(&vigil.keepalive(by_id(&id, Some(30))).await.unwrap());
+        assert_eq!(envelope["status"], "pending");
+        assert_eq!(envelope["events"].as_array().map(Vec::len), Some(0));
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &quiet.root().join("watches").join("q.json"), false);
+    });
+}
+
 // ---- DF4: the reserve -----------------------------------------------------
 
 #[test]
@@ -436,16 +592,51 @@ fn an_error_that_is_not_a_full_disk_leaves_the_reserve_alone_end_to_end() {
     });
 }
 
+#[test]
+fn a_tick_on_a_disk_without_a_reserve_reports_the_first_failure_and_does_not_retry() {
+    // why: DF4a: "No reserve file, no retry: the first failure is reported
+    //      (`used_reserve` absent)." The reserve is deleted before the tick.
+    //      The fault hits ONLY the first write attempt (`Nth(1)`), so a retry
+    //      would succeed: the persist note must therefore say ok=false, kind
+    //      disk_full, with no `used_reserve` key, the file must be unchanged,
+    //      and the watch file was attempted exactly once. Control: the same
+    //      one-shot fault WITH a reserve is rescued by the retry
+    //      (`used_reserve: true`, 2 attempts).
+    // proves: CLAIM(DF4a), CLAIM(DF4)
+    scenario(|| async {
+        let with_reserve = Fixture::new().await;
+        assert!(with_reserve.reserve().exists(), "precondition: create left a reserve");
+        let (vigil, plan) = with_reserve.faulted(vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let rescued = wire(&vigil.keepalive(by_id(&with_reserve.id, None)).await.unwrap());
+        assert_eq!(persist_of(&rescued), &json!({"ok": true, "used_reserve": true, "kind": "disk_full"}), "control");
+        assert_eq!(plan.attempts(WriteKind::Watch), 2, "control: one failure, one retry");
+
+        let fixture = Fixture::new().await;
+        let _ = std::fs::remove_file(fixture.reserve());
+        assert!(!fixture.reserve().exists(), "precondition: no reserve");
+        let before = fixture.watch_bytes();
+        let (vigil, plan) = fixture.faulted(vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+
+        let envelope = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.expect("a failed save must not fail the call"));
+
+        assert_eq!(envelope["status"], "fired");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &fixture.watch_file(), true);
+        assert!(persist_of(&envelope).get("used_reserve").is_none(), "{envelope}");
+        assert_eq!(plan.attempts(WriteKind::Watch), 1, "nothing to free, so no retry");
+        assert_eq!(fixture.watch_bytes(), before);
+    });
+}
+
 // ---- DF5: every write goes through the same path --------------------------
 
 #[test]
 fn a_create_on_a_full_disk_fails_with_a_message_that_names_the_root_and_says_disk_full() {
     // why: DF5: "A create that still fails returns an error whose message names
     //      the state root and says the disk is full (not a bare `io error`)."
-    //      Nothing is left behind: no watch file, no .tmp. The substring
-    //      "disk full" (case-insensitive) is the contract this test fixes; the
-    //      spec's own wording is looser (see the red report).
-    // proves: CLAIM(DF5)
+    //      Nothing is left behind: no watch file, no .tmp. DF5b fixes the
+    //      contract: the message contains the state root path and the
+    //      lowercase words `disk full`.
+    // proves: CLAIM(DF5), CLAIM(DF5b)
     scenario(|| async {
         let env = paused_env();
         let input = env.input_path("w.log");
@@ -456,7 +647,7 @@ fn a_create_on_a_full_disk_fails_with_a_message_that_names_the_root_and_says_dis
 
         let text = error.to_string();
         assert!(text.contains(env.root().to_str().unwrap()), "should name the state root {}: {text}", env.root().display());
-        assert!(text.to_lowercase().contains("disk full"), "should say the disk is full: {text}");
+        assert!(text.contains("disk full"), "should contain the lowercase words `disk full`: {text}");
         assert!(!text.starts_with("io error"), "{text}");
         assert!(!env.root().join("watches").join("w.json").exists());
         assert!(!env.root().exists() || tmp_files(&env.root()).is_empty());
@@ -505,33 +696,33 @@ fn a_cancel_that_fits_once_the_reserve_is_freed_is_saved_and_reports_it() {
 }
 
 #[test]
-fn a_cancel_that_cannot_be_saved_is_never_a_silent_success() {
-    // why: DF5 names cancel as a write that goes through the retry path, but
-    //      the spec only says what a failing CREATE returns. For cancel two
-    //      outcomes are defensible: an error naming the state root and
-    //      saying "disk full" (like create), or an envelope with
-    //      persist.ok=false. Silently reporting a cancel that never reached
-    //      disk is the one wrong answer. Either way the watch file is
-    //      byte-identical and no .tmp is left (DF6). To be settled in the
-    //      spec (red report, A3).
-    // proves: CLAIM(DF5), CLAIM(DF6)
+fn a_cancel_that_cannot_be_saved_returns_an_envelope_with_persist_not_a_silent_success() {
+    // why: DF5a (red report A3): "A cancel that cannot be saved even after the
+    //      reserve returns an envelope with persist.ok = false (like a tick),
+    //      never a silent success." So: `Ok`, status cancelled, persist
+    //      {ok:false, kind:disk_full, error with the OS text, path = the watch
+    //      file}, and `redelivery: true` (a terminal status was not saved,
+    //      DF3a). DF6: the watch file is byte-identical (still pending) and no
+    //      .tmp is left. Both the write and its retry fail: two attempts,
+    //      because the reserve existed. A later healthy cancel from another
+    //      process really cancels, so nothing was half-done.
+    // proves: CLAIM(DF5a), CLAIM(DF3a), CLAIM(DF6)
     scenario(|| async {
         let fixture = Fixture::new().await;
         let before = fixture.watch_bytes();
-        let (vigil, _) = fixture.faulted(disk_stays_full(28));
+        let (vigil, plan) = fixture.faulted(disk_stays_full(28));
 
-        let outcome = vigil.cancel(&fixture.id).await;
+        let envelope = vigil.cancel(&fixture.id).await.expect("an unsaved cancel is an envelope, not an error");
 
-        let loud = match &outcome {
-            Err(error) => {
-                let text = error.to_string();
-                text.contains(fixture.env.root().to_str().unwrap()) && text.to_lowercase().contains("disk full")
-            }
-            Ok(envelope) => wire(envelope).get("persist").is_some_and(|persist| persist["ok"] == false),
-        };
-        assert!(loud, "a cancel that was not saved must say so: {outcome:?}");
+        assert_eq!(envelope.status, WatchStatus::Cancelled);
+        assert_failed_persist(&wire(&envelope), "disk_full", "No space left on device", &fixture.watch_file(), true);
+        assert_eq!(plan.attempts(WriteKind::Watch), 2, "the write and one retry (create left a reserve to free)");
         assert_eq!(fixture.watch_bytes(), before);
         assert!(tmp_files(&fixture.env.root()).is_empty());
+        let later = fixture.env.another_process().cancel(&fixture.id).await.unwrap();
+        assert_eq!(later.status, WatchStatus::Cancelled);
+        assert!(wire(&later).get("persist").is_none());
+        assert_eq!(fixture.env.vigil.store().load(&fixture.id).unwrap().status, WatchStatus::Cancelled, "the retried cancel is saved");
     });
 }
 
@@ -566,8 +757,9 @@ fn a_missing_lock_file_is_created_through_the_reserve_and_the_tick_still_answers
 fn a_lock_file_that_can_never_be_created_fails_the_call_with_a_message_that_names_the_root() {
     // why: DF5: without a lock the tick cannot run, so there is no answer to
     //      save; the call fails, but as "disk full" naming the root, not as a
-    //      bare `io error: ... (os error 28)`.
-    // proves: CLAIM(DF5)
+    //      bare `io error: ... (os error 28)`. DF5b: the message contains the
+    //      state root path and the lowercase words `disk full`.
+    // proves: CLAIM(DF5), CLAIM(DF5b)
     scenario(|| async {
         let fixture = Fixture::new().await;
         std::fs::remove_file(fixture.env.root().join("locks").join("w.lock")).unwrap();
@@ -577,7 +769,45 @@ fn a_lock_file_that_can_never_be_created_fails_the_call_with_a_message_that_name
 
         let text = error.to_string();
         assert!(text.contains(fixture.env.root().to_str().unwrap()), "{text}");
-        assert!(text.to_lowercase().contains("disk full"), "{text}");
+        assert!(text.contains("disk full"), "lowercase `disk full` (DF5b): {text}");
+    });
+}
+
+// ---- DF7: a failed create does not burn the id --------------------------
+
+#[test]
+fn a_create_whose_baseline_save_fails_removes_its_placeholder_so_the_id_can_be_reused() {
+    // why: DF7 (red report A7): `create` writes a placeholder (watch write 1)
+    //      to reserve the id, then the baseline (watch write 2). Writes 2 and
+    //      3 fail here (the baseline and its retry), so the call fails with
+    //      the DF5b error. Before DF7 the placeholder stayed and the agent's
+    //      retry with the same id got `DuplicateId`. Now: no `dup.json`, `list`
+    //      is empty, no .tmp, and once space exists (a healthy process) the
+    //      same id is created. The error is not DuplicateId either.
+    //      The placeholder's success leaves a reserve (nothing blocks its
+    //      creation), so the failed baseline is retried once: 3 watch attempts
+    //      (placeholder ok, baseline fails, retry fails) prove the placeholder
+    //      really was written before the failure.
+    // proves: CLAIM(DF7), CLAIM(DF5b)
+    scenario(|| async {
+        let env = paused_env();
+        let input = env.input_path("w.log");
+        write_file(&input, "old\n");
+        let plan = FaultPlan::from_rules(vec![rule(WriteKind::Watch, 28, When::Range { first: 2, last: None })]);
+        let vigil = env.another_process().with_write_faults(plan.clone());
+
+        let error = vigil.create(change_request("dup", &input, 20)).await.expect_err("the baseline cannot be written");
+
+        let text = error.to_string();
+        assert!(text.contains(env.root().to_str().unwrap()) && text.contains("disk full"), "DF5b: {text}");
+        assert_eq!(plan.attempts(WriteKind::Watch), 3, "placeholder (ok), baseline (fails), retry (fails)");
+        assert!(!env.root().join("watches").join("dup.json").exists(), "the placeholder must be removed");
+        assert!(env.vigil.list().await.unwrap().is_empty());
+        assert!(tmp_files(&env.root()).is_empty());
+
+        let created = env.another_process().create(change_request("dup", &input, 20)).await.expect("the id is free again once space exists");
+        assert_eq!(created.watch_id.as_str(), "dup");
+        assert_eq!(env.vigil.store().load(&wid("dup")).unwrap().tick, 0);
     });
 }
 

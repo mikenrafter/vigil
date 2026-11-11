@@ -468,8 +468,9 @@ async fn keepalive_over_mcp_on_a_full_disk_returns_the_envelope_with_persist_not
     //      ("io error: No space left on device") with no envelope. Now the
     //      call is NOT isError, carries the fired envelope (event "w:1:0",
     //      summary "boom") and the persist note, and the watch file on disk is
-    //      byte-identical (DF6).
-    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF6)
+    //      byte-identical (DF6). DF3a: the envelope carries an event that was
+    //      not saved, so `redelivery: true` is present.
+    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF3a), CLAIM(DF6)
     let sandbox = Sandbox::new();
     let input = sandbox.input("w.log");
     std::fs::write(&input, "boot\n").unwrap();
@@ -486,7 +487,7 @@ async fn keepalive_over_mcp_on_a_full_disk_returns_the_envelope_with_persist_not
     assert_eq!(envelope["next"], "act on events");
     assert_eq!(envelope["events"][0]["event_id"], "w:1:0");
     assert_eq!(envelope["events"][0]["summary"], "boom");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"));
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), true);
     assert_eq!(sandbox.watch_bytes("w"), before);
     assert!(sandbox.tmp_files().is_empty());
     client.cancel().await.unwrap();
@@ -533,8 +534,10 @@ async fn the_same_mcp_server_delivers_an_unsaved_result_again_to_a_no_id_keepali
 #[tokio::test]
 async fn watch_create_over_mcp_on_a_full_disk_is_an_error_that_names_the_root_and_says_disk_full() {
     // why: DF5 through MCP: the agent must be able to tell "the disk is full"
-    //      from a generic failure, and find which directory to free.
-    // proves: CLAIM(DF5)
+    //      from a generic failure, and find which directory to free. DF5b:
+    //      the message contains the state root path and the lowercase words
+    //      `disk full`.
+    // proves: CLAIM(DF5), CLAIM(DF5b)
     let sandbox = Sandbox::new();
     let input = sandbox.input("w.log");
     std::fs::write(&input, "boot\n").unwrap();
@@ -545,7 +548,7 @@ async fn watch_create_over_mcp_on_a_full_disk_is_an_error_that_names_the_root_an
     assert_eq!(created.is_error, Some(true), "{created:?}");
     let text = created.content[0].as_text().expect("text content").text.clone();
     assert!(text.contains(sandbox.state_root().to_str().unwrap()), "should name the state root: {text}");
-    assert!(text.to_lowercase().contains("disk full"), "should say the disk is full: {text}");
+    assert!(text.contains("disk full"), "should contain the lowercase words `disk full`: {text}");
     assert!(sandbox.watch_file("w").is_none());
     client.cancel().await.unwrap();
 }

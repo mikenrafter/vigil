@@ -320,16 +320,22 @@ pub fn stderr_lines(output: &Output) -> Vec<String> {
 }
 
 /// The `persist` note of a failed write, field by field against the spec
-/// (DF2, DF3): exactly these five keys.
-pub fn assert_failed_persist(envelope: &serde_json::Value, kind: &str, os_text: &str, file: &Path) {
+/// (DF2, DF3a): `ok`, `kind`, `error`, `path`, plus `redelivery: true` exactly
+/// when something is at risk (the envelope has events, or a terminal status
+/// that was not saved); with `redelivery == false` the key must be ABSENT.
+pub fn assert_failed_persist(envelope: &serde_json::Value, kind: &str, os_text: &str, file: &Path, redelivery: bool) {
     let persist = envelope.get("persist").unwrap_or_else(|| panic!("the envelope has no `persist` field: {envelope}"));
     let object = persist.as_object().unwrap_or_else(|| panic!("persist is not an object: {persist}"));
     let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
     keys.sort();
-    assert_eq!(keys, ["error", "kind", "ok", "path", "redelivery"], "{persist}");
+    if redelivery {
+        assert_eq!(keys, ["error", "kind", "ok", "path", "redelivery"], "{persist}");
+        assert_eq!(persist["redelivery"], true, "{persist}");
+    } else {
+        assert_eq!(keys, ["error", "kind", "ok", "path"], "nothing is at risk, so no `redelivery` key: {persist}");
+    }
     assert_eq!(persist["ok"], false, "{persist}");
     assert_eq!(persist["kind"], kind, "{persist}");
-    assert_eq!(persist["redelivery"], true, "{persist}");
     assert_eq!(persist["path"], file.to_str().unwrap(), "{persist}");
     let error = persist["error"].as_str().unwrap_or_else(|| panic!("error is not a string: {persist}"));
     assert!(error.contains(os_text), "error {error:?} should carry the OS message {os_text:?}");

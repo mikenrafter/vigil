@@ -308,3 +308,151 @@ asserted field by field, so I expect them to bite.
 
 Red commit `fb2cdea5` on `feat/vigil-disk-full`. A report cannot contain the SHA of the commit that
 holds it, so this line was added in a one-file follow-up commit.
+
+---
+
+# Round 2
+
+Spec: `specs/disk-full.md`, section "Amendments after red" (commit
+`610c3ad4`), which answers A1-A10 above. This round only changes tests. No
+behaviour was added; the stub is as in round 1.
+
+STATUS: done. Red commit for this round: see "Commit" at the end of this section.
+
+## Amendments and the tests that pin them
+
+| Amendment | What is pinned | Tests (changed = C, new = N) |
+|---|---|---|
+| DF1a (A1) | a tick whose save failed ends the call; no in-memory re-tick; `wait` sleeps one interval after a pending envelope with `persist.ok = false` | C `a_quiet_tick_that_cannot_save_...` (exactly 2 reads, `waited_s` 0, healthy twin reads 3); N `wait_sleeps_one_interval_...`; N CLI quiet keepalive returns at once |
+| DF3a (A2) | `redelivery: true` only with events or an unsaved terminal status | C `assert_failed_persist` in `disk_full_tests.rs` and `tests/common/mod.rs` (new `redelivery` argument, key set checked both ways); C fired/expired callers say `true`; C quiet case says absent |
+| DF3b (A9) | redelivered events are those since the last saved baseline | N `a_redelivery_covers_everything_since_the_last_saved_baseline_...` |
+| DF4a (A4) | no reserve file, no retry | N store test (attempt count 1, a one-shot fault is not retried); C lock entry test (no-reserve leg); N engine test (`used_reserve` absent) |
+| DF5a (A3) | an unrecoverable cancel is an envelope with `persist.ok = false` | C `a_cancel_that_cannot_be_saved_...`; N CLI cancel test |
+| DF5b (A6) | message holds the state root and lowercase `disk full`; `persist.error` has the OS text | C every "names the root" assertion (no `to_lowercase()` any more) |
+| DF7 (A7) | a failed baseline save removes the placeholder, so the same id can be created again | N engine test; N CLI test |
+
+## Result
+
+50 tests fail on assertions, none on compile errors, none by hanging. Every
+test that passed before still passes.
+
+| Target | passed | failed | new tests (round 1 + round 2) | new tests that fail |
+|---|---|---|---|---|
+| `--lib` | 243 | 37 | 35 + 6 = 41 | 37 |
+| `--test cli_e2e` | 28 | 10 | 8 + 3 = 11 | 10 |
+| `--test mcp_e2e` | 10 | 3 | 3 + 0 = 3 | 3 |
+| total | 281 | 50 | 46 + 9 = 55 | 50 |
+
+Round 1 was 281 passed, 41 failed. The 9 new tests are the 9 new failures; the
+same 5 controls still pass (they must stay green after green). Changed tests
+stay red for the same reason as before, now on a sharper assertion. Run on
+the stub with the command at the top of this report (qex job `vigil-red2`,
+about 16 s, 750 MB).
+
+Intermittent failures seen this round, none of them in tests I touched:
+
+* `engine::tests::prune_also_removes_abandoned_pending_watches_and_their_lock_files_but_never_the_global_lock`
+  and `engine::tests::listing_prunes_too` failed in some of the 11 prototype
+  runs (2 and 3 of them) and passed alone and on the next run. They did not
+  fail on the committed tree (the 3 stub runs of this round). Not investigated; they are about pruning old watches and
+  have nothing to do with disk full. The known flaky
+  `inputs::tests::port_without_a_want_...` did not fail this round.
+
+## Changed and added tests
+
+CLAIM ids: the spec's DF1-DF7 and the amendments DF1a, DF3a, DF3b, DF4a, DF5a,
+DF5b (grep `CLAIM(DF1a)` etc. finds the proof). `x` = the file the test is in.
+
+### `src/disk_full_tests.rs`
+
+| Test | Claim | Change | Fails today on |
+|---|---|---|---|
+| `a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again` | DF1, DF1a, DF2, DF3a | rewritten. Healthy twin of a 30 s call reads 3 times (baseline + t=0 + t=20); the faulted call reads exactly 2, has `waited_s` 0, and its persist has exactly `error, kind, ok, path` | no `persist` field (stub never fails the save) |
+| `wait_sleeps_one_interval_after_a_pending_envelope_that_could_not_be_saved` | DF1a | new. `wait` on a quiet watch (interval 20 s), every write fails, stopped after 50 s of virtual time: still running; scripted reads start at offsets `[0, 0, 20, 40]` s; at least 3 failed-save attempts. A `wait` without the sleep spins, which the real-time watchdog turns into a failure | precondition `attempts >= 3` (stub: 0) |
+| `redelivery_is_flagged_exactly_when_events_or_a_terminal_status_are_at_risk` | DF3a | new. Four unsaved envelopes: fired (event) true, expired (no events, terminal) true, cancelled (terminal) true, quiet pending ABSENT | no `persist` field |
+| `a_redelivery_covers_everything_since_the_last_saved_baseline_when_the_input_kept_changing` | DF3b, DF3 | new. Call 1 loses event `w:1:0` ("boom"); the input grows ("bang"); call 2 must equal a healthy twin world in which both lines were appended before one tick (event `w:1:0`, summary "bang", digest has both lines, `tick` 1), and differ from the lost event | no `persist` field |
+| `a_tick_on_a_disk_without_a_reserve_reports_the_first_failure_and_does_not_retry` | DF4a, DF4 | new. A fault on the first write only: with a reserve the retry rescues it (control, 2 attempts); with the reserve deleted the note is `ok:false`, no `used_reserve`, 1 attempt, file unchanged | precondition: no reserve (stub never makes one) |
+| `a_cancel_that_cannot_be_saved_returns_an_envelope_with_persist_not_a_silent_success` | DF5a, DF3a, DF6 | tightened. It used to accept an error or an envelope; now only an `Ok` cancelled envelope with `ok:false`, `kind` disk_full, `redelivery` true, 2 attempts, file byte-identical, and a later healthy cancel really cancels | no `persist` field |
+| `a_create_whose_baseline_save_fails_removes_its_placeholder_so_the_id_can_be_reused` | DF7, DF5b | new. Writes 2 and 3 fail (baseline and its retry); the error names the root and says `disk full`; 3 attempts prove the placeholder was written; no `dup.json`, `list` empty, no `.tmp`; a healthy process creates the same id | `create` succeeds on the stub |
+| `a_create_on_a_full_disk_...`, `a_lock_file_that_can_never_be_created_...` | DF5, DF5b | `to_lowercase()` removed: the text must contain the root and the lowercase `disk full` | unchanged |
+| `the_failed_save_is_described_in_persist_...`, `assert_failed_persist` | DF2, DF3a | helper has a `redelivery: bool` argument and checks the key set both ways (five keys, or four with the key absent); the errno table fires an event, so `true` | unchanged |
+
+### `src/store.rs`
+
+| Test | Claim | Change |
+|---|---|---|
+| `with_no_reserve_file_a_full_disk_is_reported_at_the_first_failure_with_no_retry` | DF4a, DF5b | new. For 28 and 122: with a reserve, a first-write-only fault is rescued (control, 2 attempts, `used_reserve`); with the reserve deleted, `DiskFull` naming the root after exactly 1 attempt, old file intact, no `.tmp` |
+| `creating_a_lock_file_on_a_full_disk_goes_through_the_reserve_and_retry_on_every_entry_point` | DF5, DF4a | gained a third leg per entry point (4 of them): no reserve, a first-creation-only fault, `DiskFull` after 1 attempt (the "left open" comment is gone) |
+| `a_disk_that_stays_full_...`, `says_disk_full_naming` | DF4, DF5b | exact lowercase `disk full` |
+
+### `tests/cli_e2e.rs`, `tests/mcp_e2e.rs`, `tests/common/mod.rs`
+
+| Test | Claim | Change |
+|---|---|---|
+| `a_quiet_keepalive_on_a_full_disk_returns_pending_at_once_without_a_redelivery_flag` (x cli) | DF1a, DF3a, DF2 | new. Must exit within 5 s (a healthy call lasts 270 s): exit 0, pending, four-key persist, one stderr line naming the root. On the stub it is killed after 5 s, so the red run waits 5 s for it |
+| `cancel_on_a_full_disk_prints_the_envelope_with_persist_and_leaves_the_watch_pending` (cli) | DF5a, DF3a, DF6 | new. Exit 0, `cancelled` envelope with the five-key persist, one stderr line naming the root, file unchanged and still `pending` |
+| `a_create_whose_baseline_cannot_be_saved_leaves_no_placeholder_so_the_same_id_can_be_created_again` (cli) | DF7, DF5b | new. `watch:28:2..`: exit 1, root and `disk full` on stderr, no watch file, no `.tmp`; then a healthy process creates the same id (exit 0) |
+| `keepalive_on_a_full_disk_...`, `wait_keeps_its_exit_code_when_the_final_save_fails` (cli), `keepalive_over_mcp_on_a_full_disk_...` (mcp) | DF3a, DF1a | pass `redelivery = true` (events or a terminal status at risk). The `wait` expired case now also relies on DF1a: one pending envelope, one sleep of 1 s, then one expired envelope, one JSON on stdout |
+| `create_on_a_full_disk_...` (cli), `watch_create_over_mcp_on_a_full_disk_...` (mcp) | DF5b | exact lowercase `disk full` |
+| `assert_failed_persist` (common) | DF2, DF3a | new `redelivery: bool` argument, same two key sets as the engine helper |
+
+## Decisions I took where the amendments leave room
+
+* **Expiry says `redelivery: true`.** DF3a counts "expired" as a terminal
+  status that was not saved. The brief for this round said "update the quiet/
+  expiry cases"; I read it as quiet = absent, expired = true. If you meant
+  expiry to be absent, change one row in
+  `redelivery_is_flagged_exactly_when_events_or_a_terminal_status_are_at_risk`
+  and the `wait` expired case in `cli_e2e.rs`.
+* **Cancel on a full disk exits 0 in the CLI** and writes one stderr line
+  naming the root, like a keepalive. DF5a only says "an envelope".
+* **DF4a with a reserve that exists but cannot be deleted still retries.**
+  The round 1 test `a_reserve_that_cannot_be_deleted_...` stays: "no reserve
+  file" means the file is absent, not that deleting failed.
+* **DF7 test models the placeholder with `Range{first: 2}`**: placeholder is
+  watch write 1, the baseline is write 2, so the placeholder write is what
+  succeeds. It does not fault `Reserve`, otherwise there is no reserve after
+  write 1 and DF4a (correctly) skips the retry; I made that mistake first and
+  the prototype showed it.
+* **The `wait` test counts reads, not envelopes**, because `wait` only returns
+  on a finished watch. The 50 s window and the offsets `[0, 0, 20, 40]` are
+  derived above, not read from output.
+
+## Evidence the tests are satisfiable and sharp (not committed)
+
+Throwaway green prototype: round 1's prototype plus the amendments (stop after
+an unsaved tick, `wait` sleeps one interval, `redelivery` only when something
+is at risk, no retry without a reserve file for both watch writes and lock
+creation, placeholder removed on a failed baseline). In a scratch copy under
+the session scratchpad, not in the repo. With it all 331 tests pass (280 lib,
+38 cli, 13 mcp), on the exact test files in the commit.
+
+One mutation at a time on that prototype, tests that went red:
+
+| Mutation | Killed by |
+|---|---|
+| no stop after an unsaved tick | 12 engine tests (most with the watchdog spin message), the quiet CLI test and 5 other e2e tests (cli and mcp) |
+| `wait` does not sleep | `wait_sleeps_one_interval_...` |
+| `wait` sleeps 1 s instead of the interval | `wait_sleeps_one_interval_...` |
+| `redelivery` always on | the quiet engine test, the DF3a table, the quiet CLI test |
+| `redelivery` never on | the DF3a table, the errno table, cancel (engine and CLI), fired CLI and MCP tests, `wait` CLI |
+| retry even without a reserve (watch write) | the DF4a engine test and the DF4a store test |
+| retry even without a reserve (lock creation) | the lock entry-point store test |
+| placeholder not removed | the DF7 engine and CLI tests |
+
+## Notes for the green phase
+
+* `redelivery` is decided from the envelope's content, so the same rule serves
+  tick, expiry and cancel: events non-empty or status terminal.
+* `Vigil::wait` must sleep the watch's `interval_s` (not a constant), and only
+  after a pending envelope whose `persist.ok` is false.
+* DF4a distinguishes "no `.reserve`" (no retry) from "`.reserve` could not be
+  deleted" (retry). Both lock creation and watch writes follow it.
+* A tick whose save failed must not mark the watch returned (round 1, still
+  pinned) and must end the call.
+
+## Commit
+
+Tests and this section: `vigil: tighten red tests for disk-full amendments
+(DF1a-DF7)`. The SHA is in the last line of the final message and, as in
+round 1, is added to this file in a one-file follow-up commit.

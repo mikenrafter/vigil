@@ -894,9 +894,10 @@ fn keepalive_on_a_full_disk_prints_the_envelope_exits_0_and_names_the_state_root
     //      nothing. Now: exit 0, the full fired envelope on stdout (tick 1,
     //      event "w:1:0", summary "boom"), a persist note with the right kind
     //      per errno (28 -> disk_full, 5 -> io), exactly ONE line on stderr
-    //      and that line names the state root. DF6: the watch file is
-    //      byte-identical and no .tmp remains.
-    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF6)
+    //      and that line names the state root. DF3a: the envelope has an
+    //      event that was not saved, so `redelivery: true` is present. DF6:
+    //      the watch file is byte-identical and no .tmp remains.
+    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF3a), CLAIM(DF6)
     for (plan, kind, os_text) in [
         (DISK_STAYS_FULL, "disk_full", "No space left on device"),
         ("watch:5:all", "io", "Input/output error"),
@@ -914,7 +915,7 @@ fn keepalive_on_a_full_disk_prints_the_envelope_exits_0_and_names_the_state_root
         assert_eq!(envelope["tick"], 1);
         assert_eq!(envelope["events"][0]["event_id"], "w:1:0");
         assert_eq!(envelope["events"][0]["summary"], "boom");
-        assert_failed_persist(&envelope, kind, os_text, &sandbox.watch_path("w"));
+        assert_failed_persist(&envelope, kind, os_text, &sandbox.watch_path("w"), true);
         let lines = stderr_lines(&output);
         assert_eq!(lines.len(), 1, "{plan}: exactly one stderr line, got {lines:?}");
         assert!(lines[0].contains(sandbox.state_root().to_str().unwrap()), "{plan}: the line must name the state root: {:?}", lines[0]);
@@ -953,16 +954,20 @@ fn wait_keeps_its_exit_code_when_the_final_save_fails() {
     // why: DF1: "`wait` keeps its outcome code" (W6: fired 0, expired 3). The
     //      envelope is printed with persist.ok=false and the exit code is the
     //      one the outcome decides, not 1. Fired: the change is sensed on the
-    //      first tick. Expired: deadline_s 1, nothing changes, the expiry
-    //      write is the one that fails.
-    // proves: CLAIM(DF1), CLAIM(DF2)
+    //      first tick. Expired: deadline_s 1, nothing changes. DF1a: the first
+    //      tick cannot save and returns a pending envelope, `wait` sleeps one
+    //      interval (1 s) and calls again, the watch is overdue and the
+    //      expiry write is the one that fails: ONE envelope on stdout, exit 3.
+    //      DF3a: both are terminal statuses that were not saved, so both say
+    //      `redelivery: true`.
+    // proves: CLAIM(DF1), CLAIM(DF1a), CLAIM(DF2), CLAIM(DF3a)
     let fired = Sandbox::new();
     change_ready(&fired);
     let output = run_with(&fired, Some(DISK_STAYS_FULL), &["wait", "w"]);
     assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "fired");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &fired.watch_path("w"));
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &fired.watch_path("w"), true);
 
     let expired = Sandbox::new();
     let input = expired.input("e.log");
@@ -973,7 +978,7 @@ fn wait_keeps_its_exit_code_when_the_final_save_fails() {
     assert_eq!(output.status.code(), Some(3), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "expired");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &expired.watch_path("e"));
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &expired.watch_path("e"), true);
 }
 
 #[test]
@@ -1021,9 +1026,9 @@ fn create_on_a_full_disk_exits_1_with_a_line_that_names_the_root_and_says_disk_f
     // why: DF5: "A create that still fails returns an error whose message names
     //      the state root and says the disk is full (not a bare `io error`)."
     //      Through the binary: exit 1 (a real failure, nothing was created),
-    //      the stderr line names the root and says "disk full", and no watch
-    //      file or .tmp is left.
-    // proves: CLAIM(DF5)
+    //      the stderr line names the root and contains the lowercase words
+    //      `disk full` (DF5b), and no watch file or .tmp is left.
+    // proves: CLAIM(DF5), CLAIM(DF5b)
     let sandbox = Sandbox::new();
     let input = sandbox.input("w.log");
     std::fs::write(&input, "boot\n").unwrap();
@@ -1031,7 +1036,7 @@ fn create_on_a_full_disk_exits_1_with_a_line_that_names_the_root_and_says_disk_f
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(stderr.contains(sandbox.state_root().to_str().unwrap()), "should name the state root: {stderr}");
-    assert!(stderr.to_lowercase().contains("disk full"), "should say the disk is full: {stderr}");
+    assert!(stderr.contains("disk full"), "should contain the lowercase words `disk full`: {stderr}");
     assert!(sandbox.watch_file("w").is_none());
     assert!(sandbox.tmp_files().is_empty());
 }
@@ -1068,4 +1073,96 @@ fn a_malformed_fault_plan_is_refused_loudly_instead_of_injecting_nothing() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains(FAULT_ENV), "{:?}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(run_with(&sandbox, None, &["list"]).status.code(), Some(0), "control");
+}
+
+// ---- round 2: amendments DF1a, DF3a, DF5a, DF7 (specs/disk-full.md) ------
+
+#[test]
+fn a_quiet_keepalive_on_a_full_disk_returns_pending_at_once_without_a_redelivery_flag() {
+    // why: DF1a (red report A1): a tick whose save failed ends the call. A
+    //      quiet watch looks due again at once (its `last_tick_at` never
+    //      moved), so without the rule the process either spins on the full
+    //      disk or ticks in memory until `max_s` (the default is 270 s). Here
+    //      the call must return within 5 s of real time (the interval is 1 s):
+    //      exit 0, `pending` / "call keepalive again", persist.ok=false with
+    //      kind disk_full. DF3a: nothing is at risk (no events, status not
+    //      terminal), so the `redelivery` key is ABSENT. Exactly one stderr
+    //      line, naming the state root (DF2).
+    // proves: CLAIM(DF1a), CLAIM(DF3a), CLAIM(DF2)
+    let sandbox = Sandbox::new();
+    create_via_cli(&sandbox, "w", &sandbox.input("w.log"));
+    let before = sandbox.watch_bytes("w");
+    let mut command = sandbox.faulted_command(DISK_STAYS_FULL);
+    command.args(["keepalive", "w"]);
+
+    let output = output_within(command, Duration::from_secs(5));
+
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "pending");
+    assert_eq!(envelope["next"], "call keepalive again");
+    assert_eq!(envelope["events"].as_array().map(Vec::len), Some(0), "{envelope}");
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), false);
+    let lines = stderr_lines(&output);
+    assert_eq!(lines.len(), 1, "exactly one stderr line, got {lines:?}");
+    assert!(lines[0].contains(sandbox.state_root().to_str().unwrap()), "{:?}", lines[0]);
+    assert_eq!(sandbox.watch_bytes("w"), before);
+}
+
+#[test]
+fn cancel_on_a_full_disk_prints_the_envelope_with_persist_and_leaves_the_watch_pending() {
+    // why: DF5a (red report A3): a cancel that cannot be saved, even after the
+    //      reserve, is not an error and not a silent success: it prints the
+    //      cancelled envelope with persist.ok=false (like a tick), exits 0
+    //      (the exit code of `cancel` does not change, D2), writes one stderr
+    //      line naming the state root, and the file on disk is the old pending
+    //      one, byte for byte, with no .tmp. DF3a: a terminal status was not
+    //      saved, so `redelivery: true`.
+    // proves: CLAIM(DF5a), CLAIM(DF3a), CLAIM(DF6)
+    let sandbox = Sandbox::new();
+    create_via_cli(&sandbox, "w", &sandbox.input("w.log"));
+    let before = sandbox.watch_bytes("w");
+
+    let output = run_with(&sandbox, Some(DISK_STAYS_FULL), &["cancel", "w"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "cancelled");
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), true);
+    let lines = stderr_lines(&output);
+    assert_eq!(lines.len(), 1, "exactly one stderr line, got {lines:?}");
+    assert!(lines[0].contains(sandbox.state_root().to_str().unwrap()), "{:?}", lines[0]);
+    assert_eq!(sandbox.watch_bytes("w"), before, "the cancel was not saved, so the file is as it was");
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
+    assert!(sandbox.tmp_files().is_empty(), "{:?}", sandbox.tmp_files());
+}
+
+#[test]
+fn a_create_whose_baseline_cannot_be_saved_leaves_no_placeholder_so_the_same_id_can_be_created_again() {
+    // why: DF7 (red report A7): `create` first writes a placeholder that
+    //      reserves the id (attempt 1 of the watch writes), then the baseline
+    //      (attempt 2 onwards fail here: `watch:28:2..`). Before the fix the
+    //      error was returned but the placeholder stayed, so the agent's retry
+    //      with the same id got `duplicate id`. Deleting a file works on a
+    //      full disk, so the placeholder must be removed. Process 1 exits 1
+    //      naming the root and `disk full`; no watch file, no .tmp. Process 2
+    //      (space exists again) creates the same id: exit 0 and a pending
+    //      watch file.
+    // proves: CLAIM(DF7), CLAIM(DF5b)
+    let sandbox = Sandbox::new();
+    let input = sandbox.input("w.log");
+    std::fs::write(&input, "boot\n").unwrap();
+
+    let failed = run_with(&sandbox, Some("watch:28:2.."), &["create", &change_watch_json("w", &input, 1)]);
+
+    assert_eq!(failed.status.code(), Some(1), "stderr {:?}", String::from_utf8_lossy(&failed.stderr));
+    let stderr = String::from_utf8_lossy(&failed.stderr).to_string();
+    assert!(stderr.contains(sandbox.state_root().to_str().unwrap()) && stderr.contains("disk full"), "{stderr}");
+    assert!(sandbox.watch_file("w").is_none(), "the placeholder must be removed, found {:?}", sandbox.watch_file("w"));
+    assert!(!sandbox.watch_path("w").exists());
+    assert!(sandbox.tmp_files().is_empty(), "{:?}", sandbox.tmp_files());
+
+    let retry = run_with(&sandbox, None, &["create", &change_watch_json("w", &input, 1)]);
+    assert_eq!(retry.status.code(), Some(0), "the same id must be free again: {:?}", String::from_utf8_lossy(&retry.stderr));
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
 }

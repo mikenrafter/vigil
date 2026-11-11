@@ -876,9 +876,10 @@ mod tests {
         watch
     }
 
+    /// DF5b: the state root path and the lowercase words `disk full`.
     fn says_disk_full_naming(error: &StoreError, root: &Path) -> bool {
         let text = error.to_string();
-        text.contains(root.to_str().unwrap()) && text.to_lowercase().contains("disk full")
+        text.contains(root.to_str().unwrap()) && text.contains("disk full")
     }
 
     #[test]
@@ -987,7 +988,8 @@ mod tests {
         //      fail, so: two attempts, not one and not a loop; the reserve is
         //      gone (it was deleted for the retry); the error is the DiskFull
         //      variant.
-        // proves: CLAIM(DF4), CLAIM(DF5), CLAIM(DF6)
+        //      DF5b: the message has the root path and lowercase `disk full`.
+        // proves: CLAIM(DF4), CLAIM(DF5), CLAIM(DF5b), CLAIM(DF6)
         for errno in DISK_FULL_ERRNOS {
             let dir = tempfile::tempdir().unwrap();
             let before = sample("w");
@@ -1005,6 +1007,43 @@ mod tests {
             assert_eq!(std::fs::read(store.watch_path(&wid("w"))).unwrap(), bytes_before, "errno {errno}: previous file byte-identical");
             assert_eq!(store.load(&wid("w")).unwrap(), before);
             assert!(tmp_files(dir.path()).is_empty(), "errno {errno}: no .tmp");
+        }
+    }
+
+    #[test]
+    fn with_no_reserve_file_a_full_disk_is_reported_at_the_first_failure_with_no_retry() {
+        // why: DF4a (red report A4): "No reserve file, no retry: the first
+        //      failure is reported (`used_reserve` absent)." The reserve is
+        //      removed after a first save. The fault hits ONLY the first Watch
+        //      attempt (`Nth(1)`), so a retry would succeed and hide the
+        //      failure; the save must instead fail as DiskFull naming the
+        //      root, after exactly ONE attempt, with the old file intact and
+        //      no .tmp. Control in the same test: with a reserve the identical
+        //      fault is rescued by the retry (2 attempts, `used_reserve`).
+        // proves: CLAIM(DF4a), CLAIM(DF5b)
+        for errno in DISK_FULL_ERRNOS {
+            let rescued = tempfile::tempdir().unwrap();
+            Store::new(rescued.path()).save(&sample("w")).unwrap();
+            assert!(reserve_path(rescued.path()).exists(), "precondition: errno {errno}: a reserve exists");
+            let (store, plan) = faulted(rescued.path(), vec![rule(WriteKind::Watch, errno, When::Nth(1)), rule(WriteKind::Reserve, errno, When::Every)]);
+            assert!(store.save(&newer(sample("w"))).unwrap().used_reserve, "control: errno {errno}: with a reserve the retry rescues it");
+            assert_eq!(plan.attempts(WriteKind::Watch), 2, "control: errno {errno}");
+
+            let dir = tempfile::tempdir().unwrap();
+            let before = sample("w");
+            Store::new(dir.path()).save(&before).unwrap();
+            let _ = std::fs::remove_file(reserve_path(dir.path()));
+            assert!(!reserve_path(dir.path()).exists(), "precondition: errno {errno}: no reserve");
+            let bytes_before = std::fs::read(Store::new(dir.path()).watch_path(&wid("w"))).unwrap();
+
+            let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, errno, When::Nth(1)), rule(WriteKind::Reserve, errno, When::Every)]);
+            let error = store.save(&newer(before.clone())).expect_err("nothing to free: the first failure is final");
+
+            assert!(matches!(error, StoreError::DiskFull(_)), "errno {errno}: got {error:?}");
+            assert!(says_disk_full_naming(&error, dir.path()), "errno {errno}: {error}");
+            assert_eq!(plan.attempts(WriteKind::Watch), 1, "errno {errno}: no reserve, no retry");
+            assert_eq!(std::fs::read(store.watch_path(&wid("w"))).unwrap(), bytes_before, "errno {errno}");
+            assert!(tmp_files(dir.path()).is_empty(), "errno {errno}");
         }
     }
 
@@ -1137,7 +1176,8 @@ mod tests {
         //      each is checked, so a retry wired into only one of them fails
         //      here. Rescue: full while the reserve exists, lock created after
         //      the reserve is spent. Persistent: an error naming the root.
-        // proves: CLAIM(DF5)
+        //      DF4a: with no reserve to free, the first failure is final.
+        // proves: CLAIM(DF5), CLAIM(DF4a)
         for entry in LOCK_ENTRIES {
             let dir = tempfile::tempdir().unwrap();
             Store::new(dir.path()).save(&sample("w")).unwrap();
@@ -1150,8 +1190,8 @@ mod tests {
             take(&store, entry).unwrap_or_else(|error| panic!("{entry}: the retry should have created the lock: {error}"));
             assert!(!reserve_path(dir.path()).exists(), "{entry}: the reserve was spent");
 
-            // A reserve exists here too: whether a retry is made when there
-            // is nothing to free is left open (red report, A4), not pinned.
+            // A reserve exists here: the retry is made (2 attempts). DF4a
+            // (nothing to free, no retry) is the third leg below.
             let stuck = tempfile::tempdir().unwrap();
             Store::new(stuck.path()).save(&sample("w")).unwrap();
             assert!(reserve_path(stuck.path()).exists(), "precondition: {entry}: a save leaves a reserve");
@@ -1160,6 +1200,18 @@ mod tests {
             assert!(matches!(error, StoreError::DiskFull(_)), "{entry}: {error:?}");
             assert!(says_disk_full_naming(&error, stuck.path()), "{entry}: {error}");
             assert_eq!(plan.attempts(WriteKind::Lock), 2, "{entry}: one retry");
+
+            // DF4a: no reserve, no retry. The fault hits only the first
+            // creation attempt, so a retry would have taken the lock.
+            let bare = tempfile::tempdir().unwrap();
+            Store::new(bare.path()).save(&sample("w")).unwrap();
+            let _ = std::fs::remove_file(reserve_path(bare.path()));
+            assert!(!reserve_path(bare.path()).exists(), "precondition: {entry}: no reserve");
+            let (store, plan) = faulted(bare.path(), vec![rule(WriteKind::Lock, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+            let error = take(&store, entry).expect_err("nothing to free, so the first failure is final");
+            assert!(matches!(error, StoreError::DiskFull(_)), "{entry}: {error:?}");
+            assert!(says_disk_full_naming(&error, bare.path()), "{entry}: {error}");
+            assert_eq!(plan.attempts(WriteKind::Lock), 1, "{entry}: no reserve, no retry (DF4a)");
         }
     }
 
