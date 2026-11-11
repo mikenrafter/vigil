@@ -156,6 +156,17 @@ async fn call_noid(vigil: &Vigil, max_s: Option<u64>, orchestrator: Option<bool>
     serde_json::to_value(&envelope).unwrap()
 }
 
+/// S2 supersedes the pre-S2 assertions that an orchestrator call's `cache` holds
+/// only the three AI3 keys: an orchestrator call also makes its start credit
+/// check, which is reported as `credit_check`. Returns `cache` without that key
+/// and asserts the check is there and says "not on credits" (the quiet probe).
+fn cache_without_start_check(envelope: &Value) -> Value {
+    let mut cache = envelope["cache"].clone();
+    let check = cache.as_object_mut().expect("cache object").remove("credit_check").expect("S2: an orchestrator call reports its start credit check");
+    assert_eq!(check["on_credits"], false, "{check}");
+    cache
+}
+
 fn keys(value: &Value) -> Vec<&str> {
     value.as_object().expect("an object").keys().map(String::as_str).collect()
 }
@@ -263,7 +274,7 @@ async fn an_orchestrator_on_a_five_minute_cache_keeps_270_s_and_reports_5m() {
     let started = Instant::now();
     let envelope = call(&vigil, &id, None, Some(true)).await;
     assert_eq!(started.elapsed(), Duration::from_secs(270));
-    assert_eq!(envelope["cache"], json!({"ttl": "5m", "source": "claude-transcript", "interval_s": 270}));
+    assert_eq!(cache_without_start_check(&envelope), json!({"ttl": "5m", "source": "claude-transcript", "interval_s": 270}));
 }
 
 #[tokio::test(start_paused = true)]
@@ -341,7 +352,7 @@ async fn an_explicit_max_s_wins_over_the_cache_and_is_clamped_to_the_transport()
     let (id, _) = quiet_watch(&rig, &vigil, "w", 300, 40_000, |_| {}).await;
     let short = call(&vigil, &id, Some(100), Some(true)).await;
     assert_eq!((&short["waited_s"], &short["max_s"]), (&json!(100), &json!(100)));
-    assert_eq!(short["cache"], json!({"ttl": "unknown", "source": "explicit", "interval_s": 100}));
+    assert_eq!(cache_without_start_check(&short), json!({"ttl": "unknown", "source": "explicit", "interval_s": 100}));
     let huge = call(&vigil, &id, Some(9999), Some(true)).await;
     assert_eq!((&huge["waited_s"], &huge["cache"]["interval_s"]), (&json!(3300), &json!(3300)));
 
@@ -364,7 +375,7 @@ async fn a_codex_orchestrator_gets_270_s_from_the_codex_default() {
     let (id, _) = quiet_watch(&rig, &vigil, "w", 300, 7200, |_| {}).await;
     let envelope = call(&vigil, &id, None, Some(true)).await;
     assert_eq!(envelope["waited_s"], 270);
-    assert_eq!(envelope["cache"], json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
+    assert_eq!(cache_without_start_check(&envelope), json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
 }
 
 // --------------------------------------------------- AI6: short calls ----

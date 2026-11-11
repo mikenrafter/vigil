@@ -1595,13 +1595,17 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
 
 // ---- N3: print, then commit ----
 
-/// `vigil <args>` whose standard output is closed (fd 1 not open at all).
+/// `vigil <args>` whose standard output is a pipe nobody reads any more (the
+/// read end is closed right after the spawn, long before the process has
+/// anything to print): every write fails with EPIPE. A descriptor that is not
+/// open at all is not testable: Rust's runtime re-opens fds 0-2 as /dev/null
+/// before `main`, so such a process cannot tell.
 fn run_with_closed_stdout(sandbox: &Sandbox, args: &[&str]) -> std::process::Output {
-    let mut command = std::process::Command::new("sh");
-    command.arg("-c").arg("exec \"$@\" >&-").arg("sh").arg(vigil_bin()).args(args);
-    sandbox.configure(&mut command);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    finish_within(command.spawn().unwrap(), Duration::from_secs(12))
+    let mut command = sandbox.command();
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    drop(child.stdout.take());
+    finish_within(child, Duration::from_secs(12))
 }
 
 /// `vigil <args>` whose standard output is `/dev/full` (every write fails with ENOSPC).
@@ -1621,9 +1625,9 @@ fn a_failed_stdout_write_leaves_the_event_uncommitted_and_the_next_call_replays_
     //      keepalive must return the same attention event at once, flagged
     //      `redelivered: true` (the agent may or may not have seen it). Control:
     //      with a working stdout the event is delivered once and a later call
-    //      (the watch has since expired) does not replay it. Rust's own stdout
-    //      swallows a closed descriptor silently, so a naive println! passes
-    //      the "closed" case as a success and commits an undelivered event.
+    //      (the watch has since expired) does not replay it. A naive println!
+    //      panics on EPIPE (exit 101, no clean error) and Rust's own stdout
+    //      swallows EBADF, so the delivery must be written and checked by hand.
     // proves: CLAIM(N3)
     let sandbox = Sandbox::new();
     for (id, run) in [
