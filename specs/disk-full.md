@@ -64,3 +64,30 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
 - D4: skill doc (`agent-integration/skills/vigil/SKILL.md`) is updated in the
   same change: glob inputs take `pattern`; a `change` watch ends after it
   fires; what `persist` means and what to do (free space, keep calling).
+
+## Amendments after red (orchestrator, 2026-11-10; answers red report A1–A10)
+
+- **A1 → DF1a.** A tick whose save failed ends the call and returns its
+  envelope (no in-memory re-ticking, no spin). `vigil wait`, after a pending
+  envelope with `persist.ok = false`, sleeps one interval before calling again.
+- **A2 → DF3a.** `redelivery: true` only when something is at risk: the
+  envelope has events, or a terminal status (fired/expired/cancelled) that
+  was not saved. Otherwise the field is absent.
+- **A3 → DF5a.** A cancel that cannot be saved even after the reserve returns
+  an envelope with `persist.ok = false` (like a tick), never a silent success.
+- **A4 → DF4a.** No reserve file, no retry: the first failure is reported
+  (`used_reserve` absent).
+- **A5.** Literal reading kept: the reserve is recreated after any successful
+  write, including right after the retry when there is room.
+- **A6 → DF5b.** Error contract: the message contains the state root path and
+  the lowercase words `disk full`; `persist.error` carries the OS text.
+- **A7 → DF7.** A `create` whose baseline save fails removes its placeholder
+  file, so the agent can retry with the same id.
+- **A8.** Skill doc (D4): after a failed save `status` may still say pending
+  while keepalive answered fired; trust the envelope, keep calling.
+- **A9 → DF3b.** Redelivered events are those since the last saved baseline:
+  the unsaved ones plus anything newer.
+- **A10.** Out of scope (pruning old watches to free space).
+- **Seam.** `VIGIL_TEST_FAULT` stays an env var read in `main.rs`; it is
+  documented as test-only, a malformed value is a hard error, unset changes
+  nothing.
