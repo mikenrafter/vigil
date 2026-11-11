@@ -467,7 +467,9 @@ impl Vigil {
         let terminal = watch.status.is_finished();
         // Before the literal: the session lock taken for `session_ticks` below
         // lives to the end of the statement, and `replayed_events` takes it too.
-        let events = self.replayed_events(watch);
+        // S6: a pending watch's file holds only the outbox of attention events;
+        // `status` neither delivers nor acknowledges them, so it shows none.
+        let events = if terminal { self.replayed_events(watch) } else { Vec::new() };
         Envelope {
             watch_id: watch.spec.id.clone(),
             status: watch.status,
@@ -489,6 +491,8 @@ impl Vigil {
             others: Vec::new(),
             persist: None,
             persist_failures: Vec::new(),
+            cache: None,
+            clock: None,
         }
     }
 }

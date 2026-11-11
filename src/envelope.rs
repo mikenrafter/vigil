@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::CacheNote;
 use crate::clock::Timestamp;
 use crate::error::{FailureKind, WriteFailure};
 use crate::watch::{Event, JudgeStatus, WatchId, WatchStatus};
@@ -194,6 +195,34 @@ pub struct Envelope {
     /// when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub persist_failures: Vec<SecondaryFailure>,
+    /// AI3: how the call window was chosen. Only blocking returns (a keepalive,
+    /// and the final envelope of a `wait`, S1); absent from status and cancel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheNote>,
+    /// AI4: how long this call waited and how long the watch has lived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<ClockNote>,
+}
+
+/// The envelope's `clock` (AI4). `since_last_call_s` is always present on the
+/// wire, `null` on the first call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockNote {
+    /// Seconds this call (or this whole `wait`) waited.
+    pub waited_s: u64,
+    /// Seconds since the watch was created (A13: equals `elapsed_s`).
+    pub watch_age_s: u64,
+    /// Seconds since the previous envelope this watch returned; `None` on the
+    /// first call.
+    pub since_last_call_s: Option<u64>,
+    /// One plain line for the agent, see [`clock_summary`].
+    pub summary: String,
+}
+
+impl ClockNote {
+    pub fn new(waited_s: u64, watch_age_s: u64, since_last_call_s: Option<u64>) -> ClockNote {
+        ClockNote { waited_s, watch_age_s, since_last_call_s, summary: clock_summary(waited_s, watch_age_s, since_last_call_s) }
+    }
 }
 
 impl Envelope {
@@ -209,8 +238,22 @@ impl Envelope {
 /// the same tiers with the seconds dropped from a minute up, and says
 /// `first call` when `since_last_call_s` is `None`.
 pub fn clock_summary(waited_s: u64, watch_age_s: u64, since_last_call_s: Option<u64>) -> String {
-    let _ = (waited_s, watch_age_s, since_last_call_s);
-    String::new() // RED
+    let last = match since_last_call_s {
+        None => "first call".to_string(),
+        Some(seconds) if seconds < 60 => format!("last call {seconds}s ago"),
+        Some(seconds) if seconds < 3600 => format!("last call {}m ago", seconds / 60),
+        Some(seconds) => format!("last call {}h {}m ago", seconds / 3600, seconds % 3600 / 60),
+    };
+    format!("waited {} this call; watching for {}; {last}", format_span(waited_s), format_span(watch_age_s))
+}
+
+/// `45s` under a minute, `4m 30s` under an hour, `2h 10m` from an hour (A14).
+pub fn format_span(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
+    }
 }
 
 /// Cut `digest` so the WHOLE result, `DIGEST_CUT_MARKER` included, is at most
@@ -262,6 +305,8 @@ mod tests {
             others: vec![],
             persist: None,
             persist_failures: vec![],
+            cache: None,
+            clock: None,
         }
     }
 

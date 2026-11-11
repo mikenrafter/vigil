@@ -1,5 +1,6 @@
 //! One evaluation round of one watch (SPEC "Tick logic").
 
+use crate::attention::Activity;
 use crate::clock::Timestamp;
 use crate::engine::{expired_if_overdue, Persisted, Vigil};
 use crate::error::VigilError;
@@ -187,6 +188,7 @@ impl Vigil {
 
         watch.tick = tick;
         watch.last_tick_at = Some(now);
+        watch.activity = Some(activity_after(&watch, &readings, now));
         watch.input_states = readings.into_iter().map(|reading| reading.state).collect();
         if !fired_events.is_empty() {
             let terminal = Terminal {
@@ -336,6 +338,24 @@ fn judge_event(watch: &WatchFile, tick: u64, judged: &[ChangedInput], summary: O
         summary,
         judge: answers,
         redelivered: false,
+        detail: None,
+    }
+}
+
+/// What this tick saw, for the stall rule (AI5): when any input, and when a
+/// file/glob/cmd input, last changed, and whether a `process` input runs. The
+/// reference moments start at the watch's creation (the baseline) and move to
+/// the tick's own time when it sees a change.
+fn activity_after(watch: &WatchFile, readings: &[Reading], now: Timestamp) -> Activity {
+    let before = watch.activity.unwrap_or(Activity { last_change_at: watch.created_at, last_output_change_at: watch.created_at, process_running: false });
+    let seen = || watch.spec.inputs.iter().zip(readings);
+    let changed = seen().any(|(_, reading)| reading.changed);
+    let output_changed = seen().any(|(input, reading)| reading.changed && matches!(input, Input::File { .. } | Input::Glob { .. } | Input::Cmd { .. }));
+    let process_running = seen().any(|(input, reading)| matches!(input, Input::Process { .. }) && !reading.is_error && reading.text == "running");
+    Activity {
+        last_change_at: if changed { now } else { before.last_change_at },
+        last_output_change_at: if output_changed { now } else { before.last_output_change_at },
+        process_running,
     }
 }
 
@@ -370,6 +390,7 @@ fn change_events(watch: &WatchFile, tick: u64, readings: &[Reading]) -> Vec<Even
             summary: summarize(input, &reading.text),
             judge: None,
             redelivered: false,
+            detail: None,
         })
         .collect()
 }
@@ -401,6 +422,7 @@ fn condition_events(watch: &mut WatchFile, tick: u64, readings: &[Reading]) -> V
         summary: cap_bytes(&format!("condition met: {summary}"), MAX_SUMMARY_BYTES),
         judge: None,
         redelivered: false,
+        detail: None,
     }]
 }
 

@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::attention::{Activity, AttentionReason};
 use crate::clock::Timestamp;
+use crate::credit::{CreditSource, HookOutcome};
 use crate::error::CreateError;
 use crate::judge::{Answer, JudgeRule, RuleTest};
 
@@ -217,8 +219,7 @@ pub struct CreateRequest {
     pub judge_questions: Option<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_rule: Option<JudgeRule>,
-    /// AI5: how long the job should take, in seconds (>= 1, A16). RED: not
-    /// yet carried into the spec.
+    /// AI5: how long the job should take, in seconds (>= 1, A16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_s: Option<u64>,
     /// AI5: how long inputs may stay unchanged while a `process` input runs.
@@ -305,6 +306,15 @@ pub struct WatchSpec {
     pub deadline_s: u64,
     #[serde(flatten)]
     pub fire: FireRule,
+    /// AI5: how long the job should take (>= 1 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_s: Option<u64>,
+    /// AI5: how long inputs may stay unchanged while a process input runs (>= 1 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_s: Option<u64>,
+    /// AI1' (A8): keepalive calls for this watch are the orchestrator's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orchestrator: bool,
 }
 
 impl WatchSpec {
@@ -325,6 +335,11 @@ impl WatchSpec {
         let deadline_s = request.deadline_s.unwrap_or(DEFAULT_DEADLINE_S);
         if !(MIN_DEADLINE_S..=MAX_DEADLINE_S).contains(&deadline_s) {
             return Err(CreateError::DeadlineOutOfRange(deadline_s));
+        }
+        for (field, value) in [("expect_s", request.expect_s), ("stall_s", request.stall_s)] {
+            if value == Some(0) {
+                return Err(CreateError::BelowOneSecond { field });
+            }
         }
         let interval_s = request.interval_s.unwrap_or(DEFAULT_INTERVAL_S).clamp(MIN_INTERVAL_S, MAX_INTERVAL_S);
         for input in &request.inputs {
@@ -352,7 +367,17 @@ impl WatchSpec {
                 }
             }
         };
-        Ok(WatchSpec { id, prompt: request.prompt, inputs: request.inputs, interval_s, deadline_s, fire })
+        Ok(WatchSpec {
+            id,
+            prompt: request.prompt,
+            inputs: request.inputs,
+            interval_s,
+            deadline_s,
+            fire,
+            expect_s: request.expect_s,
+            stall_s: request.stall_s,
+            orchestrator: request.orchestrator.unwrap_or(false),
+        })
     }
 
     /// V11: resolve relative file paths, glob patterns and `cmd` working
@@ -470,6 +495,46 @@ pub struct Event {
     /// only on the copy placed in an envelope; a stored event never has it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redelivered: bool,
+    /// What kind of event this is when it is not an ordinary one (A21): an
+    /// ordinary event has no `kind` key and is byte-identical to today's.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<EventDetail>,
+}
+
+/// The extra fields of the two events that are not about a watch's inputs
+/// (A17). Internally tagged, so the wire carries `kind` and the fields beside
+/// the ordinary event keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventDetail {
+    /// AI5: the watch needs the agent (`overdue` or `stalled`). Saved with the
+    /// watch until a delivery is committed (S6). vigil always sets `reason`;
+    /// it is optional on READ only, so that `kind` alone decides what an
+    /// envelope means (a tolerant reader, see `keepalive::wait_exit_code`).
+    Attention {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<AttentionReason>,
+    },
+    /// AI8: the account's credit state changed. Not saved (A18). The fields
+    /// are optional on read for the same reason as above.
+    CreditStateChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_credits: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<CreditSource>,
+        #[serde(default)]
+        windows: Vec<Value>,
+        /// What the operator hook did, when one is configured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hook: Option<HookOutcome>,
+    },
+}
+
+impl Event {
+    /// Is this an attention or credit event (the kinds that end a pending call)?
+    pub fn is_call_ending(&self) -> bool {
+        self.detail.is_some()
+    }
 }
 
 impl Event {
@@ -535,9 +600,22 @@ pub struct WatchFile {
     /// V3: the terminal events only (empty while pending, empty for expired
     /// and cancelled). There is no `delivered_through`. Each event's
     /// `summary` is at most `MAX_SUMMARY_BYTES` (X2).
+    ///
+    /// S6: while the watch is pending this is the OUTBOX of attention events
+    /// that were raised and saved but not yet acknowledged by a committed
+    /// delivery. `finish` replaces it with the terminal events.
     pub events: Vec<Event>,
     /// Last observed change; the terminal digest (V14).
     pub last_digest: String,
+    /// AI5 / S6: the attention reasons raised so far; each fires once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention_raised: Vec<AttentionReason>,
+    /// AI5: what the ticks saw (see `Activity`); `None` before the first tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
+    /// AI4 / A13: when this watch last returned an envelope (pending only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_call_at: Option<Timestamp>,
 }
 
 impl WatchFile {
@@ -557,6 +635,9 @@ impl WatchFile {
             pending_change: None,
             events: Vec::new(),
             last_digest: String::new(),
+            attention_raised: Vec::new(),
+            activity: None,
+            last_call_at: None,
         }
     }
     /// V3/V4: store the terminal result. Succeeds exactly once; afterwards the
@@ -570,6 +651,7 @@ impl WatchFile {
         self.events = terminal.events;
         self.last_digest = terminal.digest;
         self.pending_change = None;
+        self.last_call_at = None;
         Ok(())
     }
     /// V16: a pending watch whose `deadline_at` is at or before `now`.
@@ -891,6 +973,7 @@ mod tests {
                 summary: summary.into(),
                 judge: None,
                 redelivered: false,
+                detail: None,
             }],
             digest: summary.into(),
         }

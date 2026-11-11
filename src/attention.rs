@@ -1,9 +1,22 @@
-//! Early attention (specs/auto-interval.md AI5): when a watch has run longer
-//! than its owner expected, or its inputs have gone quiet while its process
-//! still runs, the call ends early with one `attention` event.
+//! Early attention (specs/auto-interval.md AI5, S6): when a watch has run
+//! longer than its owner expected, or its inputs have gone quiet while its
+//! process still runs, the call ends early with one `attention` event.
 //!
-//! RED phase: stubs only. Tests below and in `auto_interval_tests` define the
-//! contract.
+//! The rules here are pure: given a watch, the time and whether the call
+//! window is long, [`due_reasons`] says which reasons are due. `Vigil`
+//! (keepalive.rs) turns each due reason into an event, persists it with the
+//! watch and delivers it like any other event.
+//!
+//! Invariants: a reason is raised at most once per watch (`attention_raised`
+//! is saved together with the event, S6); a finished watch raises nothing
+//! (A15); `Stalled` needs a process input that the last tick saw running.
+//! Mating parts: `tick.rs` (keeps `Activity`), `watch::WatchFile` (stores the
+//! flags and the event until it is acknowledged).
+
+use serde::{Deserialize, Serialize};
+
+use crate::clock::Timestamp;
+use crate::watch::{Event, EventDetail, Input, WatchFile, WatchStatus, MAX_SUMMARY_BYTES};
 
 /// AI5: "1.5x or 9 minutes over, whichever comes first" (build-loop budget rule).
 pub const OVERDUE_EXTRA_CAP_S: u64 = 540;
@@ -13,11 +26,102 @@ pub const DEFAULT_STALL_S: u64 = 900;
 /// AI5 (A1): a call window above this is "long".
 pub const LONG_WINDOW_S: u64 = 270;
 
+/// Why a watch needs the agent's attention. Wire: `"overdue"` / `"stalled"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionReason {
+    /// It has run past its `expect_s` budget.
+    Overdue,
+    /// Nothing changed for `stall_s` while its process input still runs.
+    Stalled,
+}
+
+/// What the ticks have seen so far, kept in the watch file so a new process
+/// continues the same stall clock (A15: once per reason holds across processes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activity {
+    /// When any input last changed (a tick that saw a change).
+    pub last_change_at: Timestamp,
+    /// When a `file`, `glob` or `cmd` input last changed: the clock of the
+    /// default stall rule (AI5 / D3).
+    pub last_output_change_at: Timestamp,
+    /// Did the latest tick see a `process` input running?
+    pub process_running: bool,
+}
+
 /// The elapsed time since create at which `overdue` fires, in whole seconds:
-/// `min(1.5 x expect_s, expect_s + 540)` (A15: inclusive; odd `expect_s` is
-/// not pinned).
+/// `min(1.5 x expect_s, expect_s + 540)`. A15: inclusive; an odd `expect_s`
+/// rounds the 1.5x up (the spec leaves it open).
 pub fn overdue_after_s(expect_s: u64) -> u64 {
-    expect_s // RED: wrong on purpose
+    expect_s.saturating_mul(3).div_ceil(2).min(expect_s.saturating_add(OVERDUE_EXTRA_CAP_S))
+}
+
+/// The moment `overdue` fires for `watch`, if it still can.
+pub fn overdue_at(watch: &WatchFile) -> Option<Timestamp> {
+    let expect_s = watch.spec.expect_s?;
+    (watch.status == WatchStatus::Pending && !watch.attention_raised.contains(&AttentionReason::Overdue))
+        .then(|| watch.created_at.plus_secs(overdue_after_s(expect_s)))
+}
+
+/// The reasons that are due for `watch` at `now`, in the order they are
+/// raised (overdue, then stalled). `long_window` is whether this call's window
+/// is longer than [`LONG_WINDOW_S`] (the default stall applies to long calls only).
+pub fn due_reasons(watch: &WatchFile, now: Timestamp, long_window: bool) -> Vec<AttentionReason> {
+    if watch.status != WatchStatus::Pending {
+        return Vec::new();
+    }
+    let mut due = Vec::new();
+    if overdue_at(watch).is_some_and(|at| now >= at) {
+        due.push(AttentionReason::Overdue);
+    }
+    if !watch.attention_raised.contains(&AttentionReason::Stalled) {
+        let activity = watch.activity.unwrap_or(Activity { last_change_at: watch.created_at, last_output_change_at: watch.created_at, process_running: false });
+        // A15: "neither field set" is literal; `expect_s` alone turns the default off.
+        let rule = match (watch.spec.stall_s, watch.spec.expect_s) {
+            (Some(stall_s), _) => Some((stall_s, activity.last_change_at)),
+            (None, None) if long_window => Some((DEFAULT_STALL_S, activity.last_output_change_at)),
+            (None, _) => None,
+        };
+        if let Some((stall_s, since)) = rule
+            && activity.process_running
+            && now.secs_since(since) >= stall_s as i64
+        {
+            due.push(AttentionReason::Stalled);
+        }
+    }
+    due
+}
+
+/// The event for `reason`, with its W1 id `<watch>:<tick>:<n>` where `n`
+/// counts the reasons raised before it, so two events at one tick differ (S6).
+pub fn event_for(watch: &WatchFile, reason: AttentionReason, now: Timestamp) -> Event {
+    let age = format_span(now.secs_since(watch.created_at).max(0) as u64);
+    let (input, summary) = match reason {
+        AttentionReason::Overdue => {
+            let expected = format_span(watch.spec.expect_s.unwrap_or(0));
+            ("watch".to_string(), format!("overdue: running for {age}, expected {expected}"))
+        }
+        AttentionReason::Stalled => {
+            let label = watch.spec.inputs.iter().find(|input| matches!(input, Input::Process { .. })).map_or_else(|| "watch".to_string(), Input::label);
+            let quiet = watch.activity.map_or(0, |activity| now.secs_since(activity.last_change_at).max(0) as u64);
+            (label.clone(), format!("stalled: no input changed for {} while {label} runs", format_span(quiet)))
+        }
+    };
+    Event {
+        event_id: Event::make_id(watch.spec.id.as_str(), watch.tick, watch.attention_raised.len()),
+        tick: watch.tick,
+        watch_id: watch.spec.id.to_string(),
+        input,
+        summary: crate::tick::cap_bytes(&summary, MAX_SUMMARY_BYTES),
+        judge: None,
+        redelivered: false,
+        detail: Some(EventDetail::Attention { reason: Some(reason) }),
+    }
+}
+
+/// `4m 30s`, `1h 5m`, `45s`: the same tiers as the clock summary.
+fn format_span(seconds: u64) -> String {
+    crate::envelope::format_span(seconds)
 }
 
 #[cfg(test)]

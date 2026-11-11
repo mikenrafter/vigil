@@ -54,6 +54,10 @@ pub enum CreateError {
     /// V19 + X7: `timeout_s` must lie in 0.1..=19.
     #[error("timeout_s must be within 0.1..=19, got {0}")]
     TimeoutOutOfRange(f64),
+    /// AI5 (A16): `expect_s` and `stall_s` must be at least one second; zero
+    /// would raise attention on the very first tick.
+    #[error("{field} must be at least 1 second")]
+    BelowOneSecond { field: &'static str },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
