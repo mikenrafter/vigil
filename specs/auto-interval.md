@@ -213,3 +213,21 @@ are accepted as written, except:
   orchestrator watch makes the call an orchestrator call), attention on a
   secondary watch, attention vs terminal result in the same call (terminal is
   primary; attention still delivered, as a secondary event).
+
+## Defaults after spec review round 2 (final round; Sol 6/10; orchestrator, 2026-11-11)
+
+Red-report defaults R2-A1..A8 accepted (A7 offsets: 60, 300, 540 s). Remaining:
+- **N1.** A cross-process test races two real vigil processes (barrier via a
+  file/FIFO) and proves `credit.lock` is held through both the hook and the
+  `credit-state.json` update: the hook runs once.
+- **N2.** Production read paths (transcript tail, fallback scan, `uw` output)
+  go through the counting seam; tests assert bytes consumed on those paths,
+  not only content.
+- **N3.** The CLI prints the envelope before committing delivery (print, then
+  `commit_delivery`); a failed stdout write leaves it uncommitted, so the next
+  call replays it (`redelivered: true`). Test with a closed stdout.
+- **N4.** Hook delivery is at-least-once: deduplication counts only after the
+  state write commits; hooks must be idempotent (documented; the default
+  `claude-cache-ttl-policy` is, since it sets a value). If the state write
+  fails or the process dies after the hook, the next check re-runs it. Test
+  with an injected failure after the hook's side effect.
