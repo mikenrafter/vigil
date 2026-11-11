@@ -220,6 +220,10 @@ Non-blocking reads and cancel. `watch_status` also reports judge reachability
 - `events` is empty on a pure timeout. Then `status` is `pending`, `next` is
   `"call keepalive again"`, and the envelope is short, so a quiet hour costs
   a few hundred tokens per tick, not thousands.
+- `persist` and `persist_failures` appear only when a state write failed or had
+  to spend the reserve (see "Surviving a full disk"); an event carries
+  `"redelivered": true` only when it follows a failed save. A healthy call has
+  none of these keys.
 
 ## Tick logic (inside `keepalive`)
 
@@ -271,7 +275,7 @@ Nothing is written to the working tree, `$XDG_CONFIG_HOME` or any repository.
   `judge_strikes`, the pending change (V14, R7), `last_digest`, and the
   terminal events.
 - Writes are atomic: write `<id>.json.tmp` in the same directory, fsync,
-  rename.
+  rename. A failed write is survived, see "Surviving a full disk" below.
 - **One lock for everything** (V4, V5): every mutation (create, tick,
   cancel, prune) holds an exclusive `flock` on `$XDG_STATE_HOME/vigil/lock`
   for its read-modify-write, and re-reads the watch after taking it. The lock
@@ -283,6 +287,95 @@ Nothing is written to the working tree, `$XDG_CONFIG_HOME` or any repository.
   past its deadline counts as expired with `finished_at = deadline_at` (V16).
 - Elapsed time survives restarts for free: `created_at` and `deadline_at` are
   in the file.
+
+### Surviving a full disk
+
+Full contract and decisions: `specs/disk-full.md` (claims DF1-DF7 and the
+amendments S1-S6, N1-N3); proof: `src/disk_full_tests.rs`, the `store.rs` and
+`fault.rs` tests, `tests/cli_e2e.rs`, `tests/mcp_e2e.rs`. The intent: a state
+write that fails must never cost the agent the tick's answer, and a full disk
+must be named as such.
+
+- **The answer survives (DF1).** If sensing works and the watch-file write
+  fails, `keepalive` (MCP and CLI) still returns the full envelope for the tick,
+  built from memory: the same `events`, `digest`, `status`, `next` as a
+  successful tick. The CLI exits as it would have (`keepalive` 0; `wait` keeps
+  its outcome code). A tick whose save failed ends the call at once and is
+  answered as is (DF1a): no in-memory re-ticking, so a full disk is not hammered.
+  `vigil wait` sleeps one `interval_s` after a pending envelope that could not be
+  saved, then calls again.
+- **The failure is visible (DF2).** The envelope carries
+  `"persist": {"ok": false, "kind": "disk_full" | "io", "error": "<OS text>", "path": "<file>"}`.
+  `kind` is `disk_full` for ENOSPC (28) and EDQUOT (122), `io` otherwise.
+  `"redelivery": true` is added only when something is at risk: the envelope has
+  events or a terminal status (fired, expired, cancelled) that was not saved
+  (DF3a). `"first_error"` is added whenever a retry was made and failed, even if
+  both errors match; `error` and `kind` are then the retry's (S4). With several
+  covered watches, `persist` describes the watch whose envelope is returned and
+  `"persist_failures": [{"watch_id", "kind", "error", "path"}]` lists every other
+  covered watch whose save failed in that call (absent when empty, S5). A
+  healthy write has no `persist` key. The CLI writes one line to stderr naming
+  the state root for each failed save.
+- **At least once, best effort (DF3, S1).** A failed save does not advance the
+  persisted baseline, so the next tick senses the change again, from the last
+  saved baseline (DF3b: the unsaved changes plus anything newer). The call's own
+  answer is the guarantee; redelivery is best effort:
+  - `file` appends are redelivered (the newest `tail_bytes` of the appends since
+    the saved offset, within the 64 KiB capture cap of V12 and W7: older bytes
+    are skipped and `[truncated]` is said);
+  - `glob` reports its CURRENT matches, like the transient inputs `cmd`, `url`,
+    `port` and `process`, which report their state at the next sensing and may
+    not repeat a change that has reverted;
+  - an expiry or a cancellation saved by another process wins over redelivery.
+  A result that could not be saved is not marked returned (V7), so the next
+  no-id call covers it again. `redelivered: true` is set on every event of a tick
+  that follows a failed save, by the process that failed to save (the MCP
+  server, or `vigil wait`); a fresh CLI process cannot know, so its events are
+  unflagged. Agents must not deduplicate by `event_id` across a persist failure
+  (the tick number did not advance, so ids can repeat with other content) and
+  treat any event after an envelope with `persist.ok = false` as possibly
+  repeated. `watch_status` may lag: after a failed save it can still say
+  `pending` while `keepalive` answered `fired`.
+- **The reserve (DF4).** The store keeps `<root>/.reserve`: 256 KiB (262144
+  bytes) of real zeros, fsynced, never kept open. It is valid only as a regular
+  file of exactly that length with at least that much allocated
+  (`st_blocks * 512`), so a short, sparse or non-regular reserve is replaced
+  (DF4b). After any successful write that finds it invalid or absent it is
+  created, best effort: failing to make or delete it is never an error.
+  A write that fails with `disk_full` while the file exists causes the store to
+  delete it and retry the same write once. If the retry succeeds the tick is
+  persisted and the envelope carries
+  `"persist": {"ok": true, "used_reserve": true, "kind": "disk_full"}`. With no
+  reserve file there is no retry (DF4a). The rescue is best effort: a write
+  larger than the reserve, inode exhaustion, quotas, compression or a different
+  filesystem can still fail, and then DF1 and DF2 apply.
+- **Locks (DF4c-DF4e).** Reserve creation, deletion and the retry run under the
+  store-wide lock `<root>/lock`, taken after any watch lock (lock order is
+  unchanged). A caller that holds it (`create`) reuses it. The lock FILE exists
+  before any reserve is published; a missing store-wide lock file that cannot be
+  created allows no rescue and publishes no reserve (DF4d). A rescue waits for
+  the lock at most `min(2 s, remaining call budget)`; on timeout it reports the
+  first failure, leaves the reserve untouched and does not retry (DF4e).
+- **Every write, one path (DF5).** Watch create, tick save, cancel and lock-file
+  creation all use the reserve-and-retry path. A failure that survives it is an
+  error whose message names the state root and contains the words `disk full`
+  (`watch_create`, and any call that cannot even take its lock), except a tick
+  or a cancel, whose answer is returned with `persist.ok = false` (DF5a). A
+  `create` whose baseline cannot be saved removes its placeholder, so the same
+  id can be used again (DF7).
+- **Atomicity (DF6).** The rename of `<id>.json.tmp` over `<id>.json` is the
+  commit point: on any failure before it the previous file is intact and the
+  attempt's own `.tmp` is removed (best effort; the write's error, never the
+  cleanup's, is the one reported, N3). A leftover `.tmp` is overwritten by that
+  watch's next write; other `*.tmp` files are never swept, because another
+  process may be mid-write. A crash between deleting the reserve and the retry
+  leaves no reserve; the next successful write makes one.
+- **Test seam (S6).** `VIGIL_TEST_FAULT` makes the store's writes fail on
+  purpose (`KIND[@STAGE]:ERRNO:WHEN[:FILE]`, grammar in `src/fault.rs`). It is
+  for vigil's own tests and assumes a trusted process environment: whoever can
+  set it can disable writes, inheriting it does so too, and a malformed value
+  stops vigil from starting (it is never read as "no faults"). `main.rs` reads
+  it at the edge; unset it changes nothing.
 
 ## Open questions (resolve in phase 0)
 
