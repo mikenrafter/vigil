@@ -27,8 +27,14 @@ use crate::config::Config;
 use crate::judge::BoxFuture;
 use crate::process::{lead_own_group, GroupGuard};
 
-/// A10: the `uw` call is abandoned (and the transcript fallback used) after this.
+/// A10, S7: the whole probe (`uw`, then the transcript fallback) answers within
+/// this. `uw` itself gets all of it but the fallback's share (review S2).
 pub const UW_TIMEOUT: Duration = Duration::from_secs(5);
+/// Review S2: the part of the probe's timeout kept for the transcript fallback,
+/// as a divisor (a fifth: 1 s of 5 s). The engine cuts a check at the probe's
+/// whole timeout, so a `uw` that used all of it would leave the fallback no
+/// time and a hung `uw` would read as "unknown" although the transcripts say.
+pub const FALLBACK_SHARE_DIVISOR: u32 = 5;
 /// AI2' fallback: a transcript counts if modified within this many seconds.
 pub const RECENT_TRANSCRIPT_S: u64 = 600;
 /// A11: the hook's captured output is cut to this many bytes, marker included.
@@ -192,10 +198,19 @@ impl CreditProbe for SystemCreditProbe {
 }
 
 impl SystemCreditProbe {
+    /// CLAIM(S2-share): `uw` may run for `uw_timeout` minus the fallback's
+    /// share, so the fallback (a bounded, synchronous read of at most 20 tails)
+    /// has run and the answer is in before `timeout()` ends [review S2;
+    /// credit::tests::the_whole_check_including_the_transcript_fallback_fits_inside_the_probes_own_timeout].
+    fn uw_budget(&self) -> Duration {
+        self.uw_timeout - self.uw_timeout / FALLBACK_SHARE_DIVISOR
+    }
+
     /// `uw --json status` in its own process group, read through the byte cap
-    /// (S8) and the timeout (A10). `None`: missing, failed, slow, junk or too
-    /// long, so the transcripts decide. Dropping the future (a cancelled
-    /// call), the timeout and a rejected output all SIGKILL the whole group (S7).
+    /// (S8) and the timeout (A10, `uw_budget`). `None`: missing, failed, slow,
+    /// junk or too long, so the transcripts decide. Dropping the future (a
+    /// cancelled call), the timeout and a rejected output all SIGKILL the whole
+    /// group (S7).
     async fn ask_uw(&self) -> Option<CreditState> {
         use tokio::io::AsyncReadExt;
         let mut command = tokio::process::Command::new(&self.uw_command);
@@ -220,7 +235,8 @@ impl SystemCreditProbe {
             let status = child.wait().await.ok()?;
             status.success().then_some(output)
         };
-        let output = tokio::time::timeout(self.uw_timeout, run).await.ok().flatten();
+        // ↳ CLAIM(S2-share)
+        let output = tokio::time::timeout(self.uw_budget(), run).await.ok().flatten();
         guard.kill_now();
         parse_uw_status(std::str::from_utf8(&output?).ok()?)
     }

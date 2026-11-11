@@ -2402,7 +2402,10 @@ async fn a_uw_that_hangs_still_leaves_the_engine_time_to_read_the_transcripts() 
     //      the probe's timeout, from the transcripts (`credit_state_changed`,
     //      on_credits true, source transcripts), and the state file records
     //      it. Before the fix the call kept going to its 30 s end with no
-    //      event (cut here by the 10 s guard).
+    //      event (cut here by the 10 s guard) - but only when the two 1.5 s
+    //      timers fell in different milliseconds, so this is the end-to-end
+    //      guard; the deterministic proof is the probe-level test in
+    //      `credit::tests` (the check must finish before `timeout()`).
     // proves: CLAIM(S7-budget), CLAIM(AI2')
     let rig = Rig::real_time(|_| {});
     rig.transcript(&[assistant_line(900, 0), assistant_line(0, 500)]);
