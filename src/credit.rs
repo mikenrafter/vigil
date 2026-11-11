@@ -605,6 +605,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_whole_check_including_the_transcript_fallback_fits_inside_the_probes_own_timeout() {
+        // why: review S2. The engine cuts a check at `timeout()`. If `uw` may
+        //      use all of it, a hung `uw` leaves nothing for the fallback and
+        //      the outer cut wins (unknown). The probe's deadline is shared:
+        //      `uw` gives up early enough that the fallback has run and the
+        //      answer is in before `timeout()` has passed. Measured on the
+        //      check itself (500 ms limit, a fresh shifted transcript, a `uw`
+        //      that hangs): it returns the transcripts' verdict, and it does
+        //      so in less than `timeout()`. Before the fix it took exactly
+        //      the `uw` timeout plus the fallback.
+        // proves: CLAIM(S7-budget), CLAIM(AI2')
+        let dir = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        fresh(projects.path(), "p", "S1", &shifted(), 30);
+        let hangs = fake_uw(dir.path(), "exec sleep 30");
+        let probe = probe(&hangs, projects.path());
+        let started = std::time::Instant::now();
+        let state = probe.check(spec_instant()).await;
+        assert_eq!((state.source, state.on_credits), (CreditSource::Transcripts, Some(true)));
+        assert!(started.elapsed() < probe.timeout(), "the check took {:?}, the probe's timeout is {:?}", started.elapsed(), probe.timeout());
+    }
+
     // ---- run_credit_hook (AI8) ----
 
     fn hook_state() -> serde_json::Value {

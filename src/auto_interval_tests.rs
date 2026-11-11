@@ -2387,3 +2387,41 @@ async fn attention_due_at_the_end_of_the_budget_does_not_wait_for_a_watch_lock_h
     let next = call(&vigil, &id, Some(30), None).await;
     assert_attention(&next, "overdue", 0);
 }
+
+// ---- review S2: a hung uw must not starve the transcript fallback ----------
+
+#[tokio::test]
+async fn a_uw_that_hangs_still_leaves_the_engine_time_to_read_the_transcripts() {
+    // why: review S2. The engine bounds a check by the probe's `timeout()`;
+    //      the probe's own `uw` timeout was the same 5 s, so the outer limit
+    //      always expired first and the transcript fallback never ran: a hung
+    //      `uw` read as "unknown" although a recent main-session transcript
+    //      shows the 1h -> 5m transition. Real clock and a real process (a
+    //      `uw` that sleeps), with the probe's timeout shortened to 1.5 s so
+    //      the test is quick. Expected: the check reports the change within
+    //      the probe's timeout, from the transcripts (`credit_state_changed`,
+    //      on_credits true, source transcripts), and the state file records
+    //      it. Before the fix the call kept going to its 30 s end with no
+    //      event (cut here by the 10 s guard).
+    // proves: CLAIM(S7-budget), CLAIM(AI2')
+    let rig = Rig::real_time(|_| {});
+    rig.transcript(&[assistant_line(900, 0), assistant_line(0, 500)]);
+    let hanging_uw = rig.env.dir.path().join("hanging-uw");
+    write_script(&hanging_uw, "exec sleep 600");
+    let probe = crate::credit::SystemCreditProbe {
+        uw_command: hanging_uw,
+        projects_dir: Some(rig.projects.path().to_path_buf()),
+        uw_timeout: Duration::from_millis(1500),
+    };
+    rig.seed_credit_file(Some(false), 300);
+    let vigil = rig.env.another_process().with_agent_env(claude()).with_credit_probe(Arc::new(probe));
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 10, 3600, |_| {}).await;
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), call(&vigil, &id, Some(30), Some(true))).await;
+    assert!(outcome.is_ok(), "S2: no answer after {:?}: the hung uw cost the call the whole check", started.elapsed());
+    let answer = outcome.unwrap();
+    let event = only_event(&answer);
+    assert_eq!((&event["kind"], &event["on_credits"], &event["source"]), (&json!("credit_state_changed"), &json!(true), &json!("transcripts")), "{answer}");
+    assert_eq!(rig.read_credit_file()["on_credits"], true, "the verdict was recorded");
+}
