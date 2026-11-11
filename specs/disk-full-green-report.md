@@ -371,7 +371,7 @@ re-run; the crate is still not rustfmt-formatted at the baseline.
 
 ## Review round 2 fixes (Sol 4/10, bar 9)
 
-STATUS: in progress (this section is kept current as the round goes). Two findings,
+STATUS: done. Two findings,
 both caused by the async rescue wait added for S3. Work order S4, S5. Cargo runs via
 qex, foreground. Deviation from the brief: `--mem 1.1GB` instead of `1.7GB`, because
 other sessions outside the queue left the machine 2.2 GB of usable memory and a
@@ -390,3 +390,111 @@ measured use of the test run is about 0.8 GB.
   * `disk_full_tests::a_tick_that_saved_keeps_its_report_when_the_reserve_upkeep_after_its_save_is_dropped`:
     the same class on the success side (a judge watch saved, its reserve upkeep waits for the lock, b's EIO
     ends the round). Before the fix `digest` was empty instead of naming the change `bad`.
+* Fix, commit `b28802e`. The instances of the class are the awaits that follow a tick's sensing:
+  (1) the rescue's wait for the store-wide lock after the first write failed, (2) the reserve upkeep's wait
+  after a write that succeeded. Both are covered by one mechanism, not by one patch each:
+  * `store.rs`: `Settled::{FirstAttemptFailed(&StoreError), Written}` is reported by `save_with` to an
+    observer BEFORE the wait (the first failure is reported right after the first attempt, before
+    `attempt_with_rescue` can await; `Written` right before upkeep waits, and only if upkeep has work).
+    Nothing the store does after the report changes the file other than the rescue's delete+retry and the
+    reserve fill, which still run under the store-wide lock with no `.await` between taking it and finishing
+    (CLAIM(DF4c)): a drop therefore leaves the watch file, the `.tmp` and the reserve exactly as the report says
+    (rename stays the commit point; the reserve is deleted only right before the retry, under the held lock).
+    `StoreError::write_failed` now borrows the `io::Error`.
+  * `engine.rs`: `Vigil::persist_observed` maps the report to a `Persisted` (`NotSaved(failure)` with `kind`
+    from the FIRST error, or `Saved`) for a caller's `settled` callback. The process's failed-save memory
+    (`remember_save`) is applied at the end of a save and by whoever collects a dropped save; a report alone does
+    not touch it, so a rescue that then succeeds does not flag its events as repeats.
+  * `tick.rs`: `Retained`, one slot per tick of a round. The tick keeps its `TickReport` (outcome, changed,
+    the watch as it is in memory, `Persisted`) in it at each report and clears it when the save returns, so a
+    completed tick is never collected twice.
+  * `keepalive.rs`: the round owns the slots; after `for_each_completed` it takes in the report of every tick
+    that was dropped inside its save (S1's early stop, or the budget's `timeout_at`), through the same
+    `take_in` the completed ticks use (progress, `changed`, `saves`). A dropped tick whose save was reported
+    `NotSaved` therefore reaches the envelope as `persist` / `persist_failures`, with its events, and the
+    call ends as S1 says.
+  * The two red tests counted every watch write since the create (6) where they meant the call's (2); that
+    assertion was not reached before the fix. Corrected to a difference in the same commit.
+* Mutation checks (each reverted): the first-failure report not made: both rescue tests red; no collection of
+  retained reports: all three red; no `Written` report: the upkeep test red; slots never cleared: 8 tests red
+  (a completed tick was taken in twice).
+
+### S5: the rescue deadline was captured before the write (`engine.rs`, `store.rs`, `fault.rs`)
+
+* Red test, commit `a9a2ab1`: `disk_full_tests::a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_inside_its_budget`.
+  A 30 s call whose read takes 29 s, a first write that fails with ENOSPC after 0.95 s, the store-wide lock held. It
+  failed on `the rescue must not wait once its cutoff has passed; the call took 30s` (the stale 0.9 s wait ran into the
+  outer timeout: `waited_s` 30; the S4 retention kept the answer, which is why the assertion is on the call's end). The
+  same test holds a control (lock free, same slow write): the rescue still gets the lock on its one try, spends the
+  reserve, `used_reserve`, attempt 2. Its preconditions pin that the read and the slow write really ran (`>= 29.9 s`).
+* The seam had no delay stage, so the red commit adds a minimal one (test-only semantics, documented in the `fault.rs`
+  module docs): `FaultRule::taking(duration)`. The failing attempt reports it (`Attempt::time_taken`); the store lets that
+  time pass on the call's clock right after the FIRST attempt fails and before it decides about a rescue (`Patience::elapse`:
+  a `tokio::time::sleep`, virtual under the paused test clock; a thread sleep in the blocking entry points). It applies to
+  the first attempt of a save and only when it fails; every plan without `taking`, and every plan parsed from
+  `VIGIL_TEST_FAULT` (no syntax for it), delays nothing and awaits nothing. Seam test:
+  `fault::tests::a_failure_reports_the_time_it_took_and_only_that_failure_does`.
+* Fix, commit `d9c13fe`. `Vigil::persist_observed` no longer turns the deadline into a duration: it hands the store an
+  absolute `tokio::time::Instant` cutoff (call deadline less `RESCUE_BUDGET_MARGIN`, 100 ms). The store's `LockWait
+  { ceiling, cutoff }` computes `allowed_now()` at the moment a wait is about to start: in `with_store_lock`, after the
+  store-wide lock file has been opened, so it covers both the rescue and the reserve upkeep (which caps the ceiling at
+  250 ms and keeps the cutoff). A passed cutoff means no waiting, not no rescue: the lock is still tried once, so a free
+  lock is taken. The blocking entry points (`save`, `save_within`) keep a plain duration from the start of their wait
+  (`cutoff: None`); nothing in production uses them inside a call budget.
+* Store-level tests, same commit (new API, so they could not exist before the fix):
+  `a_cutoff_that_has_passed_forbids_waiting_for_the_lock_but_not_taking_a_free_one`,
+  `the_time_left_to_the_cutoff_is_read_when_the_wait_starts_not_when_the_save_began` (write 300 ms, cutoff 500 ms:
+  the wait ends at 500 ms, not 800 ms), `reserve_upkeep_waits_no_longer_than_the_cutoff_allows` (100 ms, then 0),
+  and, for the mated S4 interface, `a_save_reports_what_it_settled_before_each_wait_it_makes` (the report precedes the
+  wait and survives a drop 100 ms into it; reserve inode and file unchanged; nothing is reported on a healthy save).
+* Mutation checks (each reverted): the cutoff ignored in `allowed_now`: 6 tests red (the S5 test, three store tests,
+  the two existing near-budget tests); the upkeep's `capped` dropping the cutoff: the upkeep test red; the wait started
+  from the ceiling alone (the old arithmetic): 6 red; margin 0 in the engine: the two near-budget tests and the S5 test
+  red.
+
+### Commits of this round
+
+| SHA | Message |
+|---|---|
+| `711bc6a` | vigil: red test for review S4 |
+| `b28802e` | vigil: a dropped rescue or upkeep wait keeps the tick's answer (review S4) |
+| `a9a2ab1` | vigil: red test for review S5 |
+| `d9c13fe` | vigil: a rescue or upkeep wait is bounded by an absolute cutoff read when it starts (review S5) |
+
+The report's own commit follows (the SHA is in the last line of the hand-off message).
+
+### Verification of this round
+
+Code tree = `d9c13fe` (the report commit changes only this file). `cargo test -j2 --no-fail-fast`, qex, foreground:
+
+| Run | `--lib` | `src/main.rs` | `cli_e2e` | `mcp_e2e` | doc-tests | Failed |
+|---|---|---|---|---|---|---|
+| 1 | 328 passed | 0 | 40 passed | 14 passed | 0 | none |
+| 2 | 328 passed | 0 | 40 passed | 14 passed | 0 | none |
+| 3 | 328 passed | 0 | 40 passed | 14 passed | 0 | none |
+
+382 tests (328 + 40 + 14), up from 373: 9 added in `--lib` (S4 3, S5 1 engine + 1 seam + 4 store). No existing test
+was changed except the attempt counts in the two S4 red tests (see S4). `cargo clippy --all-targets --no-deps -- -D warnings`
+with the same seven old lints allowed as last round exits 0: nothing new from this round. `cargo fmt --check` not re-run
+(the crate is still not rustfmt-formatted at the baseline).
+
+Flakes seen in this session, none in the three final runs and none in code touched by this round: the port-input tests
+`inputs::tests::port_reports_open_and_closed_and_whether_the_want_is_met` (once, in the S5 red run) and
+`inputs::tests::port_without_a_want_reports_no_want_status_and_want_closed_inverts` (twice, in mutated runs M1 and M6, which
+do not touch inputs). The second is the one already listed as flaky in the red reports; both bind and probe local ports
+on a machine that other sessions share. `engine::tests::listing_prunes_too` did not fail in any run of this round.
+
+### Decisions and caveats of this round
+
+* qex claim `--mem 1.1GB` instead of `1.7GB` (see the top of this section); the runs used up to 1 GB.
+* A tick dropped inside its save is reported as the store left it: `NotSaved(first error)` with `redelivery: true` for a
+  dropped rescue, `Saved` for a dropped upkeep. For a rescue that would have SUCCEEDED had it been allowed to continue,
+  the envelope therefore says "not saved" and the next call redelivers: the conservative side of DF3 (nothing is lost, an
+  event may come twice, flagged `redelivered`).
+* The collected tick also sends its progress notification and counts in `session_ticks` of the call, like a completed one.
+* A cancelled call (`keepalive_cancellable`'s cancel future) still drops everything and returns nothing (C2): the retained
+  reports are collected by the round, not by the cancel path, by design.
+* `Settled::Written` is reported only when the upkeep has something to make, so a healthy save with a valid reserve builds
+  no provisional report.
+* No MCP end-to-end test for S4/S5 (the smallest real call is 30 s); the paused-clock engine tests drive the same code
+  path, as in round 1.
