@@ -247,3 +247,20 @@ perfect:
 6. **Parent-directory fsync after the rename is not done** (the old code did not
    either); not in the spec.
 7. The flaky `listing_prunes_too` family (above) is pre-existing and unfixed.
+
+## Review round 1 fixes (Sol 6/10, bar 9)
+
+Three real bugs, each with a red test committed before its fix. Work order S1, S2, S3.
+All cargo runs via qex.
+
+### S1: a failed save did not end the round (`keepalive.rs`)
+
+* Red test: `disk_full_tests::a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held`,
+  plus `a_failed_save_ends_the_call_at_once_but_keeps_the_saves_that_were_ready_with_it`
+  (red for the same reason, and its file assertions fail a fix that drops the rest of the pass).
+  Commit `59d0f090`.
+* How it failed before the fix: watch "a" saves with EIO, watch "b"'s lock is held; the envelope
+  came back with `waited_s` 30 (the whole budget) instead of 0.
+* Fix: the `for_each_completed` callback in `sense` returns "stop" for any absorbed report whose
+  call record has an unsaved save (it was only `Finished` or a finished `Ticked`). Completions already
+  ready in the same pass are still collected by the existing stop logic (C12). Commit: see below.
