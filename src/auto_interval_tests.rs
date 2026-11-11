@@ -2711,3 +2711,40 @@ async fn attention_that_was_never_delivered_is_not_lost_by_a_cancel() {
     let event = only_event(&cancelled);
     assert_eq!((event["event_id"].as_str(), &event["redelivered"]), (Some(event_id.as_str()), &json!(true)), "{cancelled}");
 }
+
+// ---- review S7: a terminal envelope still knows when the last call was ----
+
+#[tokio::test(start_paused = true)]
+async fn a_terminal_envelope_reports_the_gap_since_the_last_call() {
+    // why: review S7 (AI4). `finish` cleared `last_call_at` before the
+    //      terminal envelope was built, so a watch that fired or expired on
+    //      its second-or-later call said `since_last_call_s: null` and "first
+    //      call" - the one envelope where the agent most needs the gap.
+    //      Call 1 of `fires` (30 s) returns at t = 30, call 1 of `expires`
+    //      returns at t = 60 (they run one after the other). Then 100 s pass
+    //      (t = 160). (1) The change is written and call 2 fires `fires` at
+    //      once: gap = 160 - 30 = 130 s. 400 s later (t = 560, past the 300 s
+    //      deadline of `expires`) (2) call 2 finds `expires` expired: gap =
+    //      560 - 60 = 500 s. In both the summary must not say "first call".
+    // proves: CLAIM(AI4)
+    let rig = Rig::new();
+    let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+    let (fires, path) = quiet_watch(&rig, &vigil, "fires", 20, 3600, |_| {}).await;
+    let (expires, _) = quiet_watch(&rig, &vigil, "expires", 20, 300, |_| {}).await;
+    for id in [&fires, &expires] {
+        let first = call(&vigil, id, Some(30), None).await;
+        assert!(first["clock"]["since_last_call_s"].is_null(), "control: the first call is the first: {first}");
+    }
+    tokio::time::advance(Duration::from_secs(100)).await;
+    append_file(&path, "boom\n");
+    let fired = call(&vigil, &fires, Some(30), None).await;
+    assert_eq!(fired["status"], "fired", "{fired}");
+    assert_eq!(fired["clock"]["since_last_call_s"], 130, "S7: {fired}");
+    assert!(!fired["clock"]["summary"].as_str().unwrap().contains("first call"), "{fired}");
+
+    tokio::time::advance(Duration::from_secs(400)).await;
+    let expired = call(&vigil, &expires, Some(30), None).await;
+    assert_eq!(expired["status"], "expired", "{expired}");
+    assert_eq!(expired["clock"]["since_last_call_s"], 500, "S7: {expired}");
+    assert!(!expired["clock"]["summary"].as_str().unwrap().contains("first call"), "{expired}");
+}
