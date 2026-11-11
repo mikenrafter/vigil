@@ -1,0 +1,249 @@
+# vigil disk-full: green phase report
+
+STATUS: done. Every test in the suite passes, including the 8 added for the final
+defaults. Two things are not as clean as they could be and are said plainly in
+"Not satisfied / caveats": `cargo clippy -- -D warnings` and `cargo fmt --check`
+fail on code this work did not touch.
+
+Spec: `specs/disk-full.md` (DF1-DF7 and every amendment; the last sections win).
+Red history: `specs/disk-full-red-report.md`. Branch `feat/vigil-disk-full`.
+Crate: ``. Also changed: `agent-integration/skills/vigil/SKILL.md`.
+
+## Commits
+
+| SHA | Message |
+|---|---|
+| `79804224` | vigil: red tests for final disk-full defaults (DF4d, DF4e, N3, S1) |
+| `f0d694b7` | vigil: make the write-fault seam real (parse, staged injection, counters) |
+| `294f8d00` | vigil: answer from memory when the disk is full (reserve, persist note, redelivery) |
+| `65515693` | vigil: CLI names the state root on stderr when a save failed (DF2) |
+| `a3871321` | vigil: document surviving a full disk (SPEC state section, skill) |
+
+A report cannot hold the SHA of the commit that contains it, so the commit of this
+file is the final one (the SHA is in the last line of the hand-off message).
+
+## Phase A: red edits for the final defaults
+
+Against the stub (`cargo test`, before any behaviour): lib 241 passed, 67 failed.
+66 of those are disk-full tests including the 8 new ones; the 67th is the known
+flaky `engine::tests::listing_prunes_too`. Every new test fails on an assertion or
+a precondition ("a save leaves a reserve", "no `persist` field"), none hangs, none
+fails to compile.
+
+| Final default | Tests | What they pin |
+|---|---|---|
+| DF4d (N1) | `store`: `a_reserve_is_published_only_after_the_store_wide_lock_file_exists`; the lock-entry test, rewritten for `lock`/`try_lock`. `disk_full_tests`: `without_a_store_wide_lock_file_that_can_be_made_there_is_no_rescue_and_the_reserve_is_left_alone` | no reserve before the lock file exists; a missing store-wide lock file that cannot be made allows no rescue: `disk_full`, reserve untouched. The test that expected a rescue for `lock`/`try_lock` is replaced; the per-watch entries keep the rescue leg (their store-wide lock file exists). Engine twin has a control where the same fault IS rescued once the lock file can be made. |
+| DF4e (N2) | `store`: `a_rescue_waits_..._at_most_the_call_budget_and_then_gives_up_untouched` (budget 0, 200 ms, and the 2 s ceiling), `a_lock_released_within_the_budget_lets_the_rescue_through` (positive control). `disk_full_tests`: `a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_with_the_envelope` | wait is `min(2 s, budget left)`; held beyond it: envelope, reserve intact (same inode), ONE attempt. The engine test has a world with 0.5 s of budget left (a 29.5 s virtual read out of a 30 s call) so it fails if the engine does not pass its budget. Adds the stub `Store::save_within`. |
+| N3 | `store`: `the_error_a_failed_write_returns_is_the_writes_own_never_the_cleanups`; the cleanup-leftover test now fails the cleanup with EACCES while the write is EIO | different errnos for write and cleanup; the returned error is the write's, both directions (EIO write + ENOSPC cleanup; ENOSPC write + EIO cleanup), at four stages |
+| S1 qualifier | `disk_full_tests`: `a_glob_redelivers_its_current_matches_and_never_a_match_that_has_vanished`, `a_file_redelivers_every_append_since_the_saved_baseline_up_to_the_64_kib_capture_cap` | glob is transient: both-stay gives "a | b", a-vanishes gives only "b" (and a appears nowhere), all-vanish is a quiet saved `pending`. File: 20000+20000 bytes redelivered whole; 40000+40000 keeps the newest 65536 bytes with `[truncated]` and loses FIRST's tag. Oracle: the stored `last_digest`, not cut by the 8 KiB envelope limit. |
+
+Note on one test with a range: the `lock`/`try_lock` rescue leg asserts 1 or 2 lock
+creation attempts (`(1..=2).contains(..)`). The spec does not say whether the rescue's
+own try to create the store-wide lock file counts as a second attempt; my
+implementation makes it (2). The range is the honest reading of the spec, and the
+reserve/lock-file assertions next to it are exact.
+
+## Phase B: what was built, and the design choices
+
+### Seam (`src/fault.rs`)
+
+Real matching. `begin` counts one attempt per call and fixes each matching rule's
+ordinal at that moment (a file-filtered rule counts only its own file), so later
+attempts cannot shift it; `Attempt::at` fires the first rule at that stage whose
+`When` holds, evaluating `while=PATH` at the stage. `parse` refuses a rule with an
+unknown kind or stage, a stage the kind never has (`lock@sync`), errno 0, attempt 0,
+an inverted range, a path-like or empty FILE, a wrong field count, or an empty rule;
+messages name the offending piece. `WriteKind::stages()` is the table of what each
+kind has; the module docs state that `VIGIL_TEST_FAULT` is test-only and assumes a
+trusted environment (S6). `main.rs` already read the variable at the edge and
+already failed loudly on a bad plan; unset it changes nothing.
+
+### Store (`src/store.rs`, `src/error.rs`)
+
+* **`write_staged`**: create, write, short write, sync, rename (the commit point),
+  cleanup. A failed attempt removes only its own `.tmp`, best effort, and returns the
+  WRITE's error (N3). A leftover `.tmp` is truncated and consumed by that watch's next
+  write; nothing sweeps other `*.tmp` files.
+* **One rescue path** (`attempt_with_rescue`) for watch files, lock files and the
+  reserve upkeep: run the attempt; on ENOSPC/EDQUOT with a reserve file present, take
+  the store-wide lock, re-check the reserve is still there (a racing rescue may have
+  spent it: then no retry, DF4a), delete it, retry once, and re-make the reserve on
+  success (A5). A failed retry returns the retry's error plus `first_error`.
+* **Lock access as a type**: `StoreLockAccess::{Held(&StoreLock), Wait(Duration)}`.
+  `Store::save_under(watch, &StoreLock)` is what `create` calls for its placeholder, so
+  it reuses the lock it holds and never waits for itself; `save_within(watch, budget)`
+  waits `min(2 s, budget)`; `save` waits 2 s.
+* **`StoreLock` (store-wide) and `WatchLock` are now different types**, so
+  `save_under` cannot be handed a watch lock.
+* **DF4d**: `with_store_lock` makes the lock file first (through the seam, with no
+  rescue of its own); if it cannot, nothing runs: no rescue, no reserve. Taking
+  `lock`/`try_lock` for a missing store-wide lock file that cannot be made therefore
+  reports `disk_full` with the reserve untouched.
+* **DF4b**: valid reserve = regular file (not a symlink), exactly 262144 bytes,
+  `st_blocks * 512 >= 262144`. Replaced when invalid, written in place with
+  `create_new` (never through a symlink), real zeros, `sync_all`, half written then the
+  `ShortWrite` stage, and removed again if anything fails. Never kept open.
+* **Errors**: `StoreError::Io` and `DiskFull` keep their names (tests match them) and
+  now carry an `IoFailure { os_error, write: Option<WriteContext { path, state_root,
+  first_error }> }`. The message names the state root and says `disk full`
+  (lowercase) for ENOSPC/EDQUOT.
+
+### Engine, keepalive, tick, envelope
+
+* A failed write is a value, not an error: `Persisted::{Saved, SavedOnReserve,
+  NotSaved(PersistFailure)}` (`engine.rs`). `Vigil::persist` does the save, passes
+  the call budget to `save_within`, and keeps the process's memory of which watches
+  failed to save (`Session::unsaved`, for S1).
+* `TickReport` (now `pub(crate)`) carries the watch as the tick left it, saved or
+  not, plus `persisted` and `redelivered`. `sense` accumulates a `CallRecord`
+  (changes, risky saves, redelivered ids) and ends the call right after a round with
+  an unsaved tick (DF1a). `keepalive_envelope` answers from the in-memory copy for such
+  a watch, flags events of redelivering watches, does NOT mark an unsaved terminal
+  result returned (DF3), and builds `persist`/`persist_failures`.
+* `PersistNote` is an enum (`ReserveSpent`, `NotSaved { failure, redelivery }`) behind
+  a private flat wire struct (`#[serde(into, try_from)]`), so the Rust type cannot hold
+  `ok: true` together with an `error`. `redelivery` is computed once, from the
+  envelope's content: events present, or a terminal status (DF3a).
+* `cancel` returns an envelope with `persist` (DF5a); `create` saves its placeholder
+  under the held lock and removes it when the baseline cannot be saved (DF7); `wait`
+  sleeps one `interval_s` after a pending envelope that could not be saved (DF1a).
+* `Event` has `redelivered` (skipped when false, never stored true). `Envelope` has
+  `persist` and `persist_failures` (both absent on a healthy call).
+* CLI: one stderr line per failed save naming the state root (`keepalive`, `wait`,
+  `cancel`); exit codes unchanged.
+
+Decisions I took where the spec leaves room:
+
+* If a covered watch other than the primary spent the reserve and the primary has no
+  note of its own, the envelope's `persist` is `ReserveSpent`: the agent should learn
+  the disk is full whichever watch noticed. A primary's own note always wins.
+* `watch_create` returns no `persist` note when its save used the reserve (the
+  `Created` shape has no such field and the spec is silent). Only a failure is
+  reported, as an error.
+* `wait` prints the stderr line for the final envelope only; intermediate pending
+  envelopes whose save failed are silent on stderr.
+* A failed `create_dir_all(watches/)` is inside the retried closure, so a full disk
+  that fails the directory is rescued like the file.
+
+## Verification
+
+All cargo runs via qex, foreground. Full output of each is under the session
+scratchpad (`run*.log`, `final*.log`).
+
+### The three final full runs (`cargo test -j2 --no-fail-fast`, tree = `a3871321`)
+
+| Run | `--lib` | `src/main.rs` | `cli_e2e` | `mcp_e2e` | doc-tests | Failed tests |
+|---|---|---|---|---|---|---|
+| 1 | 308 passed, 0 failed | 0 | 40 passed, 0 failed | 14 passed, 0 failed | 0 | none |
+| 2 | 307 passed, 1 failed | 0 | 40 passed, 0 failed | 14 passed, 0 failed | 0 | `engine::tests::listing_prunes_too` |
+| 3 | 308 passed, 0 failed | 0 | 40 passed, 0 failed | 14 passed, 0 failed | 0 | none |
+
+362 tests in the suite (308 + 40 + 14), up from 354 after red round 3 (8 added in
+Phase A). The first full run after the green code (before the docs commit) was also
+308/40/14, all passing.
+
+### Flaky tests
+
+* `engine::tests::listing_prunes_too` fails sometimes (1 of the 3 final runs). It
+  also failed on the Phase A stub run, before any behaviour existed, so it predates
+  this work. It also failed in one mutated run together with
+  `engine::tests::prune_also_removes_abandoned_pending_watches_and_their_lock_files_but_never_the_global_lock`.
+  The red reports (rounds 2 and 3) already list both and give a cause I did not
+  re-verify: `prune` only try-locks a watch's lock file, and a child forked by a
+  concurrent test and not yet exec'd still holds the descriptor, so the candidate is
+  skipped. Not touched.
+* `inputs::tests::port_without_a_want_reports_no_want_status_and_want_closed_inverts`
+  (flaky per the red report) did not fail in any run of this session.
+* `keepalive::tests::a_blocked_call_returns_early_...` (flaky per round 1) did not
+  fail in any run of this session.
+
+### clippy and rustfmt
+
+Both are in `TOOLS` (`cargo-clippy`, `cargo-fmt`/`rustfmt`).
+
+* `cargo clippy --all-targets -j2 -- -D warnings`: **fails** (qex reports exit 97 for a failed job), 6 errors in the lib
+  (and again in the lib test), all in files and lines this work did not touch:
+  `testing.rs` (3 x `new_without_default`/`field_reassign_with_default`,
+  `collapsible_if`, and the `read` extern signature lint
+  `suspicious_runtime_symbol_definitions`) and `watch.rs:93` (`derivable_impls`). The
+  same command also stops the `mcp_e2e` target at `tests/mcp_e2e.rs:252`
+  (`type_complexity`), a line from an earlier commit. With exactly those seven lints
+  allowed (`-A clippy::new_without_default -A clippy::field_reassign_with_default -A
+  clippy::collapsible_if -A clippy::derivable_impls -A
+  suspicious_runtime_symbol_definitions -A clippy::type_complexity`) clippy over all
+  targets exits **0**: nothing from this work is flagged. I did not fix the old
+  lints: they are in test infrastructure and an unrelated impl.
+* `cargo fmt --check`: **fails** (exit 1), 911 hunks across 19 files. The crate is not
+  rustfmt-formatted at the baseline: untouched files (`clock.rs`, `config.rs`,
+  `judge.rs`) fail too. I matched the surrounding style and did not reformat the
+  crate, which would bury this change in an unrelated diff.
+
+### Mutation checks (each reverted; nothing committed)
+
+Applied in disjoint batches and attributed by which tests went red.
+
+| Mutation | Killed by |
+|---|---|
+| proceed without a store-wide lock file that could not be made (DF4d) | `without_a_store_wide_lock_file_...`, `a_reserve_is_published_only_after_...`, the lock-entry test |
+| ignore the call budget, always wait 2 s (DF4e) | the store budget test and the engine DF4e test |
+| the cleanup's error replaces the write's (N3) | `the_error_a_failed_write_returns_is_the_writes_own_...` and the cleanup-leftover test (the old test, with equal errnos, would not have caught it; this is why it changed) |
+| a retry that does not delete the reserve first | 10 store/engine tests (all `WhileExists(reserve)` rescues) |
+| reserve validity ignores `st_blocks` | `an_invalid_reserve_is_replaced_by_the_next_successful_write` (the sparse rows) |
+| `create` calls `save` instead of `save_under` (self-wait) | `a_create_that_fits_once_the_reserve_is_freed_succeeds` |
+| drop the re-check of the reserve under the lock (DF4c/DF4a) | `two_rescues_racing_on_one_root_spend_the_reserve_exactly_once` |
+| unsaved results counted as returned (DF3) | `a_no_id_keepalive_...`, `a_cancel_saved_by_another_process_wins_...`, `one_terminal_result_saved_and_another_unsaved_...` |
+| `wait` does not sleep (DF1a) | `wait_sleeps_one_interval_...` |
+| no stop after an unsaved tick (DF1a) | watchdog failures across the tick tests |
+| events not flagged `redelivered` (S1) | the flag tests (`every_event_...`, the glob and file tests, the DF3 tests) |
+| create keeps its placeholder (DF7) | `a_create_whose_baseline_save_fails_removes_its_placeholder_...` |
+
+Not mutated: the S1 file/glob tests have no code of their own to break (they pin
+existing reader behaviour through the new redelivery path); their sharpness is that
+they need `persist`/`redelivered` to exist at all.
+
+### A real ENOSPC, not only the seam
+
+`unshare -Urm` works on this box, so I mounted a 1 MiB tmpfs in a private mount
+namespace and ran the built binary against it (scripts in the session scratchpad,
+nothing touched the host's filesystems; the tmpfs vanished with the namespace):
+
+* healthy `create` left `lock`, `locks/`, `watches/` and a 262144-byte `.reserve`;
+* disk filled to 0 free, input changed, `keepalive`: exit 0, the full fired envelope,
+  `persist = {"ok": true, "used_reserve": true, "kind": "disk_full"}`, no stderr
+  line, and a new valid reserve appeared again (the replaced watch file freed exactly
+  the page the new reserve needed);
+* reserve removed first, disk full, `keepalive`: exit 0, full fired envelope,
+  `persist = {ok: false, kind: disk_full, error: "No space left on device (os error
+  28)", path: <watch file>, redelivery: true}`, ONE stderr line naming the state
+  root, the watch file byte-identical, no `.tmp`;
+* the same disk, `create`: exit 1, `error: disk full: cannot write .../w4.json (state
+  root ...): No space left on device (os error 28)`, no `w4.json` left behind;
+* space freed, a fresh process: the same event (`w3:1:0`, "boom2") again, persisted,
+  no `persist` field, empty stderr, no `redelivered` flag (a fresh process cannot
+  know, as decided), the reserve back.
+
+## Not satisfied / caveats
+
+Nothing in the spec was left unimplemented and no test was weakened. What is not
+perfect:
+
+1. **`cargo clippy -- -D warnings` and `cargo fmt --check` do not pass**, for the
+   old reasons above. They are the only red gates.
+2. **No real quota or inode-exhaustion drill** (EDQUOT, ENOSPC on create from a full
+   inode table): only the seam covers those. The ENOSPC drill above is on tmpfs.
+3. **A filesystem that compresses or deduplicates zeros** reports fewer blocks for
+   the reserve than its length, so it is never "valid" (DF4b, S2) and every healthy
+   write finds it invalid and re-writes 256 KiB with an fsync. Correct by the spec's
+   definition, but a cost on such filesystems. The skill and SPEC say the rescue can
+   fail there; they do not mention the repeated rewrite.
+4. **The rescue wait blocks a thread.** `Store` is synchronous, so a rescue that
+   waits for the store-wide lock sleeps its runtime thread for up to `min(2 s,
+   budget)`. In practice the lock is held for milliseconds by another process;
+   the cost is bounded and only paid on a full disk. The DF4e engine test therefore
+   takes about 2.5 s of real time.
+5. **`lib.rs` still has the old "RED phase: every public item below is a stub"
+   header** and `#![allow(dead_code, unused_variables)]` from before this work;
+   I left them.
+6. **Parent-directory fsync after the rename is not done** (the old code did not
+   either); not in the spec.
+7. The flaky `listing_prunes_too` family (above) is pre-existing and unfixed.
