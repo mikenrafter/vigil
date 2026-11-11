@@ -160,3 +160,11 @@ credits (writes cost 1.25x input instead of 2x), `"1h"` otherwise (the pinned
 default). vigil then reads the new TTL from the transcript at its next call
 and shortens its interval to 270 s by itself. A rebuild resets the file to the
 pinned 1 h, which is the correct state off credits.
+
+## Defaults after red (orchestrator, 2026-11-11)
+
+The red report's A1–A22 (`host-config.research/vigil-auto-interval/red-report.md`)
+are accepted as written, except:
+- **A12 amended.** `vigil wait`'s final envelope also carries `clock` (and
+  `cache`), since a background `vigil wait` is the main way Claude sessions
+  use vigil; status and cancel envelopes do not.
