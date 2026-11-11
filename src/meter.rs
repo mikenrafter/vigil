@@ -33,10 +33,11 @@ pub struct FileTally {
     pub lowest_offset: Option<u64>,
 }
 
-type Shared = Arc<Mutex<BTreeMap<PathBuf, FileTally>>>;
+type Tallies = BTreeMap<PathBuf, FileTally>;
+type Shared = Arc<Mutex<Tallies>>;
 
 static ACTIVE_TAPS: AtomicUsize = AtomicUsize::new(0);
-static TAPS: Mutex<Vec<(PathBuf, Weak<Mutex<BTreeMap<PathBuf, FileTally>>>)>> = Mutex::new(Vec::new());
+static TAPS: Mutex<Vec<(PathBuf, Weak<Mutex<Tallies>>)>> = Mutex::new(Vec::new());
 
 /// A registration: everything read below `prefix` while this is alive is
 /// counted here. Dropping it unregisters.
@@ -127,6 +128,10 @@ pub(crate) struct MeteredFile {
 impl MeteredFile {
     pub(crate) fn open(path: &Path) -> std::io::Result<MeteredFile> {
         let file = File::open(path)?;
+        // A device or a pipe that raced into the path is not a transcript.
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+        }
         note_open(path);
         Ok(MeteredFile { file, path: path.to_path_buf(), position: 0 })
     }

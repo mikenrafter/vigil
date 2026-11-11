@@ -59,16 +59,20 @@ impl Config {
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .map_or(default, |value| value.max(floor))
         };
+        let non_empty = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        let claude_projects_dir = non_empty("VIGIL_CLAUDE_PROJECTS_DIR")
+            .map(PathBuf::from)
+            .or_else(|| non_empty("CLAUDE_CONFIG_DIR").map(|dir| PathBuf::from(dir).join("projects")))
+            .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".claude/projects")));
         Config {
             judge_url: lookup("VIGIL_JUDGE_URL").unwrap_or_else(|| DEFAULT_JUDGE_URL.to_string()),
             judge_state_bytes: number("VIGIL_JUDGE_STATE_BYTES", DEFAULT_JUDGE_STATE_BYTES, MIN_JUDGE_STATE_BYTES),
             digest_max_bytes: number("VIGIL_DIGEST_MAX_BYTES", DEFAULT_DIGEST_MAX_BYTES, MIN_DIGEST_MAX_BYTES),
             judge_timeout: Duration::from_secs(10),
             health_timeout: Duration::from_secs(2),
-            // RED: the environment-derived values are not read yet.
-            claude_projects_dir: None,
-            uw_command: PathBuf::from(DEFAULT_UW_COMMAND),
-            on_credit_change: None,
+            claude_projects_dir,
+            uw_command: PathBuf::from(non_empty("VIGIL_UW_COMMAND").unwrap_or_else(|| DEFAULT_UW_COMMAND.to_string())),
+            on_credit_change: non_empty("VIGIL_ON_CREDIT_CHANGE"),
             credit_check_every: DEFAULT_CREDIT_CHECK_EVERY,
             credit_hook_timeout: DEFAULT_CREDIT_HOOK_TIMEOUT,
         }

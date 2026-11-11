@@ -1,4 +1,4 @@
-//! Cache-aware call window (specs/auto-interval.md AI1', AI3).
+//! Cache-aware call window (specs/auto-interval.md AI1', AI3, S4, S8).
 //!
 //! The agent should not decide how long a keepalive call blocks. A call made
 //! by the main orchestrator session gets a window derived from the session's
@@ -7,9 +7,15 @@
 //! Code) and `newest_cache_write` (reader); `choose_window` (decision) and the
 //! envelope's `cache` field (report).
 //!
-//! RED phase: every body is a stub that returns a neutral value, so the tests
-//! fail on assertions. Types and signatures are the contract.
+//! Threat model (technical-excellence section 6): the transcript directory
+//! belongs to the same user as vigil, so a planted file is not a privilege
+//! boundary; the code still refuses to follow symlinks or open FIFOs and never
+//! splices an unchecked session id into a path, so a stray link cannot make a
+//! keepalive read an arbitrary file or hang on a pipe (S8). A file swapped
+//! between the lookup and the open is accepted risk: the open re-checks that
+//! the handle is a regular file.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -57,9 +63,17 @@ pub struct CacheNote {
     pub source: TtlSource,
     /// The call window in seconds (A1); equals the envelope's `max_s`.
     pub interval_s: u64,
-    /// AI2': the newest credit check; long calls only.
+    /// AI2': the newest credit check made in this call, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit_check: Option<CreditCheck>,
+}
+
+impl CacheNote {
+    /// The window of a caller that is not the orchestrator, or whose cache is
+    /// not known: 270 s, `unknown`, `default`.
+    pub const fn unknown_default() -> CacheNote {
+        CacheNote { ttl: Ttl::Unknown, source: TtlSource::Default, interval_s: DEFAULT_WINDOW_S, credit_check: None }
+    }
 }
 
 /// Which agent is calling, read from the environment at the binary edge
@@ -72,11 +86,58 @@ pub struct AgentEnv {
     pub codex: bool,
 }
 
+/// Who is calling, as far as vigil can tell (S4). Derived from [`AgentEnv`]
+/// once, so every decision matches on the same four cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Identity<'a> {
+    /// Claude Code, and nothing suggests Codex: its transcript can be trusted.
+    Claude { session_id: &'a str },
+    /// Codex, and nothing suggests Claude Code: 5 minutes, 300 s tool timeout.
+    Codex,
+    /// Both signals are present (a Claude Code started from a Codex shell, or
+    /// the reverse): vigil cannot say which one is calling, so it assumes the
+    /// stricter limits of both (S4).
+    Ambiguous,
+    /// Neither signal.
+    Unknown,
+}
+
+impl Identity<'_> {
+    /// The largest window an explicit `max_s` may ask for (A2): 3300, the
+    /// largest vigil ever picks itself. Codex's tool timeout (300 s) is a hard
+    /// limit, so a caller that may be Codex, and one that is both Claude and
+    /// Codex, get 270 (R2-A1, S4). The old fixed 270 ceiling is gone for every
+    /// other caller: the engine tests that ask for 3300 without any agent
+    /// signal pin that.
+    pub const fn window_ceiling_s(self) -> u64 {
+        match self {
+            Identity::Codex | Identity::Ambiguous => CODEX_MAX_WINDOW_S,
+            Identity::Claude { .. } | Identity::Unknown => ONE_HOUR_WINDOW_S,
+        }
+    }
+}
+
 impl AgentEnv {
     /// Build from the whole environment (`std::env::vars()` in the binary).
     pub fn from_vars(vars: impl IntoIterator<Item = (String, String)>) -> AgentEnv {
-        let _ = vars;
-        AgentEnv::default() // RED
+        let mut agent = AgentEnv::default();
+        for (name, value) in vars {
+            if name == "CLAUDE_CODE_SESSION_ID" && !value.is_empty() {
+                agent.claude_session_id = Some(value);
+            } else if name == "AGENT" && value == "codex" || name.starts_with("CODEX_") {
+                agent.codex = true;
+            }
+        }
+        agent
+    }
+
+    pub fn identity(&self) -> Identity<'_> {
+        match (self.claude_session_id.as_deref(), self.codex) {
+            (Some(_), true) => Identity::Ambiguous,
+            (Some(session_id), false) => Identity::Claude { session_id },
+            (None, true) => Identity::Codex,
+            (None, false) => Identity::Unknown,
+        }
     }
 }
 
@@ -95,8 +156,87 @@ pub struct WindowRequest<'a> {
 /// at most one transcript tail, and only for an orchestrator on Claude Code
 /// with no explicit `max_s` (A4).
 pub fn choose_window(request: &WindowRequest<'_>) -> CacheNote {
-    let _ = request;
-    CacheNote { ttl: Ttl::Unknown, source: TtlSource::Default, interval_s: DEFAULT_WINDOW_S, credit_check: None } // RED
+    let identity = request.agent.identity();
+    // CLAIM(A2-explicit): an explicit window wins, within 30 s and the identity's ceiling [red-report A2, R2-A1; cache::an_explicit_max_s_wins_and_is_clamped_to_the_transport_limit]
+    if let Some(explicit) = request.explicit_s {
+        let interval_s = explicit.clamp(MIN_WINDOW_S, identity.window_ceiling_s());
+        return CacheNote { ttl: Ttl::Unknown, source: TtlSource::Explicit, interval_s, credit_check: None };
+    }
+    if !request.orchestrator {
+        return CacheNote::unknown_default();
+    }
+    match identity {
+        Identity::Codex => CacheNote { ttl: Ttl::FiveMinutes, source: TtlSource::CodexDefault, interval_s: DEFAULT_WINDOW_S, credit_check: None },
+        Identity::Ambiguous | Identity::Unknown => CacheNote::unknown_default(),
+        Identity::Claude { session_id } => match request.projects_dir.and_then(|dir| ttl_of_session(dir, session_id)) {
+            Some(Ttl::OneHour) => CacheNote { ttl: Ttl::OneHour, source: TtlSource::ClaudeTranscript, interval_s: ONE_HOUR_WINDOW_S, credit_check: None },
+            Some(Ttl::FiveMinutes) => CacheNote { ttl: Ttl::FiveMinutes, source: TtlSource::ClaudeTranscript, interval_s: DEFAULT_WINDOW_S, credit_check: None },
+            Some(Ttl::Unknown) | None => CacheNote::unknown_default(),
+        },
+    }
+}
+
+/// The shape of a transcript record, as far as vigil reads it (A6): nothing
+/// else in the line is looked at, so text quoted inside a tool result or the
+/// nested `iterations[]` copy cannot be mistaken for a usage block.
+#[derive(Deserialize)]
+struct Record {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default, rename = "isSidechain")]
+    is_sidechain: bool,
+    #[serde(default)]
+    message: Option<Message>,
+}
+
+#[derive(Deserialize)]
+struct Message {
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    cache_creation: Option<CacheCreation>,
+}
+
+#[derive(Deserialize)]
+struct CacheCreation {
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+}
+
+impl Record {
+    /// The TTL this record wrote the cache with: `1h` is checked before `5m`
+    /// (AI1'); a record that did not write (`0`/`0`), is not a main-session
+    /// assistant turn, or has no `cache_creation` object says nothing.
+    fn cache_write(&self) -> Option<Ttl> {
+        if self.kind.as_deref() != Some("assistant") || self.is_sidechain {
+            return None;
+        }
+        let split = self.message.as_ref()?.usage.as_ref()?.cache_creation.as_ref()?;
+        if split.ephemeral_1h_input_tokens > 0 {
+            Some(Ttl::OneHour)
+        } else if split.ephemeral_5m_input_tokens > 0 {
+            Some(Ttl::FiveMinutes)
+        } else {
+            None
+        }
+    }
+}
+
+/// The TTLs of the cache writes in `tail`, newest first (A6): complete JSON
+/// lines only, main-session assistant records only, torn, junk, legacy and
+/// over-long (S8) lines skipped. Shared by the window decision (newest write)
+/// and the credit fallback (a 5m write after an earlier 1h one).
+pub fn cache_writes_newest_first(tail: &[u8]) -> impl Iterator<Item = Ttl> + '_ {
+    tail.rsplit(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty() && line.len() <= MAX_TRANSCRIPT_LINE_BYTES)
+        .filter_map(|line| serde_json::from_slice::<Record>(line).ok())
+        .filter_map(|record| record.cache_write())
 }
 
 /// The TTL of the newest usable cache write in `tail` (A6): complete JSON
@@ -106,26 +246,44 @@ pub fn choose_window(request: &WindowRequest<'_>) -> CacheNote {
 /// `MAX_TRANSCRIPT_LINE_BYTES` is skipped like any other unusable line.
 /// `None`: no usable write (unknown).
 pub fn newest_cache_write(tail: &[u8]) -> Option<Ttl> {
-    let _ = tail;
-    None // RED
+    cache_writes_newest_first(tail).next()
 }
 
 /// The last `max_bytes` of `path`, cut at a line start (A6): when the cut
 /// falls inside a line that line is dropped; when it falls exactly on a line
 /// start the line is kept. A file no longer than `max_bytes` is returned
-/// whole.
+/// whole. The file is opened through the read meter and must be a regular file.
 pub fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let _ = (path, max_bytes);
-    Ok(Vec::new()) // RED
+    let mut file = crate::meter::MeteredFile::open(path)?;
+    read_tail_from(&mut file, max_bytes)
 }
 
 /// S8: `read_tail` over any `Read + Seek`: seek to `len - max_bytes - 1` (the
 /// byte before the cut says whether it falls on a line start), read to the
 /// end, drop a partial first line. At most `max_bytes + 1` bytes are ever
 /// read, and none from before that offset, however long the source is.
-pub fn read_tail_from<R: std::io::Read + std::io::Seek>(reader: &mut R, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let _ = (reader, max_bytes);
-    Ok(Vec::new()) // RED
+pub fn read_tail_from<R: Read + Seek>(reader: &mut R, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let len = reader.seek(SeekFrom::End(0))?;
+    if len <= max_bytes {
+        reader.seek(SeekFrom::Start(0))?;
+        let mut whole = Vec::with_capacity(len as usize);
+        reader.take(max_bytes).read_to_end(&mut whole)?;
+        return Ok(whole);
+    }
+    // ↳ CLAIM(S8-tail): one byte before the cut tells whether the cut is a line start; nothing earlier is read [spec S8; cache::read_tail_from_pulls_only_the_last_512_kib_out_of_a_huge_file]
+    reader.seek(SeekFrom::Start(len - max_bytes - 1))?;
+    let mut bytes = Vec::with_capacity(max_bytes as usize + 1);
+    reader.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    let cut_is_a_line_start = bytes.first() == Some(&b'\n');
+    let keep_from = if cut_is_a_line_start {
+        1
+    } else {
+        // Inside a line: drop it up to and including its newline. A tail that
+        // is all one partial line has no complete line at all.
+        bytes.iter().position(|&byte| byte == b'\n').map_or(bytes.len(), |newline| newline + 1)
+    };
+    bytes.drain(..keep_from);
+    Ok(bytes)
 }
 
 /// `<projects_dir>/*/<session_id>.jsonl` (A5): one level deep, never under a
@@ -134,16 +292,45 @@ pub fn read_tail_from<R: std::io::Read + std::io::Seek>(reader: &mut R, max_byte
 /// (to a file or to a project directory) or a FIFO is not a transcript and is
 /// never opened.
 pub fn find_session_transcript(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
-    let _ = (projects_dir, session_id);
-    None // RED
+    let valid = (1..=64).contains(&session_id.len()) && session_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if !valid {
+        return None;
+    }
+    let file_name = format!("{session_id}.jsonl");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for project in regular_subdirectories(projects_dir) {
+        let candidate = project.join(&file_name);
+        let Ok(metadata) = std::fs::symlink_metadata(&candidate) else { continue };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(best, _)| modified > *best) {
+            newest = Some((modified, candidate));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// The directories directly below `dir` that are real directories (a symlink
+/// to a directory is not one, S8), in name order. An unreadable `dir` has none.
+pub(crate) fn regular_subdirectories(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect();
+    found.sort();
+    found
 }
 
 /// `newest_cache_write` over the last `TRANSCRIPT_TAIL_BYTES` of the session's
 /// transcript; `None` when the file is missing, unreadable or has no usable
 /// write.
 pub fn ttl_of_session(projects_dir: &Path, session_id: &str) -> Option<Ttl> {
-    let _ = (projects_dir, session_id);
-    None // RED
+    let path = find_session_transcript(projects_dir, session_id)?;
+    newest_cache_write(&read_tail(&path, TRANSCRIPT_TAIL_BYTES).ok()?)
 }
 
 #[cfg(test)]
