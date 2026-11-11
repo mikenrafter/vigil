@@ -453,6 +453,6 @@ One mutation at a time on that prototype, tests that went red:
 
 ## Commit
 
-Tests and this section: `vigil: tighten red tests for disk-full amendments
-(DF1a-DF7)`. The SHA is in the last line of the final message and, as in
-round 1, is added to this file in a one-file follow-up commit.
+Round 2 red commit `0d126e4f` (`0d126e4f04bb16a514ae9a1b5390f38b005d8dc9`), message `vigil: tighten red tests for
+disk-full amendments (DF1a-DF7)`. A report cannot hold the SHA of the commit
+that contains it, so this line was added in a one-file follow-up commit.
