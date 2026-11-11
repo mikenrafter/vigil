@@ -1900,9 +1900,16 @@ fn rescue_waits_of_different_watches_overlap_and_never_block_the_executor() {
         heartbeat.abort();
 
         assert_eq!(envelope["status"], "pending", "{envelope}");
-        assert_eq!(persist_of(&envelope)["ok"], false, "{envelope}");
-        assert_eq!(persist_of(&envelope)["kind"], "disk_full", "{envelope}");
-        assert!(persist_of(&envelope).get("first_error").is_none(), "the rescue timed out, nothing was retried: {envelope}");
+        // Which failure the envelope shows depends on which rescue gave up
+        // first (the three deadlines differ by microseconds, S1 ends the round
+        // at the first one absorbed): as `persist` when it is the primary "a",
+        // else in `persist_failures`. Either way a disk_full failure with the
+        // OS text, and nothing retried (no `first_error`).
+        let failure = envelope.get("persist").or_else(|| envelope["persist_failures"].get(0)).unwrap_or_else(|| panic!("no failure reported at all: {envelope}"));
+        assert_eq!(failure["kind"], "disk_full", "{envelope}");
+        assert!(failure["error"].as_str().is_some_and(|text| text.contains("No space left on device")), "{envelope}");
+        assert!(failure.get("first_error").is_none(), "the rescue timed out, nothing was retried: {envelope}");
+        assert_ne!(failure.get("ok"), Some(&json!(true)), "{envelope}");
         assert!(elapsed >= Duration::from_millis(1900), "precondition: the rescues really waited for the lock (DF4e: 2 s), took {elapsed:?}");
         assert!(elapsed < Duration::from_secs(4), "the three 2 s waits must overlap (about 2 s), not add up to 6 s: took {elapsed:?}");
         assert!(beats.load(std::sync::atomic::Ordering::SeqCst) >= 30, "the executor was blocked: {} heartbeats in {elapsed:?}", beats.load(std::sync::atomic::Ordering::SeqCst));
