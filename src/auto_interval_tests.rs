@@ -2644,6 +2644,39 @@ async fn an_attention_event_keeps_its_id_when_a_tick_lands_between_a_failed_save
     assert_eq!((&d["waited_s"], &d["events"]), (&json!(270), &json!([])), "saved this time, and acknowledged: {d}");
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_retried_attention_event_is_flagged_redelivered_even_when_nothing_else_remembers_the_failure() {
+    // why: review S5, mutation check. In the test above the `redelivered` flag
+    //      also comes from the tick that precedes the retry (its report says it
+    //      followed a failed save), so deleting the flag on the retry itself
+    //      went unnoticed. Here a separate tick (`tick_due`, not through a
+    //      call) saves successfully after the failed attention save and so
+    //      clears the process's memory of failed saves; the next call has no
+    //      tick of its own to run. The retry (id `w:1:0`, remembered by the
+    //      event cache) must still say `redelivered: true`.
+    // proves: CLAIM(S5-identity)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let healthy = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &healthy, "w", 600, 7200, |request| request.expect_s = Some(60)).await;
+    call(&healthy, &id, Some(30), None).await;
+
+    let marker = rig.env.input_path("full");
+    write_file(&marker, "full");
+    let faults = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::WhileExists(marker.clone()))]);
+    let faulted = rig.vigil(AgentEnv::default(), &probe).with_write_faults(faults);
+    let b = call(&faulted, &id, None, None).await;
+    assert_eq!(only_event(&b)["event_id"], "w:1:0", "{b}");
+
+    std::fs::remove_file(marker).unwrap();
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(faulted.tick_due(&id).await.unwrap(), crate::tick::TickOutcome::Ticked, "the tick that clears the failure memory");
+    let c = call(&faulted, &id, None, None).await;
+    assert_eq!(c["waited_s"], 0, "{c}");
+    let again = only_event(&c);
+    assert_eq!((again["event_id"].as_str(), &again["redelivered"]), (Some("w:1:0"), &json!(true)), "{c}");
+}
+
 // ---- review S6: a terminal result does not swallow unacknowledged attention ----
 
 /// A watch (cadence 600 s, overdue at 90 s) whose attention was raised and saved
