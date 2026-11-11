@@ -508,7 +508,7 @@ mod tests {
         // why: A11: the output rides in the event, which rides in the agent's
         //      context. 100 000 bytes of 'a' must come back as at most
         //      MAX_HOOK_OUTPUT_BYTES (2048), not empty and not whole.
-        // proves: CLAIM(AI8)
+        // proves: CLAIM(AI8), CLAIM(S8-output)
         let outcome = run_credit_hook("head -c 100000 /dev/zero | tr '\\0' 'a'", &hook_state(), Duration::from_secs(10)).await;
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.output.contains('a'));
@@ -592,14 +592,17 @@ mod tests {
         assert_eq!(unset.check(spec_instant()).await.on_credits, None, "no projects dir configured");
     }
 
-    #[test]
-    fn an_unknown_check_has_a_null_on_credits_on_the_wire() {
+    #[tokio::test]
+    async fn an_unknown_check_has_a_null_on_credits_on_the_wire() {
         // why: S5 wire: `cache.credit_check.on_credits` is true / false / null.
         //      Pinned as literal JSON, with `credit-state.json`'s shape beside
         //      it (S2/S9): both are written by one process and read by another.
-        //      [g] passes against the stub: a data pin, not behaviour.
+        //      Use the production probe's unavailable-source answer, so a stub
+        //      that falsely reports off fails this wire assertion too.
         // proves: CLAIM(S5), CLAIM(S9)
-        let check = CreditCheck { at: at("2026-10-29T14:07:11Z"), source: CreditSource::Transcripts, on_credits: None };
+        let dir = tempfile::tempdir().unwrap();
+        let state = SystemCreditProbe { uw_command: dir.path().join("missing"), projects_dir: None, uw_timeout: Duration::from_millis(500) }.check(spec_instant()).await;
+        let check = CreditCheck { at: at("2026-10-29T14:07:11Z"), source: state.source, on_credits: state.on_credits };
         assert_eq!(serde_json::to_string(&check).unwrap(), r#"{"at":"2026-10-29T14:07:11Z","source":"transcripts","on_credits":null}"#);
         let file = CreditStateFile { on_credits: Some(false), checked_at: at("2026-10-29T14:07:11Z") };
         assert_eq!(serde_json::to_string(&file).unwrap(), r#"{"on_credits":false,"checked_at":"2026-10-29T14:07:11Z"}"#);
@@ -624,7 +627,9 @@ mod tests {
         let projects = tempfile::tempdir().unwrap();
         let state = probe(&uw, projects.path()).check(spec_instant()).await;
         assert_eq!(state.source, CreditSource::Transcripts, "the hung uw is abandoned");
-        let pid = pid_written_to(&pid_file).await.expect("uw was run");
+        let pid = pid_written_to(&pid_file).await;
+        assert!(pid.is_some(), "uw must run before testing descendant cleanup");
+        let pid = pid.unwrap();
         assert!(gone_within_2_s(pid).await, "uw's background child {pid} survived the timeout");
     }
 
@@ -640,10 +645,9 @@ mod tests {
         let uw = fake_uw(dir.path(), &format!("sleep 60 &\necho $! > '{}'\nwait", pid_file.display()));
         let projects = tempfile::tempdir().unwrap();
         let slow = SystemCreditProbe { uw_command: uw, projects_dir: Some(projects.path().to_path_buf()), uw_timeout: Duration::from_secs(30) };
-        let check = slow.check(spec_instant());
-        tokio::pin!(check);
+        let mut check = slow.check(spec_instant());
         let pid = tokio::select! {
-            _ = &mut check => panic!("the check returned before uw could be cancelled"),
+            _ = &mut check => { assert!(false, "the check returned before uw could be cancelled"); unreachable!() },
             pid = pid_written_to(&pid_file) => pid.expect("uw was run"),
         };
         drop(check);
@@ -659,10 +663,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let command = format!("sleep 60 & echo $! > '{}'; wait", pid_file.display());
-        let run = run_credit_hook(&command, &hook_state(), Duration::from_secs(30));
-        tokio::pin!(run);
+        let state = hook_state();
+        let mut run = Box::pin(run_credit_hook(&command, &state, Duration::from_secs(30)));
         let pid = tokio::select! {
-            _ = &mut run => panic!("the hook returned before it could be cancelled"),
+            _ = &mut run => { assert!(false, "the hook returned before it could be cancelled"); unreachable!() },
             pid = pid_written_to(&pid_file) => pid.expect("the hook was run"),
         };
         drop(run);

@@ -1,7 +1,8 @@
 //! End-to-end suite for the `vigil` binary's CLI subcommands. Lives in tests/
 //! (not beside a module) because it spawns the built binary
 //! (CARGO_BIN_EXE_vigil) and checks process-level behaviour: exit codes,
-//! stdout JSON, and files on disk. Each test finishes in well under 5 s;
+//! stdout JSON, and files on disk. Most tests finish in well under 5 s;
+//! red auto-interval waits have explicit deadlines of up to 8 s;
 //! `interval_s: 1` is the only clock these tests wait on. Since V1 the
 //! baseline is taken at `create`, so a single write after create is enough
 //! to make a watch fire: no repeating appender is needed (and a repeating
@@ -1373,11 +1374,11 @@ fn codex_is_recognised_from_the_environment_and_gets_the_codex_default() {
 }
 
 #[test]
-fn the_cli_wait_final_envelope_has_no_cache_or_clock() {
-    // why: A12: `wait` is the no-ceiling variant and prints no call window, so
-    //      no cache/clock either. Positive control first: a `keepalive` of
+fn the_cli_wait_final_envelope_carries_cache_and_clock() {
+    // why: S1 reverses A12. `wait` carries its last cache and total clock.
+    //      Positive control first: a `keepalive` of
     //      another watch in the same sandbox does carry both.
-    // proves: CLAIM(AI6)
+    // proves: CLAIM(AI6), CLAIM(S1)
     let (sandbox, fake_uw) = auto_sandbox(true);
     assert!(create_with(&sandbox, "k", serde_json::json!({})).status.success());
     let blocking = fire_and_keepalive(&sandbox, &fake_uw, "k", &[], &[]);
@@ -1391,7 +1392,8 @@ fn the_cli_wait_final_envelope_has_no_cache_or_clock() {
     }), Duration::from_secs(10));
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "fired");
-    assert!(envelope.get("cache").is_none() && envelope.get("clock").is_none(), "{envelope}");
+    assert_eq!(envelope["cache"], serde_json::json!({"ttl":"unknown", "source":"default", "interval_s":270}));
+    assert!(envelope["clock"]["waited_s"].is_u64(), "{envelope}");
 }
 
 #[test]
@@ -1403,4 +1405,93 @@ fn creating_a_watch_with_a_zero_expect_s_fails() {
     let output = create_with(&sandbox, "w", serde_json::json!({"expect_s": 0}));
     assert_eq!(output.status.code(), Some(1), "stdout {:?}", String::from_utf8_lossy(&output.stdout));
     assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn cli_wait_orchestrator_reports_the_ttl_window_and_checks_credits() {
+    // why: S1/S3. A quiet watch expires after 8s, allowing its credit probe
+    //      to run before expiry. The final envelope must retain both the
+    //      3300s selected TTL window and the real probe result. The deadline
+    //      leaves the probe its full 5s budget plus margin.
+    // proves: CLAIM(S1), CLAIM(S3)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "w", serde_json::json!({"deadline_s":8})).status.success());
+    let output = finish_within(piped({
+        let mut command = sandbox.command();
+        command.args(["wait", "w", "--orchestrator"]).env("CLAUDE_CODE_SESSION_ID", SESSION).env("VIGIL_UW_COMMAND", fake_uw);
+        command
+    }), Duration::from_secs(11));
+    assert_eq!(output.status.code(), Some(3));
+    let answer = stdout_json(&output);
+    assert_eq!(answer["cache"]["ttl"], "1h");
+    assert_eq!(answer["cache"]["credit_check"]["on_credits"], false);
+    assert_eq!(answer["cache"]["interval_s"], 3300);
+    assert!(answer["clock"]["waited_s"].is_u64());
+}
+
+#[test]
+fn cli_wait_attention_exits_5_and_leaves_the_watch_pending() {
+    // why: S3. An unchanged watch with expect_s=2 is overdue after 3 whole
+    //      seconds. wait must deliver attention and exit 5; looping until
+    //      expiry would exit 3, and prematurely ending the watch is wrong.
+    // proves: CLAIM(S3)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "w", serde_json::json!({"expect_s":2, "deadline_s":5})).status.success());
+    let output = finish_within(piped({
+        let mut command = sandbox.command();
+        command.args(["wait", "w"]).env("VIGIL_UW_COMMAND", fake_uw);
+        command
+    }), Duration::from_secs(7));
+    assert_eq!(output.status.code(), Some(5), "{}", String::from_utf8_lossy(&output.stderr));
+    let answer = stdout_json(&output);
+    assert_eq!(answer["status"], "pending");
+    assert_eq!(answer["next"], "act on events");
+    assert_eq!(answer["events"].as_array().unwrap().len(), 1);
+    assert_eq!(answer["events"][0]["kind"], "attention");
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
+}
+
+#[test]
+fn cli_wait_orchestrator_credit_change_exits_5_and_reaches_the_agent() {
+    // why: S3/S2. Persisted off baseline + a real fake-uw answering on.
+    //      Only wait --orchestrator checks this short 5m session. CLI stdout
+    //      carries the change, exit 5, while the watch remains pending.
+    // proves: CLAIM(S3), CLAIM(S2)
+    let (sandbox, fake_uw) = auto_sandbox(false);
+    vigil::testing::write_script(&fake_uw, "echo '{\"usage\":[{\"provider\":\"ClaudeCode\",\"windows\":[{\"window\":\"weekly\",\"exceeded\":true}]}]}'");
+    assert!(create_with(&sandbox, "w", serde_json::json!({"deadline_s":8})).status.success());
+    std::fs::write(sandbox.state_root().join("credit-state.json"), r#"{"on_credits":false,"checked_at":"2020-01-01T00:00:00Z"}"#).unwrap();
+    let output = finish_within(piped({
+        let mut command = sandbox.command();
+        command.args(["wait", "w", "--orchestrator"]).env("CLAUDE_CODE_SESSION_ID", SESSION).env("VIGIL_UW_COMMAND", fake_uw);
+        command
+    }), Duration::from_secs(11));
+    assert_eq!(output.status.code(), Some(5));
+    let answer = stdout_json(&output);
+    assert_eq!(answer["status"], "pending");
+    assert_eq!(answer["events"].as_array().unwrap().len(), 1);
+    assert_eq!(answer["events"][0]["kind"], "credit_state_changed");
+    assert_eq!(answer["events"][0]["on_credits"], true);
+    assert_eq!(answer["cache"]["interval_s"], 270);
+    assert_eq!(answer["cache"]["credit_check"]["on_credits"], true);
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
+}
+
+#[test]
+fn cli_both_agent_signals_cap_both_nesting_directions_at_270() {
+    // why: S4. Inherited CODEX_HOME from a Codex parent and inherited Claude
+    //      session id in AGENT=codex are ambiguous. Claude-only control proves
+    //      the real transcript is otherwise sufficient for 3300.
+    // proves: CLAIM(S4)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "control", serde_json::json!({})).status.success());
+    let control = fire_and_keepalive(&sandbox, &fake_uw, "control", &["--orchestrator"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
+    assert_eq!(control["cache"]["interval_s"], 3300);
+    for (id, signal, value) in [("claude-in-codex", "CODEX_HOME", "/inherited"), ("codex-in-claude", "AGENT", "codex")] {
+        assert!(create_with(&sandbox, id, serde_json::json!({})).status.success());
+        let answer = fire_and_keepalive(&sandbox, &fake_uw, id, &["--orchestrator"], &[("CLAUDE_CODE_SESSION_ID", SESSION), (signal, value)]);
+        assert_eq!(answer["cache"]["interval_s"], 270, "{id}");
+        assert_eq!(answer["cache"]["ttl"], "unknown", "{id}");
+        assert_eq!(answer["cache"]["source"], "default", "{id}");
+    }
 }

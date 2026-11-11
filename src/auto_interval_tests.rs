@@ -91,8 +91,16 @@ impl Rig {
         std::fs::write(self.credit_file(), json!({"on_credits": on_credits, "checked_at": checked_at}).to_string()).unwrap();
     }
 
+    fn read_credit_file_opt(&self) -> Option<Value> {
+        std::fs::read_to_string(self.credit_file()).ok().map(|text| serde_json::from_str(&text).expect("credit-state.json is JSON"))
+    }
+
     fn read_credit_file(&self) -> Value {
-        serde_json::from_str(&std::fs::read_to_string(self.credit_file()).expect("credit-state.json exists")).expect("credit-state.json is JSON")
+        let bytes = std::fs::read_to_string(self.credit_file());
+        assert!(bytes.is_ok(), "credit-state.json must be persisted: {bytes:?}");
+        let file = serde_json::from_str(&bytes.unwrap());
+        assert!(file.is_ok(), "credit-state.json must be valid JSON: {file:?}");
+        file.unwrap()
     }
 
     /// The session transcript `sess-1` under project `p`.
@@ -810,7 +818,7 @@ async fn a_long_call_checks_credit_state_at_the_start_and_every_240_s() {
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
     let started = Instant::now();
-    let envelope = call(&vigil, &id, Some(3300), None).await;
+    let envelope = call(&vigil, &id, Some(3300), Some(true)).await;
     let expected: Vec<u64> = (0..14).map(|n| n * 240).collect();
     assert_eq!(probe.offsets_from(started), expected);
     assert_eq!(
@@ -820,23 +828,22 @@ async fn a_long_call_checks_credit_state_at_the_start_and_every_240_s() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn only_calls_longer_than_270_s_check_credit_state() {
-    // why: AI2' "a long call" (A9) and AI6. An explicit 270 s call makes no
-    //      check and has no credit_check; an explicit 271 s call is long: it
-    //      checks at 0 and 240. Boundary on the "> 270" line.
-    // proves: CLAIM(AI2'), CLAIM(AI6)
+async fn credit_monitoring_follows_the_orchestrator_even_with_a_short_window() {
+    // why: S2 replaces A9's window gate. Explicit 271 s without an
+    //      orchestrator must not probe; 270 s WITH it checks even though short.
+    // proves: CLAIM(S2)
     let rig = Rig::new();
     let probe = quiet_probe();
     let vigil = rig.vigil(AgentEnv::default(), &probe);
-    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
-    let short = call(&vigil, &id, Some(270), None).await;
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 20, 7200, |_| {}).await;
+    let ordinary = call(&vigil, &id, Some(271), Some(false)).await;
     assert_eq!(probe.asked_count(), 0);
-    assert!(short["cache"].get("credit_check").is_none(), "{short}");
+    assert!(ordinary["cache"].get("credit_check").is_none());
     let started = Instant::now();
-    let long = call(&vigil, &id, Some(271), None).await;
-    assert_eq!(probe.offsets_from(started), vec![0, 240]);
-    assert_eq!(long["waited_s"], 271);
-    assert!(long["cache"].get("credit_check").is_some());
+    let short = call(&vigil, &id, Some(270), Some(true)).await;
+    assert_eq!(short["waited_s"], 270);
+    assert_eq!(probe.offsets_from(started), vec![0]);
+    assert_eq!(short["cache"]["credit_check"]["on_credits"], false);
 }
 
 #[tokio::test(start_paused = true)]
@@ -857,7 +864,7 @@ async fn the_credit_state_flipping_on_ends_the_call_with_one_event_and_records_t
     probe.set_steady(credit_state(true, CreditSource::Uw));
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
-    let envelope = call(&vigil, &id, Some(3300), None).await;
+    let envelope = call(&vigil, &id, Some(3300), Some(true)).await;
     assert_eq!((&envelope["status"], &envelope["next"], &envelope["waited_s"]), (&json!("pending"), &json!("act on events"), &json!(720)), "{envelope}");
     let event = only_event(&envelope);
     assert_eq!(event["kind"], "credit_state_changed");
@@ -878,26 +885,27 @@ async fn credits_ending_is_reported_too_and_the_same_state_is_reported_only_once
     //      event on_credits false at 240. A second call over the same Vigil
     //      with the state still off runs its full 3300 s with no event (the
     //      previous state is remembered in credit-state.json, S9), and a
-    //      third where it flips on again at 480 ends at 480 with on_credits
-    //      true.
+    //      third first checks 60 s in, since the last check was at absolute
+    //      3360 and this call starts at 3540. Its third verdict arrives at
+    //      540 s (60, 300, 540), reporting on_credits true. S2 keeps cadence.
     // proves: CLAIM(AI8)
     let rig = Rig::new();
     let probe = ScriptedCreditProbe::new(credit_state(false, CreditSource::Uw));
     probe.push(credit_state(true, CreditSource::Uw));
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |_| {}).await;
-    let first = call(&vigil, &id, Some(3300), None).await;
+    let first = call(&vigil, &id, Some(3300), Some(true)).await;
     assert_eq!(first["waited_s"], 240, "{first}");
     assert_eq!(only_event(&first)["on_credits"], false);
 
-    let second = call(&vigil, &id, Some(3300), None).await;
+    let second = call(&vigil, &id, Some(3300), Some(true)).await;
     assert_eq!((&second["waited_s"], &second["events"]), (&json!(3300), &json!([])), "{second}");
 
     probe.push(credit_state(false, CreditSource::Uw));
     probe.push(credit_state(false, CreditSource::Uw));
     probe.push(credit_state(true, CreditSource::Uw));
-    let third = call(&vigil, &id, Some(3300), None).await;
-    assert_eq!(third["waited_s"], 480, "{third}");
+    let third = call(&vigil, &id, Some(3300), Some(true)).await;
+    assert_eq!(third["waited_s"], 540, "{third}");
     assert_eq!(only_event(&third)["on_credits"], true);
 }
 
@@ -913,7 +921,7 @@ async fn the_first_check_a_process_makes_is_a_baseline_never_a_change() {
     let probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
-    let envelope = call(&vigil, &id, Some(3300), None).await;
+    let envelope = call(&vigil, &id, Some(3300), Some(true)).await;
     assert_eq!((&envelope["waited_s"], &envelope["events"]), (&json!(3300), &json!([])), "{envelope}");
     assert_eq!(envelope["cache"]["credit_check"]["on_credits"], true);
 }
@@ -928,7 +936,7 @@ async fn the_event_names_the_source_the_probe_used() {
     probe.push(credit_state(false, CreditSource::Transcripts));
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
-    let envelope = call(&vigil, &id, Some(3300), None).await;
+    let envelope = call(&vigil, &id, Some(3300), Some(true)).await;
     let event = only_event(&envelope);
     assert_eq!((&event["kind"], &event["source"], &event["windows"]), (&json!("credit_state_changed"), &json!("transcripts"), &json!([])));
     assert_eq!(envelope["cache"]["credit_check"]["source"], "transcripts");
@@ -943,12 +951,19 @@ async fn the_event_names_the_source_the_probe_used() {
 
 const REAL_CALL_LIMIT: Duration = Duration::from_secs(20);
 
+async fn real_call_with(vigil: &Vigil, id: &WatchId, max_s: Option<u64>, orchestrator: Option<bool>) -> Value {
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator };
+    let result = tokio::time::timeout(REAL_CALL_LIMIT, vigil.keepalive(request)).await;
+    assert!(result.is_ok(), "the call should have ended on the credit event, not run its full window");
+    let envelope = result.unwrap().unwrap();
+    serde_json::to_value(&envelope).unwrap()
+}
+
 async fn real_call(vigil: &Vigil, id: &WatchId) -> Value {
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3300), orchestrator: None };
-    let envelope = tokio::time::timeout(REAL_CALL_LIMIT, vigil.keepalive(request))
-        .await
-        .expect("the call should have ended on the credit event, not run its full window")
-        .unwrap();
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3300), orchestrator: Some(true) };
+    let result = tokio::time::timeout(REAL_CALL_LIMIT, vigil.keepalive(request)).await;
+    assert!(result.is_ok(), "the call should have ended on the credit event, not run its full window");
+    let envelope = result.unwrap().unwrap();
     serde_json::to_value(&envelope).unwrap()
 }
 
@@ -996,7 +1011,7 @@ async fn the_hook_runs_once_per_change_with_the_state_on_stdin_and_its_result_in
     assert_eq!(seen["windows"], event["windows"]);
     assert_eq!(seen["at"], envelope["cache"]["credit_check"]["at"]);
 
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3300), orchestrator: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3300), orchestrator: Some(true) };
     let second = tokio::time::timeout(Duration::from_millis(900), vigil.keepalive(request)).await;
     assert!(second.is_err(), "no change, so no event and no early end: {second:?}");
     assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 1, "the hook runs once per change");
@@ -1042,4 +1057,1233 @@ async fn a_hook_that_cannot_run_does_not_stop_the_event() {
     let envelope = real_call(&vigil, &id).await;
     let event = only_event(&envelope);
     assert_eq!((&event["kind"], &event["on_credits"], &event["hook"]["exit_code"]), (&json!("credit_state_changed"), &json!(true), &json!(127)));
+}
+
+// =====================================================================
+// Round 2: spec review amendments S1-S10
+// =====================================================================
+
+fn is_attention(event: &Value, reason: &str) -> bool {
+    event["kind"] == "attention" && event["reason"] == reason
+}
+
+/// W1: `<watch_id>:<tick>:<n>`.
+fn is_w1_id(id: &str, watch: &str) -> bool {
+    let Some(rest) = id.strip_prefix(&format!("{watch}:")) else { return false };
+    let parts: Vec<&str> = rest.split(':').collect();
+    parts.len() == 2 && parts.iter().all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+// ------------------------------------------------ S1 / S3: wait ----
+
+#[tokio::test(start_paused = true)]
+async fn the_final_envelope_of_wait_carries_cache_and_a_clock_that_spans_the_whole_wait() {
+    // why: S1. `wait` runs several 270 s calls internally; the agent sees ONE
+    //      envelope, so `clock` must describe the whole wait, not the last
+    //      internal call. Quiet watch (cadence 20, deadline 3600), a change
+    //      written at virtual t = 590, seen by the tick at 600: internal calls
+    //      are 0-270, 270-540, 540-600 (a fire). Whole wait: waited 600,
+    //      watch age 600. The first internal call has no earlier call, and the
+    //      second and third would report 270 / 60 s "since last call" if the
+    //      clock were taken from them: the wait's own value is null (first call
+    //      ever for this watch). `cache` comes from the last internal call: a
+    //      plain wait is not the orchestrator and did not set a window, so
+    //      unknown / default / 270 (R2-A2: not "explicit", the caller chose
+    //      nothing). No top-level waited_s / max_s (one call's window).
+    // proves: CLAIM(S1)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, path) = quiet_watch(&rig, &vigil, "w", 20, 3600, |_| {}).await;
+    let appender = async {
+        tokio::time::sleep(Duration::from_secs(590)).await;
+        append_file(&path, "boom\n");
+    };
+    let (waited, ()) = tokio::join!(vigil.wait(&id), appender);
+    let envelope = serde_json::to_value(waited.unwrap()).unwrap();
+    assert_eq!(envelope["status"], "fired");
+    assert_eq!(
+        envelope["clock"],
+        json!({"waited_s": 600, "watch_age_s": 600, "since_last_call_s": null, "summary": "waited 10m 0s this call; watching for 10m 0s; first call"})
+    );
+    assert_eq!(envelope["cache"], json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+    assert!(envelope.get("waited_s").is_none() && envelope.get("max_s").is_none(), "{envelope}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_wait_measures_the_gap_from_the_envelope_the_first_one_returned() {
+    // why: S1 + S3 + A13. The first wait ends early on an attention event
+    //      (expect_s 100 -> overdue at 150) and returns at t = 150; the agent
+    //      thinks for 30 s; the second wait starts at 180 and sees a change
+    //      written at 590 on the tick at 600. Second wait: waited 600 - 180 =
+    //      420 (7m 0s), watch age 600, since_last_call_s = 600 - 150 = 450
+    //      (the first wait's return, not one of the second wait's own internal
+    //      calls), summary "last call 7m ago" (450 s = 7m 30s, seconds dropped
+    //      from a minute up, A14). Internal calls inside the first wait must
+    //      not leak into the second wait's "last call".
+    // proves: CLAIM(S1), CLAIM(S3)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, path) = quiet_watch(&rig, &vigil, "w", 20, 3600, |request| request.expect_s = Some(100)).await;
+    let first = serde_json::to_value(vigil.wait(&id).await.unwrap()).unwrap();
+    assert_eq!((&first["status"], &first["clock"]["waited_s"]), (&json!("pending"), &json!(150)), "{first}");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let appender = async {
+        tokio::time::sleep(Duration::from_secs(410)).await;
+        append_file(&path, "boom\n");
+    };
+    let (second, ()) = tokio::join!(vigil.wait(&id), appender);
+    let second = serde_json::to_value(second.unwrap()).unwrap();
+    assert_eq!(second["status"], "fired", "{second}");
+    assert_eq!(
+        second["clock"],
+        json!({"waited_s": 420, "watch_age_s": 600, "since_last_call_s": 450, "summary": "waited 7m 0s this call; watching for 10m 0s; last call 7m ago"})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_returns_on_an_attention_event_with_the_watch_still_pending() {
+    // why: S3. A plain `wait` must hand an attention event to the agent (it
+    //      would otherwise sit in a loop for the rest of a stuck build). Quiet
+    //      watch, deadline 20 000, expect_s 2000 -> overdue at min(3000, 2540)
+    //      = 2540. wait runs nine 270 s calls (2430) and the tenth ends at
+    //      2540: the returned envelope is pending, `next` "act on events", has
+    //      the single attention event, `wait_exit_code` is 5, and its clock
+    //      says waited 2540 (not the 110 s of the last internal call). The
+    //      watch is still live: a later change fires it with exit code 0
+    //      (control that 5 is not "any pending").
+    // proves: CLAIM(S3), CLAIM(S1)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, path) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |request| request.expect_s = Some(2000)).await;
+    let envelope = vigil.wait(&id).await.unwrap();
+    assert_eq!(crate::keepalive::wait_exit_code(&envelope), Some(5), "{envelope:?}");
+    let value = serde_json::to_value(&envelope).unwrap();
+    assert_eq!((&value["status"], &value["next"]), (&json!("pending"), &json!("act on events")));
+    assert!(is_attention(only_event(&value), "overdue"), "{value}");
+    assert_eq!(value["clock"]["waited_s"], 2540);
+    assert_eq!(value["elapsed_s"], 2540);
+
+    append_file(&path, "boom\n");
+    let fired = vigil.wait(&id).await.unwrap();
+    assert_eq!(fired.status, crate::watch::WatchStatus::Fired);
+    assert_eq!(crate::keepalive::wait_exit_code(&fired), Some(0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_orchestrator_wait_uses_the_ttl_window_and_returns_on_a_credit_change() {
+    // why: S3. `wait --orchestrator` is how a background wait stays alive for
+    //      an hour. On a 1h cache its internal call is 3300 s (cache 1h /
+    //      claude-transcript / 3300 in the final envelope) and it runs the
+    //      credit checks: probe says off at the baseline (0) and on at 240, so
+    //      the wait returns at 240 with a credit_state_changed event, pending,
+    //      exit code 5, credit_check recorded at +240. Negative control in the
+    //      same test: a plain `wait` over the same Vigil makes no credit check
+    //      at all (probe untouched) and fires normally on a change.
+    // proves: CLAIM(S3), CLAIM(S1)
+    let rig = Rig::new();
+    rig.one_hour_cache();
+    let probe = quiet_probe();
+    probe.push(credit_state(false, CreditSource::Uw));
+    probe.push(credit_state(true, CreditSource::Uw));
+    let vigil = rig.vigil(claude(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |_| {}).await;
+    let envelope = vigil.wait_with(&id, true).await.unwrap();
+    assert_eq!(crate::keepalive::wait_exit_code(&envelope), Some(5), "{envelope:?}");
+    let value = serde_json::to_value(&envelope).unwrap();
+    assert_eq!(only_event(&value)["kind"], "credit_state_changed");
+    assert_eq!(value["cache"]["ttl"], "1h");
+    assert_eq!(value["cache"]["source"], "claude-transcript");
+    assert_eq!(value["cache"]["interval_s"], 3300);
+    assert_eq!(value["cache"]["credit_check"]["at"], serde_json::to_value(spec_instant().plus_secs(240)).unwrap());
+    assert_eq!(value["clock"]["waited_s"], 240);
+
+    let before = probe.asked_count();
+    let (plain, path) = quiet_watch(&rig, &vigil, "plain", 20, 3600, |_| {}).await;
+    append_file(&path, "boom\n");
+    let fired = serde_json::to_value(vigil.wait(&plain).await.unwrap()).unwrap();
+    assert_eq!(fired["status"], "fired");
+    assert_eq!(probe.asked_count(), before, "a plain wait is not the orchestrator: no credit check");
+}
+
+// ------------------------------------------------ S2: the full sequence ----
+
+#[tokio::test(start_paused = true)]
+async fn the_whole_automatic_sequence_1h_then_credits_then_5m_then_credits_end_then_1h_again() {
+    // why: S2 (the blocker of review round 1): nothing in the loop may be done
+    //      by the agent. One orchestrator, one 1h transcript, a scripted probe
+    //      and a scripted hook that does what the default policy hook does and
+    //      what Claude Code then does (a write with the new TTL lands in the
+    //      transcript: 5m when the state says on credits, 1h when it says off).
+    //      Calls, all `orchestrator: true`, no max_s, zero agent gap:
+    //        1  t=0     window 3300 (1h). Start check (no credit-state.json):
+    //                   off = baseline. In-call check at 240: on -> hook(on)
+    //                   writes a 5m line; event credit_state_changed(on); the
+    //                   call ends, waited 240.
+    //        2  t=240   window 270 (newest write 5m). Last check 0 s old: no
+    //                   start check; a 270 s call has no in-call checks. Quiet:
+    //                   waited 270, returns at 510.
+    //        3  t=510   window 270. Last check (240) is 270 s old >= 240, so the
+    //                   270 s call STILL checks, at its start: off -> hook(off)
+    //                   writes a 1h line; event (off); waited 0.
+    //        4  t=510   window 3300 again (newest write 1h). Last check 0 s old:
+    //                   no start check; in-call checks every 240 s from the last
+    //                   one: 240, 480, ..., 3120 = 13 of them; waited 3300.
+    //      credit-state.json after each call is hand-derived below.
+    // proves: CLAIM(S2), CLAIM(AI2'), CLAIM(AI8)
+    let hook_cmd = "claude-cache-ttl-policy";
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.on_credit_change = Some(hook_cmd.to_string()));
+    let transcript = rig.one_hour_cache();
+    let probe = quiet_probe();
+    probe.push(credit_state(false, CreditSource::Uw));
+    probe.push(credit_state(true, CreditSource::Uw));
+    probe.push(credit_state(false, CreditSource::Uw));
+    let hook = ScriptedHookRunner::new();
+    let appended = transcript.clone();
+    hook.set_effect(move |input| {
+        let line = if input["on_credits"] == true { assistant_line(0, 500) } else { assistant_line(900, 0) };
+        append_file(&appended, &format!("{line}\n"));
+    });
+    let vigil = rig.vigil_with_hook(claude(), &probe, &hook);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |_| {}).await;
+    let t0 = Instant::now();
+
+    let first = call(&vigil, &id, None, Some(true)).await;
+    assert_eq!((&first["waited_s"], &first["next"]), (&json!(240), &json!("act on events")), "{first}");
+    assert_eq!((&first["cache"]["ttl"], &first["cache"]["interval_s"]), (&json!("1h"), &json!(3300)));
+    let event = only_event(&first);
+    assert_eq!((&event["kind"], &event["on_credits"]), (&json!("credit_state_changed"), &json!(true)));
+    assert_eq!(event["hook"]["command"], hook_cmd);
+    assert_eq!(rig.read_credit_file(), json!({"on_credits": true, "checked_at": serde_json::to_value(spec_instant().plus_secs(240)).unwrap()}));
+
+    let second = call(&vigil, &id, None, Some(true)).await;
+    assert_eq!((&second["waited_s"], &second["events"]), (&json!(270), &json!([])), "{second}");
+    assert_eq!(second["cache"]["interval_s"], 270);
+    assert_eq!(second["cache"]["ttl"], "5m", "the hook's write moved the newest write to 5m");
+    assert_eq!(rig.read_credit_file()["checked_at"], serde_json::to_value(spec_instant().plus_secs(240)).unwrap(), "no check in call 2");
+
+    let third = call(&vigil, &id, None, Some(true)).await;
+    assert_eq!(third["waited_s"], 0, "{third}");
+    assert_eq!(third["cache"]["interval_s"], 270, "decided before the check, from the 5m write");
+    let event = only_event(&third);
+    assert_eq!((&event["kind"], &event["on_credits"]), (&json!("credit_state_changed"), &json!(false)));
+    assert_eq!(rig.read_credit_file(), json!({"on_credits": false, "checked_at": serde_json::to_value(spec_instant().plus_secs(510)).unwrap()}));
+
+    let fourth = call(&vigil, &id, None, Some(true)).await;
+    assert_eq!((&fourth["waited_s"], &fourth["events"]), (&json!(3300), &json!([])), "{fourth}");
+    assert_eq!((&fourth["cache"]["ttl"], &fourth["cache"]["interval_s"]), (&json!("1h"), &json!(3300)), "the hook restored 1h");
+    let later: Vec<u64> = (1..=13).map(|n| n * 240).collect();
+    let all_asks = probe.offsets_from(t0);
+    let mut expected_all = vec![0, 240, 510];
+    expected_all.extend(later.iter().map(|n| 510 + n));
+    assert_eq!(all_asks, expected_all, "probe asks over the four calls");
+    assert_eq!(fourth["cache"]["credit_check"]["at"], serde_json::to_value(spec_instant().plus_secs(510 + 3120)).unwrap());
+
+    let runs = hook.calls();
+    assert_eq!(runs.len(), 2, "one hook run per change");
+    assert_eq!((&runs[0].input["on_credits"], &runs[1].input["on_credits"]), (&json!(true), &json!(false)));
+    assert_eq!(hook.offsets_from(t0), vec![240, 510]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_orchestrator_call_of_any_window_checks_at_its_start_when_the_last_check_is_old_enough() {
+    // why: S2 "every orchestrator call runs the credit check when the last
+    //      check ... is >= 240 s old, whatever its window". The cadence is the
+    //      `checked_at` in credit-state.json (written here as another process
+    //      would have left it): a file 239 s old -> no check; 240 s old -> one
+    //      check at offset 0 (the line is >=); no file at all -> one check. A
+    //      short window (explicit 30 s) has no in-call checks. Negative
+    //      control: the same old file and a NON-orchestrator 30 s call: no
+    //      check (only orchestrators check).
+    // proves: CLAIM(S2), CLAIM(S9)
+    let run = |age: Option<i64>, orchestrator: Option<bool>| async move {
+        let rig = Rig::new();
+        let probe = quiet_probe();
+        if let Some(age) = age {
+            rig.seed_credit_file(Some(false), age);
+        }
+        let vigil = rig.vigil(AgentEnv::default(), &probe);
+        let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
+        let started = Instant::now();
+        let envelope = call(&vigil, &id, Some(30), orchestrator).await;
+        assert_eq!(envelope["waited_s"], 30);
+        (probe.offsets_from(started), rig.read_credit_file_opt())
+    };
+    assert_eq!(run(Some(239), Some(true)).await.0, Vec::<u64>::new(), "239 s old");
+    let (offsets, file) = run(Some(240), Some(true)).await;
+    assert_eq!(offsets, vec![0], "240 s old");
+    assert_eq!(file.expect("the check was recorded")["checked_at"], serde_json::to_value(spec_instant()).unwrap());
+    assert_eq!(run(None, Some(true)).await.0, vec![0], "no file yet");
+    assert_eq!(run(Some(5000), None).await.0, Vec::<u64>::new(), "control: not an orchestrator, not a long window");
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_calls_keep_the_cadence_of_the_last_check_across_calls_and_processes() {
+    // why: S2 + S9. Call 1 (explicit 3300 s) checks at 0, 240, ..., 3120 and
+    //      ends at 3300. Call 2, from a FRESH process (a new CLI run: no memory,
+    //      its own probe), starts 180 s after the last check, so its first check
+    //      is 60 s in (3120 + 240 = 3360 = 3300 + 60) and then every 240 s:
+    //      60, 300, ..., 3180 (60 + 240 k < 3300, k = 0..13 = 14 checks). If
+    //      the cadence restarted at each call these would be 0, 240, ... .
+    // proves: CLAIM(S2), CLAIM(S9)
+    let rig = Rig::new();
+    let first_probe = quiet_probe();
+    let first = rig.vigil(AgentEnv::default(), &first_probe);
+    let (id, _) = quiet_watch(&rig, &first, "w", 600, 20_000, |_| {}).await;
+    call(&first, &id, Some(3300), Some(true)).await;
+    assert_eq!(first_probe.asked_count(), 14);
+    let second_probe = quiet_probe();
+    let second = rig.vigil(AgentEnv::default(), &second_probe);
+    let started = Instant::now();
+    call(&second, &id, Some(3300), Some(true)).await;
+    let expected: Vec<u64> = (0..14).map(|n| 60 + n * 240).collect();
+    assert_eq!(second_probe.offsets_from(started), expected);
+}
+
+#[tokio::test]
+async fn the_sequence_also_runs_with_a_real_hook_process_on_the_real_clock() {
+    // why: S2 with a real `sh` hook (the process boundary the paused test
+    //      replaces by a scripted runner). `credit_check_every` is 200 ms; the
+    //      hook reads its stdin JSON and appends a 5m line (state on) or a 1h
+    //      line (state off) to the session transcript, like the default policy
+    //      plus Claude Code. Calls: (1) 1h -> window 3300; checks at 0 (off,
+    //      baseline) and ~200 ms (on): event, hook run, call ends. (2) after
+    //      250 ms: window 270 (5m); the start check is due, off: event, hook
+    //      writes 1h. (3) window 3300 again; the in-call check says on: event.
+    //      Every event carries the hook's exit code 0.
+    // proves: CLAIM(S2), CLAIM(AI8)
+    let scratch = tempfile::tempdir().unwrap();
+    let (five, one) = (scratch.path().join("five.line"), scratch.path().join("one.line"));
+    std::fs::write(&five, format!("{}\n", assistant_line(0, 500))).unwrap();
+    std::fs::write(&one, format!("{}\n", assistant_line(900, 0))).unwrap();
+    let rig = Rig::real_time(|config| {
+        config.credit_check_every = Duration::from_millis(200);
+        let transcript = config.claude_projects_dir.clone().unwrap().join("p/sess-1.jsonl");
+        config.on_credit_change = Some(format!(
+            "if grep -Eq '\"on_credits\": ?true'; then cat '{}' >> '{}'; else cat '{}' >> '{}'; fi",
+            five.display(),
+            transcript.display(),
+            one.display(),
+            transcript.display()
+        ));
+    });
+    rig.one_hour_cache();
+    let probe = quiet_probe();
+    probe.push(credit_state(false, CreditSource::Uw));
+    probe.push(credit_state(true, CreditSource::Uw));
+    probe.push(credit_state(false, CreditSource::Uw));
+    probe.set_steady(credit_state(true, CreditSource::Uw));
+    let vigil = rig.vigil(claude(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
+
+    let first = real_call_with(&vigil, &id, None, Some(true)).await;
+    assert_eq!((&first["cache"]["interval_s"], &only_event(&first)["on_credits"]), (&json!(3300), &json!(true)), "{first}");
+    assert_eq!(only_event(&first)["hook"]["exit_code"], 0, "{first}");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let second = real_call_with(&vigil, &id, None, Some(true)).await;
+    assert_eq!((&second["cache"]["interval_s"], &only_event(&second)["on_credits"]), (&json!(270), &json!(false)), "{second}");
+    assert_eq!(only_event(&second)["hook"]["exit_code"], 0, "{second}");
+    let third = real_call_with(&vigil, &id, None, Some(true)).await;
+    assert_eq!((&third["cache"]["interval_s"], &only_event(&third)["on_credits"]), (&json!(3300), &json!(true)), "{third}");
+}
+
+// ------------------------------------------------ S4: ambiguous identity ----
+
+#[tokio::test(start_paused = true)]
+async fn an_orchestrator_with_both_a_claude_and_a_codex_signal_keeps_270_s_but_still_checks_credits() {
+    // why: S4 at the engine. The agent value holds a Claude session id AND a
+    //      Codex signal (either nesting direction produces it): the window is
+    //      270 s, unknown / default, whatever the 1h transcript says. The
+    //      orchestrator still runs its start credit check (ambiguity is about
+    //      the TTL, not about monitoring). Positive control: the same rig with
+    //      the Claude signal alone waits 3300 s.
+    // proves: CLAIM(S4), CLAIM(S2)
+    let rig = Rig::new();
+    rig.one_hour_cache();
+    let probe = quiet_probe();
+    let ambiguous = rig.vigil(AgentEnv { claude_session_id: Some("sess-1".into()), codex: true }, &probe);
+    let (id, _) = quiet_watch(&rig, &ambiguous, "w", 600, 20_000, |_| {}).await;
+    let envelope = call(&ambiguous, &id, None, Some(true)).await;
+    assert_eq!(envelope["waited_s"], 270);
+    assert_eq!(envelope["cache"]["ttl"], "unknown");
+    assert_eq!(envelope["cache"]["source"], "default");
+    assert_eq!(probe.asked_count(), 1, "one start check");
+
+    let control_probe = quiet_probe();
+    let claude_only = rig.vigil(claude(), &control_probe);
+    let control = call(&claude_only, &id, None, Some(true)).await;
+    assert_eq!((&control["waited_s"], &control["cache"]["ttl"]), (&json!(3300), &json!("1h")), "control");
+}
+
+// ------------------------------------------------ S5: tri-state ----
+
+#[tokio::test(start_paused = true)]
+async fn unknown_checks_never_make_an_event_or_a_hook_and_keep_the_last_state() {
+    // why: S5. For EACH known state, unknown checks at 240 and 480 keep it
+    //      and do not run the hook. After the full 3300s call, advance 60s
+    //      to the next due check and flip the known state: one event/hook.
+    //      Both starting states catch implementations coercing null to bool.
+    // proves: CLAIM(S5)
+    for known in [false, true] {
+        let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |c| c.on_credit_change = Some("policy".into()));
+        rig.seed_credit_file(Some(known), 1000);
+        let probe = ScriptedCreditProbe::new(credit_state(known, CreditSource::Uw));
+        probe.push(credit_state(known, CreditSource::Uw));
+        probe.push(credit_unknown(CreditSource::Transcripts));
+        probe.push(credit_unknown(CreditSource::Transcripts));
+        let hook = ScriptedHookRunner::new();
+        let vigil = rig.vigil_with_hook(claude(), &probe, &hook);
+        let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
+        let answer = call(&vigil, &id, Some(3300), Some(true)).await;
+        assert_eq!((&answer["waited_s"], &answer["events"]), (&json!(3300), &json!([])));
+        assert_eq!(probe.asked_count(), 14);
+        assert_eq!(hook.calls().len(), 0);
+        assert_eq!(rig.read_credit_file()["on_credits"], known);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        probe.set_steady(credit_state(!known, CreditSource::Uw));
+        let changed = call(&vigil, &id, Some(30), Some(true)).await;
+        assert_eq!(only_event(&changed)["on_credits"], !known);
+        assert_eq!(hook.calls().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_answer_is_recorded_as_a_check_and_reported_as_null() {
+    // why: S5. An orchestrator 271 s call checks at 0 (off) and 240 (unknown). The newest
+    //      check is the unknown one: cache.credit_check = {at: +240, source:
+    //      transcripts, on_credits: null}, and credit-state.json keeps
+    //      on_credits false but moves checked_at to +240 (an unknown check is
+    //      still a check; otherwise a failing `uw` would be asked on every
+    //      call).
+    // proves: CLAIM(S5), CLAIM(S9)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    probe.push(credit_state(false, CreditSource::Uw));
+    probe.push(credit_unknown(CreditSource::Transcripts));
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
+    let envelope = call(&vigil, &id, Some(271), Some(true)).await;
+    assert_eq!(
+        envelope["cache"]["credit_check"],
+        json!({"at": serde_json::to_value(spec_instant().plus_secs(240)).unwrap(), "source": "transcripts", "on_credits": null})
+    );
+    assert_eq!(
+        rig.read_credit_file(),
+        json!({"on_credits": false, "checked_at": serde_json::to_value(spec_instant().plus_secs(240)).unwrap()})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_change_is_still_reported_once_across_unknown_checks() {
+    // why: S5 "keeps the last known state". Recorded: on. Checks: unknown (0),
+    //      off (240). The change on -> off is seen at 240 and reported once with
+    //      the hook run once (state off). If unknown had cleared the recorded
+    //      state, the off at 240 would be taken as a baseline and nothing would
+    //      be reported; if unknown were read as off, the event would come at 0.
+    // proves: CLAIM(S5), CLAIM(AI8)
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.on_credit_change = Some("policy".into()));
+    rig.seed_credit_file(Some(true), 1000);
+    let probe = quiet_probe();
+    probe.push(credit_unknown(CreditSource::Uw));
+    probe.push(credit_state(false, CreditSource::Uw));
+    let hook = ScriptedHookRunner::new();
+    let vigil = rig.vigil_with_hook(AgentEnv::default(), &probe, &hook);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
+    let envelope = call(&vigil, &id, Some(3300), Some(true)).await;
+    assert_eq!(envelope["waited_s"], 240, "{envelope}");
+    assert_eq!(only_event(&envelope)["on_credits"], false);
+    assert_eq!(hook.calls().len(), 1);
+    assert_eq!(hook.calls()[0].input["on_credits"], false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn when_no_state_was_ever_known_the_first_known_answer_is_the_baseline() {
+    // why: S5 x A9/S9 (R2-A3). No credit-state.json; the first check is unknown
+    //      (file gets on_credits null), the second says on. There is nothing
+    //      known to differ from, so on is the baseline: no event, no hook, the
+    //      call runs its 3300 s, and the file now says on.
+    // proves: CLAIM(S5), CLAIM(S9)
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.on_credit_change = Some("policy".into()));
+    let probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
+    probe.push(credit_unknown(CreditSource::Transcripts));
+    let hook = ScriptedHookRunner::new();
+    let vigil = rig.vigil_with_hook(AgentEnv::default(), &probe, &hook);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |_| {}).await;
+    let envelope = call(&vigil, &id, Some(3300), Some(true)).await;
+    assert_eq!((&envelope["waited_s"], &envelope["events"]), (&json!(3300), &json!([])), "{envelope}");
+    assert_eq!(hook.calls().len(), 0);
+    assert_eq!(rig.read_credit_file()["on_credits"], true);
+}
+
+// ------------------------------------------------ S6: attention events ----
+
+#[tokio::test(start_paused = true)]
+async fn each_attention_reason_fires_once_and_the_ids_are_distinct_and_w1_shaped() {
+    // why: S6 "generated with distinct ids". A judge watch with a live process,
+    //      expect_s 40 (overdue at min(60, 580) = 60) and stall_s 60 (stalled at
+    //      the tick at 60): both reasons are due at the same instant and may
+    //      come in one envelope or two. Over at most three default calls the
+    //      agent must see exactly two events, kind attention, reasons {overdue,
+    //      stalled} once each, ids `w:<tick>:<n>` (W1) that differ from each
+    //      other (two events at one tick must not both be `w:4:0`), and after
+    //      that a full quiet 270 s call: neither fires again.
+    // proves: CLAIM(S6), CLAIM(AI5)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let sleeper = Sleeper::start();
+    let (id, _) = judge_watch(&rig, &vigil, "w", 20, 7200, |request| {
+        request.expect_s = Some(40);
+        request.stall_s = Some(60);
+        request.inputs.push(Input::Process { pid: sleeper.pid(), want: None });
+    })
+    .await;
+    let mut seen: Vec<Value> = Vec::new();
+    for _ in 0..3 {
+        let envelope = call(&vigil, &id, None, None).await;
+        seen.extend(envelope["events"].as_array().unwrap().iter().cloned());
+        if seen.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let mut reasons: Vec<&str> = seen.iter().map(|event| event["reason"].as_str().unwrap_or("?")).collect();
+    reasons.sort_unstable();
+    assert_eq!(reasons, ["overdue", "stalled"]);
+    assert!(seen.iter().all(|event| event["kind"] == "attention"), "{seen:?}");
+    let ids: Vec<&str> = seen.iter().map(|event| event["event_id"].as_str().unwrap()).collect();
+    assert!(ids.iter().all(|id| is_w1_id(id, "w")), "{ids:?}");
+    assert_ne!(ids[0], ids[1], "two events of one watch share an id: {ids:?}");
+    let quiet = call(&vigil, &id, None, None).await;
+    assert_eq!((&quiet["waited_s"], &quiet["events"]), (&json!(270), &json!([])), "{quiet}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_attention_event_whose_save_failed_comes_again_flagged_redelivered_with_the_same_id() {
+    // why: S6 "persisted with the tick (the one-shot flag is saved with them) ...
+    //      redelivered with `redelivered: true` after a failed save". Watch
+    //      cadence 600, expect_s 60 (overdue at 90). Call A (healthy, 30 s)
+    //      ticks at 0. Call B runs on a Vigil whose every write fails (a full
+    //      disk): at t = 90 the attention is raised, its save fails, B returns
+    //      it at waited 60 with persist.ok false and persist.redelivery true
+    //      (an at-risk envelope, DF3a) and NO redelivered flag (it is the first
+    //      delivery). Restore writes in the SAME process. The flag was never
+    //      saved, so the attention is due again at once (waited 0): the same
+    //      event_id, redelivered true, no persist note. Call D: saved this time,
+    //      so a quiet 270 s with no events.
+    // proves: CLAIM(S6), CLAIM(DF3)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let healthy = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &healthy, "w", 600, 7200, |request| request.expect_s = Some(60)).await;
+    let a = call(&healthy, &id, Some(30), None).await;
+    assert_eq!((&a["waited_s"], &a["events"]), (&json!(30), &json!([])), "{a}");
+
+    let marker = rig.env.input_path("full");
+    write_file(&marker, "full");
+    let faults = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::WhileExists(marker.clone()))]);
+    let faulted = rig.vigil(AgentEnv::default(), &probe).with_write_faults(faults);
+    let b = call(&faulted, &id, None, None).await;
+    assert_eq!(b["waited_s"], 60, "{b}");
+    let first = only_event(&b);
+    assert!(is_attention(first, "overdue"), "{b}");
+    assert_eq!((&b["persist"]["ok"], &b["persist"]["redelivery"]), (&json!(false), &json!(true)), "{b}");
+    assert!(first.get("redelivered").is_none(), "the first delivery is not a repeat: {first}");
+    let first_id = first["event_id"].as_str().unwrap().to_string();
+    assert!(is_w1_id(&first_id, "w"), "{first_id}");
+
+    std::fs::remove_file(marker).unwrap();
+    let c = call(&faulted, &id, None, None).await;
+    assert_eq!(c["waited_s"], 0, "{c}");
+    let again = only_event(&c);
+    assert_eq!(again["event_id"], first_id.as_str());
+    assert_eq!(again["redelivered"], true);
+    assert!(c.get("persist").is_none(), "{c}");
+    let d = call(&faulted, &id, None, None).await;
+    assert_eq!((&d["waited_s"], &d["events"]), (&json!(270), &json!([])), "{d}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_attention_event_that_never_reached_the_caller_comes_again_until_it_is_delivered() {
+    // why: S6 "redelivered ... after a cancellation before delivery", and
+    //      "delivered and acknowledged like other events (commit_delivery)".
+    //      The MCP layer builds the envelope, the client cancels, the Delivery
+    //      is dropped uncommitted (`keepalive_uncommitted`, as in disk_full_tests
+    //      for terminal results). Two cases, one watch each: the next call comes
+    //      from the same process, or from a fresh one (the CLI case: the
+    //      un-acknowledged event must be in the watch file). Either way the
+    //      next call returns the same event_id at once with redelivered true;
+    //      the call after it (the first was delivered and committed) is a quiet
+    //      270 s, and so is one from yet another fresh process (the
+    //      acknowledgement is persisted too).
+    // proves: CLAIM(S6)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    for fresh_process in [false, true] {
+        let name = if fresh_process { "fresh" } else { "same" };
+        let first_process = rig.vigil(AgentEnv::default(), &probe);
+        let (id, _) = quiet_watch(&rig, &first_process, name, 600, 7200, |request| request.expect_s = Some(60)).await;
+        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None };
+        let (envelope, delivery) = first_process
+            .keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>())
+            .await
+            .unwrap()
+            .expect("not cancelled");
+        let first = serde_json::to_value(&envelope).unwrap();
+        assert_attention(&first, "overdue", 90);
+        let first_id = only_event(&first)["event_id"].as_str().unwrap().to_string();
+        drop(delivery);
+
+        let later_process;
+        let second_process: &Vigil = if fresh_process {
+            later_process = rig.vigil(AgentEnv::default(), &probe);
+            &later_process
+        } else {
+            &first_process
+        };
+        let second = call(second_process, &id, None, None).await;
+        assert_eq!(second["waited_s"], 0, "{name}: {second}");
+        let again = only_event(&second);
+        assert_eq!((again["event_id"].as_str(), &again["redelivered"]), (Some(first_id.as_str()), &json!(true)), "{name}: {second}");
+        let third = call(second_process, &id, None, None).await;
+        assert_eq!((&third["waited_s"], &third["events"]), (&json!(270), &json!([])), "{name}: {third}");
+        let last = rig.vigil(AgentEnv::default(), &probe);
+        let fourth = call(&last, &id, None, None).await;
+        assert_eq!(fourth["events"], json!([]), "{name}: the acknowledgement is persisted: {fourth}");
+    }
+}
+
+// ------------------------------------------------ S7: budget and cancel ----
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_that_cannot_finish_before_the_call_ends_is_not_started() {
+    // why: S7 "a check is skipped when less than its timeout remains (it runs
+    //      on the next call)". The probe's timeout is 5 s and the call keeps a
+    //      100 ms margin, so a check needs 5.1 s. Explicit 3300 s calls with
+    //      the cadence set so that the second check falls 6 s (3294) or 5 s
+    //      (3295) before the end: 6 s remains -> the check runs (asks at 0 and
+    //      3294); 5 s remains -> skipped (asks at 0 only; exactly 5 s does not
+    //      leave 5 s after the margin - R2-A5). The skipped check is not lost:
+    //      the next call starts 3300 s after the only check, so its start check
+    //      is due at offset 0.
+    // proves: CLAIM(S7)
+    for (cadence_s, runs) in [(3294u64, true), (3295, false)] {
+        let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.credit_check_every = Duration::from_secs(cadence_s));
+        let probe = quiet_probe();
+        let vigil = rig.vigil(AgentEnv::default(), &probe);
+        let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |_| {}).await;
+        let started = Instant::now();
+        let first = call(&vigil, &id, Some(3300), Some(true)).await;
+        assert_eq!(first["waited_s"], 3300, "cadence {cadence_s}");
+        let expected: Vec<u64> = if runs { vec![0, cadence_s] } else { vec![0] };
+        assert_eq!(probe.offsets_from(started), expected, "cadence {cadence_s}");
+        if !runs {
+            let before = probe.asked_count();
+            call(&vigil, &id, Some(30), Some(true)).await;
+            assert_eq!(probe.asked_count(), before + 1, "the skipped check runs at the start of the next call");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fast_probe_leaves_the_remaining_budget_available_to_the_hook() {
+    // why: S7. Probe reserve is 5s, but an instant probe does not spend it.
+    //      Checks at 3284 and 3286 both leave >=10.1s for the hook, so both
+    //      run with the full 10s hook timeout. R2-A5: do not reserve 15.1s
+    //      for a check; bound each operation against the actual budget left.
+    // proves: CLAIM(S7)
+    for cadence in [3284, 3286] {
+        let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |c| {
+            c.credit_check_every = Duration::from_secs(cadence);
+            c.on_credit_change = Some("policy".into());
+        });
+        let probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
+        probe.push(credit_state(false, CreditSource::Uw));
+        let hook = ScriptedHookRunner::new();
+        let vigil = rig.vigil_with_hook(claude(), &probe, &hook);
+        let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |_| {}).await;
+        let start = Instant::now();
+        let answer = call(&vigil, &id, Some(3300), Some(true)).await;
+        assert_eq!(probe.offsets_from(start), vec![0, cadence]);
+        assert_eq!(answer["waited_s"], cadence);
+        assert_eq!(only_event(&answer)["on_credits"], true);
+        assert_eq!(hook.calls().len(), 1);
+        assert_eq!(hook.calls()[0].timeout, Duration::from_secs(10));
+        assert_eq!(hook.offsets_from(start), vec![cadence]);
+    }
+}
+
+fn pid_file_value(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse().ok())
+}
+
+/// Real time, at most 5 s: resolves once a script has written its child's pid.
+async fn child_pid_appears(path: &std::path::Path) {
+    for _ in 0..100 {
+        if pid_file_value(path).is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn child_is_gone_within_2_s(pid: u32) -> bool {
+    for _ in 0..40 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+        let gone = match stat {
+            None => true,
+            Some(line) => line[line.rfind(')').unwrap() + 1..].trim_start().starts_with('Z'),
+        };
+        if gone {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn cancelling_a_call_during_the_uw_probe_leaves_no_uw_descendants() {
+    // why: S7 "cancel during probe". The real SystemCreditProbe runs a fake
+    //      `uw` that backgrounds a `sleep 60`, writes its pid and waits. A call
+    //      with a long window (explicit 600 s) checks at its start; the cancel
+    //      future fires as soon as the pid file exists, so the probe is dropped
+    //      mid-flight. The call must report cancelled, and the sleeper must be
+    //      gone. (The cancel future gives up after 5 s so a missing check ends
+    //      the test as a failed assertion, not a hang.)
+    // proves: CLAIM(S7-kill)
+    let scratch = tempfile::tempdir().unwrap();
+    let pid_file = scratch.path().join("pid");
+    let uw = scratch.path().join("uw");
+    write_script(&uw, &format!("sleep 60 &\necho $! > '{}'\nwait", pid_file.display()));
+    let rig = Rig::real_time(|config| config.uw_command = uw.clone());
+    let vigil = rig.env.another_process().with_agent_env(AgentEnv::default());
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
+    let request = KeepaliveRequest { watch_id: Some(id), max_s: Some(600), orchestrator: Some(true) };
+    let cancelled = vigil.keepalive_cancellable(request, &crate::keepalive::NoProgress, child_pid_appears(&pid_file)).await.unwrap();
+    assert!(cancelled.is_none(), "the call should have been cancelled mid-probe");
+    let pid = pid_file_value(&pid_file);
+    assert!(pid.is_some(), "the call must start uw before cancellation");
+    let pid = pid.unwrap();
+    let _cleanup = ChildCleanup(pid);
+    assert!(child_is_gone_within_2_s(pid).await, "uw's child {pid} survived the cancel");
+}
+
+#[tokio::test]
+async fn cancelling_a_call_during_the_hook_leaves_no_hook_descendants() {
+    // why: S7 "cancel during hook". The hook backgrounds a `sleep 60`, writes
+    //      its pid and waits (timeout 30 s, so only the cancel can end it). The
+    //      probe is scripted (off baseline, then on after 200 ms), the hook is
+    //      the real process runner. After the cancel the sleeper is gone.
+    // proves: CLAIM(S7-kill)
+    let scratch = tempfile::tempdir().unwrap();
+    let pid_file = scratch.path().join("pid");
+    let command = format!("sleep 60 & echo $! > '{}'; wait", pid_file.display());
+    let rig = Rig::real_time(move |config| {
+        config.credit_check_every = Duration::from_millis(200);
+        config.credit_hook_timeout = Duration::from_secs(30);
+        config.on_credit_change = Some(command);
+    });
+    let probe = off_then_on();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
+    let request = KeepaliveRequest { watch_id: Some(id), max_s: Some(600), orchestrator: Some(true) };
+    let cancelled = vigil.keepalive_cancellable(request, &crate::keepalive::NoProgress, child_pid_appears(&pid_file)).await.unwrap();
+    assert!(cancelled.is_none(), "the call should have been cancelled mid-hook");
+    let pid = pid_file_value(&pid_file);
+    assert!(pid.is_some(), "the call must start the hook before cancellation");
+    let pid = pid.unwrap();
+    let _cleanup = ChildCleanup(pid);
+    assert!(child_is_gone_within_2_s(pid).await, "the hook's child {pid} survived the cancel");
+}
+
+#[tokio::test]
+async fn the_hook_receives_at_most_4_kib_on_stdin_even_with_a_long_window_list() {
+    // why: S8 through the engine and a real hook. The probe reports 300
+    //      windows; the real hook copies its stdin to a file. The file is at
+    //      most 4096 bytes and still one JSON object with the verdict. Control:
+    //      the same run with 3 windows passes them all on, so the bound cuts
+    //      only the excess.
+    // proves: CLAIM(S8-stdin)
+    let stdin_of = |windows: usize| async move {
+        let scratch = tempfile::tempdir().unwrap();
+        let out = scratch.path().join("stdin.json");
+        let command = format!("cat > '{}'", out.display());
+        let rig = Rig::real_time(move |config| {
+            config.credit_check_every = Duration::from_millis(200);
+            config.on_credit_change = Some(command);
+        });
+        let probe = ScriptedCreditProbe::new(credit_state_with_windows(true, windows));
+        probe.push(credit_state_with_windows(false, windows));
+        let vigil = rig.vigil(AgentEnv::default(), &probe);
+        let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
+        real_call_with(&vigil, &id, Some(600), Some(true)).await;
+        std::fs::read_to_string(&out).expect("the hook ran")
+    };
+    let small: Value = serde_json::from_str(&stdin_of(3).await).unwrap();
+    assert_eq!(small["windows"].as_array().unwrap().len(), 3);
+    let big = stdin_of(300).await;
+    assert!(big.len() <= 4096, "{} bytes", big.len());
+    let parsed: Value = serde_json::from_str(&big).expect("still one JSON object");
+    assert_eq!((&parsed["on_credits"], &parsed["source"]), (&json!(true), &json!("uw")));
+}
+
+// ------------------------------------------------ S9: shared state ----
+
+#[tokio::test(start_paused = true)]
+async fn a_fresh_process_measures_a_change_against_credit_state_json_not_against_its_memory() {
+    // why: S9. The previous in-memory baseline (A9) is gone: process B has
+    //      never seen the state, credit-state.json says on (last check 1000 s
+    //      ago), the probe says off, so B reports the change at once (waited 0)
+    //      and runs the hook once. A memory-based baseline would swallow it.
+    // proves: CLAIM(S9)
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.on_credit_change = Some("policy".into()));
+    rig.seed_credit_file(Some(true), 1000);
+    let probe = quiet_probe();
+    let hook = ScriptedHookRunner::new();
+    let vigil = rig.vigil_with_hook(AgentEnv::default(), &probe, &hook);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
+    let envelope = call(&vigil, &id, Some(30), Some(true)).await;
+    assert_eq!((&envelope["waited_s"], &only_event(&envelope)["on_credits"]), (&json!(0), &json!(false)), "{envelope}");
+    assert_eq!(hook.calls().len(), 1);
+    assert_eq!(rig.read_credit_file()["on_credits"], false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_one_process_reported_a_change_a_later_process_reports_nothing() {
+    // why: S9 "a process runs the hook only when its observed known state
+    //      differs from the recorded one, then records it". P1 sees off -> on
+    //      and records on. P2 (fresh, its own probe, 240 s later so its start
+    //      check is due) observes on: equal to the recorded state, so no event,
+    //      no second hook run, and its 30 s call is quiet. One hook run in all.
+    // proves: CLAIM(S9)
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.on_credit_change = Some("policy".into()));
+    rig.seed_credit_file(Some(false), 1000);
+    let hook = ScriptedHookRunner::new();
+    let first_probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
+    let p1 = rig.vigil_with_hook(AgentEnv::default(), &first_probe, &hook);
+    let (id, _) = quiet_watch(&rig, &p1, "w", 3600, 7200, |_| {}).await;
+    let one = call(&p1, &id, Some(30), Some(true)).await;
+    assert_eq!(only_event(&one)["on_credits"], true, "{one}");
+
+    tokio::time::sleep(Duration::from_secs(240)).await;
+    let second_probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
+    let p2 = rig.vigil_with_hook(AgentEnv::default(), &second_probe, &hook);
+    let two = call(&p2, &id, Some(30), Some(true)).await;
+    assert_eq!(second_probe.asked_count(), 1, "the check was due");
+    assert_eq!((&two["waited_s"], &two["events"]), (&json!(30), &json!([])), "{two}");
+    assert_eq!(hook.calls().len(), 1, "one change, one hook run");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_credit_state_file_is_a_baseline_and_is_rewritten() {
+    // why: S9 robustness. A torn write, a hand edit, or an older format must not
+    //      crash a call or fire the hook. Three bad contents; each time the probe
+    //      says on: no event, no hook, the call runs its 30 s, and the file is
+    //      rewritten as valid {on_credits: true, checked_at: now}.
+    // proves: CLAIM(S9)
+    for (name, content) in [("not json", "not json at all"), ("empty object", "{}"), ("wrong types", r#"{"on_credits": "yes", "checked_at": 5}"#)] {
+        let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.on_credit_change = Some("policy".into()));
+        std::fs::create_dir_all(rig.env.root()).unwrap();
+        std::fs::write(rig.credit_file(), content).unwrap();
+        let probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
+        let hook = ScriptedHookRunner::new();
+        let vigil = rig.vigil_with_hook(AgentEnv::default(), &probe, &hook);
+        let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
+        let envelope = call(&vigil, &id, Some(30), Some(true)).await;
+        assert_eq!((&envelope["waited_s"], &envelope["events"]), (&json!(30), &json!([])), "{name}: {envelope}");
+        assert_eq!(hook.calls().len(), 0, "{name}");
+        assert_eq!(rig.read_credit_file(), json!({"on_credits": true, "checked_at": serde_json::to_value(spec_instant()).unwrap()}), "{name}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_that_detect_the_same_change_run_the_hook_once() {
+    // why: S9 (two Engine instances on one root, real flock, a real hook that
+    //      takes 0.4 s). credit-state.json says off; both instances' probes say
+    //      on; both start an orchestrator call at the same moment on their own
+    //      watch. Without `credit.lock` around probe + hook both would run the
+    //      hook (counter 2) and both would end with an event. With it the
+    //      loser, once the winner recorded on, observes on == recorded and
+    //      carries on quietly (so its call is still running after 3 s). Exactly
+    //      one envelope, one hook run, the file says on, the lock file exists.
+    // proves: CLAIM(S9)
+    let scratch = tempfile::tempdir().unwrap();
+    let counter = scratch.path().join("count");
+    let command = format!("cat > /dev/null; sleep 0.4; echo run >> '{}'", counter.display());
+    let rig = Rig::real_time(move |config| config.on_credit_change = Some(command));
+    rig.seed_credit_file(Some(false), 1000);
+    let (probe_a, probe_b) = (ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw)), ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw)));
+    let a = rig.vigil(AgentEnv::default(), &probe_a);
+    let b = rig.vigil(AgentEnv::default(), &probe_b);
+    let (id_a, _) = quiet_watch(&rig, &a, "a", 3600, 7200, |_| {}).await;
+    let (id_b, _) = quiet_watch(&rig, &b, "b", 3600, 7200, |_| {}).await;
+    async fn run(vigil: &Vigil, id: &WatchId) -> Result<Result<crate::Envelope, crate::VigilError>, tokio::time::error::Elapsed> {
+        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30), orchestrator: Some(true) };
+        tokio::time::timeout(Duration::from_secs(3), vigil.keepalive(request)).await
+    }
+    let (ra, rb) = tokio::join!(run(&a, &id_a), run(&b, &id_b));
+    let finished: Vec<Value> = [ra, rb].into_iter().filter_map(Result::ok).map(|envelope| serde_json::to_value(envelope.unwrap()).unwrap()).collect();
+    assert_eq!(finished.len(), 1, "exactly one process reports the change: {finished:?}");
+    assert_eq!(only_event(&finished[0])["kind"], "credit_state_changed");
+    assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 1, "the hook ran once");
+    assert_eq!(rig.read_credit_file()["on_credits"], true);
+    assert!(rig.env.root().join("credit.lock").exists());
+}
+
+// ------------------------------------------------ S10: no-id, several watches ----
+
+#[tokio::test(start_paused = true)]
+async fn any_covered_orchestrator_watch_makes_a_no_id_call_an_orchestrator_call() {
+    // why: S10 (mixed flags). Two watches in one process: `a` stored with
+    //      orchestrator true, `b` without. A no-id call with no flag of its own
+    //      covers both and is an orchestrator call because `a` is: 3300 s on a
+    //      1h cache. Controls, each on its own Vigil: both watches unflagged ->
+    //      270 s; an explicit `orchestrator: false` on the call overrides the
+    //      stored flag (A8) -> 270 s.
+    // proves: CLAIM(S10), CLAIM(AI1')
+    let scenario = |flag_a: Option<bool>, call_flag: Option<bool>| async move {
+        let rig = Rig::new();
+        rig.one_hour_cache();
+        let probe = quiet_probe();
+        let vigil = rig.vigil(claude(), &probe);
+        quiet_watch(&rig, &vigil, "a", 600, 20_000, |request| request.orchestrator = flag_a).await;
+        quiet_watch(&rig, &vigil, "b", 600, 20_000, |_| {}).await;
+        call_noid(&vigil, None, call_flag).await
+    };
+    let mixed = scenario(Some(true), None).await;
+    assert_eq!((&mixed["waited_s"], &mixed["cache"]["ttl"]), (&json!(3300), &json!("1h")), "{mixed}");
+    let none = scenario(None, None).await;
+    assert_eq!((&none["waited_s"], &none["cache"]["source"]), (&json!(270), &json!("default")), "control: {none}");
+    let overridden = scenario(Some(true), Some(false)).await;
+    assert_eq!(overridden["waited_s"], 270, "an explicit false wins: {overridden}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn attention_on_a_secondary_watch_ends_a_no_id_call_and_is_delivered_once() {
+    // why: S10 (secondary watch). `a` (nearest deadline, 3000 s) is the primary
+    //      of a no-id envelope; `b` (deadline 7200) is overdue at 90 s
+    //      (expect_s 60). The call ends at 90 with a's status pending, `next`
+    //      "act on events" and ONE event, b's attention (event.watch_id "b",
+    //      id b:...). The next no-id call is quiet for its full 270 s: b's
+    //      attention was delivered and acknowledged along with the envelope.
+    // proves: CLAIM(S10), CLAIM(S6)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    quiet_watch(&rig, &vigil, "a", 600, 3000, |_| {}).await;
+    quiet_watch(&rig, &vigil, "b", 600, 7200, |request| request.expect_s = Some(60)).await;
+    let first = call_noid(&vigil, None, None).await;
+    assert_eq!((&first["watch_id"], &first["status"], &first["next"], &first["waited_s"]), (&json!("a"), &json!("pending"), &json!("act on events"), &json!(90)), "{first}");
+    let event = only_event(&first);
+    assert!(is_attention(event, "overdue"), "{first}");
+    assert_eq!(event["watch_id"], "b");
+    assert!(is_w1_id(event["event_id"].as_str().unwrap(), "b"), "{event}");
+    let second = call_noid(&vigil, None, None).await;
+    assert_eq!((&second["waited_s"], &second["events"]), (&json!(270), &json!([])), "{second}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn when_a_watch_fires_and_another_needs_attention_in_one_call_the_terminal_result_is_primary() {
+    // why: S10 (attention vs terminal). `a` is a change watch whose input is
+    //      written at t = 15, so its tick at 20 fires it (tick 2, event
+    //      `a:2:0`). `b` is a judge watch with a live process and stall_s 20, so
+    //      its tick at 20 raises `stalled`. One call, one envelope: the primary
+    //      is the fired watch (status fired), events = [a's terminal event,
+    //      b's attention] in that order with distinct ids, `others` empty (b
+    //      is still pending). The next no-id call covers only b (a was
+    //      returned), is quiet for 270 s, and b's attention does not return.
+    // proves: CLAIM(S10), CLAIM(S6)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let sleeper = Sleeper::start();
+    let (_, path_a) = quiet_watch(&rig, &vigil, "a", 20, 3600, |_| {}).await;
+    judge_watch(&rig, &vigil, "b", 20, 3000, |request| {
+        request.stall_s = Some(20);
+        request.inputs.push(Input::Process { pid: sleeper.pid(), want: None });
+    })
+    .await;
+    let appender = async {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        append_file(&path_a, "boom\n");
+    };
+    let (first, ()) = tokio::join!(call_noid(&vigil, None, None), appender);
+    assert_eq!((&first["watch_id"], &first["status"], &first["next"]), (&json!("a"), &json!("fired"), &json!("act on events")), "{first}");
+    let events = first["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "{first}");
+    assert_eq!(events[0]["event_id"], "a:2:0");
+    assert!(events[0].get("kind").is_none(), "the terminal event is an ordinary one: {first}");
+    assert!(is_attention(&events[1], "stalled") && events[1]["watch_id"] == "b", "{first}");
+    assert_ne!(events[0]["event_id"], events[1]["event_id"]);
+    assert!(first.get("others").is_none(), "b is pending, not finished: {first}");
+
+    let second = call_noid(&vigil, None, None).await;
+    assert_eq!((&second["watch_id"], &second["waited_s"], &second["events"]), (&json!("b"), &json!(270), &json!([])), "{second}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watch_finishing_at_its_attention_threshold_emits_only_its_terminal_event() {
+    // why: A15 says a finished watch emits no attention. S10's same-call
+    //      secondary attention belongs to a different, still-pending watch.
+    //      Control: the identical threshold without a change emits attention.
+    // proves: CLAIM(S10), CLAIM(AI5)
+    let rig = Rig::new();
+    let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+    let (control, _) = quiet_watch(&rig, &vigil, "control", 20, 3600, |r| r.expect_s = Some(40)).await;
+    assert_attention(&call(&vigil, &control, None, None).await, "overdue", 60);
+    let (id, path) = quiet_watch(&rig, &vigil, "w", 20, 3600, |r| r.expect_s = Some(40)).await;
+    let appender = async { tokio::time::sleep(Duration::from_secs(55)).await; append_file(&path, "done\n"); };
+    let (answer, ()) = tokio::join!(call(&vigil, &id, None, None), appender);
+    assert_eq!(answer["status"], "fired");
+    assert_eq!(answer["waited_s"], 60);
+    assert_eq!(only_event(&answer)["event_id"], "w:4:0");
+    assert!(only_event(&answer).get("kind").is_none());
+}
+
+// ---- Spec review round 2: S1-S10 -----------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn orchestrator_wait_uses_ttl_checks_and_keeps_the_final_calls_changed_cache() {
+    // why: S1/S3. First window 3300, transcript drops at 3000, last window
+    //      270 and expiry at 3500. This separates last cache from first cache
+    //      and total time from the final internal call's 200 s.
+    // proves: CLAIM(S1), CLAIM(S3)
+    let rig = Rig::new();
+    let path = rig.one_hour_cache();
+    let probe = quiet_probe();
+    let vigil = rig.vigil(claude(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 3500, |_| {}).await;
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3000)).await;
+        append_file(&path, &(assistant_line(0, 500) + "\n"));
+    });
+    let envelope = serde_json::to_value(vigil.wait_with(&id, true).await.unwrap()).unwrap();
+    writer.await.unwrap();
+    assert_eq!(envelope["status"], "expired");
+    assert_eq!(envelope["cache"]["interval_s"], 270);
+    assert_eq!(envelope["cache"]["ttl"], "5m");
+    assert_eq!(envelope["clock"]["waited_s"], 3500);
+    assert_eq!(envelope["clock"]["watch_age_s"], 3500);
+    assert_eq!(probe.asked_count(), 14, "0..3120, then the short last call is not due at 3300");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_checks_keep_either_known_state_without_event_or_hook() {
+    // why: S5. On->unknown and off->unknown must preserve last known state
+    //      across processes, yet advance checked_at. A subsequent same known
+    //      state is quiet; the opposite known state runs one hook (control).
+    // proves: CLAIM(S5)
+    for known in [false, true] {
+        let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |c| c.on_credit_change = Some("record".into()));
+        rig.seed_credit_file(Some(known), 240);
+        let probe = ScriptedCreditProbe::new(credit_unknown(CreditSource::Transcripts));
+        let hook = ScriptedHookRunner::new();
+        let vigil = rig.vigil_with_hook(claude(), &probe, &hook);
+        let (id, _) = quiet_watch(&rig, &vigil, "w", 10, 3600, |_| {}).await;
+        let unknown = call(&vigil, &id, Some(30), Some(true)).await;
+        assert_eq!(unknown["events"], json!([]));
+        assert!(unknown["cache"]["credit_check"].is_object(), "unknown check must be recorded: {unknown}");
+        assert!(unknown["cache"]["credit_check"]["on_credits"].is_null());
+        assert_eq!(rig.read_credit_file()["on_credits"], known);
+        assert_eq!(rig.read_credit_file()["checked_at"], json!(spec_instant()));
+        assert_eq!(hook.calls().len(), 0);
+        tokio::time::sleep(Duration::from_secs(210)).await;
+        probe.set_steady(credit_state(known, CreditSource::Uw));
+        let fresh = rig.vigil_with_hook(claude(), &probe, &hook);
+        assert_eq!(call(&fresh, &id, Some(30), Some(true)).await["events"], json!([]));
+        assert_eq!(hook.calls().len(), 0);
+        tokio::time::sleep(Duration::from_secs(210)).await;
+        probe.set_steady(credit_state(!known, CreditSource::Uw));
+        let changed = call(&fresh, &id, Some(30), Some(true)).await;
+        assert_eq!(only_event(&changed)["on_credits"], !known);
+        assert_eq!(hook.calls().len(), 1);
+    }
+}
+
+fn stored_watch(rig: &Rig, id: &WatchId) -> Value {
+    serde_json::from_slice(&std::fs::read(rig.env.root().join("watches").join(format!("{id}.json"))).unwrap()).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_attention_reasons_and_a_later_terminal_event_have_distinct_persisted_ids() {
+    // why: S6. Overdue at 30, stall at 60, then ordinary fire: three
+    //      distinct IDs must survive the tick save; acknowledging one reason
+    //      must not suppress the other or re-emit the first.
+    // proves: CLAIM(S6)
+    let rig = Rig::new();
+    let child = Sleeper::start();
+    let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+    let (id, path) = quiet_watch(&rig, &vigil, "w", 10, 3600, |r| {
+        r.expect_s = Some(20);
+        r.stall_s = Some(60);
+        r.inputs.push(Input::Process { pid: child.pid(), want: None });
+    }).await;
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None };
+    let (first, first_delivery) = vigil.keepalive_uncommitted(request.clone(), &crate::keepalive::NoProgress, std::future::pending()).await.unwrap().unwrap();
+    let first = serde_json::to_value(first).unwrap();
+    assert_attention(&first, "overdue", 30);
+    let first_id = only_event(&first)["event_id"].as_str().expect("event id").to_owned();
+    assert!(stored_watch(&rig, &id)["events"].as_array().unwrap().iter().any(|e| e["event_id"] == first_id));
+    assert_eq!(stored_watch(&rig, &id)["tick"], only_event(&first)["tick"]);
+    vigil.commit_delivery(first_delivery);
+    let (second, second_delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending()).await.unwrap().unwrap();
+    let second = serde_json::to_value(second).unwrap();
+    assert_attention(&second, "stalled", 30);
+    let second_id = only_event(&second)["event_id"].as_str().unwrap().to_owned();
+    assert_ne!(first_id, second_id);
+    assert!(stored_watch(&rig, &id)["events"].as_array().unwrap().iter().any(|e| e["event_id"] == second_id));
+    assert_eq!(stored_watch(&rig, &id)["tick"], only_event(&second)["tick"]);
+    vigil.commit_delivery(second_delivery);
+    append_file(&path, "done\n");
+    let terminal = call(&vigil, &id, None, None).await;
+    assert_eq!(terminal["status"], "fired");
+    let last_id = only_event(&terminal)["event_id"].as_str().unwrap();
+    assert_ne!(last_id, first_id);
+    assert_ne!(last_id, second_id);
+    assert!(only_event(&terminal).get("kind").is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attention_cancelled_before_delivery_is_replayed_until_commit_delivery() {
+    // why: S6. The transport can disconnect after sensing/persistence but
+    //      before handing the envelope to the agent. Drop the delivery token
+    //      at that boundary. Retry must preserve its ID and mark redelivery;
+    //      only commit_delivery acknowledges it. Fresh engine sees the ACK.
+    // proves: CLAIM(S6)
+    let rig = Rig::new();
+    let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 10, 3600, |r| r.expect_s = Some(20)).await;
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None };
+    let (first, delivery) = vigil.keepalive_uncommitted(request.clone(), &crate::keepalive::NoProgress, std::future::pending()).await.unwrap().unwrap();
+    let first = serde_json::to_value(first).unwrap();
+    assert_attention(&first, "overdue", 30);
+    let event_id = only_event(&first)["event_id"].clone();
+    drop(delivery);
+    let (retry, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending()).await.unwrap().unwrap();
+    let retry = serde_json::to_value(retry).unwrap();
+    assert_eq!(only_event(&retry)["event_id"], event_id);
+    assert_eq!(only_event(&retry)["redelivered"], true);
+    vigil.commit_delivery(delivery);
+    let fresh = rig.vigil(AgentEnv::default(), &quiet_probe());
+    assert_eq!(call(&fresh, &id, Some(30), None).await["events"], json!([]));
+}
+
+struct SlowCreditProbe {
+    started: std::sync::Mutex<Vec<Instant>>,
+    dropped: std::sync::Mutex<Vec<Instant>>,
+    delay: Duration,
+    first_off: bool,
+}
+
+struct ProbeDrop<'a>(&'a std::sync::Mutex<Vec<Instant>>);
+impl Drop for ProbeDrop<'_> {
+    fn drop(&mut self) { self.0.lock().unwrap().push(Instant::now()); }
+}
+
+impl crate::credit::CreditProbe for SlowCreditProbe {
+    fn check<'a>(&'a self, _now: Timestamp) -> crate::judge::BoxFuture<'a, crate::credit::CreditState> {
+        Box::pin(async move {
+            let _guard = ProbeDrop(&self.dropped);
+            let first = { let mut asked = self.started.lock().unwrap(); asked.push(Instant::now()); asked.len() == 1 };
+            tokio::time::sleep(self.delay).await;
+            credit_state(!(self.first_off && first), CreditSource::Uw)
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_that_never_answers_is_cut_off_at_five_seconds() {
+    // why: S7. A probe advertises 5 s but takes 100 s. Its future must be
+    //      dropped after 5 s, not merely at the 30 s call boundary. Drop time
+    //      is independently observed by a guard inside the external probe.
+    // proves: CLAIM(S7-budget)
+    let rig = Rig::new();
+    rig.seed_credit_file(Some(false), 240);
+    let probe = Arc::new(SlowCreditProbe { started: Default::default(), dropped: Default::default(), delay: Duration::from_secs(100), first_off: false });
+    let vigil = rig.env.another_process().with_agent_env(claude()).with_credit_probe(probe.clone());
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 10, 3600, |_| {}).await;
+    let start = Instant::now();
+    let answer = call(&vigil, &id, Some(30), Some(true)).await;
+    assert_eq!(probe.started.lock().unwrap().len(), 1);
+    assert_eq!(probe.dropped.lock().unwrap().as_slice(), &[start + Duration::from_secs(5)]);
+    assert_eq!(start.elapsed(), Duration::from_secs(30));
+    assert_eq!(answer["status"], "pending");
+    assert_eq!(answer["events"], json!([]));
+    assert_eq!(rig.read_credit_file()["on_credits"], false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hook_timeout_is_cut_to_remaining_budget_minus_100_ms() {
+    // why: S7. Long window 3300, check at 3294 takes 5 s, leaving 1 s.
+    //      Reserve 100 ms and give the hook 900 ms. A 20 s hook must time
+    //      out at 3299.9; its normal 10 s timeout cannot overrun the call.
+    // proves: CLAIM(S7-budget)
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |c| {
+        c.on_credit_change = Some("slow-hook".into());
+        c.credit_check_every = Duration::from_secs(3294);
+    });
+    let probe = Arc::new(SlowCreditProbe { started: Default::default(), dropped: Default::default(), delay: Duration::from_secs(5), first_off: true });
+    let hook = ScriptedHookRunner::new();
+    hook.set_delay(Duration::from_secs(20));
+    let vigil = rig.env.another_process().with_agent_env(claude()).with_credit_probe(probe).with_hook_runner(hook.clone());
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 10_000, |_| {}).await;
+    let start = Instant::now();
+    let answer = call(&vigil, &id, Some(3300), Some(true)).await;
+    assert_eq!(hook.calls().len(), 1);
+    assert_eq!(hook.calls()[0].timeout, Duration::from_millis(900));
+    assert_eq!(start.elapsed(), Duration::from_millis(3_299_900));
+    assert_eq!(only_event(&answer)["hook"]["timed_out"], true);
+}
+
+fn dead_child(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| s[s.rfind(')').unwrap() + 1..].trim_start().starts_with('Z'))
+}
+
+struct ChildCleanup(u32);
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if !dead_child(self.0) { let _ = std::process::Command::new("kill").args(["-KILL", &self.0.to_string()]).status(); }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_engines_share_a_real_credit_flock_and_run_the_change_hook_once() {
+    // why: S9. Hold a real OS flock while both engines complete 30s calls:
+    //      neither may probe/run a hook. Release it, then let both detect
+    //      off->on on distinct watches. Only one hook runs. Virtual time
+    //      removes scheduler guesses; the companion test runs a real shell
+    //      hook concurrently on the real clock.
+    // proves: CLAIM(S9)
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" { fn flock(fd: i32, op: i32) -> i32; }
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |c| c.on_credit_change = Some("record".into()));
+    rig.seed_credit_file(Some(false), 240);
+    let holder = std::fs::File::create(rig.env.root().join("credit.lock")).unwrap();
+    assert_eq!(unsafe { flock(holder.as_raw_fd(), 2) }, 0);
+    let probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
+    let hook = ScriptedHookRunner::new();
+    hook.set_delay(Duration::from_secs(1));
+    let a = rig.vigil_with_hook(claude(), &probe, &hook);
+    let b = rig.vigil_with_hook(claude(), &probe, &hook);
+    let (aid, _) = quiet_watch(&rig, &a, "a", 10, 3600, |_| {}).await;
+    let (bid, _) = quiet_watch(&rig, &b, "b", 10, 3600, |_| {}).await;
+    let (held_a, held_b) = tokio::join!(call(&a, &aid, Some(30), Some(true)), call(&b, &bid, Some(30), Some(true)));
+    let checks_while_locked = probe.asked_count();
+    let hooks_while_locked = hook.calls().len();
+    assert_eq!(unsafe { flock(holder.as_raw_fd(), 8) }, 0);
+    drop(holder);
+    assert_eq!(checks_while_locked, 0, "external credit.lock must block both probes");
+    assert_eq!(hooks_while_locked, 0, "hook must hold credit.lock too");
+    assert_eq!((&held_a["waited_s"], &held_b["waited_s"]), (&json!(30), &json!(30)));
+    assert_eq!((&held_a["events"], &held_b["events"]), (&json!([]), &json!([])));
+    let (a, b) = tokio::join!(call(&a, &aid, Some(30), Some(true)), call(&b, &bid, Some(30), Some(true)));
+    assert_eq!(hook.calls().len(), 1, "same transition must apply once across engines");
+    let answers = [a, b];
+    let changes = answers.iter().flat_map(|e| e["events"].as_array().unwrap()).filter(|e| e["kind"] == "credit_state_changed").count();
+    assert_eq!(changes, 1);
+    assert_eq!(probe.asked_count(), 1, "second engine rereads checked_at under flock");
+    assert_eq!(rig.read_credit_file()["on_credits"], true);
 }
