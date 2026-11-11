@@ -302,8 +302,11 @@ impl Vigil {
         };
         let saved = match budget_end {
             Some(end) => {
-                let left = end.saturating_duration_since(tokio::time::Instant::now());
-                self.store.save_within_async(watch, left.saturating_sub(RESCUE_BUDGET_MARGIN), &on_settled).await
+                // An absolute moment, not the time left now: the store reads
+                // the time left when a wait actually starts, after a slow
+                // write has used some of it (review S5).
+                let cutoff = end.checked_sub(RESCUE_BUDGET_MARGIN).unwrap_or(end);
+                self.store.save_within_async(watch, cutoff, &on_settled).await
             }
             None => self.store.save_async(watch).await,
         };

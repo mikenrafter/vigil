@@ -2252,7 +2252,7 @@ fn a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_
     });
     scenario(|| async {
         let env = paused_env();
-        let (id, vigil, plan, reserve_before) = tick_with_a_slow_failing_write(&env, Duration::from_secs(29), Duration::from_millis(950)).await;
+        let (id, vigil, plan, _) = tick_with_a_slow_failing_write(&env, Duration::from_secs(29), Duration::from_millis(950)).await;
         let attempts_before = plan.attempts(WriteKind::Watch);
 
         let envelope = wire(&vigil.keepalive(by_id(&id, Some(30))).await.unwrap());
@@ -2260,6 +2260,6 @@ fn a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_
         assert_eq!(envelope["status"], "fired", "{envelope}");
         assert_eq!(persist_of(&envelope), &json!({"ok": true, "used_reserve": true, "kind": "disk_full"}), "{envelope}");
         assert_eq!(plan.attempts(WriteKind::Watch) - attempts_before, 2, "the free lock lets the rescue retry once");
-        assert_ne!(identity(&env.root().join(".reserve")), reserve_before, "the reserve was spent and re-made");
+        assert!(!env.root().join(".reserve").exists(), "the reserve was spent (and the plan lets no new one be made)");
     });
 }

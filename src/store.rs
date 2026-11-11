@@ -287,13 +287,51 @@ impl From<io::Error> for Failed {
 /// Nobody is listening (callers that have no result to protect).
 fn unobserved(_: Settled<'_>) {}
 
+/// How long a rescue or reserve upkeep may wait for the store-wide lock (DF4e):
+/// at most `ceiling`, and not past `cutoff`. The cutoff is an ABSOLUTE moment
+/// (on tokio's clock, virtual under a paused test clock) and the time left to
+/// it is read when the wait is about to start, not when the save began: a
+/// write that stalled before it failed has already spent part of the budget
+/// (review S5). A passed cutoff means no waiting at all, not no rescue: the
+/// lock is still tried once.
+///
+/// Invariant: `allowed_now` is `ceiling` for a wait without a cutoff, and never
+/// more than the time left to the cutoff otherwise; it only shrinks as time
+/// passes.
+#[derive(Clone, Copy)]
+struct LockWait {
+    ceiling: Duration,
+    cutoff: Option<tokio::time::Instant>,
+}
+
+impl LockWait {
+    /// A wait of at most `ceiling` from whenever it starts (callers outside a
+    /// call budget: the blocking entry points, store tests).
+    fn up_to(ceiling: Duration) -> LockWait {
+        LockWait { ceiling, cutoff: None }
+    }
+
+    /// The same wait, with a ceiling of at most `ceiling`.
+    fn capped(self, ceiling: Duration) -> LockWait {
+        LockWait { ceiling: self.ceiling.min(ceiling), ..self }
+    }
+
+    /// How long a wait that starts now may last.
+    fn allowed_now(&self) -> Duration {
+        match self.cutoff {
+            Some(cutoff) => self.ceiling.min(cutoff.saturating_duration_since(tokio::time::Instant::now())),
+            None => self.ceiling,
+        }
+    }
+}
+
 /// How a rescue or reserve upkeep gets the store-wide lock.
 #[derive(Clone, Copy)]
 enum StoreLockAccess<'held> {
     /// The caller holds it: reuse, never wait for it again.
     Held(&'held StoreLock),
-    /// Take it, waiting at most this long (DF4e).
-    Wait(Duration),
+    /// Take it, waiting as the [`LockWait`] allows (DF4e).
+    Wait(LockWait),
 }
 
 /// A write that failed even after the rescue: the error to report (the retry's
@@ -359,14 +397,14 @@ impl Store {
     /// store-wide lock at most [`RESCUE_LOCK_WAIT`]. The error of a write that
     /// still fails is `DiskFull` (naming the state root) or `Io`.
     pub fn save(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
-        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT), &unobserved))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(LockWait::up_to(RESCUE_LOCK_WAIT)), &unobserved))
     }
 
     /// `save` for a caller inside a call budget (DF4e): a rescue waits for the
     /// store-wide lock at most `min(2 s, budget_left)`; with nothing left it
     /// does not wait at all.
     pub fn save_within(&self, watch: &WatchFile, budget_left: Duration) -> Result<WriteOutcome, StoreError> {
-        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT)), &unobserved))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(LockWait::up_to(budget_left.min(RESCUE_LOCK_WAIT))), &unobserved))
     }
 
     /// `save` for a caller that already holds the store-wide lock (`create`
@@ -380,19 +418,23 @@ impl Store {
     /// rescue, but the wait for the store-wide lock yields to the executor and
     /// ends when the future is dropped.
     pub async fn save_async(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
-        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT), &unobserved).await
+        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(LockWait::up_to(RESCUE_LOCK_WAIT)), &unobserved).await
     }
 
-    /// `save_within` for async callers (review S3). `settled` hears what the
-    /// save has decided before each wait it may make (review S4, see
-    /// [`Settled`]): a caller whose future can be dropped keeps its result there.
+    /// `save_within` for async callers (review S3): no wait for the store-wide
+    /// lock (rescue or upkeep) goes on past `cutoff`, an absolute moment on
+    /// tokio's clock that is checked when the wait is about to start (review
+    /// S5; see [`LockWait`]). `settled` hears what the save has decided before
+    /// each wait it may make (review S4, see [`Settled`]): a caller whose future
+    /// can be dropped keeps its result there.
     pub async fn save_within_async(
         &self,
         watch: &WatchFile,
-        budget_left: Duration,
+        cutoff: tokio::time::Instant,
         settled: &(dyn Fn(Settled<'_>) + Sync),
     ) -> Result<WriteOutcome, StoreError> {
-        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT)), settled).await
+        let wait = LockWait { ceiling: RESCUE_LOCK_WAIT, cutoff: Some(cutoff) };
+        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(wait), settled).await
     }
 
     async fn save_with<P: Patience>(
@@ -483,14 +525,15 @@ impl Store {
     /// says. `None` when the lock could not be had in time, or its file does
     /// not exist and cannot be made (DF4d): `run` did not run.
     async fn with_store_lock<P: Patience, T>(&self, access: StoreLockAccess<'_>, run: impl FnOnce() -> T) -> Option<T> {
-        let limit = match access {
+        let wait = match access {
             StoreLockAccess::Held(_) => return Some(run()),
-            StoreLockAccess::Wait(limit) => limit,
+            StoreLockAccess::Wait(wait) => wait,
         };
         // DF4d: the lock file is made first, once, with no rescue of its own (a
         // rescue needs this lock, and the file is exactly what is missing).
         let file = self.open_lock_file_once(&self.lock_path()).ok()?;
-        let patience = P::start(limit);
+        // ↳ CLAIM(S5-cutoff): the time left is read here, when the wait starts, after the write and the lock file have taken their time [review S5; disk_full_tests a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_inside_its_budget]
+        let patience = P::start(wait.allowed_now());
         loop {
             match file.try_lock() {
                 Ok(()) => {
@@ -530,7 +573,7 @@ impl Store {
         let access = match access {
             // Never longer than the caller's own limit (a call nearly out of
             // budget does not spend it on upkeep).
-            StoreLockAccess::Wait(limit) => StoreLockAccess::Wait(limit.min(UPKEEP_LOCK_WAIT)),
+            StoreLockAccess::Wait(wait) => StoreLockAccess::Wait(wait.capped(UPKEEP_LOCK_WAIT)),
             held => held,
         };
         // ↳ CLAIM(DF4d): `with_store_lock` makes the lock file before the reserve is published [spec N1; store test a_reserve_is_published_only_after_the_store_wide_lock_file_exists]
@@ -614,7 +657,7 @@ impl Store {
     /// `open_lock_file_once` through the same reserve-and-retry path as every
     /// other write (DF5).
     async fn open_lock_file<P: Patience>(&self, path: &Path) -> Result<File, StoreError> {
-        match self.attempt_with_rescue::<P, _>(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path).map_err(Failed::from), &|_| {}).await {
+        match self.attempt_with_rescue::<P, _>(StoreLockAccess::Wait(LockWait::up_to(RESCUE_LOCK_WAIT)), || self.open_lock_file_once(path).map_err(Failed::from), &|_| {}).await {
             Ok((file, _spent_reserve)) => Ok(file),
             Err(failed) => Err(failed.into_store_error(path.to_path_buf(), &self.root)),
         }
@@ -2554,5 +2597,162 @@ mod tests {
         assert!(tmp_files(dir.path()).is_empty());
         drop(held);
         assert_eq!(store.save_async(&newer(sample("w"))).await.unwrap(), WriteOutcome { used_reserve: false }, "the fault was one-shot; nothing is left locked");
+    }
+
+    // ---- review round 2: S5 (the cutoff) and S4 (what a save reports) ------
+
+    /// Virtual time since `since`, on the paused clock of these tests.
+    fn virtual_elapsed(since: tokio::time::Instant) -> std::time::Duration {
+        since.elapsed()
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_cutoff_that_has_passed_forbids_waiting_for_the_lock_but_not_taking_a_free_one() {
+        // why: review S5, the store half: the engine now passes an absolute
+        //      cutoff. One that has already passed means NO WAIT (the rescue
+        //      reports the first failure at once; on the paused clock any
+        //      `sleep` would show as elapsed time), but it must not forbid a
+        //      rescue whose lock is free: the same passed cutoff then gets the
+        //      lock on the single try and spends the reserve. Held lock: the
+        //      first failure, 0 virtual time, reserve and file untouched, one
+        //      attempt. Free lock (control, a fresh one-shot fault): saved on
+        //      the reserve, two attempts.
+        // proves: CLAIM(S5-cutoff), CLAIM(DF4e)
+        let dir = tempfile::tempdir().unwrap();
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let (reserve_before, file_before) = (lock_identity(&reserve_path(dir.path())), std::fs::read(store.watch_path(&wid("w"))).unwrap());
+        let held = Store::new(dir.path()).lock().unwrap();
+
+        let passed = tokio::time::Instant::now();
+        let outcome = store.save_within_async(&newer(sample("w")), passed, &unobserved).await;
+
+        assert!(matches!(outcome, Err(StoreError::DiskFull(_))), "{outcome:?}");
+        assert_eq!(virtual_elapsed(passed), std::time::Duration::ZERO, "a passed cutoff means no wait");
+        assert_eq!(plan.attempts(WriteKind::Watch), 1, "no lock, no retry");
+        assert_eq!(lock_identity(&reserve_path(dir.path())), reserve_before);
+        assert_eq!(std::fs::read(store.watch_path(&wid("w"))).unwrap(), file_before);
+        drop(held);
+
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let outcome = store.save_within_async(&newer(sample("w")), passed, &unobserved).await;
+        assert_eq!(outcome.unwrap(), WriteOutcome { used_reserve: true }, "a free lock is taken on the one try");
+        assert_eq!(plan.attempts(WriteKind::Watch), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_time_left_to_the_cutoff_is_read_when_the_wait_starts_not_when_the_save_began() {
+        // why: review S5: the engine used to turn the deadline into a duration
+        //      BEFORE the write, so a write that stalled before failing left
+        //      the rescue a wait that ran past the deadline. Here the first
+        //      write fails after 300 ms (the seam's `taking`), the cutoff is
+        //      500 ms after the save began and the lock is held. Hand-derived:
+        //      the wait starts at t = 300 ms with 200 ms left to the cutoff and
+        //      ends at t = 500 ms (one 2 ms poll of slack); computed at the
+        //      start of the save it would have been 500 ms from 300 ms, i.e.
+        //      t = 800 ms. The save reports the first failure.
+        // proves: CLAIM(S5-cutoff)
+        let dir = tempfile::tempdir().unwrap();
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+        let slow = std::time::Duration::from_millis(300);
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)).taking(slow), rule(WriteKind::Reserve, 28, When::Every)]);
+        let held = Store::new(dir.path()).lock().unwrap();
+
+        let started = tokio::time::Instant::now();
+        let outcome = store.save_within_async(&newer(sample("w")), started + std::time::Duration::from_millis(500), &unobserved).await;
+        let elapsed = virtual_elapsed(started);
+
+        drop(held);
+        assert!(matches!(outcome, Err(StoreError::DiskFull(_))), "{outcome:?}");
+        assert!(elapsed >= std::time::Duration::from_millis(500), "the write (300 ms) and the 200 ms left to the cutoff: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(520), "the wait must end at the cutoff, took until {elapsed:?}");
+        assert_eq!(plan.attempts(WriteKind::Watch), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn reserve_upkeep_waits_no_longer_than_the_cutoff_allows() {
+        // why: review S5, "the rescue/upkeep": upkeep waits at most 250 ms for
+        //      the lock, but never past the caller's cutoff. The write is
+        //      healthy, the reserve is missing, the lock is held. Cutoff 100 ms
+        //      away: the upkeep gives up at about 100 ms (not 250 ms); cutoff
+        //      passed: it does not wait at all. Either way the save succeeded
+        //      and no reserve was made.
+        // proves: CLAIM(S5-cutoff), CLAIM(DF4d)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        store.save(&sample("w")).unwrap();
+        std::fs::remove_file(reserve_path(dir.path())).unwrap();
+        let held = Store::new(dir.path()).lock().unwrap();
+
+        let started = tokio::time::Instant::now();
+        let outcome = store.save_within_async(&newer(sample("w")), started + std::time::Duration::from_millis(100), &unobserved).await;
+        let elapsed = virtual_elapsed(started);
+        assert_eq!(outcome.unwrap(), WriteOutcome { used_reserve: false });
+        assert!(elapsed >= std::time::Duration::from_millis(100) && elapsed < std::time::Duration::from_millis(120), "upkeep waited {elapsed:?}, the cutoff allows 100 ms");
+
+        let again = tokio::time::Instant::now();
+        store.save_within_async(&newer(sample("w")), again, &unobserved).await.unwrap();
+        assert_eq!(virtual_elapsed(again), std::time::Duration::ZERO, "a passed cutoff means no upkeep wait");
+        drop(held);
+        assert!(!reserve_path(dir.path()).exists(), "the lock was never had, so no reserve was made");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_save_reports_what_it_settled_before_each_wait_it_makes() {
+        // why: review S4, the interface the engine's retained report depends
+        //      on (mated part: `Vigil::persist_observed`). Each wait is an
+        //      await the future can be dropped at; what the save knows must be
+        //      reported BEFORE it. (1) First write fails with ENOSPC, lock held:
+        //      `FirstAttemptFailed` with the disk-full error naming the file and
+        //      the state root, reported before the wait, so a drop 100 ms into
+        //      the wait still leaves it in the log; the reserve and the file are
+        //      untouched. (2) Healthy write, reserve missing, lock held:
+        //      `Written`, reported before the upkeep wait. (3) Healthy write,
+        //      reserve present: nothing to wait for, nothing reported (the
+        //      observer is not noise on the healthy path).
+        // proves: CLAIM(S4-retained), CLAIM(DF4c)
+        use std::sync::Mutex;
+        let log: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let observe = |point: Settled<'_>| {
+            log.lock().unwrap().push(match point {
+                Settled::FirstAttemptFailed(error) => format!("failed: {error}"),
+                Settled::Written => "written".to_string(),
+            });
+        };
+        let dir = tempfile::tempdir().unwrap();
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+
+        let (store, _) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let (reserve_before, file_before) = (lock_identity(&reserve_path(dir.path())), std::fs::read(store.watch_path(&wid("w"))).unwrap());
+        let held = Store::new(dir.path()).lock().unwrap();
+        let cutoff = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let dropped = tokio::time::timeout(std::time::Duration::from_millis(100), store.save_within_async(&newer(sample("w")), cutoff, &observe)).await;
+        assert!(dropped.is_err(), "the save was waiting for the lock when the timeout dropped it");
+        let reported = log.lock().unwrap().clone();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        let watch_file = store.watch_path(&wid("w"));
+        assert_eq!(reported[0], format!("failed: disk full: cannot write {} (state root {}): No space left on device (os error 28)", watch_file.display(), dir.path().display()));
+        assert_eq!(lock_identity(&reserve_path(dir.path())), reserve_before, "the dropped rescue left the reserve alone");
+        assert_eq!(std::fs::read(&watch_file).unwrap(), file_before, "and the file");
+        assert!(tmp_files(dir.path()).is_empty());
+        drop(held);
+
+        log.lock().unwrap().clear();
+        std::fs::remove_file(reserve_path(dir.path())).unwrap();
+        let healthy = Store::new(dir.path());
+        let held = Store::new(dir.path()).lock().unwrap();
+        let dropped = tokio::time::timeout(std::time::Duration::from_millis(100), healthy.save_within_async(&newer(sample("w")), cutoff, &observe)).await;
+        assert!(dropped.is_err(), "the upkeep was waiting for the lock when the timeout dropped it");
+        assert_eq!(*log.lock().unwrap(), ["written"]);
+        assert_eq!(healthy.load(&wid("w")).unwrap(), newer(sample("w")), "the write itself was done before the upkeep wait");
+        drop(held);
+
+        // The dropped upkeep made no reserve; one unobserved save does, then a
+        // save with a valid reserve has nothing to wait for.
+        healthy.save_within_async(&newer(sample("w")), cutoff, &unobserved).await.unwrap();
+        assert!(reserve_path(dir.path()).exists(), "precondition: the reserve is back");
+        log.lock().unwrap().clear();
+        healthy.save_within_async(&newer(sample("w")), cutoff, &observe).await.unwrap();
+        assert!(log.lock().unwrap().is_empty(), "a healthy save with a valid reserve reports nothing: {:?}", log.lock().unwrap());
     }
 }
