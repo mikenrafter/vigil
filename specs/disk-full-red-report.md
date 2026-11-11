@@ -1,7 +1,7 @@
 # vigil disk-full: red phase report
 
 Spec: `specs/disk-full.md` (claims DF1-DF6). Branch `feat/vigil-disk-full`.
-Red commit: see "Commit" at the end.
+Red commit: `fb2cdea5` (message `vigil: red tests for disk-full resilience (DF1-DF6)`).
 
 ## Result
 
@@ -306,4 +306,5 @@ asserted field by field, so I expect them to bite.
 
 ## Commit
 
-Filled in below after committing.
+Red commit `fb2cdea5` on `feat/vigil-disk-full`. A report cannot contain the SHA of the commit that
+holds it, so this line was added in a one-file follow-up commit.
