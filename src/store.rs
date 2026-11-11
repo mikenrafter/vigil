@@ -363,9 +363,6 @@ impl Store {
         self.faults = faults;
         self
     }
-    pub fn faults(&self) -> &FaultPlan {
-        &self.faults
-    }
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -402,7 +399,9 @@ impl Store {
 
     /// `save` for a caller inside a call budget (DF4e): a rescue waits for the
     /// store-wide lock at most `min(2 s, budget_left)`; with nothing left it
-    /// does not wait at all.
+    /// does not wait at all. Blocking, so tests only: production callers are
+    /// async and use [`Store::save_within_async`] (review T3).
+    #[cfg(test)]
     pub fn save_within(&self, watch: &WatchFile, budget_left: Duration) -> Result<WriteOutcome, StoreError> {
         block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(LockWait::up_to(budget_left.min(RESCUE_LOCK_WAIT))), &unobserved))
     }
