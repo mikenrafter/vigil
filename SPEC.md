@@ -300,10 +300,14 @@ must be named as such.
   fails, `keepalive` (MCP and CLI) still returns the full envelope for the tick,
   built from memory: the same `events`, `digest`, `status`, `next` as a
   successful tick. The CLI exits as it would have (`keepalive` 0; `wait` keeps
-  its outcome code). A tick whose save failed ends the call at once and is
+  its outcome code). A tick whose save failed stops the call's sensing and is
   answered as is (DF1a): no in-memory re-ticking, so a full disk is not hammered.
-  `vigil wait` sleeps one `interval_s` after a pending envelope that could not be
-  saved, then calls again.
+  An envelope with events or a terminal status is returned at once. A pending
+  one (nothing to act on) is first held for `min(interval_s, budget left)`
+  without ticking again, so a disk that stays full never turns into back-to-back
+  agent turns; the hold is part of the call (cancellable, counted in
+  `waited_s`) and the same for the MCP server, CLI `keepalive` and `wait`. It
+  uses the shortest `interval_s` of the watches whose save failed.
 - **The failure is visible (DF2).** The envelope carries
   `"persist": {"ok": false, "kind": "disk_full" | "io", "error": "<OS text>", "path": "<file>"}`.
   `kind` is `disk_full` for ENOSPC (28) and EDQUOT (122), `io` otherwise.
@@ -340,15 +344,19 @@ must be named as such.
   bytes) of real zeros, fsynced, never kept open. It is valid only as a regular
   file of exactly that length with at least that much allocated
   (`st_blocks * 512`), so a short, sparse or non-regular reserve is replaced
-  (DF4b). After any successful write that finds it invalid or absent it is
-  created, best effort: failing to make or delete it is never an error.
+  (DF4b). After any successful watch write that finds it invalid or absent it is
+  (re)made, best effort: failing to make or delete it is never an error.
   A write that fails with `disk_full` while the file exists causes the store to
   delete it and retry the same write once. If the retry succeeds the tick is
   persisted and the envelope carries
   `"persist": {"ok": true, "used_reserve": true, "kind": "disk_full"}`. With no
   reserve file there is no retry (DF4a). The rescue is best effort: a write
   larger than the reserve, inode exhaustion, quotas, compression or a different
-  filesystem can still fail, and then DF1 and DF2 apply.
+  filesystem can still fail, and then DF1 and DF2 apply. On a compressing
+  filesystem (ZFS with compression, btrfs with `compress`) the zeros take no
+  blocks, so the reserve never validates and every healthy save rewrites it
+  (cost: the store-wide lock, a 256 KiB write and an fsync per save); it also
+  protects nothing there, because freeing it frees no space.
 - **Locks (DF4c-DF4e).** Reserve creation, deletion and the retry run under the
   store-wide lock `<root>/lock`, taken after any watch lock (lock order is
   unchanged). A caller that holds it (`create`) reuses it. The lock FILE exists
