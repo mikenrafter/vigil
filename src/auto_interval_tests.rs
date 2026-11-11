@@ -2347,3 +2347,43 @@ async fn a_hook_whose_state_write_failed_runs_again_at_the_next_check() {
     assert_eq!(hook.calls().len(), 2, "after the commit the change is deduplicated again");
 }
 
+
+// ============================================================================
+// Review round 1 (Sol 6/10, bar 9): S1-S8. One red test per finding, each
+// beside the others because they drive `Vigil::keepalive` end to end.
+// ============================================================================
+
+// ---- review S1: attention never waits for a lock past the call budget ------
+
+#[tokio::test(start_paused = true)]
+async fn attention_due_at_the_end_of_the_budget_does_not_wait_for_a_watch_lock_held_elsewhere() {
+    // why: review S1 (CLAIM(V2): the whole call, lock waits included, is
+    //      bounded by max_s). Watch interval 10 s, expect_s 20 -> overdue at
+    //      min(30, 560) = 30 s, which is the end of a `max_s` 30 call. Another
+    //      process holds the watch's lock for the whole call, so the tick is
+    //      dropped at the budget (existing behaviour) and the attention check
+    //      that follows must be dropped too: it used to wait for the lock
+    //      without a deadline (blocked at 32 s and beyond), and to persist
+    //      after the budget once the lock came free.
+    //      Expected: the call answers at exactly 30 s, pending, no events, and
+    //      NOTHING was persisted after the budget (the once-per-reason flag is
+    //      not in the file). The attention is not lost: the next call, once
+    //      the lock is free, raises it at once (waited 0).
+    // proves: CLAIM(V2), CLAIM(AI5)
+    let rig = Rig::new();
+    let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 10, 3600, |request| request.expect_s = Some(20)).await;
+    let held = rig.env.vigil.store().lock_watch(&id).unwrap();
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(31), call(&vigil, &id, Some(30), None)).await;
+    assert!(outcome.is_ok(), "S1: a max_s 30 call was still waiting for the watch lock after 31 s ({:?} of virtual time)", started.elapsed());
+    let answer = outcome.unwrap();
+    assert_eq!((&answer["status"], &answer["waited_s"], &answer["events"]), (&json!("pending"), &json!(30), &json!([])), "{answer}");
+    assert_eq!(started.elapsed(), Duration::from_secs(30), "the call ends at its budget");
+    assert!(stored_watch(&rig, &id).get("attention_raised").is_none(), "nothing may be saved after the budget: {}", stored_watch(&rig, &id));
+
+    drop(held);
+    let next = call(&vigil, &id, Some(30), None).await;
+    assert_attention(&next, "overdue", 0);
+}
