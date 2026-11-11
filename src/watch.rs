@@ -597,13 +597,16 @@ pub struct WatchFile {
     pub judge_status: JudgeStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_change: Option<PendingChange>,
-    /// V3: the terminal events only (empty while pending, empty for expired
-    /// and cancelled). There is no `delivered_through`. Each event's
-    /// `summary` is at most `MAX_SUMMARY_BYTES` (X2).
+    /// V3: the terminal events (empty while pending, empty for expired and
+    /// cancelled). There is no `delivered_through`. Each event's `summary` is
+    /// at most `MAX_SUMMARY_BYTES` (X2).
     ///
     /// S6: while the watch is pending this is the OUTBOX of attention events
     /// that were raised and saved but not yet acknowledged by a committed
-    /// delivery. `finish` replaces it with the terminal events.
+    /// delivery. `finish` keeps whatever is still there (flagged
+    /// `redelivered`, the agent may already hold it) in front of the terminal
+    /// events, so a fire, an expiry or a cancel never swallows an attention
+    /// the agent has not confirmed.
     pub events: Vec<Event>,
     /// Last observed change; the terminal digest (V14).
     pub last_digest: String,
@@ -642,13 +645,20 @@ impl WatchFile {
     }
     /// V3/V4: store the terminal result. Succeeds exactly once; afterwards the
     /// watch is immutable and this returns `Err` without touching anything.
+    ///
+    /// CLAIM(S6-retain): the unacknowledged outbox survives, in front of the
+    /// terminal events and flagged `redelivered` [review S6;
+    /// auto_interval_tests::attention_that_was_never_delivered_is_still_delivered_when_the_watch_expires
+    /// and the two after it; watch::tests::finish_keeps_...].
     pub fn finish(&mut self, terminal: Terminal) -> Result<(), AlreadyFinished> {
         if self.status.is_finished() {
             return Err(AlreadyFinished(self.status));
         }
         self.status = terminal.status.into();
         self.finished_at = Some(terminal.finished_at);
-        self.events = terminal.events;
+        // ↳ CLAIM(S6-retain)
+        let unacknowledged = std::mem::take(&mut self.events).into_iter().map(|event| Event { redelivered: true, ..event });
+        self.events = unacknowledged.chain(terminal.events).collect();
         self.last_digest = terminal.digest;
         self.pending_change = None;
         self.last_call_at = None;
@@ -1025,6 +1035,47 @@ mod tests {
             assert_eq!(outcome, Err(AlreadyFinished(WatchStatus::Fired)), "{later:?} must be refused");
             assert_eq!(file, before, "{later:?} must not change anything");
         }
+    }
+
+    #[test]
+    fn finish_keeps_the_unacknowledged_outbox_before_the_terminal_events() {
+        // why: review S6 at the unit. A pending watch's `events` is the outbox of
+        //      attention the agent has not confirmed; `finish` used to replace it
+        //      with the terminal events. Hand-built: one outbox event (id w:2:0,
+        //      kind attention). After a fire the events are exactly [w:2:0
+        //      flagged redelivered, the terminal w:3:0 NOT flagged]; after an
+        //      expiry and a cancel (no terminal events) just the outbox.
+        //      Control: a watch with an empty outbox ends with the terminal
+        //      events alone, as before.
+        // proves: CLAIM(S6-retain)
+        let attention = Event {
+            event_id: Event::make_id("w", 2, 0),
+            tick: 2,
+            watch_id: "w".into(),
+            input: "watch".into(),
+            summary: "overdue: running for 2m 0s, expected 1m 0s".into(),
+            judge: None,
+            redelivered: false,
+            detail: Some(EventDetail::Attention { reason: Some(AttentionReason::Overdue) }),
+        };
+        let pending = || WatchFile::new(WatchSpec::parse(change_request("w", Path::new("/tmp/x"), 20)).unwrap(), at("2026-10-29T14:03:11Z"));
+        for status in [TerminalStatus::Fired, TerminalStatus::Expired, TerminalStatus::Cancelled] {
+            let mut file = pending();
+            file.events = vec![attention.clone()];
+            let mut result = terminal(status, "2026-10-29T14:05:00Z", 3, "done");
+            if status != TerminalStatus::Fired {
+                result.events.clear();
+            }
+            file.finish(result).unwrap();
+            let ids: Vec<&str> = file.events.iter().map(|event| event.event_id.as_str()).collect();
+            let expected: &[&str] = if status == TerminalStatus::Fired { &["w:2:0", "w:3:0"] } else { &["w:2:0"] };
+            assert_eq!(ids, expected, "{status:?}");
+            assert!(file.events[0].redelivered, "{status:?}: the agent may already hold it");
+            assert!(file.events.iter().skip(1).all(|event| !event.redelivered), "{status:?}: the terminal event is a first delivery");
+        }
+        let mut control = pending();
+        control.finish(terminal(TerminalStatus::Fired, "2026-10-29T14:05:00Z", 3, "done")).unwrap();
+        assert_eq!(control.events.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), ["w:3:0"]);
     }
 
     #[test]
