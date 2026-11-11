@@ -2546,3 +2546,52 @@ async fn a_call_that_raises_attention_at_its_first_pass_still_makes_its_due_cred
     assert_attention(&answer, "overdue", 0);
     assert_one_check_reported(&answer, &probe, "new attention");
 }
+
+// ---- review S4: attention another process saved while this call waits --------
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_call_returns_attention_that_another_process_saved_but_could_not_deliver() {
+    // why: review S4. Pending attention was looked for once, at the start of a
+    //      call. A call that was already waiting never saw attention another
+    //      CLI process persisted (and then failed to print): it ran on to the
+    //      end of its window while the agent waited on a delivery that was
+    //      already in the watch file. The watch ticks only every 3600 s, so
+    //      the waiting call has no pass of its own for a long time: it must
+    //      look at the outbox on a short cadence (5 s) as well as at every
+    //      pass.
+    //      Setup: expect_s 200 (overdue at 300 s, beyond the 270 s window, so
+    //      the waiting call never raises it itself). At t = 40 s a second
+    //      process, whose clock reads 400 s after creation, runs a call: it
+    //      raises the attention, saves it, and its delivery is dropped
+    //      (stdout failed). The waiting call must return that event, flagged
+    //      `redelivered`, within 5 s of it being saved (waited 40..=45), and
+    //      acknowledge it: the next call is quiet.
+    // proves: CLAIM(S6), CLAIM(S4-outbox)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let waiter = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &waiter, "w", 3600, 7200, |request| request.expect_s = Some(200)).await;
+
+    let waiting = call(&waiter, &id, None, None);
+    let other_process = async {
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let later_clock = Arc::new(ManualClock::new(spec_instant().plus_secs(400)));
+        let other = Vigil::new(rig.env.root(), later_clock, rig.env.judge.clone(), rig.env.config.clone())
+            .with_reader(rig.env.reader.clone())
+            .with_agent_env(AgentEnv::default());
+        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None };
+        let (envelope, delivery) = other.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().unwrap();
+        assert_attention(&serde_json::to_value(&envelope).unwrap(), "overdue", 0);
+        drop(delivery);
+    };
+    let (answer, ()) = tokio::join!(waiting, other_process);
+
+    let waited = answer["waited_s"].as_u64().unwrap();
+    assert!((40..=45).contains(&waited), "S4: the waiting call should notice the saved attention within 5 s, it waited {waited} s: {answer}");
+    assert_eq!((&answer["status"], &answer["next"]), (&json!("pending"), &json!("act on events")), "{answer}");
+    let event = only_event(&answer);
+    assert_eq!((&event["kind"], &event["reason"], &event["redelivered"]), (&json!("attention"), &json!("overdue"), &json!(true)), "{answer}");
+
+    let next = call(&waiter, &id, Some(30), None).await;
+    assert_eq!((&next["waited_s"], &next["events"]), (&json!(30), &json!([])), "the delivery was acknowledged: {next}");
+}
