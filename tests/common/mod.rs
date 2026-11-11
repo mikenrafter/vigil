@@ -320,25 +320,45 @@ pub fn stderr_lines(output: &Output) -> Vec<String> {
 }
 
 /// The `persist` note of a failed write, field by field against the spec
-/// (DF2, DF3a): `ok`, `kind`, `error`, `path`, plus `redelivery: true` exactly
-/// when something is at risk (the envelope has events, or a terminal status
-/// that was not saved); with `redelivery == false` the key must be ABSENT.
-pub fn assert_failed_persist(envelope: &serde_json::Value, kind: &str, os_text: &str, file: &Path, redelivery: bool) {
+/// (DF2, DF3a, S4): `ok`, `kind`, `error`, `path`, plus `redelivery: true`
+/// exactly when something is at risk (the envelope has events, or a terminal
+/// status that was not saved); with `redelivery == false` the key must be
+/// ABSENT. `retried`: `Some(true)` when the rescue deleted the reserve and the
+/// retry failed too, so the note also holds `first_error` (S4); `Some(false)`
+/// when no retry was made, so the key is ABSENT; `None` when real time decides
+/// (a CLI `wait`).
+pub fn assert_failed_persist(envelope: &serde_json::Value, kind: &str, os_text: &str, file: &Path, redelivery: bool, retried: Option<bool>) {
     let persist = envelope.get("persist").unwrap_or_else(|| panic!("the envelope has no `persist` field: {envelope}"));
     let object = persist.as_object().unwrap_or_else(|| panic!("persist is not an object: {persist}"));
     let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
     keys.sort();
+    let mut expected: Vec<&str> = vec!["error", "kind", "ok", "path"];
     if redelivery {
-        assert_eq!(keys, ["error", "kind", "ok", "path", "redelivery"], "{persist}");
+        expected.push("redelivery");
+    }
+    match retried {
+        Some(true) => expected.push("first_error"),
+        Some(false) => {}
+        None => {
+            if keys.contains(&"first_error") {
+                expected.push("first_error");
+            }
+        }
+    }
+    expected.sort();
+    assert_eq!(keys, expected, "redelivery {redelivery}, retried {retried:?}: {persist}");
+    if redelivery {
         assert_eq!(persist["redelivery"], true, "{persist}");
-    } else {
-        assert_eq!(keys, ["error", "kind", "ok", "path"], "nothing is at risk, so no `redelivery` key: {persist}");
     }
     assert_eq!(persist["ok"], false, "{persist}");
     assert_eq!(persist["kind"], kind, "{persist}");
     assert_eq!(persist["path"], file.to_str().unwrap(), "{persist}");
     let error = persist["error"].as_str().unwrap_or_else(|| panic!("error is not a string: {persist}"));
     assert!(error.contains(os_text), "error {error:?} should carry the OS message {os_text:?}");
+    if retried == Some(true) {
+        let first = persist["first_error"].as_str().unwrap_or_else(|| panic!("first_error is not a string: {persist}"));
+        assert!(first.contains(os_text), "first_error {first:?} should carry the OS message {os_text:?}");
+    }
 }
 
 /// DF4: the retry succeeded on the reserve's space: exactly these three keys.

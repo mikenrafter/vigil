@@ -1,9 +1,11 @@
-//! Write fault injection for the store (specs/disk-full.md, "Test seam").
+//! Write fault injection for the store (specs/disk-full.md, "Test seam", and
+//! "Amendments after spec review round 1", S4).
 //!
 //! RED PHASE STUB. The types and signatures below are the contract the red
-//! tests compile against. `check` never fails, `attempts` counts nothing and
-//! `parse` accepts everything, so with this stub the store behaves exactly as
-//! before; the green phase makes them real and wires `check` into the store.
+//! tests compile against. `begin` / `Attempt::at` never fail, the counters
+//! count nothing and `parse` accepts everything, so with this stub the store
+//! behaves exactly as before; the green phase makes them real and wires them
+//! into the store.
 //!
 //! Why a runtime plan and not `cfg(test)`: the end-to-end suites spawn the
 //! built `vigil` binary, and a `cfg(test)` or cargo-feature hook is invisible
@@ -13,37 +15,77 @@
 //! `XDG_STATE_HOME`); unset, the plan is [`FaultPlan::none`] and no code path
 //! differs from production. Accepted risk: someone exports the variable on a
 //! real host. It is named `..._TEST_...` and an unparseable value is a hard
-//! error, never silently ignored.
+//! error, never silently ignored (S6: documented as test-only).
 //!
-//! Contract of the seam (what the green phase must provide):
+//! # Contract of the seam (what the green phase must provide)
 //!
-//! * The store calls [`FaultPlan::check`] once per ATTEMPT of each kind of
-//!   write, so the retry after a disk-full failure is a second attempt:
-//!   - [`WriteKind::Watch`]: inside `write_atomic`, AFTER `<path>.tmp` was
-//!     created and BEFORE any byte is written (a stand-in for ENOSPC on
-//!     `write_all`), so the `.tmp` cleanup path is on the line;
-//!   - [`WriteKind::Lock`]: only when `open_lock_file` has to CREATE the lock
-//!     file (opening an existing one needs no disk space and is not an
-//!     attempt);
-//!   - [`WriteKind::Reserve`]: before the best-effort creation of
-//!     `<root>/.reserve`.
-//! * An `Err` from `check` is the injected failure: an `io::Error` built with
-//!   `io::Error::from_raw_os_error(errno)`, so `raw_os_error()` is the chosen
-//!   errno.
-//! * Rules are matched per kind; `Nth` / `Range` count attempts of that kind
-//!   only, 1-based, shared by every clone of the plan.
+//! One WRITE ATTEMPT is one call of [`FaultPlan::begin`]; the store then
+//! passes through the stages of that attempt and asks [`Attempt::at`] at each
+//! one. Attempts are counted once, at `begin`, whatever number of stages are
+//! asked afterwards, so the retry after a disk-full failure is attempt 2 and
+//! `Nth(2)` means "the retry". `Err` from `at` is the injected failure: an
+//! `io::Error` built with `io::Error::from_raw_os_error(errno)`.
 //!
-//! Spec syntax of [`FaultPlan::parse`] (the environment variable): rules
-//! separated by `,`, each `KIND:ERRNO:WHEN`, with `KIND` one of `watch`,
-//! `lock`, `reserve`; `ERRNO` a decimal errno; `WHEN` one of `all`, `N`
-//! (only the N-th attempt), `N..M` (attempts N through M), `N..` (attempt N
-//! and every later one), `while=PATH` (every attempt while PATH exists: a
-//! file the test creates or removes models a disk that is full or has room,
-//! across process boundaries). N is at least 1.
+//! Attempts and their stages, in the order the store passes through them
+//! (S4: the rename is the COMMIT POINT; before it the old file is intact):
+//!
+//! * [`WriteKind::Watch`], one `write_atomic` of a watch file (`begin`'s
+//!   target is the watch file, not the `.tmp`):
+//!   1. [`Stage::Create`]: instead of `File::create(<path>.tmp)`. Nothing
+//!      exists yet. This is also how inode exhaustion (ENOSPC on create) is
+//!      injected.
+//!   2. [`Stage::Write`]: after the `.tmp` exists, before any byte is written.
+//!   3. [`Stage::ShortWrite`]: after the `.tmp` exists. The store writes the
+//!      first half of the bytes (`len / 2`, so a strict, non-empty prefix; the
+//!      JSON of a watch is far longer than 1 byte), then fails.
+//!   4. [`Stage::Sync`]: all bytes written, instead of `sync_all`. The `.tmp`
+//!      holds the full content.
+//!   5. [`Stage::Rename`]: after the sync, instead of `rename`. The `.tmp`
+//!      holds the full content; the old file is still the watch.
+//!   6. [`Stage::Cleanup`]: asked only AFTER a failure at stage 2-5, instead
+//!      of removing the `.tmp`. A failure here leaves the `.tmp` behind
+//!      (best effort: the write's own error is still the one reported).
+//! * [`WriteKind::Lock`]: only when a lock file has to be CREATED (opening an
+//!   existing one needs no disk space and is not an attempt). Stage
+//!   [`Stage::Create`] only. `begin`'s target is the lock file.
+//! * [`WriteKind::Reserve`]: the best-effort creation of `<root>/.reserve`.
+//!   Stages [`Stage::Create`] (before the file is created) and
+//!   [`Stage::ShortWrite`] (the first half of the zeros is written, then the
+//!   failure; the store must not leave a reserve that looks valid).
+//!   `begin`'s target is `<root>/.reserve`.
+//!
+//! Rules are matched per kind AND stage; `Nth` / `Range` count attempts of
+//! that kind only, 1-based, shared by every clone of the plan. A rule with a
+//! file filter ([`FaultRule::only`]) matches only attempts whose target's file
+//! NAME equals the filter, and its `Nth` / `Range` count only those attempts
+//! (so "the first write of `b.json`" does not depend on how many other
+//! watches were written first). [`FaultPlan::attempts`] counts every attempt
+//! of the kind, filtered or not.
+//!
+//! # Spec syntax of [`FaultPlan::parse`] (the environment variable)
+//!
+//! Rules separated by `,`, each `KIND[@STAGE]:ERRNO:WHEN[:FILE]`.
+//!
+//! * `KIND`: `watch`, `lock`, `reserve`.
+//! * `STAGE`: `create`, `write`, `short`, `sync`, `rename`, `cleanup`, and
+//!   only the combinations listed above (`watch@` all six, `lock@create`,
+//!   `reserve@create`, `reserve@short`). Omitted: the kind's default stage,
+//!   [`WriteKind::default_stage`] (`watch` -> `write`, `lock` and `reserve` ->
+//!   `create`), which is what the pre-stage syntax meant. A name outside the
+//!   list (also a different case, an empty one, or a stage the kind does not
+//!   have) is an `Err`, never a rule that can never fire.
+//! * `ERRNO`: a decimal errno.
+//! * `WHEN`: `all`, `N` (only the N-th attempt), `N..M` (attempts N through
+//!   M), `N..` (attempt N and every later one), `while=PATH` (every attempt
+//!   while PATH exists: a file the test creates or removes models a disk that
+//!   is full or has room, across process boundaries). N is at least 1.
+//! * `FILE`: optional, a plain file name (no `/`, not empty).
+//!
+//! Paths in `while=` and file names must not contain `:` or `,`.
 
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The environment variable a spawned `vigil` reads its [`FaultPlan`] from.
@@ -52,12 +94,41 @@ pub const ENV_VAR: &str = "VIGIL_TEST_FAULT";
 /// What a store write is for; a rule selects by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WriteKind {
-    /// A watch file (`.tmp` write of `write_atomic`).
+    /// A watch file (`write_atomic`: `.tmp`, sync, rename).
     Watch,
     /// Creation of a lock file.
     Lock,
     /// Creation of `<root>/.reserve`.
     Reserve,
+}
+
+impl WriteKind {
+    /// The stage a rule without an explicit `@STAGE` targets (the pre-stage
+    /// meaning of each kind).
+    pub fn default_stage(self) -> Stage {
+        match self {
+            WriteKind::Watch => Stage::Write,
+            WriteKind::Lock | WriteKind::Reserve => Stage::Create,
+        }
+    }
+}
+
+/// A step of one write attempt (see the module docs for the order and for
+/// which kind has which stages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// Instead of creating the file (nothing exists yet). Inode exhaustion.
+    Create,
+    /// After the `.tmp` exists, before any byte is written.
+    Write,
+    /// After the `.tmp` exists: half the bytes are written, then the failure.
+    ShortWrite,
+    /// Instead of `sync_all`; the `.tmp` is complete.
+    Sync,
+    /// Instead of `rename`; the `.tmp` is complete, the old file still rules.
+    Rename,
+    /// Instead of removing the `.tmp` after a failed attempt.
+    Cleanup,
 }
 
 /// Which attempts of a kind a rule fails.
@@ -75,15 +146,38 @@ pub enum When {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultRule {
     pub kind: WriteKind,
+    /// The step of the attempt that fails.
+    pub stage: Stage,
     /// Raw OS error number: 28 (ENOSPC), 122 (EDQUOT), 5 (EIO), 13 (EACCES)...
     pub errno: i32,
     pub when: When,
+    /// Only attempts whose target file NAME is this; `None`: every attempt.
+    pub file: Option<String>,
+}
+
+impl FaultRule {
+    /// A rule at the kind's default stage ([`WriteKind::default_stage`]) for
+    /// every file.
+    pub fn new(kind: WriteKind, errno: i32, when: When) -> FaultRule {
+        FaultRule { kind, stage: kind.default_stage(), errno, when, file: None }
+    }
+    /// The same rule at another stage.
+    pub fn at(mut self, stage: Stage) -> FaultRule {
+        self.stage = stage;
+        self
+    }
+    /// The same rule restricted to attempts whose target file name is `file`.
+    pub fn only(mut self, file: &str) -> FaultRule {
+        self.file = Some(file.to_string());
+        self
+    }
 }
 
 #[derive(Debug, Default)]
 struct FaultState {
     rules: Vec<FaultRule>,
     attempts: HashMap<WriteKind, u64>,
+    injected: HashMap<(WriteKind, Stage), u64>,
 }
 
 /// The faults to inject. Clones share rules and counters (the store is
@@ -93,6 +187,23 @@ pub struct FaultPlan {
     shared: Arc<Mutex<FaultState>>,
 }
 
+/// One write attempt in flight: asks the plan, stage by stage, whether to
+/// fail. Obtained from [`FaultPlan::begin`].
+#[derive(Debug)]
+pub struct Attempt {
+    plan: FaultPlan,
+    kind: WriteKind,
+    target: PathBuf,
+}
+
+impl Attempt {
+    /// `Err` is the failure injected at `stage` of this attempt.
+    pub fn at(&self, stage: Stage) -> io::Result<()> {
+        let _ = (&self.plan, self.kind, &self.target, stage);
+        Ok(()) // STUB: green matches the rules for (kind, stage, file, attempt number).
+    }
+}
+
 impl FaultPlan {
     /// Production: never fails anything.
     pub fn none() -> FaultPlan {
@@ -100,26 +211,34 @@ impl FaultPlan {
     }
 
     pub fn from_rules(rules: Vec<FaultRule>) -> FaultPlan {
-        FaultPlan { shared: Arc::new(Mutex::new(FaultState { rules, attempts: HashMap::new() })) }
+        FaultPlan { shared: Arc::new(Mutex::new(FaultState { rules, ..FaultState::default() })) }
     }
 
     /// Parse the [`ENV_VAR`] syntax (see the module docs). `Err` carries a
     /// message naming what is wrong.
     pub fn parse(spec: &str) -> Result<FaultPlan, String> {
         let _ = spec;
-        Ok(FaultPlan::none()) // STUB: green parses.
+        Ok(FaultPlan::none()) // STUB: green parses and refuses malformed rules, stages included.
     }
 
-    /// Called by the store before one attempt of `kind`; `Err` is the injected
-    /// failure. Counts the attempt.
-    pub fn check(&self, kind: WriteKind) -> io::Result<()> {
-        let _ = kind;
-        Ok(()) // STUB: green matches the rules and counts.
+    /// Start one write attempt of `kind` on `target` and count it. The store
+    /// calls this once per attempt, never once per stage.
+    pub fn begin(&self, kind: WriteKind, target: &Path) -> Attempt {
+        // STUB: green counts the attempt (kind, and target name for filtered rules).
+        Attempt { plan: self.clone(), kind, target: target.to_path_buf() }
     }
 
-    /// How many attempts of `kind` were checked so far (all clones).
+    /// How many attempts of `kind` were begun so far (all clones, every file).
     pub fn attempts(&self, kind: WriteKind) -> u64 {
         let _ = kind;
+        0 // STUB: green returns the counter.
+    }
+
+    /// How many failures were injected so far at `stage` of `kind` attempts
+    /// (all clones). Lets a test show that its fault really fired where it
+    /// meant to, instead of the write failing for some other reason.
+    pub fn injected(&self, kind: WriteKind, stage: Stage) -> u64 {
+        let _ = (kind, stage);
         0 // STUB: green returns the counter.
     }
 }
@@ -129,30 +248,42 @@ mod tests {
     use super::*;
 
     // These pin the SEAM itself. Every other disk-full test injects its fault
-    // through it; if the seam fired at the wrong attempt, those tests would
-    // prove nothing (or fail for the wrong reason). Co-located with the seam.
+    // through it; if the seam fired at the wrong attempt or stage, those tests
+    // would prove nothing (or fail for the wrong reason). Co-located with the
+    // seam.
+
+    const ALL_STAGES: [Stage; 6] = [Stage::Create, Stage::Write, Stage::ShortWrite, Stage::Sync, Stage::Rename, Stage::Cleanup];
 
     fn errno_of(result: io::Result<()>) -> Option<i32> {
         result.err().map(|error| error.raw_os_error().expect("an injected error carries a raw os error"))
     }
 
-    /// The raw errno of each of `count` consecutive `kind` attempts.
+    /// The raw errno of `count` consecutive `kind` attempts, each asked at
+    /// `stage` of `target`.
+    fn run_at(plan: &FaultPlan, kind: WriteKind, stage: Stage, target: &str, count: usize) -> Vec<Option<i32>> {
+        (0..count).map(|_| errno_of(plan.begin(kind, Path::new(target)).at(stage))).collect()
+    }
+
+    /// `run_at` at the kind's default stage on an arbitrary file.
     fn run(plan: &FaultPlan, kind: WriteKind, count: usize) -> Vec<Option<i32>> {
-        (0..count).map(|_| errno_of(plan.check(kind))).collect()
+        run_at(plan, kind, kind.default_stage(), "/state/watches/w.json", count)
     }
 
     fn one(kind: WriteKind, errno: i32, when: When) -> FaultPlan {
-        FaultPlan::from_rules(vec![FaultRule { kind, errno, when }])
+        FaultPlan::from_rules(vec![FaultRule::new(kind, errno, when)])
     }
 
     #[test]
     fn an_empty_plan_never_fails_anything() {
         // why: control for every other test here: production runs with
-        //      `FaultPlan::none()`, which must inject nothing, whatever the kind.
+        //      `FaultPlan::none()`, which must inject nothing, whatever the
+        //      kind and the stage.
         // proves: CLAIM(DF-seam-inert)
         let plan = FaultPlan::none();
         for kind in [WriteKind::Watch, WriteKind::Lock, WriteKind::Reserve] {
-            assert_eq!(run(&plan, kind, 3), vec![None, None, None], "{kind:?}");
+            for stage in ALL_STAGES {
+                assert_eq!(run_at(&plan, kind, stage, "/state/x", 2), vec![None, None], "{kind:?} {stage:?}");
+            }
         }
     }
 
@@ -200,11 +331,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let switch = dir.path().join("disk-is-full");
         let plan = one(WriteKind::Watch, 28, When::WhileExists(switch.clone()));
-        assert_eq!(errno_of(plan.check(WriteKind::Watch)), None, "path absent: the disk has room");
+        assert_eq!(run(&plan, WriteKind::Watch, 1), vec![None], "path absent: the disk has room");
         std::fs::write(&switch, "").unwrap();
-        assert_eq!(errno_of(plan.check(WriteKind::Watch)), Some(28), "path present: the disk is full");
+        assert_eq!(run(&plan, WriteKind::Watch, 1), vec![Some(28)], "path present: the disk is full");
         std::fs::remove_file(&switch).unwrap();
-        assert_eq!(errno_of(plan.check(WriteKind::Watch)), None, "path removed: room again");
+        assert_eq!(run(&plan, WriteKind::Watch, 1), vec![None], "path removed: room again");
     }
 
     #[test]
@@ -215,40 +346,124 @@ mod tests {
         // proves: CLAIM(DF-seam)
         let plan = one(WriteKind::Watch, 28, When::Nth(2));
         let clone = plan.clone();
-        assert_eq!(errno_of(plan.check(WriteKind::Watch)), None, "attempt 1 via the original");
-        assert_eq!(errno_of(clone.check(WriteKind::Watch)), Some(28), "attempt 2 via the clone");
+        assert_eq!(run(&plan, WriteKind::Watch, 1), vec![None], "attempt 1 via the original");
+        assert_eq!(run(&clone, WriteKind::Watch, 1), vec![Some(28)], "attempt 2 via the clone");
         assert_eq!(plan.attempts(WriteKind::Watch), 2);
         assert_eq!(clone.attempts(WriteKind::Watch), 2);
     }
 
     #[test]
+    fn a_rule_fires_only_at_its_stage_and_asking_more_stages_does_not_count_more_attempts() {
+        // why: S4: "The seam injects at each stage of write_atomic". Two
+        //      things must hold for the stage tests elsewhere to mean
+        //      anything. (1) Selectivity: a rule at `Rename` fails the rename
+        //      and nothing earlier (a rule that failed `Create` instead would
+        //      leave no `.tmp` and pass a rename test for the wrong reason),
+        //      and a rule built without a stage sits at the kind's default
+        //      (Watch -> Write, Lock and Reserve -> Create). (2) Counting: one
+        //      `begin` is one attempt however many stages it is asked at, so
+        //      `Nth(2)` is still "the retry" (6 stages asked, 2 attempts).
+        //      Expected rows written out by hand.
+        // proves: CLAIM(DF-seam), CLAIM(S4)
+        for stage in ALL_STAGES {
+            let plan = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 28, When::Every).at(stage)]);
+            let attempt = plan.begin(WriteKind::Watch, Path::new("/state/watches/w.json"));
+            let failing: Vec<Stage> = ALL_STAGES.into_iter().filter(|asked| attempt.at(*asked).is_err()).collect();
+            assert_eq!(failing, vec![stage], "a Watch rule at {stage:?} must fail that stage only");
+            assert_eq!(plan.attempts(WriteKind::Watch), 1, "six stages asked, one attempt");
+            assert_eq!(plan.injected(WriteKind::Watch, stage), 1, "{stage:?}: one injected failure, at the named stage");
+        }
+        let second_attempt_only = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::Nth(2)).at(Stage::Rename)]);
+        let first = second_attempt_only.begin(WriteKind::Watch, Path::new("/s/w.json"));
+        for stage in ALL_STAGES {
+            assert!(first.at(stage).is_ok(), "attempt 1, {stage:?}");
+        }
+        let second = second_attempt_only.begin(WriteKind::Watch, Path::new("/s/w.json"));
+        assert_eq!(errno_of(second.at(Stage::Sync)), None, "attempt 2 passes the sync");
+        assert_eq!(errno_of(second.at(Stage::Rename)), Some(5), "attempt 2 fails the rename");
+
+        assert_eq!(FaultRule::new(WriteKind::Watch, 28, When::Every).stage, Stage::Write);
+        assert_eq!(FaultRule::new(WriteKind::Lock, 28, When::Every).stage, Stage::Create);
+        assert_eq!(FaultRule::new(WriteKind::Reserve, 28, When::Every).stage, Stage::Create);
+        assert_eq!(FaultRule::new(WriteKind::Watch, 28, When::Every).at(Stage::ShortWrite).stage, Stage::ShortWrite);
+    }
+
+    #[test]
+    fn a_file_filter_matches_by_file_name_and_counts_only_the_matching_attempts() {
+        // why: the multi-watch tests (S5) and the race test (S3) need "the
+        //      write of b.json fails" without depending on the order several
+        //      watches are written in, which concurrent ticks do not fix.
+        //      Attempts, in order: a, a, b, a, b. `Nth(1)` filtered to b.json
+        //      is the THIRD attempt (the first b), not the first; `Nth(2)` is
+        //      the fifth. The unfiltered counter still reads 5. A filter that
+        //      names a file nobody writes injects nothing (negative control).
+        // proves: CLAIM(DF-seam)
+        let targets = ["/s/watches/a.json", "/s/watches/a.json", "/s/watches/b.json", "/s/watches/a.json", "/s/watches/b.json"];
+        let ask = |plan: &FaultPlan| -> Vec<Option<i32>> {
+            targets.iter().map(|target| errno_of(plan.begin(WriteKind::Watch, Path::new(target)).at(Stage::Write))).collect()
+        };
+        let first_b = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 28, When::Nth(1)).only("b.json")]);
+        assert_eq!(ask(&first_b), vec![None, None, Some(28), None, None]);
+        assert_eq!(first_b.attempts(WriteKind::Watch), 5, "the kind's counter counts every file");
+        let second_b = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 28, When::Nth(2)).only("b.json")]);
+        assert_eq!(ask(&second_b), vec![None, None, None, None, Some(28)]);
+        let every_a = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::Every).only("a.json")]);
+        assert_eq!(ask(&every_a), vec![Some(5), Some(5), None, Some(5), None]);
+        let nobody = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::Every).only("c.json")]);
+        assert_eq!(ask(&nobody), vec![None; 5]);
+        let by_name_not_path = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::Every).only("b.json")]);
+        assert_eq!(errno_of(by_name_not_path.begin(WriteKind::Watch, Path::new("/elsewhere/b.json")).at(Stage::Write)), Some(5), "the name, not the directory");
+        assert_eq!(errno_of(by_name_not_path.begin(WriteKind::Watch, Path::new("/s/watches/ab.json")).at(Stage::Write)), None, "the whole name, not a suffix");
+    }
+
+    #[test]
     fn parse_builds_the_plan_the_documented_syntax_names() {
         // why: the spawned binary receives its plan as text (VIGIL_TEST_FAULT).
-        //      Each row is a spec, the kind it is checked against, and the
+        //      Each row is a spec, the kind and stage it is asked at, and the
         //      errno of each of the first attempts, written out by hand from
-        //      the grammar in the module docs.
-        // proves: CLAIM(DF-seam)
-        let cases: [(&str, WriteKind, Vec<Option<i32>>); 6] = [
-            ("watch:28:all", WriteKind::Watch, vec![Some(28), Some(28)]),
-            ("watch:5:2", WriteKind::Watch, vec![None, Some(5), None]),
-            ("watch:122:1..2", WriteKind::Watch, vec![Some(122), Some(122), None]),
-            ("watch:28:3..", WriteKind::Watch, vec![None, None, Some(28), Some(28)]),
-            ("lock:13:1", WriteKind::Lock, vec![Some(13), None]),
-            ("reserve:28:all", WriteKind::Reserve, vec![Some(28), Some(28)]),
+        //      the grammar in the module docs. Rows without `@STAGE` pin the
+        //      defaults (the pre-stage meaning); rows with one pin every stage
+        //      name of every kind; the last two pin the FILE field.
+        // proves: CLAIM(DF-seam), CLAIM(S4)
+        let cases: [(&str, WriteKind, Stage, Vec<Option<i32>>); 16] = [
+            ("watch:28:all", WriteKind::Watch, Stage::Write, vec![Some(28), Some(28)]),
+            ("watch:5:2", WriteKind::Watch, Stage::Write, vec![None, Some(5), None]),
+            ("watch:122:1..2", WriteKind::Watch, Stage::Write, vec![Some(122), Some(122), None]),
+            ("watch:28:3..", WriteKind::Watch, Stage::Write, vec![None, None, Some(28), Some(28)]),
+            ("lock:13:1", WriteKind::Lock, Stage::Create, vec![Some(13), None]),
+            ("reserve:28:all", WriteKind::Reserve, Stage::Create, vec![Some(28), Some(28)]),
+            ("watch@create:28:1", WriteKind::Watch, Stage::Create, vec![Some(28), None]),
+            ("watch@write:28:1", WriteKind::Watch, Stage::Write, vec![Some(28), None]),
+            ("watch@short:28:1", WriteKind::Watch, Stage::ShortWrite, vec![Some(28), None]),
+            ("watch@sync:5:2", WriteKind::Watch, Stage::Sync, vec![None, Some(5)]),
+            ("watch@rename:122:all", WriteKind::Watch, Stage::Rename, vec![Some(122), Some(122)]),
+            ("watch@cleanup:5:all", WriteKind::Watch, Stage::Cleanup, vec![Some(5), Some(5)]),
+            ("lock@create:28:all", WriteKind::Lock, Stage::Create, vec![Some(28), Some(28)]),
+            ("reserve@create:28:2", WriteKind::Reserve, Stage::Create, vec![None, Some(28)]),
+            ("reserve@short:28:1", WriteKind::Reserve, Stage::ShortWrite, vec![Some(28), None]),
+            ("watch@rename:28:1..1", WriteKind::Watch, Stage::Rename, vec![Some(28), None]),
         ];
-        for (spec, kind, expected) in cases {
+        for (spec, kind, stage, expected) in cases {
             let plan = FaultPlan::parse(spec).unwrap_or_else(|error| panic!("{spec:?} should parse: {error}"));
-            assert_eq!(run(&plan, kind, expected.len()), expected, "{spec:?}");
+            assert_eq!(run_at(&plan, kind, stage, "/s/w.json", expected.len()), expected, "{spec:?}");
+            let other_stage = ALL_STAGES.into_iter().find(|candidate| *candidate != stage).unwrap();
+            let fresh = FaultPlan::parse(spec).unwrap();
+            assert_eq!(run_at(&fresh, kind, other_stage, "/s/w.json", 1), vec![None], "{spec:?} must not fire at {other_stage:?}");
         }
-        let both = FaultPlan::parse("watch:28:1,reserve:5:all").expect("two rules, comma separated");
+        let both = FaultPlan::parse("watch:28:1,reserve@short:5:all").expect("two rules, comma separated");
         assert_eq!(run(&both, WriteKind::Watch, 2), vec![Some(28), None]);
-        assert_eq!(run(&both, WriteKind::Reserve, 2), vec![Some(5), Some(5)]);
+        assert_eq!(run_at(&both, WriteKind::Reserve, Stage::ShortWrite, "/s/.reserve", 2), vec![Some(5), Some(5)]);
         let dir = tempfile::tempdir().unwrap();
         let switch = dir.path().join("full");
-        let guarded = FaultPlan::parse(&format!("watch:28:while={}", switch.display())).expect("while=PATH");
-        assert_eq!(errno_of(guarded.check(WriteKind::Watch)), None);
+        let guarded = FaultPlan::parse(&format!("watch@rename:28:while={}", switch.display())).expect("while=PATH with a stage");
+        assert_eq!(run_at(&guarded, WriteKind::Watch, Stage::Rename, "/s/w.json", 1), vec![None]);
         std::fs::write(&switch, "").unwrap();
-        assert_eq!(errno_of(guarded.check(WriteKind::Watch)), Some(28));
+        assert_eq!(run_at(&guarded, WriteKind::Watch, Stage::Rename, "/s/w.json", 1), vec![Some(28)]);
+        let filtered = FaultPlan::parse("watch@sync:5:1:b.json").expect("a FILE field");
+        assert_eq!(errno_of(filtered.begin(WriteKind::Watch, Path::new("/s/watches/a.json")).at(Stage::Sync)), None, "a.json is not b.json");
+        assert_eq!(errno_of(filtered.begin(WriteKind::Watch, Path::new("/s/watches/b.json")).at(Stage::Sync)), Some(5), "the first b.json write");
+        let filtered_default_stage = FaultPlan::parse("lock:28:all:w.lock").expect("a FILE field after the default stage");
+        assert_eq!(errno_of(filtered_default_stage.begin(WriteKind::Lock, Path::new("/s/locks/w.lock")).at(Stage::Create)), Some(28));
     }
 
     #[test]
@@ -256,10 +471,70 @@ mod tests {
         // why: a typo in VIGIL_TEST_FAULT that parsed as "no faults" would make
         //      every e2e disk-full test pass vacuously (fault never fires).
         //      Unknown kind, non-numeric errno, attempt 0 (1-based), a missing
-        //      field, an inverted range, an unknown WHEN.
+        //      field, an inverted range, an unknown WHEN. Each row below is
+        //      refused.
         // proves: CLAIM(DF-seam)
         for bad in ["bogus:28:all", "watch:x:all", "watch:28:0", "watch:28", "watch:28:2..1", "watch:28:sometimes", "watch:28:all,,lock:5:1"] {
             assert!(FaultPlan::parse(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn parse_refuses_a_malformed_stage_loudly_and_names_it() {
+        // why: S4 + the same reasoning as above, one level down: `watch@renmae`
+        //      that parsed as "never fires" would turn every stage test into a
+        //      vacuous pass. Refused: an unknown name, a different case, an
+        //      empty stage, a missing kind, two stages, a field count that is
+        //      wrong, an empty or path-like FILE. And the error must say what
+        //      is wrong: it contains the offending stage name, so the person
+        //      who set the variable can fix it.
+        // proves: CLAIM(DF-seam), CLAIM(S4)
+        for bad in [
+            "watch@renmae:28:all",
+            "watch@RENAME:28:all",
+            "watch@Rename:28:all",
+            "watch@:28:all",
+            "@rename:28:all",
+            "watch@rename@sync:28:all",
+            "watch@rename:28",
+            "watch@rename:28:all:b.json:extra",
+            "watch:28:all:",
+            "watch:28:all:dir/b.json",
+            "watch@rename:28:all,watch@renmae:28:all",
+        ] {
+            assert!(FaultPlan::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+        let error = FaultPlan::parse("watch@renmae:28:all").unwrap_err();
+        assert!(error.contains("renmae"), "the message should name the bad stage: {error:?}");
+    }
+
+    #[test]
+    fn parse_accepts_exactly_the_stages_each_kind_has() {
+        // why: S4 lists the stages per kind: a watch file has all six, a lock
+        //      file is only ever created, the reserve is created or half
+        //      written. A rule at a stage the store never asks for (a
+        //      `lock@sync`, a `reserve@rename`) could never fire, so it is a
+        //      typo and is refused like one. The 18 kind x stage pairs are
+        //      listed by hand (9 accepted, 9 refused) rather than derived from
+        //      the code's own table.
+        // proves: CLAIM(DF-seam), CLAIM(S4)
+        let accepted = [
+            "watch@create", "watch@write", "watch@short", "watch@sync", "watch@rename", "watch@cleanup",
+            "lock@create",
+            "reserve@create", "reserve@short",
+        ];
+        let refused = [
+            "lock@write", "lock@short", "lock@sync", "lock@rename", "lock@cleanup",
+            "reserve@write", "reserve@sync", "reserve@rename", "reserve@cleanup",
+        ];
+        for head in accepted {
+            let spec = format!("{head}:28:all");
+            assert!(FaultPlan::parse(&spec).is_ok(), "{spec:?} must be accepted");
+        }
+        for head in refused {
+            let spec = format!("{head}:28:all");
+            assert!(FaultPlan::parse(&spec).is_err(), "{spec:?} must be refused: the store never asks for that stage");
+        }
+        assert_eq!(accepted.len() + refused.len(), 18, "3 kinds x 6 stages");
     }
 }

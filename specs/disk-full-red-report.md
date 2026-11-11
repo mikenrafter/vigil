@@ -456,3 +456,251 @@ One mutation at a time on that prototype, tests that went red:
 Round 2 red commit `0d126e4f` (`0d126e4f04bb16a514ae9a1b5390f38b005d8dc9`), message `vigil: tighten red tests for
 disk-full amendments (DF1a-DF7)`. A report cannot hold the SHA of the commit
 that contains it, so this line was added in a one-file follow-up commit.
+
+---
+
+# Round 3
+
+Spec: `specs/disk-full.md`, section "Amendments after spec review round 1"
+(commit `ebc74f6`): S1-S5 (S6 is docs only; nothing to test). This round only
+changes tests and the seam stub. No behaviour was added: with the stub, the
+store, the engine and the binary behave exactly as before.
+
+STATUS: done. Red commit for this round: see "Commit" at the end of this
+section.
+
+## Result
+
+74 tests fail on assertions, none on compile errors, none by hanging. Every
+test that passed before and was not deliberately reversed still passes.
+
+| Target | passed | failed | tests | new tests | new tests that fail |
+|---|---|---|---|---|---|
+| `--lib` | 242 | 58 | 300 | 20 | 20 |
+| `--test cli_e2e` | 28 | 12 | 40 | 2 | 2 |
+| `--test mcp_e2e` | 10 | 4 | 14 | 1 | 1 |
+| total | 280 | 74 | 354 | 23 | 23 |
+
+Round 2 was 281 passed, 50 failed (331 tests). The 23 new tests are 23 new
+failures. The 24th new failure is `a_valid_reserve_is_not_rewritten`, which
+replaces `an_existing_reserve_is_not_rewritten` (a control that passed on the
+stub; S2 reverses it on purpose), so passed drops by 1: 281 - 1 = 280. The
+other controls still pass: `an_empty_plan_never_fails_anything`,
+`taking_a_lock_whose_file_exists_...`, `a_clean_write_adds_no_persist_field_...`,
+`a_healthy_run_prints_no_persist_field_...`, and the reworked
+`lock_files_exist_only_where_a_lock_was_taken_...` (see "Existing tests I had
+to touch"). The set of failing names is the round 2 set plus the 24 above (a
+diff of the two failure lists shows only additions).
+
+Run on the stub, command as in round 1 (qex job `vigil-red3`, 28 s, 751 MB).
+Two full runs of the stub gave the same failure list (the second adds the fd test); the flaky
+`inputs::tests::port_...` did not fail on any of them. It did fail once on the
+prototype (below); left alone.
+
+Note on qex: the first two submissions sat in the queue for 3 to 9 minutes
+("waits for memory"): another agent's Gradle build held ~1.7 GB, and the claim
+of 1.7 GB plus the 1 GB reserve needs 2.7 GB free. The job itself used 751 MB.
+Nothing was killed or reconfigured.
+
+## The seam, extended (`src/fault.rs`, still a no-op stub)
+
+* `FaultPlan::begin(kind, target)` starts one write attempt and counts it;
+  `Attempt::at(stage)` asks whether that stage fails. This replaces
+  `check(kind)` (one call per attempt could not name a stage). One `begin` is
+  one attempt however many stages are asked, so `Nth(2)` is still "the retry".
+* `Stage`: `Create`, `Write`, `ShortWrite`, `Sync`, `Rename`, `Cleanup`.
+  Watch writes have all six, a lock file only `Create`, the reserve `Create`
+  and `ShortWrite` (S4's list). `Create` is before the `.tmp` exists (inode
+  exhaustion looks like ENOSPC here); `ShortWrite` writes the first
+  `len / 2` bytes and then fails; `Cleanup` is the removal of the `.tmp` after
+  a failed attempt (not in S4's list; added so the leftover can be observed:
+  see ambiguity 6).
+* `FaultRule { kind, stage, errno, when, file }` with builders
+  `FaultRule::new(kind, errno, when)` (the kind's default stage: watch ->
+  `Write`, lock and reserve -> `Create`, which is what the old syntax meant),
+  `.at(stage)`, `.only("b.json")`. The file filter matches the target's file
+  NAME and its `Nth`/`Range` count only matching attempts, so tests about
+  several watches (S3, S5) do not depend on the order concurrent ticks write
+  in.
+* `FaultPlan::injected(kind, stage)`: failures actually injected. Tests use it
+  to show a fault fired at the stage they aimed at.
+* Env var `VIGIL_TEST_FAULT`, same mechanism: `KIND[@STAGE]:ERRNO:WHEN[:FILE]`
+  (`watch@rename:28:all`, `reserve@short:28:1`, `watch@sync:5:1:b.json`).
+  Stage names: `create write short sync rename cleanup`. The stub `parse` still
+  accepts everything (like round 1): the refusal tests are red against it. The
+  contract in the module docs says malformed stages, a stage the kind does not
+  have (`lock@sync`, `reserve@rename`), a wrong case, an empty stage, an empty
+  or path-like FILE, and a wrong field count are all errors, and the message
+  names the bad stage.
+
+## Tests per claim
+
+CLAIM ids as before plus `S1`, `S4`, `S5` and `DF2a`, `DF4b`, `DF4c`. The first
+table has 24 rows: the 23 new tests and the replaced control; then the changed
+ones.
+
+### New
+
+| Test (file) | Claims | What it pins |
+|---|---|---|
+| `a_rule_fires_only_at_its_stage_...` (fault) | DF-seam, S4 | a rule at stage X fails X and no other stage (6 stages x 1 rule); defaults per kind; one `begin` = one attempt; `injected` counts per stage |
+| `a_file_filter_matches_by_file_name_...` (fault) | DF-seam | attempts a,a,b,a,b: `Nth(1).only(b)` is the 3rd, `Nth(2)` the 5th; whole name not suffix; directory ignored; kind counter counts all |
+| `parse_refuses_a_malformed_stage_loudly_...` (fault) | DF-seam, S4 | 11 malformed specs refused; message names `renmae` |
+| `parse_accepts_exactly_the_stages_each_kind_has` (fault) | DF-seam, S4 | the 18 kind x stage pairs listed by hand: 9 accepted, 9 refused |
+| `a_valid_reserve_is_not_rewritten` (store) | DF4, DF4b | same inode, same mtime (after a 30 ms pause), same bytes, across two more saves |
+| `an_invalid_reserve_is_replaced_by_the_next_successful_write` (store) | DF4b | 8 fixtures (10 bytes, 1 short, 1 long, empty, sparse full length via `set_len`, half real half sparse, dangling symlink, symlink to a valid-looking file), each shown invalid first; after one save: regular file, 262144 bytes, `st_blocks * 512 >= 262144`, all zeros, `used_reserve` false; nothing written through a symlink |
+| `a_reserve_that_could_not_be_written_whole_...` (store) | DF4, DF4b, S4 | `reserve@create` leaves no file, `reserve@short` leaves nothing that looks valid (absent or shorter); the save still succeeds; `injected` shows the fault fired; the next save repairs it |
+| `two_rescues_racing_on_one_root_spend_the_reserve_exactly_once` (store) | DF4c, DF4a | 60 rounds, 2 threads + barrier, 2 stores on one root, per-file `Nth(1)`: exactly one `used_reserve`, exactly one `DiskFull` naming the root, 3 watch attempts, reserve gone, saved/unsaved contents right |
+| `two_rescues_serialise_on_the_store_wide_lock_...` (store) | DF4c | deterministic twin: the test holds `Store::lock()`; the rescue makes its first attempt (polled on the counter) and then neither deletes the reserve nor retries for 300 ms; after release it completes with `used_reserve` |
+| `the_store_never_keeps_the_reserve_open` (store) | DF4c | no `/proc/self/fd` entry for `<root>/.reserve` after create, rescue and repair; positive control: the probe finds an fd the test opens, also as `(deleted)` |
+| `a_failure_at_any_write_stage_keeps_the_old_file_and_leaves_no_tmp` (store) | S4, DF6, DF2 | 5 stages x ENOSPC/EIO: old file byte-identical, no `.tmp`, DiskFull+root (2 attempts) vs Io (1 attempt), `injected == attempts`, inotify shows the `.tmp` was created and removed exactly when the stage is after creation |
+| `a_tmp_that_cleanup_could_not_remove_holds_exactly_...` (store) | S4, DF6 | `cleanup` fault exposes the `.tmp`: write -> empty, short -> first `len/2` bytes of the healthy file, sync and rename -> the whole healthy file; old file intact; the next successful write leaves no `.tmp` and the full content |
+| `the_state_a_rescue_leaves_when_it_dies_after_deleting_the_reserve_...` (store) | S4, DF4 | failed rescue leaves no reserve; the next process with room re-creates a valid one |
+| `every_event_of_a_tick_that_follows_a_failed_save_says_redelivered_...` (engine) | S1 | whole-object equality against literal events: healthy tick no flag; the failing tick's own event no flag; the next tick `redelivered: true`; two-input case flags both events |
+| `a_transient_input_that_reverted_..._but_a_lasting_one_is` (engine) | S1 | `cmd` probe `bad` then `ok`: next call is quiet pending, no event, no flag; control world where it stays `bad` is redelivered and flagged |
+| `an_expiry_saved_by_another_process_wins_...` (engine) | S1, DF3 | A fails to save, deadline passes, B saves expiry; A's next call returns `expired`, no events, no flag, file bytes unchanged |
+| `a_cancel_saved_by_another_process_wins_...` (engine) | S1, DF3 | MCP shape (no-id): cancelled delivered once, no events, file untouched, then `NothingToCover` |
+| `when_the_retry_fails_too_its_error_is_reported_and_the_first_one_is_kept_in_first_error` (engine) | S4 | first 28, retry 122 and retry 5: `kind`/`error` are the retry's, `first_error` the first's, exact key set |
+| `a_quiet_failed_save_on_a_secondary_watch_is_listed_in_persist_failures` (engine) | S5, DF2a, DF1a | primary a saved (no `persist`), b failed: one entry with exactly `watch_id, kind, error, path`; `waited_s` 0; a's file advanced, b's untouched; control: no keys when nothing failed |
+| `a_primary_failure_and_a_secondary_failure_of_another_kind_...` (engine) | S5, DF2a, DF2 | a EIO (primary, `persist` kind io), b ENOSPC (list has only b, kind disk_full) |
+| `one_terminal_result_saved_and_another_unsaved_...` (engine) | S5, DF1, DF3, S1 | both fire: a saved primary, b unsaved: both events in the envelope, `others` and `persist_failures` list b; next no-id call returns only b's event, flagged, persisted; then `NothingToCover`. Row 2: primary unsaved, secondary saved: `persist` with `redelivery`, `persist_failures` ABSENT |
+| `a_malformed_stage_in_a_fault_plan_is_refused_loudly_...` (cli) | DF-seam, S4 | binary exits 1 naming the variable for 5 bad plans; 3 valid staged plans run |
+| `a_failure_at_the_rename_stage_through_the_binary_...` (cli) | S4, DF6, DF1 | real env var and binary: exit 0, fired envelope with `persist` disk_full, old file byte-identical, no `.tmp` |
+| `keepalive_over_mcp_lists_a_secondary_watchs_failed_save_in_persist_failures` (mcp) | S5, DF2a, DF1a | the same over the real server; returns within 10 s although max_s is 270 |
+
+### Changed
+
+| Test | Claim | Change |
+|---|---|---|
+| `a_successful_save_leaves_a_256_kib_reserve_...` (store) | DF4b | also asserts allocation and zeros, plus a loud check that this filesystem allocates written zeros and keeps `set_len` files sparse |
+| `an_existing_reserve_is_not_rewritten` -> `a_valid_reserve_is_not_rewritten` (store) | DF4b | S2 reverses the ten byte control; the ten byte file is now a row of the replace test |
+| `lock_files_exist_only_where_a_lock_was_taken_and_saving_creates_none` (store) | DF4c | see below |
+| `creating_a_lock_file_on_a_full_disk_goes_through_...` (store) | DF5 | see below |
+| `a_tick_that_could_not_save_...`, `a_no_id_keepalive_...`, `a_redelivery_covers_everything_...` (engine), the DF3 test in `mcp_e2e` | S1 | events compared modulo the flag; the redelivery carries `redelivered: true`, the first delivery does not. DF3b now also asserts the literal event (`w:1:0`, summary `bang`, flagged) and that the digest holds `boom\nbang`; its "differs from the lost event" check had become a tautology (the flag alone made them differ) and now compares without the flag |
+| `a_separate_process_reports_the_events_a_failed_save_lost` (engine) | S1 | names the limit: a fresh process cannot know, so its event has no flag (ambiguity 1) |
+| `assert_failed_persist` (engine and `tests/common`) and its 17 call sites | S4 | new argument `retried: Option<bool>`: `Some(true)` the rescue retried and failed, so `first_error` is present; `Some(false)` it did not, so it is absent; `None` real time decides (CLI `wait` expiry) |
+| `a_create_that_fits_once_the_reserve_is_freed_succeeds` (engine) | S3 | only the why: it is the test that would hang on the self-lock (ambiguity 4) |
+
+## Existing tests I had to touch (S3 and S4 force it)
+
+* `store.rs` `lock_files_exist_only_where_a_lock_was_taken_and_saving_creates_none`
+  asserted that after a bare `Store::save` the root holds only `watches`. With
+  S3 the reserve is created under the store-wide lock, whose file is
+  `<root>/lock`, so the first save creates it. I allowed `lock` in that
+  listing, only together with the reserve, and kept the claim the test is
+  about exact: `locks/` (per-watch lock files) does not exist after a save.
+  Not loosened otherwise. If you do not want a save to create `lock`, S3 needs
+  a different lock; but then `two_rescues_serialise_...` (which holds
+  `Store::lock()`) must change too.
+* `store.rs` `creating_a_lock_file_on_a_full_disk_goes_through_the_reserve_and_retry_on_every_entry_point`:
+  its three legs relied on `<root>/lock` not existing after the setup save
+  (creation is the attempt the seam fires on). Each leg now removes the lock
+  file it will create and asserts it is gone, for all four entry points.
+* `assert_failed_persist`: see Changed (S4).
+
+## Evidence the tests are satisfiable and sharp (not committed)
+
+Throwaway green prototype in a scratch copy of the crate, outside the repo:
+`/tmp/claude-1001/-home-mini-Documents-repos-host-config/3157b4f4-be3a-4486-8a47-59027fe85b62/scratchpad/green3`.
+It starts from the round 1 prototype (reserve, retry, `persist` note, stop
+after an unsaved tick) and adds everything rounds 2 and 3 need: the real seam
+(`begin`/`at`/stages/file filter/parse), staged `write_atomic`, reserve
+validity by `st_blocks`, reserve work under the global lock with a thread-local
+registry so a save made under that lock does not wait for itself, `first_error`
+(through a side channel; a real implementation should put it in the error),
+the `redelivered` flag, `persist_failures`, `wait` sleeping one interval, and
+the placeholder removal. About 450 lines. On the exact test files in the
+commit: lib 299 of 300 pass, cli_e2e 40 of 40, mcp_e2e 14 of 14. The one lib
+failure in the final run was `engine::tests::listing_prunes_too`; across the 5
+prototype runs `engine::tests::prune_also_removes_abandoned_pending_...`,
+`listing_prunes_too` and `inputs::tests::port_reports_open_and_closed_...`
+each failed once (the first two were already seen in round 2). The prune
+ones fail when `prune` meets a lock file that a forked-but-not-yet-exec'd child
+of a concurrent test still holds (`try_lock_watch` has no patience, unlike the
+global lock); the machine was swapping. Not caused by this work; left alone.
+
+While building it, the first prototype run found two TEST bugs, both fixed in
+the commit: inotify merges identical consecutive `IN_DELETE` events, so
+"once per attempt" is not observable (the stage test now asserts "never" vs
+"at least once"); and the `assert_ne!` that DF3b used to show the input was
+re-read became a tautology once events carry a flag.
+
+Manual mutations on the prototype (11 distinct ones, applied in 2 combined
+batches of disjoint areas and attributed by which test failed), tests that
+went red:
+
+| Mutation | Killed by |
+|---|---|
+| validity ignores `st_blocks` | `an_invalid_reserve_is_replaced_...` (the sparse rows) |
+| an existing `.reserve` is never replaced | same test, first row (10 bytes) |
+| reserve delete + retry + create without the store-wide lock | `two_rescues_serialise_...` and `two_rescues_racing_...` (red within the first two of the 60 rounds: one `used_reserve`, the other "rode along" with `Ok`, nobody reported the disk full) |
+| the `cleanup` stage ignored | `a_tmp_that_cleanup_...` |
+| `short` writes everything | `a_tmp_that_cleanup_...` (ShortWrite row, exact half) |
+| `Create` stage asked after the `.tmp` exists | `a_failure_at_any_write_stage_...` |
+| the reserve `short` stage never asked | `a_reserve_that_could_not_be_written_whole_...` |
+| `redelivered` never set | 5 engine tests and the MCP DF3 test |
+| `persist_failures` includes the primary | `a_primary_failure_and_a_secondary_...` |
+| `first_error` never reported | `when_the_retry_fails_too_...` and every changed `retried = Some(true)` site |
+| file filter counts every attempt | `a_file_filter_...`, `parse_builds_...`, and the racing test |
+
+Not mutated: the expiry-wins and cancel-wins tests (the prototype has no
+replay-from-memory path to break, so they pass by construction; they pin the
+contract against a design that caches the unsaved result), the fd test, and
+the symlink-write guard.
+
+## Ambiguities and pushback (please decide)
+
+1. **`redelivered` cannot cross processes.** S1 says every event of a tick that
+   follows a failed save carries it. A separate CLI process has no memory of
+   the failure, and a full disk leaves no room for a marker file. The tests pin
+   the in-process rule (MCP shape) and, on purpose, the plain event in a fresh
+   process (`a_separate_process_...`, the CLI DF3 test). Reword S1 to "in the
+   process that failed to save" or tell me what the CLI should do.
+2. **`first_error` when the retry fails with the same error.** I read S4
+   literally: whenever a retry was made and failed, `first_error` is present,
+   even if both errors are the same ENOSPC. That changed the key-set assertion
+   at 17 sites of round 2 (`retried`). "Only when it differs" is the other
+   reading; say so and those sites go back.
+3. **S3 vs "a save creates no lock file".** Above. The test now allows `lock`
+   with a reserve.
+4. **Self-deadlock hazard in S3.** `create` writes its placeholder while
+   holding the global lock; a rescue that locks `<root>/lock` again from the
+   same process waits for itself forever (flock on a second descriptor). The
+   store needs to know the lock is held (pass the guard down, or a registry as
+   in the prototype). `a_create_that_fits_once_the_reserve_is_freed_succeeds`
+   is the existing test that turns it into a 20 s watchdog failure. Not
+   pinned: lock-file creation rescue under the store-wide lock (it is the
+   global lock file itself that may be missing).
+5. **Blocking vs try-lock.** `two_rescues_serialise_...` assumes the rescue
+   BLOCKS until the store-wide lock is free. A try-lock that gives up would
+   report the first failure and fail the post-release assertions. Say if giving
+   up is intended.
+6. **Leftover `.tmp`, "removed at the next successful write".** Pinned only
+   for the same watch's `.tmp` (a stale partial file must not block or corrupt
+   that watch's next write; this guards against `create_new`). The wider
+   reading, sweeping every `*.tmp` in `watches/` after any successful write, is
+   unsafe: it deletes another process's in-flight `.tmp` and its `rename` then
+   fails with ENOENT. Not pinned either way; I would sweep only under the
+   watch's own lock, or only files older than a minute.
+7. **Transient input that reverted.** S1 says the next sensing "may not repeat
+   a vanished change". The test pins "does not" (quiet pending), since
+   remembering an unsaved change needs state there is no room to write. If
+   "may" must allow both, the quiet assertion becomes a disjunction.
+8. **S5 with an unsaved TERMINAL secondary.** I pinned: its event is in this
+   call's `events` and `others`, it is listed in `persist_failures`, and it is
+   NOT marked returned, so the next no-id call delivers it again (flagged,
+   persisted). The primary is still chosen by V8.
+9. **S2 corners.** An invalid reserve at disk-full time (sparse, short): delete
+   and retry, or count it as "no reserve"? Not pinned. "Written with real
+   zeros and fsynced": zeros are checked, the fsync is unobservable. "Unreadable"
+   is read as "not a regular file" (a symlink); a `chmod 000` regular file of
+   the right size is valid by the metadata-only definition.
+10. **Reserve short write.** A partial `.reserve` may stay or be removed; pinned
+    only: it is never full length, never valid, and the next write repairs it.
+11. **CLI stderr for a secondary failure** is not specified and not tested (the
+    CLI covers one watch).
+
+## Commit
+
+Round 3 red commit: see the one-file follow-up that records its SHA below
+(a report cannot hold the SHA of the commit that contains it).

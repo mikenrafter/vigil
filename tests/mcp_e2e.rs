@@ -487,7 +487,7 @@ async fn keepalive_over_mcp_on_a_full_disk_returns_the_envelope_with_persist_not
     assert_eq!(envelope["next"], "act on events");
     assert_eq!(envelope["events"][0]["event_id"], "w:1:0");
     assert_eq!(envelope["events"][0]["summary"], "boom");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), true);
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), true, Some(true));
     assert_eq!(sandbox.watch_bytes("w"), before);
     assert!(sandbox.tmp_files().is_empty());
     client.cancel().await.unwrap();
@@ -522,7 +522,13 @@ async fn the_same_mcp_server_delivers_an_unsaved_result_again_to_a_no_id_keepali
     let again = keepalive_within(&client, serde_json::json!({})).await;
     assert_ne!(again.is_error, Some(true), "the unsaved result must still be covered: {again:?}");
     let again = text_json(&again);
-    assert_eq!(again["events"], lost["events"]);
+    // S1: the same event, now flagged as a redelivery by the server that knows
+    // its save failed; the first delivery (`lost`) carries no flag.
+    assert!(lost["events"][0].get("redelivered").is_none(), "{lost}");
+    assert_eq!(again["events"][0]["redelivered"], true, "{again}");
+    let mut redelivered_event = again["events"][0].clone();
+    redelivered_event.as_object_mut().unwrap().remove("redelivered");
+    assert_eq!(serde_json::json!([redelivered_event]), lost["events"], "the same event apart from the flag");
     assert!(again.get("persist").is_none(), "{again}");
     assert_eq!(sandbox.watch_file("w").unwrap()["status"], "fired");
 
@@ -552,3 +558,49 @@ async fn watch_create_over_mcp_on_a_full_disk_is_an_error_that_names_the_root_an
     assert!(sandbox.watch_file("w").is_none());
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn keepalive_over_mcp_lists_a_secondary_watchs_failed_save_in_persist_failures() {
+    // why: S5 / DF2a through the real server: the agent calls keepalive with
+    //      no id, which covers all of its watches. Two quiet watches, "a"
+    //      (deadline 3600 s, the primary: nearest deadline) and "b" (7200 s).
+    //      The disk is full for b.json only while a sentinel exists. Before S5
+    //      the envelope (about "a", no `persist`) hid b's failed save. Now it
+    //      carries `persist_failures: [{watch_id, kind, error, path}]` with
+    //      exactly b, and the call returns at once (DF1a) instead of waiting
+    //      out max_s (the 30 s floor). The healthy control (neither key on
+    //      the wire) is in the engine test: a healthy quiet call lasts max_s.
+    // proves: CLAIM(S5), CLAIM(DF2a), CLAIM(DF1a)
+    let sandbox = Sandbox::new();
+    let (a_input, b_input) = (sandbox.input("a.log"), sandbox.input("b.log"));
+    std::fs::write(&a_input, "boot\n").unwrap();
+    std::fs::write(&b_input, "boot\n").unwrap();
+    let sentinel = sandbox.dir.path().join("disk-is-full");
+    let plan = format!("watch:28:while={0}:b.json,reserve:28:while={0}", sentinel.display());
+    let client = connect_faulted(&sandbox, &plan).await;
+    for (id, input, deadline_s) in [("a", &a_input, 3600), ("b", &b_input, 7200)] {
+        let mut arguments = watch_args(id, input);
+        arguments["deadline_s"] = serde_json::json!(deadline_s);
+        let created = call(client.peer(), "watch_create", arguments).await;
+        assert_ne!(created.is_error, Some(true), "create {id} on a healthy disk: {created:?}");
+    }
+    std::fs::write(&sentinel, "").unwrap();
+    let result = keepalive_within(&client, serde_json::json!({})).await;
+
+    assert_ne!(result.is_error, Some(true), "a failed save is not a tool error: {result:?}");
+    let envelope = text_json(&result);
+    assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("pending")), "{envelope}");
+    assert!(envelope.get("persist").is_none(), "a's own save worked: {envelope}");
+    let failures = envelope["persist_failures"].as_array().unwrap_or_else(|| panic!("no persist_failures: {envelope}"));
+    assert_eq!(failures.len(), 1, "{envelope}");
+    let mut keys: Vec<&str> = failures[0].as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["error", "kind", "path", "watch_id"], "{envelope}");
+    assert_eq!(failures[0]["watch_id"], "b");
+    assert_eq!(failures[0]["kind"], "disk_full");
+    assert_eq!(failures[0]["path"], sandbox.watch_path("b").to_str().unwrap());
+    assert!(failures[0]["error"].as_str().unwrap().contains("No space left on device"), "{envelope}");
+    assert!(sandbox.tmp_files().is_empty());
+    client.cancel().await.unwrap();
+}
+

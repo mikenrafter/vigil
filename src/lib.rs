@@ -25,7 +25,7 @@ pub use config::Config;
 pub use engine::Vigil;
 pub use envelope::{Envelope, Next, OtherWatch};
 pub use error::{CreateError, StoreError, VigilError};
-pub use fault::{FaultPlan, FaultRule, WriteKind};
+pub use fault::{Attempt, FaultPlan, FaultRule, Stage, WriteKind};
 pub use judge::{Answer, Answers, Judge, JudgeError, JudgeRequest, JudgeRule, RuleTest};
 pub use keepalive::{KeepaliveRequest, ProgressSink};
 pub use store::{Store, WriteOutcome};

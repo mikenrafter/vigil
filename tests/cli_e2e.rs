@@ -898,9 +898,11 @@ fn keepalive_on_a_full_disk_prints_the_envelope_exits_0_and_names_the_state_root
     //      event that was not saved, so `redelivery: true` is present. DF6:
     //      the watch file is byte-identical and no .tmp remains.
     // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF3a), CLAIM(DF6)
-    for (plan, kind, os_text) in [
-        (DISK_STAYS_FULL, "disk_full", "No space left on device"),
-        ("watch:5:all", "io", "Input/output error"),
+    //      S4: the disk-full run retried (create left a reserve to free) and
+    //      so carries `first_error`; EIO is not retried.
+    for (plan, kind, os_text, retried) in [
+        (DISK_STAYS_FULL, "disk_full", "No space left on device", true),
+        ("watch:5:all", "io", "Input/output error", false),
     ] {
         let sandbox = Sandbox::new();
         change_ready(&sandbox);
@@ -915,7 +917,7 @@ fn keepalive_on_a_full_disk_prints_the_envelope_exits_0_and_names_the_state_root
         assert_eq!(envelope["tick"], 1);
         assert_eq!(envelope["events"][0]["event_id"], "w:1:0");
         assert_eq!(envelope["events"][0]["summary"], "boom");
-        assert_failed_persist(&envelope, kind, os_text, &sandbox.watch_path("w"), true);
+        assert_failed_persist(&envelope, kind, os_text, &sandbox.watch_path("w"), true, Some(retried));
         let lines = stderr_lines(&output);
         assert_eq!(lines.len(), 1, "{plan}: exactly one stderr line, got {lines:?}");
         assert!(lines[0].contains(sandbox.state_root().to_str().unwrap()), "{plan}: the line must name the state root: {:?}", lines[0]);
@@ -967,7 +969,7 @@ fn wait_keeps_its_exit_code_when_the_final_save_fails() {
     assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "fired");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &fired.watch_path("w"), true);
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &fired.watch_path("w"), true, Some(true));
 
     let expired = Sandbox::new();
     let input = expired.input("e.log");
@@ -978,7 +980,7 @@ fn wait_keeps_its_exit_code_when_the_final_save_fails() {
     assert_eq!(output.status.code(), Some(3), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "expired");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &expired.watch_path("e"), true);
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &expired.watch_path("e"), true, None);
 }
 
 #[test]
@@ -1102,7 +1104,7 @@ fn a_quiet_keepalive_on_a_full_disk_returns_pending_at_once_without_a_redelivery
     assert_eq!(envelope["status"], "pending");
     assert_eq!(envelope["next"], "call keepalive again");
     assert_eq!(envelope["events"].as_array().map(Vec::len), Some(0), "{envelope}");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), false);
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), false, Some(true));
     let lines = stderr_lines(&output);
     assert_eq!(lines.len(), 1, "exactly one stderr line, got {lines:?}");
     assert!(lines[0].contains(sandbox.state_root().to_str().unwrap()), "{:?}", lines[0]);
@@ -1128,7 +1130,7 @@ fn cancel_on_a_full_disk_prints_the_envelope_with_persist_and_leaves_the_watch_p
     assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "cancelled");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), true);
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), true, Some(true));
     let lines = stderr_lines(&output);
     assert_eq!(lines.len(), 1, "exactly one stderr line, got {lines:?}");
     assert!(lines[0].contains(sandbox.state_root().to_str().unwrap()), "{:?}", lines[0]);
@@ -1166,3 +1168,50 @@ fn a_create_whose_baseline_cannot_be_saved_leaves_no_placeholder_so_the_same_id_
     assert_eq!(retry.status.code(), Some(0), "the same id must be free again: {:?}", String::from_utf8_lossy(&retry.stderr));
     assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
 }
+
+// ---- round 3: seam stages (specs/disk-full.md S4) --------------------------
+
+#[test]
+fn a_malformed_stage_in_a_fault_plan_is_refused_loudly_and_a_well_formed_one_is_not() {
+    // why: S4 + the seam's own safety (see the test above): `watch@renmae`
+    //      parsed as "never fires" would make every stage test below pass
+    //      without the disk ever failing at that stage. The binary must exit 1
+    //      and name the variable for a misspelt stage, a different case, an
+    //      empty stage, and a stage the kind does not have (`lock@sync`).
+    //      Control: a valid staged plan lets a command that writes nothing run.
+    // proves: CLAIM(DF-seam), CLAIM(S4)
+    let sandbox = Sandbox::new();
+    for bad in ["watch@renmae:28:all", "watch@RENAME:28:all", "watch@:28:all", "lock@sync:28:all", "reserve@rename:28:all"] {
+        let output = run_with(&sandbox, Some(bad), &["list"]);
+        assert_eq!(output.status.code(), Some(1), "{bad:?} must be refused, stderr {:?}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(FAULT_ENV), "{bad:?}: {:?}", String::from_utf8_lossy(&output.stderr));
+    }
+    for good in ["watch@rename:28:all", "reserve@short:28:1", "watch@cleanup:5:all:w.json"] {
+        assert_eq!(run_with(&sandbox, Some(good), &["list"]).status.code(), Some(0), "{good:?} is a valid plan");
+    }
+}
+
+#[test]
+fn a_failure_at_the_rename_stage_through_the_binary_keeps_the_old_file_and_still_answers() {
+    // why: S4 through the real binary and the real env var: the stage syntax
+    //      reaches the store. The rename is the commit point: with a complete
+    //      `.tmp` but a failed rename the old watch file is byte-identical,
+    //      no `.tmp` remains, and the call still prints the full fired
+    //      envelope with persist.ok = false, kind disk_full, exit 0 (DF1/DF2).
+    //      (`reserve:28:all` so the rescue has no room to re-create anything.)
+    // proves: CLAIM(S4), CLAIM(DF6), CLAIM(DF1)
+    let sandbox = Sandbox::new();
+    change_ready(&sandbox);
+    let before = sandbox.watch_bytes("w");
+
+    let output = run_with(&sandbox, Some("watch@rename:28:all,reserve:28:all"), &["keepalive", "w"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "fired");
+    assert_eq!(envelope["events"][0]["event_id"], "w:1:0");
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), true, Some(true));
+    assert_eq!(sandbox.watch_bytes("w"), before, "the old file is still the watch");
+    assert!(sandbox.tmp_files().is_empty(), "{:?}", sandbox.tmp_files());
+}
+
