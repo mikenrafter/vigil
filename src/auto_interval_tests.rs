@@ -2640,3 +2640,74 @@ async fn an_attention_event_keeps_its_id_when_a_tick_lands_between_a_failed_save
     let d = call(&faulted, &id, None, None).await;
     assert_eq!((&d["waited_s"], &d["events"]), (&json!(270), &json!([])), "saved this time, and acknowledged: {d}");
 }
+
+// ---- review S6: a terminal result does not swallow unacknowledged attention ----
+
+/// A watch (cadence 600 s, overdue at 90 s) whose attention was raised and saved
+/// by a call whose delivery never got committed (stdout failed). Returns the
+/// vigil that made the call, the watch, its input and the attention's event id.
+async fn watch_with_undelivered_attention(rig: &Rig, id: &str, deadline_s: u64) -> (Vigil, WatchId, PathBuf, String) {
+    let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+    let (id, path) = quiet_watch(rig, &vigil, id, 600, deadline_s, |request| request.expect_s = Some(60)).await;
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None };
+    let (envelope, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().unwrap();
+    let first = serde_json::to_value(&envelope).unwrap();
+    assert_attention(&first, "overdue", 90);
+    let event_id = only_event(&first)["event_id"].as_str().unwrap().to_string();
+    drop(delivery);
+    (vigil, id, path, event_id)
+}
+
+#[tokio::test(start_paused = true)]
+async fn attention_that_was_never_delivered_is_still_delivered_when_the_watch_expires() {
+    // why: review S6. `finish` replaced the whole outbox with the terminal
+    //      events, so "stdout failed, then the deadline passed" ended in
+    //      `events: []` and the agent never learned of the attention.
+    //      Deadline 150 s: the attention is raised at 90 s and dropped; 100 s
+    //      later (t = 190) a fresh process finds the watch expired. Its
+    //      envelope must carry the attention, flagged `redelivered`, and so
+    //      must a replay by a third process (the stored result is immutable).
+    // proves: CLAIM(S6), CLAIM(V3)
+    let rig = Rig::new();
+    let (_, id, _, event_id) = watch_with_undelivered_attention(&rig, "w", 150).await;
+    tokio::time::advance(Duration::from_secs(100)).await;
+    for process in ["fresh", "replay"] {
+        let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+        let answer = call(&vigil, &id, Some(30), None).await;
+        assert_eq!(answer["status"], "expired", "{process}: {answer}");
+        let event = only_event(&answer);
+        assert_eq!((event["event_id"].as_str(), &event["redelivered"], &event["kind"]), (Some(event_id.as_str()), &json!(true), &json!("attention")), "{process}: {answer}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attention_that_was_never_delivered_comes_before_the_terminal_event_when_the_watch_fires() {
+    // why: review S6, the fire path of the same replacement (`tick` finishes
+    //      the watch). The change is written, 600 s pass so the tick is due,
+    //      and the call returns BOTH events: the attention first (redelivered),
+    //      then the ordinary terminal event, with distinct ids.
+    // proves: CLAIM(S6), CLAIM(V3)
+    let rig = Rig::new();
+    let (vigil, id, path, event_id) = watch_with_undelivered_attention(&rig, "w", 7200).await;
+    append_file(&path, "boom\n");
+    tokio::time::advance(Duration::from_secs(600)).await;
+    let answer = call(&vigil, &id, Some(30), None).await;
+    assert_eq!(answer["status"], "fired", "{answer}");
+    let events = answer["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "attention and the terminal event: {answer}");
+    assert_eq!((events[0]["event_id"].as_str(), &events[0]["redelivered"]), (Some(event_id.as_str()), &json!(true)), "{answer}");
+    assert!(events[1].get("kind").is_none() && events[1]["event_id"] != events[0]["event_id"], "{answer}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn attention_that_was_never_delivered_is_not_lost_by_a_cancel() {
+    // why: review S6, the cancel path of the same replacement. The cancel's
+    //      envelope is the first the agent sees after the dropped delivery.
+    // proves: CLAIM(S6), CLAIM(V3)
+    let rig = Rig::new();
+    let (vigil, id, _, event_id) = watch_with_undelivered_attention(&rig, "w", 7200).await;
+    let cancelled = serde_json::to_value(vigil.cancel(&id).await.unwrap()).unwrap();
+    assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+    let event = only_event(&cancelled);
+    assert_eq!((event["event_id"].as_str(), &event["redelivered"]), (Some(event_id.as_str()), &json!(true)), "{cancelled}");
+}
