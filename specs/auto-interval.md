@@ -231,3 +231,32 @@ Red-report defaults R2-A1..A8 accepted (A7 offsets: 60, 300, 540 s). Remaining:
   `claude-cache-ttl-policy` is, since it sets a value). If the state write
   fails or the process dies after the hook, the next check re-runs it. Test
   with an injected failure after the hook's side effect.
+
+## Review round 1 of the green phase (Sol 6/10, bar 9; implementer, 2026-11-11)
+
+Decisions taken while fixing S1-S8 of that review (none changes an earlier claim;
+each makes one precise):
+
+- **S1.** Every wait inside a call ends at the call's budget, the attention lock
+  wait included; nothing is saved after the budget. An attention that missed it
+  is still due and the next call raises it at once.
+- **S2.** The credit probe has one deadline (5 s). `uw` may use four fifths of
+  it; the transcript fallback runs in the rest.
+- **S3.** The due entry credit check runs on every return path of an
+  orchestrator call (carried attention, existing terminal result, newly
+  finished watch, newly raised attention). A terminal result can therefore wait
+  for one probe (at most 5 s); a credit change rides along as a secondary event.
+  A return forced by a failed save (DF1a) does not check: it is already held.
+  This reverses the round-1 reading "a call that fires at once reports no
+  `credit_check`".
+- **S4.** Pending outboxes are inspected at every sensing pass, and a waiting
+  call never sleeps more than 5 s (`OUTBOX_POLL`) between passes.
+- **S5.** A retry after a failed attention save is the same event. The memory is
+  per process (like `repeat_risk`); a different process cannot know what a dead
+  one showed.
+- **S6.** `finish` keeps the unacknowledged outbox in front of the terminal
+  events, flagged `redelivered`, for fire, expiry and cancel alike.
+- **S7.** `finish` keeps `last_call_at`.
+- **S8.** `expect_s` and `stall_s` are 1..=604800 (the longest watch); larger
+  values are refused at create. Time arithmetic is total, so a hand-edited file
+  with a larger value means "never".

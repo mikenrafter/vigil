@@ -157,8 +157,10 @@ All tools return a JSON text block (the envelope or a subset) and set
 }
 ```
 
-- `expect_s`, `stall_s` (both at least 1) and `orchestrator` are optional; see
-  "Cache-aware window, time and early attention".
+- `expect_s`, `stall_s` (both 1..=604800, the longest a watch can live: a
+  larger limit could never fire and is refused naming the field) and
+  `orchestrator` are optional; see "Cache-aware window, time and early
+  attention".
 - `fire` is `"judge"` (fire when `judge_rule` matches the judge's answer),
   `"change"` (fire on any input change, no model call), or `"condition"`
   (fire when every input that has a `want` meets it, no model call).
@@ -296,7 +298,8 @@ Nothing is written to the working tree, `$XDG_CONFIG_HOME` or any repository.
   V11), plus `status`, `created_at`, `deadline_at` (absolute UTC),
   `finished_at`, `tick`, `last_tick_at`, per-input observation state (V9),
   `judge_strikes`, the pending change (V14, R7), `last_digest`, and the
-  terminal events.
+  terminal events (in front of them, any attention that was never
+  acknowledged when the watch finished, flagged `redelivered`).
 - Also under the root: `credit.lock` (an `flock` held around a credit probe,
   its hook and the commit of the state file) and `credit-state.json`
   (`{"on_credits": true|false|null, "checked_at": ts}`: the last known credit
@@ -701,18 +704,26 @@ restricted to `[A-Za-z0-9_-]{1,64}`.
 **Clock (AI4).** `clock.since_last_call_s` is the time since the previous
 envelope this watch returned, kept in the watch file as `last_call_at` (best
 effort: a failed save of it is silent and never holds or shortens a call).
+Finishing a watch keeps the value, so the envelope that reports a fire or an
+expiry still says how long it had been since the call before.
 `wait` measures the whole wait and records only its own final return.
 
 **Credit check (AI2', AI8, S2, S5, S7, S9).** Every orchestrator call checks
 the account's credit state when the last check is at least 240 s old
-(`credit-state.json`), after its watches had their first pass; a window over
-270 s also re-checks every 240 s inside the call. One check runs under
+(`credit-state.json`), after its watches had their first pass, and on every way
+out of the call: a call that returns carried attention, an existing terminal
+result, a watch that just finished or attention it just raised makes its due
+check before it returns (a credit change then rides along as an event beside
+the terminal one). A window over 270 s also re-checks every 240 s inside the
+call. One check runs under
 `credit.lock`: re-read the state file (another process may just have checked),
 probe, compare with the recorded KNOWN state, run the hook on a change, commit
 `credit-state.json`, release. Probe: `uw --json status` (`VIGIL_UW_COMMAND`;
 only `ClaudeCode` windows count; output capped at 64 KiB; own process group),
 else any main-session transcript modified in the last 10 minutes (20 newest)
-whose newest cache write is 5m after an earlier 1h write. The verdict is
+whose newest cache write is 5m after an earlier 1h write. The probe has one
+5 s deadline: `uw` may use four fifths of it (4 s), so a hung `uw` still leaves
+the transcript fallback its last second. The verdict is
 tri-state: on, off, unknown (no source could say). Unknown keeps the last
 known state, never makes an event or a hook, and still counts as a check. The
 first known verdict is a baseline. A change ends the call with one
@@ -735,9 +746,19 @@ to changes of `file`, `glob` and `cmd` inputs of a watch that also has a running
 `process` input. Attention events are ordinary events: distinct W1 ids
 (`<watch>:<tick>:<n>`), saved with the watch before they are delivered,
 acknowledged by a committed delivery, and returned again with
-`redelivered: true` after a failed save or an uncommitted delivery. A finished
-watch raises nothing; with several watches the terminal result is the primary
-and an attention event of another watch rides along.
+`redelivered: true` after a failed save or an uncommitted delivery. A retry
+after a failed save is the same event (same id and text) even if a tick landed
+in between: the process remembers what it could not save. A finished watch
+raises nothing; with several watches the terminal result is the primary and an
+attention event of another watch rides along. A watch that finishes (fire,
+expiry, cancel) while attention is unacknowledged keeps it, flagged
+`redelivered`, in front of its terminal events.
+
+A waiting call looks at the covered watches' outboxes at every pass and sleeps
+at most 5 s between passes, so attention another process saved but could not
+hand over is returned within about 5 s. Raising attention waits for the
+watch's lock only until the call's budget ends and saves nothing after it; an
+attention not raised in time is raised by the next call.
 
 **Delivery (N3).** The CLI prints the envelope with a checked write to
 descriptor 1 and only then commits the delivery; a failed write (EPIPE,
