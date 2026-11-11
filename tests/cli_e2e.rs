@@ -1077,17 +1077,44 @@ fn a_malformed_fault_plan_is_refused_loudly_instead_of_injecting_nothing() {
     assert_eq!(run_with(&sandbox, None, &["list"]).status.code(), Some(0), "control");
 }
 
+#[test]
+fn an_empty_fault_variable_is_treated_as_unset() {
+    // why: review T8: `VIGIL_TEST_FAULT=""` (an exported-but-empty variable,
+    //      as `VAR= vigil ...` or a wrapper script leaves it) must mean "no
+    //      faults", like an empty XDG_STATE_HOME means unset in `state_root`.
+    //      Before, "" went to the plan parser and vigil refused to start
+    //      ("invalid VIGIL_TEST_FAULT"). A command that writes (create) must
+    //      succeed and its watch file must exist. Control: a malformed
+    //      non-empty value still refuses (test above), so this is not "ignore
+    //      everything".
+    // proves: CLAIM(DF-seam)
+    let sandbox = Sandbox::new();
+    let mut command = sandbox.faulted_command("");
+    let path = sandbox.input("e.log");
+    std::fs::write(&path, "boot\n").unwrap();
+    command.args(["create", &change_watch_json("e", &path, 1)]);
+
+    let output = output_within(command, RUN);
+
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(sandbox.watch_file("e").is_some(), "the write went through");
+}
+
 // ---- round 2: amendments DF1a, DF3a, DF5a, DF7 (specs/disk-full.md) ------
 
 #[test]
-fn a_quiet_keepalive_on_a_full_disk_returns_pending_at_once_without_a_redelivery_flag() {
-    // why: DF1a (red report A1): a tick whose save failed ends the call. A
-    //      quiet watch looks due again at once (its `last_tick_at` never
-    //      moved), so without the rule the process either spins on the full
-    //      disk or ticks in memory until `max_s` (the default is 270 s). Here
-    //      the call must return within 5 s of real time (the interval is 1 s):
-    //      exit 0, `pending` / "call keepalive again", persist.ok=false with
-    //      kind disk_full. DF3a: nothing is at risk (no events, status not
+fn a_quiet_keepalive_on_a_full_disk_is_held_one_interval_then_returns_pending_without_a_redelivery_flag() {
+    // why: DF1a (revised after tier-2 review, T1): a tick whose save failed
+    //      ends the call. A quiet watch looks due again at once (its
+    //      `last_tick_at` never moved), so without the rule the process either
+    //      spins on the full disk or ticks in memory until `max_s` (the default
+    //      is 270 s). But a call that returns at once leaves nothing pacing the
+    //      agent's next call. Now the call is held for min(interval, budget
+    //      left) = 1 s (the watch's interval, the budget is 270 s) and then
+    //      returns: not before 0.9 s of real time (the hold ran), well within
+    //      5 s (it did not tick on until `max_s`); exit 0, `pending` / "call
+    //      keepalive again", `waited_s` 1, persist.ok=false with kind
+    //      disk_full. DF3a: nothing is at risk (no events, status not
     //      terminal), so the `redelivery` key is ABSENT. Exactly one stderr
     //      line, naming the state root (DF2).
     // proves: CLAIM(DF1a), CLAIM(DF3a), CLAIM(DF2)
@@ -1097,12 +1124,16 @@ fn a_quiet_keepalive_on_a_full_disk_returns_pending_at_once_without_a_redelivery
     let mut command = sandbox.faulted_command(DISK_STAYS_FULL);
     command.args(["keepalive", "w"]);
 
+    let started = std::time::Instant::now();
     let output = output_within(command, Duration::from_secs(5));
+    let elapsed = started.elapsed();
 
     assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(elapsed >= Duration::from_millis(900), "the call must be held one interval (1 s), it took {elapsed:?}");
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "pending");
     assert_eq!(envelope["next"], "call keepalive again");
+    assert_eq!(envelope["waited_s"], 1, "{envelope}");
     assert_eq!(envelope["events"].as_array().map(Vec::len), Some(0), "{envelope}");
     assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), false, Some(true));
     let lines = stderr_lines(&output);

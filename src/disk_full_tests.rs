@@ -211,8 +211,13 @@ fn assert_failed_persist(envelope: &Value, kind: &str, os_text: &str, file: &Pat
 /// timeout keeps the tick reserve (X4: slowest read + 1 s = 2 s) small, so a
 /// healthy call ticks again as soon as the next interval is due.
 async fn quiet_probe_watch(env: &Env) -> WatchId {
+    quiet_probe_watch_every(env, 20).await
+}
+
+/// `quiet_probe_watch` with its own interval.
+async fn quiet_probe_watch_every(env: &Env, interval_s: u64) -> WatchId {
     env.reader.set_text("cmd:probe", "ok");
-    let mut request = change_request("q", Path::new("/unused"), 20);
+    let mut request = change_request("q", Path::new("/unused"), interval_s);
     request.inputs = vec![crate::watch::Input::Cmd { argv: vec!["probe".into()], timeout_s: Some(1.0), cwd: None }];
     env.vigil.create(request).await.unwrap().watch_id
 }
@@ -358,17 +363,21 @@ fn a_clean_write_adds_no_persist_field_to_any_envelope() {
 }
 
 #[test]
-fn a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again() {
-    // why: DF1/DF2 + DF1a for the common case, a tick that found nothing. The
-    //      save fails, so the persisted `last_tick_at` never advances and the
-    //      watch looks due again at once. DF1a: "A tick whose save failed ends
-    //      the call and returns its envelope (no in-memory re-ticking, no
-    //      spin)". A 30 s call at interval 20 would tick at t=0 and t=20, so
-    //      the healthy twin below reads 3 times (the baseline at create + two
-    //      ticks); the faulted call must read exactly 2 (baseline + the one
-    //      tick), must not have waited (`waited_s` 0 on paused time), and must
-    //      say pending / "call keepalive again" with persist.ok = false. DF3a:
-    //      nothing is at risk (no events, status not terminal), so the
+fn a_quiet_tick_that_cannot_save_is_held_for_one_interval_and_not_ticked_again() {
+    // why: DF1/DF2 + DF1a (revised after tier-2 review T1) for the common
+    //      case, a tick that found nothing. The save fails, so the persisted
+    //      `last_tick_at` never advances and the watch looks due again at
+    //      once: DF1a ends the call (no in-memory re-ticking, no spin). But a
+    //      call that returns at once leaves nothing pacing the agent's next
+    //      call, so on a disk that stays full it calls back to back. Revised
+    //      DF1a: "the call is held for min(interval_s, budget left) without
+    //      re-ticking, then returns". A 30 s call at interval 20 would tick at
+    //      t=0 and t=20, so the healthy twin below reads 3 times (the baseline
+    //      at create + two ticks); the faulted call must read exactly 2
+    //      (baseline + the one tick: the hold does NOT tick at t=20), must
+    //      have waited min(20, 30) = 20 s of virtual time (`waited_s` 20), and
+    //      must say pending / "call keepalive again" with persist.ok = false.
+    //      DF3a: nothing is at risk (no events, status not terminal), so the
     //      `redelivery` key is absent. The watchdog fails a spin.
     // proves: CLAIM(DF1), CLAIM(DF1a), CLAIM(DF2), CLAIM(DF3a)
     scenario(|| async {
@@ -382,30 +391,134 @@ fn a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again()
         let plan = FaultPlan::from_rules(disk_stays_full(28));
         let vigil = env.another_process().with_write_faults(plan);
 
+        let started = tokio::time::Instant::now();
         let envelope = vigil.keepalive(by_id(&id, Some(30))).await.expect("a failed save must not fail the call");
         let wire = wire(&envelope);
 
         assert_eq!((envelope.status, envelope.next), (WatchStatus::Pending, Next::CallKeepaliveAgain));
         assert_failed_persist(&wire, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), false, Some(true));
-        assert_eq!(env.reader.started_count("cmd:probe"), 2, "baseline + one tick: a tick whose save failed ends the call");
-        assert_eq!(envelope.waited_s, Some(0), "the call returned without sleeping toward the next tick");
+        assert_eq!(env.reader.started_count("cmd:probe"), 2, "baseline + one tick: the hold must not tick again");
+        assert_eq!(envelope.waited_s, Some(20), "held for one interval (T1)");
+        assert_eq!(started.elapsed(), Duration::from_secs(20), "the hold is one interval of the call's clock, no more");
     });
 }
 
 #[test]
-fn wait_sleeps_one_interval_after_a_pending_envelope_that_could_not_be_saved() {
-    // why: DF1a: "`vigil wait`, after a pending envelope with persist.ok =
-    //      false, sleeps one interval before calling again." `wait` loops
-    //      `keepalive` until the watch finishes; a failed save ends each call
-    //      at once and leaves the watch due, so without the sleep `wait` calls
-    //      again in a hot loop (the watchdog fails that) and hammers a full
-    //      disk. Quiet watch, interval 20 s, every write fails. `wait` runs
+fn the_hold_of_a_quiet_failed_save_never_outlasts_the_budget_that_is_left() {
+    // why: revised DF1a (T1): the hold is min(interval_s, budget left). Two
+    //      worlds where the budget is the smaller one, so a hold of the plain
+    //      interval would overrun the call. (1) interval 100 s, max_s 30: the
+    //      tick fails at t=0, 30 s are left, so the hold is 30 s and the call
+    //      ends at exactly t=30 (`waited_s` 30). (2) interval 20 s, the probe
+    //      takes 15 s: the failed save comes at t=15, 15 s are left, so the
+    //      hold is 15 s, not 20, and the call ends at t=30, not t=35.
+    //      Each reads twice (baseline + the one tick).
+    // proves: CLAIM(DF1a)
+    scenario(|| async {
+        let env = paused_env();
+        let id = quiet_probe_watch_every(&env, 100).await;
+        let vigil = env.another_process().with_write_faults(FaultPlan::from_rules(disk_stays_full(28)));
+
+        let started = tokio::time::Instant::now();
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+
+        assert!(envelope.save_failed(), "precondition: the save failed");
+        assert_eq!((envelope.waited_s, started.elapsed()), (Some(30), Duration::from_secs(30)), "interval 100 s, budget 30 s: held 30 s");
+        assert_eq!(env.reader.started_count("cmd:probe"), 2);
+    });
+    scenario(|| async {
+        let env = paused_env();
+        let id = quiet_probe_watch_every(&env, 20).await;
+        env.reader.set_sleep("cmd:probe", Duration::from_secs(15));
+        let vigil = env.another_process().with_write_faults(FaultPlan::from_rules(disk_stays_full(28)));
+
+        let started = tokio::time::Instant::now();
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+
+        assert!(envelope.save_failed(), "precondition: the save failed");
+        assert_eq!((envelope.waited_s, started.elapsed()), (Some(30), Duration::from_secs(30)), "15 s read + min(20, 15) s hold");
+        assert_eq!(env.reader.started_count("cmd:probe"), 2);
+    });
+}
+
+#[test]
+fn a_failed_save_that_carries_events_or_a_terminal_status_is_not_held() {
+    // why: revised DF1a (T1): "Envelopes with events or a terminal status
+    //      still return at once." The hold exists to pace an agent that has
+    //      nothing to act on; an envelope with an event (or an ended watch)
+    //      must reach the agent without a 20 s detour. Fired watch with one
+    //      event and an expired watch (no events, terminal status), both on a
+    //      full disk and interval 20 s: `waited_s` 0 and no virtual time spent.
+    //      The pending-and-quiet twin in the test above is held, so this is
+    //      not just "never hold".
+    // proves: CLAIM(DF1a)
+    scenario(|| async {
+        let fired = Fixture::new().await;
+        let (vigil, _) = fired.faulted(disk_stays_full(28));
+        let started = tokio::time::Instant::now();
+        let envelope = vigil.keepalive(by_id(&fired.id, Some(30))).await.unwrap();
+        assert_eq!(envelope.status, WatchStatus::Fired);
+        assert_eq!(envelope.events.len(), 1, "precondition: an event is at risk");
+        assert!(envelope.save_failed(), "precondition: the save failed");
+        assert_eq!((envelope.waited_s, started.elapsed()), (Some(0), Duration::ZERO), "fired: returned at once");
+
+        let expired_env = paused_env();
+        write_file(&expired_env.input_path("e.log"), "old\n");
+        let mut request = change_request("e", &expired_env.input_path("e.log"), 20);
+        request.deadline_s = Some(30);
+        let id = expired_env.vigil.create(request).await.unwrap().watch_id;
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        let vigil = expired_env.another_process().with_write_faults(FaultPlan::from_rules(disk_stays_full(28)));
+        let started = tokio::time::Instant::now();
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+        assert_eq!((envelope.status, envelope.events.len()), (WatchStatus::Expired, 0));
+        assert!(envelope.save_failed(), "precondition: the expiry could not be saved");
+        assert_eq!((envelope.waited_s, started.elapsed()), (Some(0), Duration::ZERO), "expired: returned at once");
+    });
+}
+
+#[test]
+fn a_hold_ends_at_the_deadline_when_the_watch_expires_during_it() {
+    // why: revised DF1a (T1) meets V3 (a watch past its deadline is expired).
+    //      The hold is min(interval, budget left), so a deadline that falls
+    //      inside it passes while the call sleeps. The envelope must describe
+    //      the watch AFTER the hold: expired (a terminal status, so the agent
+    //      stops calling), not the pending one built before it. Interval 20 s,
+    //      deadline 10 s, 30 s call, full disk: the tick at t=0 finds nothing
+    //      (the baseline was taken at create), the hold lasts 20 s, and at
+    //      t=20 the watch is 10 s past its deadline.
+    // proves: CLAIM(DF1a)
+    scenario(|| async {
+        let env = paused_env();
+        write_file(&env.input_path("d.log"), "old\n");
+        let mut request = change_request("d", &env.input_path("d.log"), 20);
+        request.deadline_s = Some(10);
+        let id = env.vigil.create(request).await.unwrap().watch_id;
+        let vigil = env.another_process().with_write_faults(FaultPlan::from_rules(disk_stays_full(28)));
+
+        let envelope = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();
+
+        assert_eq!(envelope.status, WatchStatus::Expired, "{envelope:?}");
+        assert_eq!(envelope.next, Next::WatchEnded);
+    });
+}
+
+#[test]
+fn wait_paces_a_pending_envelope_that_could_not_be_saved_by_one_interval_not_two() {
+    // why: DF1a (revised, T1): the one-interval pacing after a pending
+    //      envelope with persist.ok = false lives in the call itself, so MCP,
+    //      CLI keepalive and `wait` share it. `wait` loops `keepalive` until
+    //      the watch finishes; it must not add a sleep of its own on top of
+    //      the call's hold (a double sleep: one interval of hold, one of
+    //      sleep, ticks every 40 s instead of 20), and it must not call again
+    //      at once (the watchdog fails a hot loop that hammers a full disk).
+    //      Quiet watch, interval 20 s, every write fails. `wait` runs
     //      for 50 s of virtual time, then is stopped: it must still be
     //      running (the watch is not finished). Ticks are scripted reads of
     //      `cmd:probe`: the baseline at create (t=0) and ticks at t=0, 20, 40
     //      (hand-derived: one call per interval, 0 + 20 k < 50 for k = 0..2),
     //      and each read started exactly that long after the first, so the
-    //      sleep is one interval, not "some sleep". Each call saved (tried
+    //      pacing is one interval, not "some sleep". Each call saved (tried
     //      to) once, so at least 3 attempts to write a watch file.
     // proves: CLAIM(DF1a)
     scenario(|| async {
@@ -1216,8 +1329,9 @@ fn a_quiet_failed_save_on_a_secondary_watch_is_listed_in_persist_failures() {
     //      save fails (disk full, only for b.json). Before S5 nothing in the
     //      envelope said so. Expected: pending, watch "a", NO `persist` (a's
     //      write worked), `persist_failures` holds exactly b with the four
-    //      keys, the call returned at once (DF1a: `waited_s` 0), a's file did
-    //      advance and b's did not. Control, in a world with the same setup
+    //      keys, the call ended after the DF1a hold of one interval (`waited_s`
+    //      20: b's quiet failure paces the agent like a primary's would, T1),
+    //      a's file did advance and b's did not. Control, in a world with the same setup
     //      and no sentinel: neither `persist` nor `persist_failures` on the
     //      wire.
     // proves: CLAIM(S5), CLAIM(DF2a), CLAIM(DF1a)
@@ -1244,7 +1358,7 @@ fn a_quiet_failed_save_on_a_secondary_watch_is_listed_in_persist_failures() {
         let failures = envelope["persist_failures"].as_array().unwrap_or_else(|| panic!("no persist_failures: {envelope}"));
         assert_eq!(failures.len(), 1, "{envelope}");
         assert_persist_failure(&failures[0], "b", "disk_full", "No space left on device", &env.root().join("watches").join("b.json"));
-        assert_eq!(envelope["waited_s"], 0, "DF1a: a tick whose save failed ends the call");
+        assert_eq!(envelope["waited_s"], 20, "DF1a (T1): a quiet failed save, even a secondary's, holds the call one interval");
         assert_eq!(env.vigil.store().load(&a).unwrap().tick, a_before + 1, "a's tick was saved");
         assert_eq!(std::fs::read(env.root().join("watches").join("b.json")).unwrap(), b_before, "b's file is untouched");
         let _ = b;
@@ -1664,9 +1778,10 @@ fn a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_h
     //      quiet watches "a" (nearer deadline, so the primary) and "b"; a's
     //      save fails with EIO, b's lock is held for the whole call. Expected:
     //      the envelope is a's pending envelope with `persist` (io, a's file),
-    //      it returned at once (`waited_s` 0, hand-derived: nothing sleeps in
-    //      this world once b's tick is dropped), and b was never read (still
-    //      only its baseline read). Control: with the lock free and no fault
+    //      it did not wait for b's lock: the only wait is the DF1a hold of one
+    //      interval (`waited_s` 20, hand-derived: b's tick is dropped, so
+    //      nothing else sleeps; waiting for b would have used all 30 s), and b
+    //      was never read (still only its baseline read). Control: with the lock free and no fault
     //      the same call sees both watches tick (2 reads of each probe).
     // proves: CLAIM(DF1a)
     scenario(|| async {
@@ -1690,15 +1805,15 @@ fn a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_h
 
         assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("pending")), "{envelope}");
         assert_failed_persist(&envelope, "io", "Input/output error", &env.root().join("watches").join("a.json"), false, Some(false));
-        assert_eq!(envelope["waited_s"], 0, "DF1a: the call ends at once, it does not wait for b's lock: {envelope}");
-        assert!(started.elapsed() < Duration::from_secs(1), "virtual time spent: {:?}", started.elapsed());
+        assert_eq!(envelope["waited_s"], 20, "DF1a: the call ends after its one-interval hold, it does not wait for b's lock: {envelope}");
+        assert_eq!(started.elapsed(), Duration::from_secs(20), "virtual time spent");
         assert_eq!(env.reader.started_count("cmd:probe-b"), 1, "b was dropped before it read anything");
         assert!(envelope.get("persist_failures").is_none(), "b did not fail, it was dropped: {envelope}");
     });
 }
 
 #[test]
-fn a_failed_save_ends_the_call_at_once_but_keeps_the_saves_that_were_ready_with_it() {
+fn a_failed_save_ends_the_round_but_keeps_the_saves_that_were_ready_with_it() {
     // why: review S1: "signal round completion as soon as an absorbed report
     //      is unsaved, preserving already-ready results". The early stop must
     //      not throw away a tick that finished in the same pass. Red before the
@@ -1708,9 +1823,10 @@ fn a_failed_save_ends_the_call_at_once_but_keeps_the_saves_that_were_ready_with_
     //      "c" saves fine, "b"'s lock is held for the whole call. a is polled
     //      before c, so the stop is signalled while c's completion is still to
     //      be collected: c's tick must be on disk (tick 1, hand-derived: one
-    //      tick in a call that ended at once) and a's file must be unchanged
-    //      (tick 0). The envelope is a's (tie on deadline, lowest id), with
-    //      `persist`; c's success adds nothing to it; the call took no time.
+    //      tick in a call that ended after the one DF1a hold) and a's file must
+    //      be unchanged (tick 0). The envelope is a's (tie on deadline, lowest
+    //      id), with `persist`; c's success adds nothing to it; the call
+    //      waited one interval (`waited_s` 20, T1).
     // proves: CLAIM(DF1a)
     scenario(|| async {
         let env = paused_env();
@@ -1727,7 +1843,7 @@ fn a_failed_save_ends_the_call_at_once_but_keeps_the_saves_that_were_ready_with_
         assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("pending")), "{envelope}");
         assert_failed_persist(&envelope, "io", "Input/output error", &env.root().join("watches").join("a.json"), false, Some(false));
         assert!(envelope.get("persist_failures").is_none(), "c saved and b was dropped: {envelope}");
-        assert_eq!(envelope["waited_s"], 0, "{envelope}");
+        assert_eq!(envelope["waited_s"], 20, "{envelope}");
         assert_eq!(env.vigil.store().load(&c).unwrap().tick, 1, "c's tick was ready in the same pass and is saved");
         assert_eq!(env.vigil.store().load(&a).unwrap().tick, 0, "a's save failed");
         assert_eq!(env.vigil.store().load(&b).unwrap().tick, 0, "b never got its lock");

@@ -377,4 +377,39 @@ mod tests {
             .expect("not cancelled");
         assert_eq!(second.status, crate::watch::WatchStatus::Fired);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_mcp_call_is_held_one_interval_after_a_quiet_failed_save_and_a_cancel_ends_the_hold() {
+        // why: DF1a (revised, T1): MCP, CLI keepalive and `wait` share one
+        //      pacing path. `run_keepalive` is the MCP server's call. Quiet
+        //      watch, interval 20 s, every write fails: the call is held 20 s
+        //      (virtual) and returns pending with persist.ok=false. A cancel
+        //      5 s into the hold ends it at once (`Ok(None)`, 5 s spent): the
+        //      hold is part of the cancellable call, not a sleep after it.
+        // proves: CLAIM(DF1a), CLAIM(call-budget)
+        use crate::fault::{FaultPlan, FaultRule, When, WriteKind};
+        use crate::testing::*;
+        let env = Env::with_clock(std::sync::Arc::new(TokioClock::new(spec_instant())));
+        let path = env.input_path("w.log");
+        write_file(&path, "old\n");
+        env.vigil.create(change_request("w", &path, 20)).await.unwrap();
+        let plan = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 28, When::Every), FaultRule::new(WriteKind::Reserve, 28, When::Every)]);
+        let vigil = env.another_process().with_write_faults(plan);
+
+        let started = tokio::time::Instant::now();
+        let envelope = run_keepalive(&vigil, KeepaliveRequest { watch_id: None, max_s: Some(30) }, std::future::pending::<()>(), |_update| std::future::ready(()))
+            .await
+            .unwrap()
+            .expect("not cancelled");
+        assert!(envelope.save_failed(), "precondition: the save failed");
+        // 20 s of hold; the progress flush after it adds at most its 250 ms.
+        assert_eq!(envelope.waited_s, Some(20));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(20) && started.elapsed() < std::time::Duration::from_secs(21), "{:?}", started.elapsed());
+
+        let started = tokio::time::Instant::now();
+        let cancel = async { tokio::time::sleep(std::time::Duration::from_secs(5)).await };
+        let cancelled = run_keepalive(&vigil, KeepaliveRequest { watch_id: None, max_s: Some(30) }, cancel, |_update| std::future::ready(())).await.unwrap();
+        assert!(cancelled.is_none(), "the cancel ended the hold");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+    }
 }
