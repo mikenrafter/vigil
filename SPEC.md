@@ -98,9 +98,12 @@ and Codex has no equivalent (`FINDINGS.md` §2).
    is disputed in the sources found, so never depend on it.
 3. **`vigil wait` (Claude Code, no re-trigger).** `vigil wait <id>` blocks
    with no 270 s ceiling until the watch fires, expires or is cancelled,
-   prints the final envelope and exits (0 fired, 3 expired, 4 cancelled, 2 usage,
-   1 error). The agent runs it once as a background command; Claude Code
-   wakes the agent when it exits.
+   prints the final envelope and exits (0 fired, 3 expired, 4 cancelled,
+   5 attention, 2 usage, 1 error). Exit 5 means an `attention` or
+   `credit_state_changed` event ended the wait while the watch is still live;
+   `--orchestrator` gives `wait` the orchestrator's window and credit checks
+   (see "Cache-aware window, time and early attention"). The agent runs it
+   once as a background command; Claude Code wakes the agent when it exits.
    Trade-off: no model calls while waiting, so the prompt cache goes cold
    after its TTL. Use `keepalive` to stay warm, `wait` for long waits where
    a cold cache is fine. Codex has no background wake, so it uses
@@ -111,10 +114,12 @@ and Codex has no equivalent (`FINDINGS.md` §2).
 The agent stays "in cache" only if the gap between its requests is under the
 prompt-cache TTL, so every `keepalive` call has a fixed window:
 
-- `max_s` is clamped to **30 minimum, 270 maximum**; the default and the
-  value vigil enforces as the ceiling is **270**. The ceiling is not
-  configurable. Values outside the range are clamped, not rejected, and the
-  envelope reports the value used (`waited_s`).
+- The window is chosen by vigil, not by the agent: **270 s** by default, and
+  up to **3300 s** for the orchestrator on a 1-hour prompt cache (see
+  "Cache-aware window, time and early attention"). An explicit `max_s` still
+  wins, clamped to 30..=3300 (30..=270 for Codex and for an ambiguous
+  caller). Values outside the range are clamped, not rejected, and the
+  envelope reports the value used (`max_s`, `waited_s`).
 - A deadline of any length (hours, days) needs no special path. Each call
   checks the wall clock against the deadline: has it passed, yes or no. If
   not, the call returns `pending` after at most 270 s and the agent calls
@@ -145,10 +150,15 @@ All tools return a JSON text block (the envelope or a subset) and set
   "deadline_s": 3600,
   "fire": "judge",
   "judge_questions": {"failed": {"type": "noul", "instructions": "Did the build fail?"}},
-  "judge_rule": {"question": "failed", "noul_gte": 0.8}
+  "judge_rule": {"question": "failed", "noul_gte": 0.8},
+  "expect_s": 1200,
+  "stall_s": 300,
+  "orchestrator": true
 }
 ```
 
+- `expect_s`, `stall_s` (both at least 1) and `orchestrator` are optional; see
+  "Cache-aware window, time and early attention".
 - `fire` is `"judge"` (fire when `judge_rule` matches the judge's answer),
   `"change"` (fire on any input change, no model call), or `"condition"`
   (fire when every input that has a `want` meets it, no model call).
@@ -174,12 +184,14 @@ All tools return a JSON text block (the envelope or a subset) and set
 
 ### `keepalive`
 
-Input: `{watch_id?: string, max_s?: number}`. With no `watch_id`, it covers
-the pending watches this `vigil mcp` process created. Watches from another
-session (or from before a restart) need their id.
+Input: `{watch_id?: string, max_s?: number, orchestrator?: boolean}`. With no
+`watch_id`, it covers the pending watches this `vigil mcp` process created.
+Watches from another session (or from before a restart) need their id. Leave
+`max_s` out: vigil chooses the window. `orchestrator: true` is for the main
+session only.
 
-Blocks until any covered watch fires or expires, or `max_s` (30 to 270,
-default 270) elapses. Ticks run in this call, each when the watch's
+Blocks until any covered watch fires, expires or needs attention, or the
+window (270 s by default, see below) elapses. Ticks run in this call, each when the watch's
 `last_tick_at + interval_s` comes due, so the cadence holds across calls and
 an immediate re-call does not cause an extra tick.
 
@@ -220,6 +232,17 @@ Non-blocking reads and cancel. `watch_status` also reports judge reachability
 - `events` is empty on a pure timeout. Then `status` is `pending`, `next` is
   `"call keepalive again"`, and the envelope is short, so a quiet hour costs
   a few hundred tokens per tick, not thousands.
+- `cache` and `clock` ride on every blocking return (a `keepalive`, and the
+  final envelope of a `wait`), never on status or cancel:
+  `"cache": {"ttl": "1h"|"5m"|"unknown", "source": "claude-transcript"|"codex-default"|"default"|"explicit", "interval_s": 270}`
+  (plus `credit_check` after an orchestrator's credit check) and
+  `"clock": {"waited_s", "watch_age_s", "since_last_call_s" (null on the first call), "summary"}`.
+  `summary` is one plain line, e.g. `waited 55m 0s this call; watching for
+  2h 10m; last call 55m ago`.
+- An event with a `kind` key is not about an input: `attention` (with
+  `reason` `overdue` | `stalled`) or `credit_state_changed` (`on_credits`,
+  `source`, `windows`, optional `hook`). Either one ends the call with
+  `status: "pending"` and `next: "act on events"`.
 - `persist` and `persist_failures` appear only when a state write failed or had
   to spend the reserve (see "Surviving a full disk"); an event carries
   `"redelivered": true` only when it follows a failed save. A healthy call has
@@ -274,6 +297,13 @@ Nothing is written to the working tree, `$XDG_CONFIG_HOME` or any repository.
   `finished_at`, `tick`, `last_tick_at`, per-input observation state (V9),
   `judge_strikes`, the pending change (V14, R7), `last_digest`, and the
   terminal events.
+- Also under the root: `credit.lock` (an `flock` held around a credit probe,
+  its hook and the commit of the state file) and `credit-state.json`
+  (`{"on_credits": true|false|null, "checked_at": ts}`: the last known credit
+  state and the time of the newest check, which paces the checks of every
+  process). While a watch is pending its file may hold, in `events`, attention
+  events not yet acknowledged, plus `attention_raised`, `activity` and
+  `last_call_at`.
 - Writes are atomic: write `<id>.json.tmp` in the same directory, fsync,
   rename. A failed write is survived, see "Surviving a full disk" below.
 - **One lock for everything** (V4, V5): every mutation (create, tick,
@@ -444,9 +474,9 @@ server that returns canned answers.
    timeout, three strikes). Tests: each failure path, including that a
    change is never dropped.
 3. **MCP front and `keepalive`.** stdio server, the five tools, envelope,
-   `instructions`, `max_s` clamp to 30-270, progress notifications. Tests: an MCP client
+   `instructions`, `max_s` clamp to 30-3300 (originally 30-270), progress notifications. Tests: an MCP client
    in the test drives create, then repeated keepalive; blocked call returns
-   early on fire; `max_s` of 5 and 9999 are clamped to 30 and 270; a deadline hours away returns `pending` at 270 s; pending returns carry `tick` and `now`; quiet envelope is
+   early on fire; `max_s` of 5 and 9999 are clamped to 30 and 3300 (270 for Codex; originally 270, see "Cache-aware window"); a deadline hours away returns `pending` at 270 s (the default window); pending returns carry `tick` and `now`; quiet envelope is
    small.
 4. **Nix packaging and skill.** Scout module, flakelet, agent skill, MCP
    wiring. Verify per `AGENTS.md`: the affected output evaluates, then
@@ -633,3 +663,88 @@ Round 2 was the last spec round; these are decisions, not open questions.
 - X8 (lock inode split): after taking a watch lock, compare the locked fd's
   `(dev, inode)` with the lock path's; if they differ or the path is gone,
   release and retry (bounded by the call budget).
+
+## Cache-aware window, time and early attention
+
+Full claims and decisions: `specs/auto-interval.md` (AI1-AI8, S1-S10, N1-N4).
+This section is the behaviour as built.
+
+**Why.** An agent should not pick a tick length. A Claude main session with a
+1-hour prompt cache needs a call only every ~55 minutes; a 270 s tick costs
+about 11 times as many model calls. A long wait hides time, so a long window
+needs a clock in the envelope and an early wake when a job looks stuck.
+
+**Window (AI1', AI3, S4).** Per call, in this order:
+1. An explicit `max_s` / `--max-s` wins, clamped to 30..=3300, or 30..=270
+   when the caller is Codex or ambiguous. `cache` is `unknown` / `explicit`.
+2. A caller that is not the orchestrator gets 270 s (`unknown` / `default`).
+   Subagents therefore need no special instruction.
+3. The orchestrator is a call with `orchestrator: true` (MCP), `--orchestrator`
+   (CLI), or any covered pending watch created with `orchestrator: true`; an
+   explicit `false` overrides the stored flag. Its window comes from the
+   session's own transcript (`CLAUDE_CODE_SESSION_ID`,
+   `~/.claude/projects/*/<id>.jsonl`, or `VIGIL_CLAUDE_PROJECTS_DIR`, or
+   `$CLAUDE_CONFIG_DIR/projects`): the newest main-session assistant record
+   with a nonzero `usage.cache_creation` write; `ephemeral_1h_input_tokens > 0`
+   gives 1 h and 3300 s, else a 5m write gives 5m and 270 s; nothing usable
+   gives `unknown` and 270 s. Codex (`AGENT=codex` or any `CODEX_*` variable)
+   is `5m` / `codex-default` / 270 s. Claude and Codex signals together are
+   ambiguous (a Claude started from a Codex shell or the reverse): 270 s,
+   `unknown`.
+4. The window is decided again at every call.
+
+Bounds (S8): only the last 512 KiB of a transcript is read (a seek, at most
+512 KiB + 1 byte consumed), lines over 64 KiB are skipped, only regular files
+are opened (a symlink or FIFO is never followed or opened), the session id is
+restricted to `[A-Za-z0-9_-]{1,64}`.
+
+**Clock (AI4).** `clock.since_last_call_s` is the time since the previous
+envelope this watch returned, kept in the watch file as `last_call_at` (best
+effort: a failed save of it is silent and never holds or shortens a call).
+`wait` measures the whole wait and records only its own final return.
+
+**Credit check (AI2', AI8, S2, S5, S7, S9).** Every orchestrator call checks
+the account's credit state when the last check is at least 240 s old
+(`credit-state.json`), after its watches had their first pass; a window over
+270 s also re-checks every 240 s inside the call. One check runs under
+`credit.lock`: re-read the state file (another process may just have checked),
+probe, compare with the recorded KNOWN state, run the hook on a change, commit
+`credit-state.json`, release. Probe: `uw --json status` (`VIGIL_UW_COMMAND`;
+only `ClaudeCode` windows count; output capped at 64 KiB; own process group),
+else any main-session transcript modified in the last 10 minutes (20 newest)
+whose newest cache write is 5m after an earlier 1h write. The verdict is
+tri-state: on, off, unknown (no source could say). Unknown keeps the last
+known state, never makes an event or a hook, and still counts as a check. The
+first known verdict is a baseline. A change ends the call with one
+`credit_state_changed` event and runs the hook `VIGIL_ON_CREDIT_CHANGE` (an
+`sh -c` command, empty means none) with `{on_credits, source, at, windows}` as
+one JSON line (at most 4096 bytes, `windows` cut as a prefix) on stdin, a 10 s
+timeout, output cut to 2048 bytes. The hook is delivered AT LEAST ONCE: the
+state file is written after the hook, so a crash or a failed write makes the
+next check run it again; hooks must be idempotent. Probe and hook are bounded
+by the call budget minus a 100 ms margin (a check that cannot finish is skipped
+and left to the next call), and cancelling a call kills their process groups.
+
+**Attention (AI5, S6).** A watch may declare `expect_s` and `stall_s`. vigil
+raises one `attention` event per reason per watch: `overdue` when the watch has
+run `min(1.5 x expect_s, expect_s + 540)` seconds (the wake is scheduled for
+that moment, however rarely the watch ticks), and `stalled` when no input
+changed for `stall_s` while a `process` input still runs (evaluated at ticks).
+With neither field set, a window over 270 s applies a default `stall_s` of 900
+to changes of `file`, `glob` and `cmd` inputs of a watch that also has a running
+`process` input. Attention events are ordinary events: distinct W1 ids
+(`<watch>:<tick>:<n>`), saved with the watch before they are delivered,
+acknowledged by a committed delivery, and returned again with
+`redelivered: true` after a failed save or an uncommitted delivery. A finished
+watch raises nothing; with several watches the terminal result is the primary
+and an attention event of another watch rides along.
+
+**Delivery (N3).** The CLI prints the envelope with a checked write to
+descriptor 1 and only then commits the delivery; a failed write (EPIPE,
+ENOSPC) exits 1 and leaves the events to be replayed by the next call.
+
+**Environment.** `CLAUDE_CODE_SESSION_ID`, `AGENT`, `CODEX_*` (identity);
+`VIGIL_CLAUDE_PROJECTS_DIR`, `CLAUDE_CONFIG_DIR`, `HOME` (transcripts);
+`VIGIL_UW_COMMAND`; `VIGIL_ON_CREDIT_CHANGE`. `VIGIL_TEST_FAULT` gains the write
+kind `credit` and `hold=PATH` rules (test-only, trusted environment).
+
