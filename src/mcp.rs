@@ -66,6 +66,19 @@ pub struct CreateArgs {
     pub deadline_s: Option<u64>,
     /// "judge", "change" or "condition".
     pub fire: String,
+    /// How long the job should take, in seconds (at least 1). vigil raises one
+    /// `attention` event when the watch has run 1.5x this long (or 9 minutes
+    /// over, whichever comes first).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expect_s: Option<u64>,
+    /// Seconds the inputs may stay unchanged while a `process` input still
+    /// runs (at least 1) before vigil raises one `attention` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_s: Option<u64>,
+    /// True when keepalive calls for this watch are the main orchestrator
+    /// session's (the same as passing `orchestrator: true` to keepalive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<bool>,
     /// fire = judge: Laya questions keyed by id, types noul, choice, score.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<serde_json::Map<String, Value>>")]
@@ -80,8 +93,11 @@ pub struct CreateArgs {
 pub struct KeepaliveArgs {
     /// Watch to cover; without it, the watches this server created.
     pub watch_id: Option<String>,
-    /// Seconds to block, clamped to 30..=270 (default 270).
+    /// Leave this out: vigil chooses how long the call blocks. Only to force a
+    /// shorter wait (30 or more).
     pub max_s: Option<u64>,
+    /// True only for the main orchestrator session; a subagent never sets it.
+    pub orchestrator: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -118,7 +134,7 @@ where
     N: FnMut(ProgressUpdate) -> F,
     F: std::future::Future<Output = ()>,
 {
-    let call_end = tokio::time::Instant::now() + std::time::Duration::from_secs(crate::keepalive::clamp_max_s(request.max_s));
+    let started = tokio::time::Instant::now();
     let (sender, mut updates) = mpsc::unbounded_channel::<ProgressUpdate>();
     let mut cancel = std::pin::pin!(cancel);
     let outcome = {
@@ -136,7 +152,11 @@ where
             () = forward => unreachable!("the forwarder never completes"),
         }
     };
-    // The sender went with `run`; what is queued can still be sent, briefly.
+    // The sender went with `run`; what is queued can still be sent, briefly. A20: the
+    // bound is the window the call really used (the envelope's `max_s`), not
+    // the 270 s ceiling of an explicit request.
+    let window_s = outcome.as_ref().ok().and_then(|done| done.as_ref()).and_then(|(envelope, _)| envelope.max_s).unwrap_or(0);
+    let call_end = started + std::time::Duration::from_secs(window_s);
     let flush = PROGRESS_FLUSH.min(call_end.saturating_duration_since(tokio::time::Instant::now()));
     // C2: the results count as returned only once the flush is over and no
     // cancel has arrived; a cancel during the flush makes the transport
@@ -229,7 +249,7 @@ impl VigilServer {
     }
 
     #[tool(
-        description = "Block up to max_s (30-270, default 270) while watches tick; return when one fires or ends. Call again while next is \"call keepalive again\".",
+        description = "Block while watches tick (vigil chooses how long; leave max_s out) and return when one fires, ends or needs attention. Pass orchestrator: true only from the main session. Call again while next is \"call keepalive again\".",
         meta = always_load()
     )]
     async fn keepalive(
@@ -241,7 +261,7 @@ impl VigilServer {
             Ok(id) => id,
             Err(error) => return Ok(reply::<()>(Err(error))),
         };
-        let request = KeepaliveRequest { watch_id, max_s: args.max_s, orchestrator: None };
+        let request = KeepaliveRequest { watch_id, max_s: args.max_s, orchestrator: args.orchestrator };
         let token = ctx.meta.get_progress_token();
         let outcome = run_keepalive(&self.vigil, request, ctx.ct.cancelled(), |update| {
             let peer = ctx.peer.clone();

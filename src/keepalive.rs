@@ -6,9 +6,12 @@ use tokio::time::Instant;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::attention::{due_reasons, event_for, overdue_at, LONG_WINDOW_S};
+use crate::cache::{choose_window, CacheNote, WindowRequest};
 use crate::clock::Timestamp;
+use crate::credit::CreditCheck;
 use crate::engine::{expired_if_overdue, Persisted};
-use crate::envelope::{cut_digest, Envelope, OtherWatch, PersistNote, SecondaryFailure};
+use crate::envelope::{cut_digest, ClockNote, Envelope, Next, OtherWatch, PersistNote, SecondaryFailure};
 use crate::error::VigilError;
 use crate::tick::{digest_of, is_due, Retained, TickOutcome, TickReport};
 use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId, WatchStatus};
@@ -43,8 +46,9 @@ pub struct KeepaliveRequest {
     #[serde(default)]
     pub max_s: Option<u64>,
     /// AI1' (A8): this call is the main orchestrator session's, so it gets the
-    /// TTL-derived window. `Some(false)` overrides a flag stored on the watch;
-    /// `None` defers to the stored flag. RED: ignored by the engine.
+    /// TTL-derived window and the credit checks. `Some(false)` overrides a flag
+    /// stored on the watch; `None` defers to the stored flag (S10: any covered
+    /// watch that stores it makes a no-id call an orchestrator call).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<bool>,
 }
@@ -77,13 +81,13 @@ impl ProgressSink for NoProgress {
 /// and 5 for a still-pending envelope that `wait` returned because of an
 /// `attention` or `credit_state_changed` event ("attention; the watch is still
 /// live"). 1 is an error and 2 a usage error (clap); neither is returned here,
-/// and any other pending envelope has no code. RED: 5 is not returned yet.
+/// and any other pending envelope has no code.
 pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
     match envelope.status {
         WatchStatus::Fired => Some(0),
         WatchStatus::Expired => Some(3),
         WatchStatus::Cancelled => Some(4),
-        WatchStatus::Pending => None,
+        WatchStatus::Pending => envelope.events.iter().any(Event::is_call_ending).then_some(5),
     }
 }
 
@@ -105,6 +109,15 @@ struct CallRecord {
     saves: BTreeMap<WatchId, SaveRecord>,
     /// S1: watches that ticked in this call right after a failed save.
     redelivered: BTreeSet<WatchId>,
+    /// S6: ids of the attention events already in the covered watches' files
+    /// when the call began; whatever is returned of them is a redelivery.
+    carried: BTreeSet<String>,
+    /// AI5: some covered watch raised attention in this call.
+    raised_attention: bool,
+    /// AI8: the call's credit event, if the check saw a change (not saved, A18).
+    credit_events: Vec<Event>,
+    /// AI2': the newest credit check of this call.
+    credit_check: Option<CreditCheck>,
 }
 
 impl CallRecord {
@@ -117,16 +130,27 @@ impl CallRecord {
             self.redelivered.insert(id.clone());
         }
         let Some(watch) = report.after else { return };
-        // A clean save says nothing; a reserve spent earlier in the call stays
-        // the note unless a later save fails.
-        let nothing_new = match report.persisted {
+        self.note_save(id, watch, report.persisted);
+    }
+
+    /// Remember a save that needs saying. A clean save says nothing; a reserve
+    /// spent earlier in the call stays the note unless a later save fails.
+    fn note_save(&mut self, id: &WatchId, watch: WatchFile, persisted: Persisted) {
+        let nothing_new = match persisted {
             Persisted::Saved => true,
             Persisted::SavedOnReserve => self.saves.contains_key(id),
             Persisted::NotSaved(_) => false,
         };
         if !nothing_new {
-            self.saves.insert(id.clone(), SaveRecord { watch, persisted: report.persisted });
+            self.saves.insert(id.clone(), SaveRecord { watch, persisted });
         }
+    }
+
+    /// Does this call end now because the agent has something to act on that is
+    /// not a finished watch (attention, a credit change, or an attention event
+    /// that was never acknowledged)?
+    fn has_events_for_the_agent(&self) -> bool {
+        self.raised_attention || !self.credit_events.is_empty() || !self.carried.is_empty()
     }
 
     /// DF1a: a save that failed ends the call.
@@ -222,6 +246,20 @@ where
     .await
 }
 
+/// What one call is, decided before it starts: the window and the note that
+/// explains it (AI1', AI3), and whether it is the orchestrator's (S2).
+struct CallPlan {
+    orchestrator: bool,
+    window: CacheNote,
+}
+
+impl CallPlan {
+    /// AI5 (A1): is the window longer than the default 270 s?
+    fn is_long(&self) -> bool {
+        self.window.interval_s > LONG_WINDOW_S
+    }
+}
+
 impl crate::engine::Vigil {
     /// Block until a covered watch fires or expires, or `max_s` (clamped)
     /// elapses. SPEC "keepalive" + V2/V7/V8/V14/V26.
@@ -273,24 +311,83 @@ impl crate::engine::Vigil {
         progress: &dyn ProgressSink,
         cancel: impl std::future::Future<Output = ()>,
     ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
-        let max_s = clamp_max_s(request.max_s);
+        self.blocking_call(request, progress, cancel, true).await
+    }
+
+    /// One blocking call. `remember_call` is whether the watch files record
+    /// this return as "the last call" (AI4): `wait` records only its own final
+    /// return, not the calls it makes inside.
+    async fn blocking_call(
+        &self,
+        request: KeepaliveRequest,
+        progress: &dyn ProgressSink,
+        cancel: impl std::future::Future<Output = ()>,
+        remember_call: bool,
+    ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
+        let covered = self.covered_ids(request.watch_id.as_ref())?;
+        let plan = self.plan_call(&request, &covered);
+        let max_s = plan.window.interval_s;
         let started = Instant::now();
         let budget_end = started + Duration::from_secs(max_s);
-        let covered = self.covered_ids(request.watch_id.as_ref())?;
         let finish = async {
-            let call = self.sense(&covered, budget_end, progress).await?;
-            let answer = self.keepalive_envelope(&covered, &call, started.elapsed().as_secs(), max_s)?;
+            let call = self.sense(&covered, budget_end, progress, &plan).await?;
+            let answer = self.keepalive_envelope(&covered, &call, &plan, started.elapsed().as_secs())?;
             // ↳ CLAIM(DF1a-hold): the one pacing for MCP, CLI keepalive and `wait` [spec DF1a revised, review T1; disk_full_tests a_quiet_tick_that_cannot_save_is_held_for_one_interval_and_not_ticked_again, mcp::tests the_mcp_call_is_held_one_interval_after_a_quiet_failed_save_and_a_cancel_ends_the_hold]
-            let Some(hold) = self.hold_after_unsaved_quiet_tick(&answer.0, &call, budget_end) else { return Ok(answer) };
-            tokio::time::sleep(hold).await;
-            // The watch may have passed its deadline while the call slept: the
-            // envelope describes it as it is now (V3), still without ticking.
-            self.keepalive_envelope(&covered, &call, started.elapsed().as_secs(), max_s)
+            let answer = match self.hold_after_unsaved_quiet_tick(&answer.0, &call, budget_end) {
+                None => answer,
+                Some(hold) => {
+                    tokio::time::sleep(hold).await;
+                    // The watch may have passed its deadline while the call slept: the
+                    // envelope describes it as it is now (V3), still without ticking.
+                    self.keepalive_envelope(&covered, &call, &plan, started.elapsed().as_secs())?
+                }
+            };
+            if remember_call {
+                self.remember_last_call(&covered, &call, answer.0.now).await;
+            }
+            Ok(answer)
         };
         tokio::select! {
             biased;
             () = cancel => Ok(None),
             envelope = finish => envelope.map(Some),
+        }
+    }
+
+    /// What this call is: its window (AI1', AI3), whether it is the
+    /// orchestrator's (A8, S10) and so whether it checks credit state.
+    fn plan_call(&self, request: &KeepaliveRequest, covered: &[WatchId]) -> CallPlan {
+        // A8: the caller's flag wins, `Some(false)` included; else any covered
+        // pending watch that stores the flag makes this an orchestrator call.
+        let orchestrator = request.orchestrator.unwrap_or_else(|| {
+            covered.iter().filter_map(|id| self.store.load(id).ok()).any(|watch| !watch.status.is_finished() && watch.spec.orchestrator)
+        });
+        let window = choose_window(&WindowRequest {
+            explicit_s: request.max_s,
+            orchestrator,
+            agent: &self.agent,
+            projects_dir: self.config.claude_projects_dir.as_deref(),
+        });
+        CallPlan { orchestrator, window }
+    }
+
+    /// AI4 / A13: record on every covered, still pending watch that an
+    /// envelope was returned at `now`. Best effort and silent (a full disk
+    /// must not cost the call its answer or hold it): one non-blocking try for
+    /// the watch's lock, one write without the reserve, errors ignored. A watch
+    /// whose save failed in this call is left alone.
+    async fn remember_last_call(&self, covered: &[WatchId], call: &CallRecord, now: Timestamp) {
+        for id in covered {
+            if call.unsaved_watch(id).is_some() {
+                continue;
+            }
+            let Ok(Some(_lock)) = self.store.try_lock_watch_async(id).await else { continue };
+            let Ok(mut watch) = self.store.load(id) else { continue };
+            if watch.status.is_finished() {
+                continue;
+            }
+            watch.last_call_at = Some(now);
+            let _ = self.store.save_quietly(&watch);
         }
     }
 
@@ -305,10 +402,22 @@ impl crate::engine::Vigil {
     /// starve another. A tick runs only if the budget left covers its reserve
     /// (X4), except the one due when the call starts. Expiry never needs a
     /// reserve and its deadline wake is kept when sensing is skipped (C7).
-    async fn sense(&self, covered: &[WatchId], budget_end: Instant, progress: &dyn ProgressSink) -> Result<CallRecord, VigilError> {
+    async fn sense(&self, covered: &[WatchId], budget_end: Instant, progress: &dyn ProgressSink, plan: &CallPlan) -> Result<CallRecord, VigilError> {
         let mut call = CallRecord::default();
         let mut ticks_in_call = 0u64;
         let mut first_pass = true;
+        let mut credit = plan.orchestrator.then(|| self.credit_plan(plan.window.interval_s));
+        // S6: attention that was raised and saved but never acknowledged is
+        // delivered again at once, ahead of any sensing.
+        for id in covered {
+            let watch = self.load_watch(id)?;
+            if !watch.status.is_finished() {
+                call.carried.extend(watch.events.iter().map(|event| event.event_id.clone()));
+            }
+        }
+        if call.has_events_for_the_agent() {
+            return Ok(call);
+        }
         loop {
             // C12: a covered watch that is already terminal (finished before
             // this call, or by another process) is returned before any round
@@ -382,6 +491,17 @@ impl crate::engine::Vigil {
                 return Ok(call);
             }
 
+            // AI5: a covered watch that has run too long, or gone quiet while its
+            // process runs, raises its attention event (after the round, so a
+            // watch that just finished raises nothing, A15, and one that fired
+            // in the same round still gets the secondary event, S10).
+            for id in covered {
+                self.raise_attention(id, plan.is_long(), budget_end, &mut call).await?;
+            }
+            if call.any_unsaved() {
+                return Ok(call);
+            }
+
             let now = self.clock.now();
             let mut any_finished = false;
             let mut next_wake: Option<Timestamp> = None;
@@ -394,10 +514,30 @@ impl crate::engine::Vigil {
                 let due_at = watch.last_tick_at.map_or(now, |last| last.plus_secs(watch.spec.interval_s));
                 // A due tick the reserve forbids is not waited for; its deadline still is.
                 let wake = if is_due(&watch, now) && self.reserve_blocks(&watch, budget_end) { watch.deadline_at } else { due_at.min(watch.deadline_at) };
+                // AI5: the overdue moment is a wake of its own, however rarely the watch ticks.
+                let wake = overdue_at(&watch).map_or(wake, |overdue| wake.min(overdue.max(now)));
                 next_wake = Some(next_wake.map_or(wake, |current| current.min(wake)));
             }
-            if any_finished {
+            if any_finished || call.raised_attention {
                 return Ok(call);
+            }
+            // AI2' / S2: the orchestrator's credit check, after the watches had
+            // their pass (a finished watch is never held back by a probe).
+            if let Some(credit) = credit.as_mut() {
+                if credit.is_due(self.clock.now()) {
+                    let anchor = self.load_watch(&covered[0])?;
+                    let step = self.run_credit_step(credit, budget_end, (&anchor.spec.id, anchor.tick)).await?;
+                    if step.check.is_some() {
+                        call.credit_check = step.check;
+                    }
+                    if let Some(event) = step.event {
+                        call.credit_events.push(event);
+                        return Ok(call);
+                    }
+                }
+                if let Some(due) = credit.next_due_at() {
+                    next_wake = Some(next_wake.map_or(due, |current| current.min(due)));
+                }
             }
             let left = budget_end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -430,6 +570,38 @@ impl crate::engine::Vigil {
         (!hold.is_zero()).then_some(hold)
     }
 
+    /// AI5 / S6: raise the attention events that are due for `id`, if any.
+    /// Cheap when nothing is due (one read, no lock). Otherwise the watch's
+    /// lock is taken, the rule is evaluated again under it, and the events are
+    /// appended to the watch's outbox together with the once-per-reason flags
+    /// in ONE save: either both are on disk or neither is (a failed save raises
+    /// them again at the next pass, with the same ids).
+    async fn raise_attention(&self, id: &WatchId, long_window: bool, budget_end: Instant, call: &mut CallRecord) -> Result<(), VigilError> {
+        if due_reasons(&self.load_watch(id)?, self.clock.now(), long_window).is_empty() {
+            return Ok(());
+        }
+        let (_lock, mut watch) = self.lock_and_load(id).await?;
+        let now = self.clock.now();
+        let due = due_reasons(&watch, now, long_window);
+        if due.is_empty() {
+            return Ok(());
+        }
+        // S1, decided before this save changes the answer.
+        let repeating = self.may_repeat(id);
+        for reason in due {
+            let event = event_for(&watch, reason, now);
+            watch.events.push(event);
+            watch.attention_raised.push(reason);
+        }
+        let persisted = self.persist(&watch, Some(budget_end)).await?;
+        if repeating {
+            call.redelivered.insert(id.clone());
+        }
+        call.raised_attention = true;
+        call.note_save(id, watch, persisted);
+        Ok(())
+    }
+
     /// X4: true when the budget left is below the watch's tick reserve.
     fn reserve_blocks(&self, watch: &WatchFile, budget_end: Instant) -> bool {
         let reserve = tick_reserve(&watch.spec.inputs, matches!(watch.spec.fire, FireRule::Judge { .. }), self.config.judge_timeout);
@@ -448,21 +620,45 @@ impl crate::engine::Vigil {
     /// event batch (no streaming, R8/V21). With `orchestrator` the internal
     /// calls use the TTL-derived window and run the credit checks. The final
     /// envelope carries `cache` (from its last internal call) and a `clock`
-    /// that measures the whole wait. RED: the stub loops on attention and
-    /// ignores `orchestrator`.
+    /// that measures the whole wait.
     pub async fn wait_with(&self, id: &WatchId, orchestrator: bool) -> Result<Envelope, VigilError> {
-        let _ = orchestrator;
+        let (envelope, delivery) = self.wait_uncommitted(id, orchestrator).await?;
+        self.commit_delivery(delivery);
+        Ok(envelope)
+    }
+
+    /// `wait_with` that leaves its final delivery for the caller to commit once
+    /// the envelope is printed (N3). Intermediate quiet returns are committed
+    /// here: they carry nothing the agent has not got.
+    pub async fn wait_uncommitted(&self, id: &WatchId, orchestrator: bool) -> Result<(Envelope, Delivery), VigilError> {
+        let started = Instant::now();
+        let last_call_before = self.load_watch(id)?.last_call_at;
         loop {
-            let mut envelope = self.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(MAX_MAX_S), orchestrator: None }).await?;
-            if envelope.status.is_finished() {
-                envelope.waited_s = None;
-                envelope.max_s = None;
-                return Ok(envelope);
+            // R2-A2: a plain wait chooses nothing itself (automatic window, the
+            // stored flag decides); `--orchestrator` says so.
+            let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: orchestrator.then_some(true) };
+            let (mut envelope, delivery) = self
+                .blocking_call(request, &NoProgress, std::future::pending::<()>(), false)
+                .await?
+                .expect("a call that cannot be cancelled always finishes");
+            let ends_here = envelope.status.is_finished() || envelope.events.iter().any(Event::is_call_ending);
+            if !ends_here {
+                // DF1a: a pending envelope whose save failed was already held one
+                // interval inside the call (`hold_after_unsaved_quiet_tick`), so
+                // calling again now does not spin on a full disk and `wait` adds
+                // no sleep of its own (that would tick every two intervals).
+                self.commit_delivery(delivery);
+                continue;
             }
-            // DF1a: a pending envelope whose save failed was already held one
-            // interval inside the call (`hold_after_unsaved_quiet_tick`), so
-            // calling again now does not spin on a full disk and `wait` adds
-            // no sleep of its own (that would tick every two intervals).
+            envelope.waited_s = None;
+            envelope.max_s = None;
+            let waited_s = started.elapsed().as_secs();
+            let since_last_call_s = last_call_before.map(|at| envelope.now.secs_since(at).max(0) as u64);
+            envelope.clock = Some(ClockNote::new(waited_s, envelope.elapsed_s, since_last_call_s));
+            if !envelope.status.is_finished() {
+                self.remember_last_call(std::slice::from_ref(id), &CallRecord::default(), envelope.now).await;
+            }
+            return Ok((envelope, delivery));
         }
     }
 
@@ -491,15 +687,9 @@ impl crate::engine::Vigil {
     /// Build the return value of a call (V8, V14, X1, S5) and record what it
     /// delivered. A covered watch whose save failed in this call is read from
     /// `call` (its file is the previous one); every other from disk.
-    fn keepalive_envelope(
-        &self,
-        covered: &[WatchId],
-        call: &CallRecord,
-        waited_s: u64,
-        max_s: u64,
-    ) -> Result<(Envelope, Delivery), VigilError> {
+    fn keepalive_envelope(&self, covered: &[WatchId], call: &CallRecord, plan: &CallPlan, waited_s: u64) -> Result<(Envelope, Delivery), VigilError> {
         let now = self.clock.now();
-        let mut watches: Vec<WatchFile> = covered
+        let watches: Vec<WatchFile> = covered
             .iter()
             .map(|id| match call.unsaved_watch(id) {
                 Some(unsaved) => Ok(expired_if_overdue(unsaved.clone(), now)),
@@ -522,7 +712,7 @@ impl crate::engine::Vigil {
         // so do stored events this process replays while it may be repeating
         // them; the in-memory copy of an unsaved result is only a repeat if
         // its own tick followed a failed save (it is the first delivery).
-        let events: Vec<Event> = finished
+        let mut events: Vec<Event> = finished
             .iter()
             .flat_map(|watch| {
                 let own_tick_followed_failed_save = call.redelivered.contains(&watch.spec.id);
@@ -531,6 +721,22 @@ impl crate::engine::Vigil {
                 stored.into_iter().map(move |event| Event { redelivered: event.redelivered || own_tick_followed_failed_save, ..event })
             })
             .collect();
+        // S6: the attention events of the pending covered watches ride along,
+        // whichever watch is the primary. One that was already in the file when
+        // the call began, or whose raising followed a failed save, is a repeat.
+        let mut acknowledgements: Vec<(WatchId, Vec<String>)> = Vec::new();
+        for watch in watches.iter().filter(|watch| !watch.status.is_finished() && !watch.events.is_empty()) {
+            let unsaved = call.unsaved_watch(&watch.spec.id).is_some();
+            let repeat_of_failed_save = call.redelivered.contains(&watch.spec.id);
+            events.extend(watch.events.iter().map(|event| Event {
+                redelivered: event.redelivered || repeat_of_failed_save || call.carried.contains(&event.event_id),
+                ..event.clone()
+            }));
+            if !unsaved {
+                acknowledgements.push((watch.spec.id.clone(), watch.events.iter().map(|event| event.event_id.clone()).collect()));
+            }
+        }
+        events.extend(call.credit_events.iter().cloned());
         let others: Vec<OtherWatch> = finished
             .iter()
             .filter(|watch| watch.spec.id != primary.spec.id)
@@ -549,36 +755,79 @@ impl crate::engine::Vigil {
         // handed over (C2). The count shown already includes this return.
         envelope.session_ticks += 1;
         envelope.waited_s = Some(waited_s);
-        envelope.max_s = Some(max_s);
+        envelope.max_s = Some(plan.window.interval_s);
         envelope.events = events;
         envelope.others = others;
         if !primary.status.is_finished() {
             envelope.digest = cut_digest(&digest_of(&call.changed), self.config.digest_max_bytes);
+            // A17: an attention or credit event is something to act on, though
+            // the watch is still live.
+            if envelope.events.iter().any(Event::is_call_ending) {
+                envelope.next = Next::ActOnEvents;
+            }
         }
         // DF3a: at risk when the envelope has events or a terminal status.
         let at_risk = !envelope.events.is_empty() || envelope.status.is_finished();
         envelope.persist = call.note_for(&primary.spec.id, at_risk);
         envelope.persist_failures = call.secondary_failures(&primary.spec.id);
-        watches.clear();
-        Ok((envelope, Delivery(delivered)))
+        // AI3, AI4: how the window was chosen, and the clock the agent cannot see.
+        envelope.cache = Some(CacheNote { credit_check: call.credit_check.clone(), ..plan.window.clone() });
+        let since_last_call_s = primary.last_call_at.map(|at| now.secs_since(at).max(0) as u64);
+        envelope.clock = Some(ClockNote::new(waited_s, envelope.elapsed_s, since_last_call_s));
+        Ok((envelope, Delivery { returned: delivered, acknowledged: acknowledgements }))
     }
 
     /// Record that a call's envelope reached the caller (V7): its terminal
-    /// results will not be returned again and `session_ticks` counts it.
+    /// results will not be returned again and `session_ticks` counts it. The
+    /// attention events it carried are acknowledged in the watch files (S6),
+    /// best effort: an acknowledgement that cannot be saved leaves the event
+    /// to be delivered again, flagged `redelivered`.
     pub fn commit_delivery(&self, delivery: Delivery) {
-        let mut session = self.session.lock().expect("session mutex poisoned");
-        session.session_ticks += 1;
-        for id in &delivery.0 {
-            // Review S2: delivered, so nothing of it can be a repeat any more.
-            session.repeat_risk.remove(id);
+        {
+            let mut session = self.session.lock().expect("session mutex poisoned");
+            session.session_ticks += 1;
+            for id in &delivery.returned {
+                // Review S2: delivered, so nothing of it can be a repeat any more.
+                session.repeat_risk.remove(id);
+            }
+            session.returned.extend(delivery.returned);
         }
-        session.returned.extend(delivery.0);
+        for (id, event_ids) in &delivery.acknowledged {
+            self.acknowledge(id, event_ids);
+        }
+    }
+
+    /// Remove the acknowledged events from `id`'s outbox. Waits for the watch's
+    /// lock only briefly (a tick of another process may hold it); on any
+    /// failure the events stay and are redelivered.
+    fn acknowledge(&self, id: &WatchId, event_ids: &[String]) {
+        const PATIENCE: Duration = Duration::from_millis(250);
+        let give_up = std::time::Instant::now() + PATIENCE;
+        let _lock = loop {
+            match self.store.try_lock_watch(id) {
+                Ok(Some(lock)) => break lock,
+                Ok(None) if std::time::Instant::now() < give_up => std::thread::sleep(Duration::from_millis(2)),
+                Ok(None) | Err(_) => return,
+            }
+        };
+        let Ok(mut watch) = self.store.load(id) else { return };
+        let before = watch.events.len();
+        watch.events.retain(|event| !event_ids.contains(&event.event_id));
+        if watch.status.is_finished() || watch.events.len() == before {
+            return;
+        }
+        let _ = self.store.save_quietly(&watch);
     }
 }
 
-/// The terminal results an envelope carries, not yet marked returned (C2).
+/// What an envelope carries that must be marked once it is really handed over
+/// (C2): terminal results (not returned again) and attention events (removed
+/// from the watch's outbox, S6).
 #[must_use = "an uncommitted delivery leaves its results to be returned again"]
-pub struct Delivery(Vec<WatchId>);
+pub struct Delivery {
+    returned: Vec<WatchId>,
+    acknowledged: Vec<(WatchId, Vec<String>)>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -668,6 +917,8 @@ mod tests {
             others: vec![],
             persist: None,
             persist_failures: vec![],
+            cache: None,
+            clock: None,
         }
     }
 
@@ -758,16 +1009,21 @@ mod tests {
         assert_eq!(envelope.next, Next::CallKeepaliveAgain);
         assert_eq!(envelope.judge_status, JudgeStatus::Skipped);
         let wire = serde_json::to_string(&envelope).unwrap();
-        assert!(wire.len() < 400, "quiet envelope should be a few hundred bytes, got {}: {wire}", wire.len());
+        // AI6 adds `cache` and `clock` (about 190 bytes) to the 244-byte envelope
+        // this bound was set for (400): still "a few hundred bytes".
+        assert!(wire.len() < 512, "quiet envelope should be a few hundred bytes, got {}: {wire}", wire.len());
     }
 
     #[tokio::test(start_paused = true)]
     async fn max_s_below_the_floor_and_above_the_ceiling_are_clamped_and_reported() {
-        // why: SPEC: max_s 5 -> 30, 9999 -> 270, absent -> 270, "the envelope
-        //      reports the value used" (V26 `max_s`), and the call really
-        //      blocks that long (virtual time).
+        // why: SPEC: max_s 5 -> 30, absent -> 270, "the envelope reports the
+        //      value used" (V26 `max_s`), and the call really blocks that long
+        //      (virtual time). 9999 -> 3300 since auto-interval A2: the ceiling
+        //      of an explicit window is the largest vigil ever picks (3300), 270
+        //      only for Codex or an ambiguous caller (pinned in cache.rs and the
+        //      Codex e2e tests); this engine has no agent signal at all.
         // proves: CLAIM(max-s-clamp)
-        for (requested, used) in [(Some(5), 30), (Some(9999), 270), (None, 270)] {
+        for (requested, used) in [(Some(5), 30), (Some(9999), 3300), (None, 270)] {
             let env = paused_env();
             let vigil = process(&env);
             let (id, _) = quiet_watch(&env, &vigil, "w", 20, 7200).await;
@@ -1414,7 +1670,16 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(30), "the call must end exactly at max_s");
         assert_eq!(envelope.status, WatchStatus::Pending);
         assert_eq!((envelope.waited_s, envelope.max_s), (Some(30), Some(30)));
-        assert_eq!(std::fs::read(vigil.store().watch_path(&id)).unwrap(), before, "an aborted tick writes nothing");
+        // A13: the only thing a call may add to the file is the time of its own
+        // return (`last_call_at`, AI4); the tick's data must be byte-for-byte as before.
+        let without_bookkeeping = |bytes: Vec<u8>| {
+            let mut watch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let removed = watch.as_object_mut().unwrap().remove("last_call_at");
+            (watch, removed.is_some())
+        };
+        let (after_watch, had_last_call) = without_bookkeeping(std::fs::read(vigil.store().watch_path(&id)).unwrap());
+        assert_eq!(after_watch, without_bookkeeping(before).0, "an aborted tick writes nothing");
+        assert!(had_last_call, "the call itself did record when it returned");
 
         env.reader.set_sleep("cmd:overrun", Duration::ZERO);
         let next = vigil.keepalive(by_id(&id, Some(30))).await.unwrap();

@@ -102,12 +102,29 @@ fn build_vigil(root: Option<PathBuf>) -> anyhow::Result<Vigil> {
     // Test seam (fault.rs): unset in production, so the plan injects nothing.
     let faults = vigil::FaultPlan::from_env_value(std::env::var(vigil::fault::ENV_VAR).ok().as_deref())
         .map_err(|error| anyhow::anyhow!("invalid {}: {error}", vigil::fault::ENV_VAR))?;
-    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults))
+    // A3, S4: who is calling is read here, once, from the whole environment.
+    let agent = vigil::cache::AgentEnv::from_vars(std::env::vars());
+    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string(value)?);
     Ok(())
+}
+
+/// N3: write an envelope to the process's real standard output and say whether
+/// it got there. Rust's own `stdout()` ignores a closed descriptor (EBADF) and
+/// `println!` panics on any other failure, so a delivery committed after it
+/// could be committed for an envelope nobody received. This writes through a
+/// duplicate of descriptor 1 (the duplication itself fails when it is closed),
+/// reports every error, and flushes.
+fn deliver_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    let mut stdout = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned().map_err(|error| anyhow::anyhow!("cannot write the envelope to stdout: {error}"))?);
+    stdout.write_all(&line).and_then(|()| stdout.flush()).map_err(|error| anyhow::anyhow!("cannot write the envelope to stdout: {error}"))
 }
 
 /// DF2: the envelope on stdout is complete even when its save failed; stderr
@@ -165,14 +182,21 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Keepalive { id, max_s, orchestrator } => {
             let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s, orchestrator: orchestrator.then_some(true) };
-            let envelope = vigil.keepalive(request).await?;
-            print_json(&envelope)?;
+            let (envelope, delivery) = vigil
+                .keepalive_uncommitted(request, &vigil::keepalive::NoProgress, std::future::pending::<()>())
+                .await?
+                .expect("a call that cannot be cancelled always finishes");
+            // N3: print, THEN commit. A failed write leaves the delivery
+            // uncommitted (the error ends the process), so the next call replays it.
+            deliver_json(&envelope)?;
+            vigil.commit_delivery(delivery);
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(0)
         }
         Command::Wait { id, orchestrator } => {
-            let envelope = vigil.wait_with(&WatchId::parse(&id)?, orchestrator).await?;
-            print_json(&envelope)?;
+            let (envelope, delivery) = vigil.wait_uncommitted(&WatchId::parse(&id)?, orchestrator).await?;
+            deliver_json(&envelope)?;
+            vigil.commit_delivery(delivery);
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(wait_exit_code(&envelope).unwrap_or(0))
         }

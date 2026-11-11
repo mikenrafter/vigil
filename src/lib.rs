@@ -1,8 +1,11 @@
 //! vigil: an MCP server that keeps an agent's turn open while a cheap judge
 //! watches things for it. See `SPEC.md` and `FINDINGS.md` beside this crate.
 //!
-//! RED phase: every public item below is a stub. Types and signatures are the
-//! contract the tests compile against; bodies are `todo!()` unless trivial.
+//! Module map: `watch`/`store`/`tick` (watches and their files), `keepalive`
+//! (the blocking call), `cache` (call window from the prompt-cache TTL),
+//! `attention` (early wake rules), `credit` + `monitor` (the orchestrator's
+//! credit check and hook), `envelope` (what the agent reads), `mcp` (the
+//! server front), `fault`/`meter`/`testing` (test seams).
 #![allow(dead_code, unused_variables)] // phase 2-3 stubs remain
 
 pub mod attention;
@@ -17,6 +20,8 @@ pub mod fault;
 pub mod inputs;
 pub mod judge;
 pub mod meter;
+pub(crate) mod monitor;
+pub(crate) mod process;
 pub mod keepalive;
 pub mod mcp;
 pub mod store;
