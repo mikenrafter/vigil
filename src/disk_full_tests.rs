@@ -1983,3 +1983,28 @@ fn a_rescue_with_almost_no_budget_left_still_returns_the_answer() {
         assert_eq!(identity(&reserve), reserve_before, "the reserve is untouched");
     });
 }
+
+#[test]
+fn the_redelivery_memory_is_released_when_its_envelope_is_delivered() {
+    // why: review S2 keeps the memory "until delivery commits", not for ever.
+    //      GUARD (passes before the S2 fix too): a memory that never shrinks
+    //      would flag every later replay of the watch, and the set would grow
+    //      with every failure the process has had. Call 1 cannot save; call 2
+    //      retries, saves and is delivered (committed) with the flag; after
+    //      that `watch_status` shows the stored event WITHOUT it, because the
+    //      agent already holds this exact content. The flagged call-2 envelope
+    //      is the positive control: the flag was there to release.
+    // proves: CLAIM(S1)
+    scenario(|| async {
+        let fixture = Fixture::new().await;
+        let input = fixture.env.input_path("w.log");
+        let (vigil, _) = fixture.faulted(vec![rule(WriteKind::Watch, 28, When::Range { first: 1, last: Some(2) })]);
+        assert_eq!(persist_of(&wire(&vigil.keepalive(by_id(&fixture.id, None)).await.unwrap()))["ok"], false, "precondition: call 1 could not save");
+
+        let delivered = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.unwrap());
+        assert_eq!(delivered["events"], json!([change_event("w", 0, &input, "boom", true)]), "control: the delivered retry is flagged");
+
+        let status = wire(&vigil.status(&fixture.id).await.unwrap().envelope);
+        assert_eq!(status["events"], json!([change_event("w", 0, &input, "boom", false)]), "delivered, so the memory is released");
+    });
+}
