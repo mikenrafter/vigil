@@ -203,6 +203,16 @@ impl Envelope {
     }
 }
 
+/// AI4 (A14): the one-line `clock.summary`, e.g.
+/// `waited 55m 0s this call; watching for 2h 10m; last call 55m ago`.
+/// `waited` and `watching for` use `Ns` / `Mm Ss` / `Hh Mm`; `last call` uses
+/// the same tiers with the seconds dropped from a minute up, and says
+/// `first call` when `since_last_call_s` is `None`.
+pub fn clock_summary(waited_s: u64, watch_age_s: u64, since_last_call_s: Option<u64>) -> String {
+    let _ = (waited_s, watch_age_s, since_last_call_s);
+    String::new() // RED
+}
+
 /// Cut `digest` so the WHOLE result, `DIGEST_CUT_MARKER` included, is at most
 /// `max_bytes` (V27, S27). A digest that already fits is returned untouched
 /// and unmarked. Otherwise keep the newest end on a UTF-8 boundary and append
@@ -252,6 +262,34 @@ mod tests {
             others: vec![],
             persist: None,
             persist_failures: vec![],
+        }
+    }
+
+    #[test]
+    fn the_clock_summary_reproduces_the_spec_example_and_the_tier_boundaries() {
+        // why: AI4 gives one example line: `waited 55m 0s this call; watching
+        //      for 2h 10m; last call 55m ago`. Inputs that make it: waited
+        //      3300 s = 55m 0s; age 7800 s = 2h 10m; since 3300 s = 55m (A14:
+        //      seconds dropped for "last call"). More goldens, each worked by
+        //      hand (A14 tiers: <60 s `Ns`; <3600 s `Mm Ss`; else `Hh Mm`):
+        //        270 s            -> 4m 30s     (the default window)
+        //        45 s             -> 45s
+        //        59 / 60 s        -> 59s / 1m 0s
+        //        3599 / 3600 s    -> 59m 59s / 1h 0m
+        //        since 3 s        -> 3s ago ; 59 -> 59s ago ; 60 -> 1m ago ; 119 -> 1m ago
+        //        since 3660 s     -> 1h 1m ago
+        //        since None       -> first call
+        //      One line only: no newline in any of them.
+        // proves: CLAIM(AI4)
+        assert_eq!(clock_summary(3300, 7800, Some(3300)), "waited 55m 0s this call; watching for 2h 10m; last call 55m ago");
+        assert_eq!(clock_summary(270, 270, None), "waited 4m 30s this call; watching for 4m 30s; first call");
+        assert_eq!(clock_summary(45, 45, Some(3)), "waited 45s this call; watching for 45s; last call 3s ago");
+        assert_eq!(clock_summary(59, 60, Some(59)), "waited 59s this call; watching for 1m 0s; last call 59s ago");
+        assert_eq!(clock_summary(60, 3599, Some(60)), "waited 1m 0s this call; watching for 59m 59s; last call 1m ago");
+        assert_eq!(clock_summary(3599, 3600, Some(119)), "waited 59m 59s this call; watching for 1h 0m; last call 1m ago");
+        assert_eq!(clock_summary(3600, 3600, Some(3660)), "waited 1h 0m this call; watching for 1h 0m; last call 1h 1m ago");
+        for line in [clock_summary(3300, 7800, Some(3300)), clock_summary(0, 0, None)] {
+            assert!(!line.contains('\n'), "{line:?}");
         }
     }
 

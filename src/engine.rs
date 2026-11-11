@@ -109,11 +109,17 @@ pub struct Vigil {
     /// V11: relative inputs resolve against this at `create`.
     pub(crate) cwd: PathBuf,
     pub(crate) session: Mutex<Session>,
+    /// A3: which agent is calling; read from the environment at the binary
+    /// edge and handed over with `with_agent_env`.
+    pub(crate) agent: crate::cache::AgentEnv,
+    /// A9: every credit check goes through this (tests: `ScriptedCreditProbe`).
+    pub(crate) credit_probe: Arc<dyn crate::credit::CreditProbe>,
 }
 
 impl Vigil {
     /// The creating cwd is the process's current directory.
     pub fn new(root: impl Into<PathBuf>, clock: Arc<dyn Clock>, judge: Arc<dyn Judge>, config: Config) -> Vigil {
+        let credit_probe = Arc::new(crate::credit::SystemCreditProbe::from_config(&config));
         Vigil {
             store: Store::new(root),
             clock,
@@ -122,7 +128,22 @@ impl Vigil {
             reader: Arc::new(SystemReader),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             session: Mutex::new(Session::default()),
+            agent: crate::cache::AgentEnv::default(),
+            credit_probe,
         }
+    }
+
+    /// Tell the engine which agent calls it (A3). Default: neither Claude
+    /// nor Codex.
+    pub fn with_agent_env(mut self, agent: crate::cache::AgentEnv) -> Vigil {
+        self.agent = agent;
+        self
+    }
+
+    /// Replace the credit probe (tests: `testing::ScriptedCreditProbe`).
+    pub fn with_credit_probe(mut self, probe: Arc<dyn crate::credit::CreditProbe>) -> Vigil {
+        self.credit_probe = probe;
+        self
     }
 
     /// Override the working directory used to resolve relative inputs (V11).

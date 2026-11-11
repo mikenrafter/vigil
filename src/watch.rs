@@ -217,6 +217,16 @@ pub struct CreateRequest {
     pub judge_questions: Option<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_rule: Option<JudgeRule>,
+    /// AI5: how long the job should take, in seconds (>= 1, A16). RED: not
+    /// yet carried into the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_s: Option<u64>,
+    /// AI5: how long inputs may stay unchanged while a `process` input runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_s: Option<u64>,
+    /// AI1' (A8): store "keepalive calls for this watch are the orchestrator's".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<bool>,
 }
 
 /// The fire rule with its data: judge fields exist only for `Judge`, so an

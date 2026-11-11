@@ -646,6 +646,9 @@ mod tests {
             fire: FireKind::Condition,
             judge_questions: None,
             judge_rule: None,
+            expect_s: None,
+            stall_s: None,
+            orchestrator: None,
         }
     }
 

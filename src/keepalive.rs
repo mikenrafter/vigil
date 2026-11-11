@@ -42,6 +42,11 @@ pub struct KeepaliveRequest {
     pub watch_id: Option<WatchId>,
     #[serde(default)]
     pub max_s: Option<u64>,
+    /// AI1' (A8): this call is the main orchestrator session's, so it gets the
+    /// TTL-derived window. `Some(false)` overrides a flag stored on the watch;
+    /// `None` defers to the stored flag. RED: ignored by the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<bool>,
 }
 
 /// One best-effort progress notification (SPEC delivery path 2, V18).
@@ -434,7 +439,7 @@ impl crate::engine::Vigil {
     /// holds the whole event batch (no streaming, R8/V21).
     pub async fn wait(&self, id: &WatchId) -> Result<Envelope, VigilError> {
         loop {
-            let mut envelope = self.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(MAX_MAX_S) }).await?;
+            let mut envelope = self.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(MAX_MAX_S), orchestrator: None }).await?;
             if envelope.status.is_finished() {
                 envelope.waited_s = None;
                 envelope.max_s = None;
@@ -594,11 +599,11 @@ mod tests {
     }
 
     fn by_id(id: &crate::watch::WatchId, max_s: Option<u64>) -> KeepaliveRequest {
-        KeepaliveRequest { watch_id: Some(id.clone()), max_s }
+        KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator: None }
     }
 
     fn no_id(max_s: Option<u64>) -> KeepaliveRequest {
-        KeepaliveRequest { watch_id: None, max_s }
+        KeepaliveRequest { watch_id: None, max_s, orchestrator: None }
     }
 
     async fn quiet_watch(env: &Env, vigil: &Vigil, id: &str, interval_s: u64, deadline_s: u64) -> (crate::watch::WatchId, std::path::PathBuf) {

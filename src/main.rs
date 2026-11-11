@@ -155,7 +155,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
         Command::Keepalive { id, max_s } => {
-            let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s };
+            let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s, orchestrator: None };
             let envelope = vigil.keepalive(request).await?;
             print_json(&envelope)?;
             warn_about_unsaved(vigil.store().root(), &envelope);

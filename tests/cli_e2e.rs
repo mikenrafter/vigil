@@ -1246,3 +1246,161 @@ fn a_failure_at_the_rename_stage_through_the_binary_keeps_the_old_file_and_still
     assert!(sandbox.tmp_files().is_empty(), "{:?}", sandbox.tmp_files());
 }
 
+
+// ---- auto-interval (specs/auto-interval.md) --------------------------------
+//
+// The sandbox HOME is the only place vigil looks for `~/.claude/projects`, and
+// `VIGIL_UW_COMMAND` points at a fake `uw`, so none of these touches the real
+// transcripts or the real usagewindow. Every watch fires on its first tick, so
+// no test waits out a window; what is checked is the window vigil CHOSE
+// (`max_s`, `cache`), which is reported on the envelope.
+
+const SESSION: &str = "sess-1";
+
+/// A sandbox with a Claude transcript for `SESSION` whose newest write is `1h`
+/// (or `5m` when `one_hour` is false), and a fake `uw` that reports no credits.
+fn auto_sandbox(one_hour: bool) -> (Sandbox, std::path::PathBuf) {
+    use vigil::testing::{assistant_line, write_script, write_transcript};
+    let sandbox = Sandbox::new();
+    let lines = if one_hour { vec![assistant_line(0, 500), assistant_line(900, 0)] } else { vec![assistant_line(900, 0), assistant_line(0, 500)] };
+    write_transcript(&sandbox.home().join(".claude/projects"), "p", SESSION, &lines);
+    let fake_uw = sandbox.dir.path().join("fake-uw");
+    write_script(&fake_uw, "echo '{\"usage\": []}'");
+    (sandbox, fake_uw)
+}
+
+fn create_with(sandbox: &Sandbox, id: &str, extra: serde_json::Value) -> std::process::Output {
+    let input = sandbox.input(&format!("{id}.log"));
+    std::fs::write(&input, "boot\n").unwrap();
+    let mut watch: serde_json::Value = serde_json::from_str(&change_watch_json(id, &input, 1)).unwrap();
+    for (key, value) in extra.as_object().unwrap() {
+        watch[key] = value.clone();
+    }
+    sandbox.run(&["create", &watch.to_string()])
+}
+
+/// `vigil keepalive <id> <args>` after one write to the watch's input, with
+/// extra environment variables, finishing inside 10 s.
+fn fire_and_keepalive(sandbox: &Sandbox, fake_uw: &std::path::Path, id: &str, args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
+    append_once(&sandbox.input(&format!("{id}.log")), "go");
+    let mut command = sandbox.command();
+    command.arg("keepalive").arg(id).args(args).env("VIGIL_UW_COMMAND", fake_uw);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = finish_within(piped(command), Duration::from_secs(10));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    stdout_json(&output)
+}
+
+#[test]
+fn the_cli_orchestrator_flag_on_a_one_hour_cache_chooses_a_3300_s_window() {
+    // why: AI1' + AI3 through the real binary: CLAUDE_CODE_SESSION_ID is read
+    //      from the environment at the edge, the transcript from the sandbox
+    //      HOME (~/.claude/projects/p/sess-1.jsonl, newest write 1h), and the
+    //      window reported on the envelope is 3300 s with its reason. The
+    //      watch fires at once, so the call returns immediately; AI4's clock
+    //      block is there too (first call: since_last_call_s null).
+    // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(AI4)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
+    let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &["--orchestrator"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
+    assert_eq!(envelope["status"], "fired");
+    assert_eq!(envelope["max_s"], 3300);
+    assert_eq!(envelope["cache"]["ttl"], "1h");
+    assert_eq!(envelope["cache"]["source"], "claude-transcript");
+    assert_eq!(envelope["cache"]["interval_s"], 3300);
+    let clock = envelope["clock"].as_object().expect("clock object");
+    let mut names: Vec<&str> = clock.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["since_last_call_s", "summary", "waited_s", "watch_age_s"]);
+    assert!(clock["since_last_call_s"].is_null());
+}
+
+#[test]
+fn without_the_flag_the_cli_window_stays_270_s() {
+    // why: AI1' (Rev 2): same environment, same transcript, no --orchestrator
+    //      -> 270 s and "unknown / default" (vigil did not look). A subagent
+    //      shares CLAUDE_CODE_SESSION_ID, so the flag is the only difference.
+    // proves: CLAIM(AI1'), CLAIM(AI6)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
+    let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &[], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
+    assert_eq!(envelope["max_s"], 270);
+    assert_eq!(envelope["cache"], serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+}
+
+#[test]
+fn an_explicit_max_s_beats_the_flag_and_the_cache() {
+    // why: AI1' "explicit max_s still wins": --max-s 60 --orchestrator on a 1h
+    //      cache -> 60 s, source explicit.
+    // proves: CLAIM(AI1'), CLAIM(AI3)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
+    let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &["--orchestrator", "--max-s", "60"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
+    assert_eq!(envelope["max_s"], 60);
+    assert_eq!(envelope["cache"], serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 60}));
+}
+
+#[test]
+fn a_watch_created_with_orchestrator_true_gets_the_long_window_without_the_flag() {
+    // why: AI1' "the watch can also store it at create", and AI5's new create
+    //      fields must be accepted over the CLI (expect_s, stall_s). The
+    //      keepalive carries no flag.
+    // proves: CLAIM(AI1'), CLAIM(AI5)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    let created = create_with(&sandbox, "w", serde_json::json!({"orchestrator": true, "expect_s": 600, "stall_s": 120}));
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &[], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
+    assert_eq!(envelope["max_s"], 3300);
+    assert_eq!(envelope["cache"]["source"], "claude-transcript");
+}
+
+#[test]
+fn codex_is_recognised_from_the_environment_and_gets_the_codex_default() {
+    // why: AI1' / A3: AGENT=codex (no Claude session id) + --orchestrator ->
+    //      270 s, 5m / codex-default. AGENT=claude, as on the dev machine, is
+    //      not Codex (checked in the same test: it falls to unknown/default).
+    // proves: CLAIM(AI1'), CLAIM(AI3)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
+    let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &["--orchestrator"], &[("AGENT", "codex")]);
+    assert_eq!(envelope["cache"], serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
+
+    assert!(create_with(&sandbox, "v", serde_json::json!({})).status.success());
+    let claude = fire_and_keepalive(&sandbox, &fake_uw, "v", &["--orchestrator"], &[("AGENT", "claude")]);
+    assert_eq!(claude["cache"], serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+}
+
+#[test]
+fn the_cli_wait_final_envelope_has_no_cache_or_clock() {
+    // why: A12: `wait` is the no-ceiling variant and prints no call window, so
+    //      no cache/clock either. Positive control first: a `keepalive` of
+    //      another watch in the same sandbox does carry both.
+    // proves: CLAIM(AI6)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    assert!(create_with(&sandbox, "k", serde_json::json!({})).status.success());
+    let blocking = fire_and_keepalive(&sandbox, &fake_uw, "k", &[], &[]);
+    assert!(blocking.get("cache").is_some() && blocking.get("clock").is_some(), "{blocking}");
+    assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
+    append_once(&sandbox.input("w.log"), "go");
+    let output = finish_within(piped({
+        let mut command = sandbox.command();
+        command.args(["wait", "w"]);
+        command
+    }), Duration::from_secs(10));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "fired");
+    assert!(envelope.get("cache").is_none() && envelope.get("clock").is_none(), "{envelope}");
+}
+
+#[test]
+fn creating_a_watch_with_a_zero_expect_s_fails() {
+    // why: A16 through the CLI: exit status 1 and a message on stderr, nothing
+    //      on stdout. (Engine-level coverage is in auto_interval_tests.)
+    // proves: CLAIM(AI5)
+    let sandbox = Sandbox::new();
+    let output = create_with(&sandbox, "w", serde_json::json!({"expect_s": 0}));
+    assert_eq!(output.status.code(), Some(1), "stdout {:?}", String::from_utf8_lossy(&output.stdout));
+    assert!(!output.stderr.is_empty());
+}

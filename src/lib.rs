@@ -5,8 +5,11 @@
 //! contract the tests compile against; bodies are `todo!()` unless trivial.
 #![allow(dead_code, unused_variables)] // phase 2-3 stubs remain
 
+pub mod attention;
+pub mod cache;
 pub mod clock;
 pub mod config;
+pub mod credit;
 pub mod engine;
 pub mod envelope;
 pub mod error;
@@ -35,5 +38,7 @@ pub use watch::{
     WatchStatus,
 };
 
+#[cfg(test)]
+mod auto_interval_tests;
 #[cfg(test)]
 mod disk_full_tests;

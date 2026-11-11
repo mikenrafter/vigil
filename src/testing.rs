@@ -35,6 +35,11 @@ pub fn default_config() -> Config {
         digest_max_bytes: 8192,
         judge_timeout: Duration::from_secs(10),
         health_timeout: Duration::from_secs(2),
+        claude_projects_dir: None,
+        uw_command: "uw".into(),
+        on_credit_change: None,
+        credit_check_every: Duration::from_secs(240),
+        credit_hook_timeout: Duration::from_secs(10),
     }
 }
 
@@ -623,6 +628,9 @@ pub fn change_request(id: &str, path: &Path, interval_s: u64) -> CreateRequest {
         fire: FireKind::Change,
         judge_questions: None,
         judge_rule: None,
+        expect_s: None,
+        stall_s: None,
+        orchestrator: None,
     }
 }
 
@@ -649,6 +657,149 @@ pub fn judge_request(id: &str, path: &Path, interval_s: u64) -> CreateRequest {
         fire: FireKind::Judge,
         judge_questions: Some(failed_questions()),
         judge_rule: Some(failed_rule()),
+        expect_s: None,
+        stall_s: None,
+        orchestrator: None,
+    }
+}
+
+// ---- auto-interval fixtures (specs/auto-interval.md) ----------------------
+
+/// One assistant record in the shape Claude Code 2.1.301 writes to
+/// `~/.claude/projects/*/<session>.jsonl` (captured 2026-11-11 from a live
+/// session; trimmed to the keys vigil may read). `cache_creation` is the
+/// per-TTL write split; the nested `iterations[]` copy is real and must not
+/// confuse a reader.
+pub fn assistant_line(one_hour_tokens: u64, five_minute_tokens: u64) -> String {
+    let split = serde_json::json!({
+        "ephemeral_1h_input_tokens": one_hour_tokens,
+        "ephemeral_5m_input_tokens": five_minute_tokens,
+    });
+    serde_json::json!({
+        "parentUuid": "00000000-0000-0000-0000-000000000000",
+        "isSidechain": false,
+        "type": "assistant",
+        "timestamp": "2026-11-11T07:00:22.032Z",
+        "message": {
+            "role": "assistant",
+            "model": "claude-sonnet-5-5",
+            "usage": {
+                "input_tokens": 2,
+                "cache_creation_input_tokens": one_hour_tokens + five_minute_tokens,
+                "cache_read_input_tokens": 154199,
+                "output_tokens": 470,
+                "cache_creation": split,
+                "iterations": [{"type": "message", "cache_creation": split}],
+            },
+        },
+    })
+    .to_string()
+}
+
+/// The same record as a subagent turn inside the main file (`isSidechain`).
+pub fn sidechain_line(one_hour_tokens: u64, five_minute_tokens: u64) -> String {
+    let mut record: serde_json::Value = serde_json::from_str(&assistant_line(one_hour_tokens, five_minute_tokens)).unwrap();
+    record["isSidechain"] = serde_json::Value::Bool(true);
+    record.to_string()
+}
+
+/// A user record whose tool result quotes `text` (for example `cat` of a
+/// transcript): a naive substring search finds usage numbers in it.
+pub fn user_line_quoting(text: &str) -> String {
+    serde_json::json!({
+        "isSidechain": false,
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "tool_result", "content": text}]},
+    })
+    .to_string()
+}
+
+/// `<projects>/<project>/<session>.jsonl` with one record per line.
+pub fn write_transcript(projects_dir: &Path, project: &str, session: &str, lines: &[String]) -> std::path::PathBuf {
+    let path = projects_dir.join(project).join(format!("{session}.jsonl"));
+    let mut text = lines.join("\n");
+    if !lines.is_empty() {
+        text.push('\n');
+    }
+    write_file(&path, &text);
+    path
+}
+
+/// `<projects>/<project>/<session>/subagents/<agent>.jsonl`.
+pub fn write_subagent_transcript(projects_dir: &Path, project: &str, session: &str, agent: &str, lines: &[String]) -> std::path::PathBuf {
+    let path = projects_dir.join(project).join(session).join("subagents").join(format!("{agent}.jsonl"));
+    let mut text = lines.join("\n");
+    text.push('\n');
+    write_file(&path, &text);
+    path
+}
+
+/// Make `path` look last-modified `age_s` seconds before the wall-clock
+/// instant `now` (the injected clock), so mtime checks do not depend on the
+/// host clock.
+pub fn set_age(path: &Path, now: Timestamp, age_s: u64) {
+    let seconds = (now.0.timestamp() - age_s as i64).max(0) as u64;
+    let modified = std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(modified).unwrap();
+}
+
+/// An executable `#!/bin/sh` script (a fake `uw`, a hook).
+pub fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    write_file(path, &format!("#!/bin/sh\n{body}\n"));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A credit verdict for `ScriptedCreditProbe`.
+pub fn credit_state(on_credits: bool, source: crate::credit::CreditSource) -> crate::credit::CreditState {
+    // A10: the `uw` source carries its ClaudeCode windows as evidence; the
+    // transcript source has none.
+    let windows = match source {
+        crate::credit::CreditSource::Uw => vec![serde_json::json!({"window": {"Rolling": {"minutes": 10080}}, "exceeded": on_credits})],
+        crate::credit::CreditSource::Transcripts => Vec::new(),
+    };
+    crate::credit::CreditState { on_credits, source, windows }
+}
+
+/// A `CreditProbe` that answers from a script (then a steady verdict) and
+/// records when it was asked, in tokio time (virtual under `start_paused`) and
+/// wall-clock time.
+pub struct ScriptedCreditProbe {
+    script: Mutex<VecDeque<crate::credit::CreditState>>,
+    steady: Mutex<crate::credit::CreditState>,
+    asked: Mutex<Vec<(tokio::time::Instant, Timestamp)>>,
+}
+
+impl ScriptedCreditProbe {
+    /// Always `steady` once the script is used up.
+    pub fn new(steady: crate::credit::CreditState) -> Arc<ScriptedCreditProbe> {
+        Arc::new(ScriptedCreditProbe { script: Mutex::new(VecDeque::new()), steady: Mutex::new(steady), asked: Mutex::new(Vec::new()) })
+    }
+    /// The next unanswered check gets `state`.
+    pub fn push(&self, state: crate::credit::CreditState) {
+        self.script.lock().unwrap().push_back(state);
+    }
+    pub fn set_steady(&self, state: crate::credit::CreditState) {
+        *self.steady.lock().unwrap() = state;
+    }
+    /// How many checks were made.
+    pub fn asked_count(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+    /// Seconds after `start` (tokio time) of each check, in order.
+    pub fn offsets_from(&self, start: tokio::time::Instant) -> Vec<u64> {
+        self.asked.lock().unwrap().iter().map(|(instant, _)| instant.duration_since(start).as_secs()).collect()
+    }
+}
+
+impl crate::credit::CreditProbe for ScriptedCreditProbe {
+    fn check<'a>(&'a self, now: Timestamp) -> BoxFuture<'a, crate::credit::CreditState> {
+        Box::pin(async move {
+            self.asked.lock().unwrap().push((tokio::time::Instant::now(), now));
+            let next = self.script.lock().unwrap().pop_front();
+            next.unwrap_or_else(|| self.steady.lock().unwrap().clone())
+        })
     }
 }
 

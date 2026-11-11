@@ -604,3 +604,115 @@ async fn keepalive_over_mcp_lists_a_secondary_watchs_failed_save_in_persist_fail
     client.cancel().await.unwrap();
 }
 
+
+// ---- auto-interval (specs/auto-interval.md) --------------------------------
+//
+// As in cli_e2e.rs: the sandbox HOME holds the transcript, `VIGIL_UW_COMMAND`
+// is a fake `uw`, and every watch fires on its first tick so no call waits out
+// its window; what is checked is the window vigil chose and reported.
+
+async fn connect_with_env(sandbox: &Sandbox, env: &[(&str, &std::ffi::OsStr)]) -> Client {
+    let transport = TokioChildProcess::new(sandbox.tokio_command().configure(|c| {
+        c.arg("mcp");
+        for (name, value) in env {
+            c.env(name, value);
+        }
+    }))
+    .unwrap();
+    ().serve(transport).await.expect("initialize handshake")
+}
+
+fn transcript_sandbox() -> (Sandbox, std::path::PathBuf) {
+    use vigil::testing::{assistant_line, write_script, write_transcript};
+    let sandbox = Sandbox::new();
+    write_transcript(&sandbox.home().join(".claude/projects"), "p", "sess-1", &[assistant_line(0, 500), assistant_line(900, 0)]);
+    let fake_uw = sandbox.dir.path().join("fake-uw");
+    write_script(&fake_uw, "echo '{\"usage\": []}'");
+    (sandbox, fake_uw)
+}
+
+async fn fired_keepalive(client: &Client, sandbox: &Sandbox, id: &str, extra_create: serde_json::Value, keepalive: serde_json::Value) -> serde_json::Value {
+    let input = sandbox.input(&format!("{id}.log"));
+    std::fs::write(&input, "boot\n").unwrap();
+    let mut create = watch_args(id, &input);
+    for (key, value) in extra_create.as_object().unwrap() {
+        create[key] = value.clone();
+    }
+    let created = call(client.peer(), "watch_create", create).await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    append_line(&input, "go");
+    let result = keepalive_within(client, keepalive).await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    text_json(&result)
+}
+
+#[tokio::test]
+async fn the_mcp_schemas_declare_the_new_fields() {
+    // why: AI1' / AI5: an agent only passes what the schema shows it.
+    //      keepalive gains `orchestrator` (boolean); watch_create gains
+    //      `expect_s`, `stall_s` (integers) and `orchestrator` (boolean).
+    // proves: CLAIM(AI1'), CLAIM(AI5)
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let schema = |name: &str| serde_json::Value::Object((*tools.iter().find(|t| t.name == name).unwrap().input_schema).clone());
+    let keepalive = schema("keepalive");
+    assert!(keepalive["properties"]["orchestrator"].to_string().contains("boolean"), "{keepalive}");
+    let create = schema("watch_create");
+    for field in ["expect_s", "stall_s"] {
+        assert!(create["properties"][field].to_string().contains("integer"), "{field}: {create}");
+    }
+    assert!(create["properties"]["orchestrator"].to_string().contains("boolean"), "{create}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_mcp_orchestrator_call_gets_the_one_hour_window_and_a_plain_call_does_not() {
+    // why: AI1' + AI3 over real stdio MCP, server started with
+    //      CLAUDE_CODE_SESSION_ID=sess-1. `orchestrator: true` -> 3300 s,
+    //      1h / claude-transcript; the same server, same transcript, no flag
+    //      (a second watch) -> 270 s, unknown / default. Also the clock block
+    //      is present on the wire.
+    // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(AI4)
+    let (sandbox, fake_uw) = transcript_sandbox();
+    let client = connect_with_env(&sandbox, &[("CLAUDE_CODE_SESSION_ID", "sess-1".as_ref()), ("VIGIL_UW_COMMAND", fake_uw.as_os_str())]).await;
+    let long = fired_keepalive(&client, &sandbox, "a", serde_json::json!({}), serde_json::json!({"watch_id": "a", "orchestrator": true})).await;
+    assert_eq!(long["max_s"], 3300);
+    assert_eq!(long["cache"], serde_json::json!({"ttl": "1h", "source": "claude-transcript", "interval_s": 3300}));
+    assert!(long["clock"]["summary"].as_str().is_some_and(|line| !line.is_empty() && !line.contains('\n')), "{long}");
+    let plain = fired_keepalive(&client, &sandbox, "b", serde_json::json!({}), serde_json::json!({"watch_id": "b"})).await;
+    assert_eq!(plain["max_s"], 270);
+    assert_eq!(plain["cache"], serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stored_orchestrator_flag_and_an_explicit_max_s_over_mcp() {
+    // why: AI1': `orchestrator: true` stored by watch_create is honoured by a
+    //      bare keepalive (3300 s); an explicit max_s wins over it (max_s 45
+    //      -> 45 s, source explicit).
+    // proves: CLAIM(AI1'), CLAIM(AI3)
+    let (sandbox, fake_uw) = transcript_sandbox();
+    let client = connect_with_env(&sandbox, &[("CLAUDE_CODE_SESSION_ID", "sess-1".as_ref()), ("VIGIL_UW_COMMAND", fake_uw.as_os_str())]).await;
+    let stored = fired_keepalive(&client, &sandbox, "a", serde_json::json!({"orchestrator": true, "expect_s": 600}), serde_json::json!({"watch_id": "a"})).await;
+    assert_eq!(stored["cache"]["interval_s"], 3300);
+    let explicit = fired_keepalive(&client, &sandbox, "b", serde_json::json!({"orchestrator": true}), serde_json::json!({"watch_id": "b", "max_s": 45})).await;
+    assert_eq!(explicit["cache"], serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 45}));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_mcp_server_started_by_codex_never_exceeds_270_s() {
+    // why: AI1' / A2: AGENT=codex -> 5m / codex-default, 270 s, and even an
+    //      explicit max_s of 9999 is clamped to 270 (Codex MCP tool timeout is
+    //      300 s). A Claude session id in the same environment would win (A3),
+    //      so it is absent here.
+    // proves: CLAIM(AI1'), CLAIM(AI3)
+    let (sandbox, fake_uw) = transcript_sandbox();
+    let client = connect_with_env(&sandbox, &[("AGENT", "codex".as_ref()), ("VIGIL_UW_COMMAND", fake_uw.as_os_str())]).await;
+    let derived = fired_keepalive(&client, &sandbox, "a", serde_json::json!({}), serde_json::json!({"watch_id": "a", "orchestrator": true})).await;
+    assert_eq!(derived["cache"], serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
+    let clamped = fired_keepalive(&client, &sandbox, "b", serde_json::json!({}), serde_json::json!({"watch_id": "b", "orchestrator": true, "max_s": 9999})).await;
+    assert_eq!(clamped["max_s"], 270);
+    client.cancel().await.unwrap();
+}
