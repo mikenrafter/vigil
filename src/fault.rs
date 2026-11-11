@@ -329,6 +329,18 @@ impl FaultPlan {
         Ok(FaultPlan::from_rules(rules))
     }
 
+    /// The plan for the value of [`ENV_VAR`] (`None`: not set). Unset and the
+    /// empty string both inject nothing, as an empty `XDG_STATE_HOME` is unset
+    /// (`store::state_root`): `VIGIL_TEST_FAULT= vigil ...` and wrappers that
+    /// export the variable empty must not stop vigil from starting. Any other
+    /// value is parsed, and a malformed one is an error (see [`FaultPlan::parse`]).
+    pub fn from_env_value(value: Option<&str>) -> Result<FaultPlan, String> {
+        match value.filter(|spec| !spec.is_empty()) {
+            Some(spec) => FaultPlan::parse(spec),
+            None => Ok(FaultPlan::none()),
+        }
+    }
+
     /// Start one write attempt of `kind` on `target` and count it. The store
     /// calls this once per attempt, never once per stage.
     pub fn begin(&self, kind: WriteKind, target: &Path) -> Attempt {
@@ -421,6 +433,22 @@ mod tests {
     // through it; if the seam fired at the wrong attempt or stage, those tests
     // would prove nothing (or fail for the wrong reason). Co-located with the
     // seam.
+
+    #[test]
+    fn an_unset_or_empty_environment_value_injects_nothing_and_a_malformed_one_is_refused() {
+        // why: review T8: `VIGIL_TEST_FAULT=""` is "unset", like an empty
+        //      XDG_STATE_HOME; only the empty string and `None` mean "no
+        //      faults". The control rows keep it from becoming "ignore every
+        //      value": a malformed one and a real plan still behave as before.
+        // proves: CLAIM(DF-seam)
+        for value in [None, Some("")] {
+            let plan = FaultPlan::from_env_value(value).unwrap_or_else(|error| panic!("{value:?} must be accepted: {error}"));
+            assert_eq!(run(&plan, WriteKind::Watch, 2), [None, None], "{value:?} injects nothing");
+        }
+        assert!(FaultPlan::from_env_value(Some("this is not a fault plan")).is_err(), "control: malformed is still an error");
+        let plan = FaultPlan::from_env_value(Some("watch:28:all")).unwrap();
+        assert_eq!(run(&plan, WriteKind::Watch, 2), [Some(28), Some(28)], "control: a real plan injects");
+    }
 
     const ALL_STAGES: [Stage; 6] = [Stage::Create, Stage::Write, Stage::ShortWrite, Stage::Sync, Stage::Rename, Stage::Cleanup];
 
