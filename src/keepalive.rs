@@ -17,6 +17,14 @@ use crate::monitor::CreditPlan;
 use crate::tick::{digest_of, is_due, Retained, TickOutcome, TickReport};
 use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId, WatchStatus};
 
+/// CLAIM(S4-outbox): how long a waiting call may sleep before it looks at the
+/// watches' outboxes again. Attention that another process saves (and then
+/// fails to hand over) is found at the next pass; a watch that ticks rarely
+/// has no pass of its own for a long time, so this bounds the wait to 5 s
+/// [review S4; auto_interval_tests::a_waiting_call_returns_attention_that_another_process_saved_but_could_not_deliver].
+/// Each look is one small file read per covered watch.
+pub const OUTBOX_POLL: Duration = Duration::from_secs(5);
+
 pub const MIN_MAX_S: u64 = 30;
 pub const MAX_MAX_S: u64 = 270;
 pub const DEFAULT_MAX_S: u64 = 270;
@@ -408,28 +416,31 @@ impl crate::engine::Vigil {
         let mut ticks_in_call = 0u64;
         let mut first_pass = true;
         let mut credit = plan.orchestrator.then(|| self.credit_plan(plan.window.interval_s));
-        // S6: attention that was raised and saved but never acknowledged is
-        // delivered again at once, ahead of any sensing.
-        for id in covered {
-            let watch = self.load_watch(id)?;
-            if !watch.status.is_finished() {
-                call.carried.extend(watch.events.iter().map(|event| event.event_id.clone()));
-            }
-        }
-        if call.has_events_for_the_agent() {
-            self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
-            return Ok(call);
-        }
         loop {
+            // S6, review S4: attention that was raised and saved but never
+            // acknowledged (the transport died, or another process saved it
+            // while this call waited) is delivered at once, ahead of any
+            // sensing. Looked at on EVERY pass, not only at the start of the
+            // call. Every way this call raises attention ends the call, so
+            // whatever a pending outbox holds at the start of a pass was put
+            // there by someone else and is a repeat.
             // C12: a covered watch that is already terminal (finished before
             // this call, or by another process) is returned before any round
             // is awaited, so a held lock elsewhere cannot hold it back.
-            // ↳ CLAIM(S3-credit): it still owes the orchestrator's due check
+            // ↳ CLAIM(S4-outbox)
+            // ↳ CLAIM(S3-credit): both returns still owe the orchestrator's due check
+            let mut any_terminal = false;
             for id in covered {
-                if self.load_watch(id)?.status.is_finished() {
-                    self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
-                    return Ok(call);
+                let watch = self.load_watch(id)?;
+                if watch.status.is_finished() {
+                    any_terminal = true;
+                } else {
+                    call.carried.extend(watch.events.iter().map(|event| event.event_id.clone()));
                 }
+            }
+            if any_terminal || call.has_events_for_the_agent() {
+                self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
+                return Ok(call);
             }
             let now = self.clock.now();
             let mut round: Vec<&WatchId> = Vec::new();
@@ -545,7 +556,8 @@ impl crate::engine::Vigil {
             let until_wake = next_wake
                 .map(|wake| (wake.0 - self.clock.now().0).to_std().unwrap_or(Duration::ZERO))
                 .unwrap_or(left);
-            tokio::time::sleep(until_wake.min(left)).await;
+            // ↳ CLAIM(S4-outbox): never sleep past the next look at the outboxes
+            tokio::time::sleep(until_wake.min(left).min(OUTBOX_POLL)).await;
         }
     }
 
