@@ -616,7 +616,10 @@ pub struct WatchFile {
     /// AI5: what the ticks saw (see `Activity`); `None` before the first tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Activity>,
-    /// AI4 / A13: when this watch last returned an envelope (pending only).
+    /// AI4 / A13: when this watch last returned an envelope. Only a pending
+    /// watch is updated; `finish` keeps the value, so the envelope that
+    /// reports the terminal result can still say how long it had been since
+    /// the call before (review S7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_call_at: Option<Timestamp>,
 }
@@ -650,6 +653,8 @@ impl WatchFile {
     /// terminal events and flagged `redelivered` [review S6;
     /// auto_interval_tests::attention_that_was_never_delivered_is_still_delivered_when_the_watch_expires
     /// and the two after it; watch::tests::finish_keeps_...].
+    /// CLAIM(S7-clock): `last_call_at` survives too [review S7;
+    /// auto_interval_tests::a_terminal_envelope_reports_the_gap_since_the_last_call].
     pub fn finish(&mut self, terminal: Terminal) -> Result<(), AlreadyFinished> {
         if self.status.is_finished() {
             return Err(AlreadyFinished(self.status));
@@ -661,7 +666,6 @@ impl WatchFile {
         self.events = unacknowledged.chain(terminal.events).collect();
         self.last_digest = terminal.digest;
         self.pending_change = None;
-        self.last_call_at = None;
         Ok(())
     }
     /// V16: a pending watch whose `deadline_at` is at or before `now`.
@@ -1076,6 +1080,21 @@ mod tests {
         let mut control = pending();
         control.finish(terminal(TerminalStatus::Fired, "2026-10-29T14:05:00Z", 3, "done")).unwrap();
         assert_eq!(control.events.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), ["w:3:0"]);
+    }
+
+    #[test]
+    fn finish_keeps_the_time_of_the_last_call() {
+        // why: review S7 at the unit. `finish` used to clear `last_call_at`, so
+        //      the terminal envelope could not say how long it had been since
+        //      the call before. Hand-built: a last call at 14:03:30; every kind
+        //      of finish leaves it exactly as it was.
+        // proves: CLAIM(S7-clock)
+        for status in [TerminalStatus::Fired, TerminalStatus::Expired, TerminalStatus::Cancelled] {
+            let mut file = WatchFile::new(WatchSpec::parse(change_request("w", Path::new("/tmp/x"), 20)).unwrap(), at("2026-10-29T14:03:11Z"));
+            file.last_call_at = Some(at("2026-10-29T14:03:30Z"));
+            file.finish(terminal(status, "2026-10-29T14:05:00Z", 3, "done")).unwrap();
+            assert_eq!(file.last_call_at, Some(at("2026-10-29T14:03:30Z")), "{status:?}");
+        }
     }
 
     #[test]
