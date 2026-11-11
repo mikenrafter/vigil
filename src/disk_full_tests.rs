@@ -1801,3 +1801,136 @@ fn a_retry_that_saved_keeps_its_redelivered_flag_until_the_envelope_is_really_de
         assert_eq!(replay["events"], json!([change_event("w", 0, &input, "boom", true)]), "call 3 replays what call 2 never delivered");
     });
 }
+
+// ---- review round 1 (Sol 6/10): S3 the rescue wait blocked the executor ----
+
+/// Like [`scenario`] but on REAL time: the contended-lock wait of a rescue is
+/// measured against the wall clock and against a task that must keep running
+/// meanwhile, which paused virtual time cannot show (a blocked thread does not
+/// advance it).
+fn real_time_scenario<F>(body: impl FnOnce() -> F + Send + 'static)
+where
+    F: Future<Output = ()>,
+{
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(body());
+        }));
+        let _ = done.send(());
+        if let Err(panic) = run {
+            std::panic::resume_unwind(panic);
+        }
+    });
+    match finished.recv_timeout(WATCHDOG) {
+        Ok(()) => {
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(_) => panic!("no result after {WATCHDOG:?} of real time"),
+    }
+}
+
+/// Three quiet watches "a", "b", "c" on a real-time clock whose saves fail with
+/// ENOSPC once the sentinel exists, a reserve that is present (so every failed
+/// save wants a rescue), and the STORE-WIDE lock held by the test (so every
+/// rescue has to wait for it). The disk is made full after the watches exist.
+async fn watches_whose_rescues_all_wait_for_a_held_store_lock(env: &Env) -> (Vigil, crate::store::StoreLock) {
+    let sentinel = env.dir.path().join("disk-is-full");
+    let vigil = env.another_process().with_write_faults(failing_files_while(&sentinel, &[("a.json", 28), ("b.json", 28), ("c.json", 28)]));
+    for id in ["a", "b", "c"] {
+        probe_watch(env, &vigil, id).await;
+    }
+    assert!(env.root().join(".reserve").exists(), "precondition: a reserve exists, so each failed save asks for a rescue");
+    std::fs::write(&sentinel, "").unwrap();
+    let held = env.vigil.store().lock().unwrap();
+    (vigil, held)
+}
+
+#[test]
+fn rescue_waits_of_different_watches_overlap_and_never_block_the_executor() {
+    // why: review S3: `Store::with_store_lock` slept its backoff with
+    //      `std::thread::sleep` inside the async tick, so while one watch's
+    //      rescue waited (up to min(2 s, budget), DF4e) the thread that polls
+    //      EVERY covered tick was parked: three watches serialised their 2 s
+    //      waits into 6 s and nothing else on the runtime ran. Setup: three
+    //      quiet watches whose saves fail with ENOSPC while the store-wide
+    //      lock is held for the whole call, so each rescue waits its full 2 s
+    //      and gives up (reserve untouched, DF4e). Real time, single-threaded
+    //      runtime. Expected, derived from DF4e and the round being
+    //      concurrent (C1): the three 2 s waits overlap, so the call takes
+    //      about 2 s, not 3 x 2 s = 6 s (bound 4 s, halfway between), and a
+    //      heartbeat task that wakes every 10 ms keeps running through it
+    //      (about 200 beats in 2 s; a parked thread gives 0 or 1; bound 30).
+    //      The envelope is still the answer: pending, `persist` disk_full for
+    //      the watch it describes, no retry (so no `first_error`).
+    // proves: CLAIM(DF4e), CLAIM(DF1)
+    real_time_scenario(|| async {
+        let env = Env::with_clock(Arc::new(TokioClock::new(spec_instant())));
+        let (vigil, _held) = watches_whose_rescues_all_wait_for_a_held_store_lock(&env).await;
+        let reserve_before = identity(&env.root().join(".reserve"));
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat = {
+            let beats = beats.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
+        let elapsed = started.elapsed();
+        heartbeat.abort();
+
+        assert_eq!(envelope["status"], "pending", "{envelope}");
+        assert_eq!(persist_of(&envelope)["ok"], false, "{envelope}");
+        assert_eq!(persist_of(&envelope)["kind"], "disk_full", "{envelope}");
+        assert!(persist_of(&envelope).get("first_error").is_none(), "the rescue timed out, nothing was retried: {envelope}");
+        assert!(elapsed >= Duration::from_millis(1900), "precondition: the rescues really waited for the lock (DF4e: 2 s), took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(4), "the three 2 s waits must overlap (about 2 s), not add up to 6 s: took {elapsed:?}");
+        assert!(beats.load(std::sync::atomic::Ordering::SeqCst) >= 30, "the executor was blocked: {} heartbeats in {elapsed:?}", beats.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "DF4e: a rescue that gave up touched nothing");
+    });
+}
+
+#[test]
+fn a_cancel_during_a_rescue_wait_is_observed_at_once() {
+    // why: review S3: "cancellation must still be observed". The rescue wait
+    //      slept a parked thread, so a `cancel` that completed 200 ms into the
+    //      wait was only noticed after the whole 2 s wait (C2: a cancelled call
+    //      writes nothing and returns nothing). One quiet watch whose save
+    //      fails with ENOSPC, the store-wide lock held, the cancel future
+    //      ready after 200 ms of real time. Expected: `Ok(None)` (cancelled),
+    //      within 1 s (bound: well under the 2 s wait, well over 200 ms), and
+    //      neither the reserve nor the watch file touched. Control: the same
+    //      call without a cancel really waits (the other test in this section
+    //      pins the 2 s).
+    // proves: CLAIM(C2), CLAIM(DF4e)
+    real_time_scenario(|| async {
+        let env = Env::with_clock(Arc::new(TokioClock::new(spec_instant())));
+        let sentinel = env.dir.path().join("disk-is-full");
+        let vigil = env.another_process().with_write_faults(failing_files_while(&sentinel, &[("a.json", 28)]));
+        let id = probe_watch(&env, &vigil, "a").await;
+        assert!(env.root().join(".reserve").exists(), "precondition: a reserve exists");
+        std::fs::write(&sentinel, "").unwrap();
+        let _held = env.vigil.store().lock().unwrap();
+        let (reserve_before, file_before) = (identity(&env.root().join(".reserve")), std::fs::read(env.root().join("watches").join("a.json")).unwrap());
+
+        let started = std::time::Instant::now();
+        let outcome = vigil
+            .keepalive_cancellable(by_id(&id, Some(30)), &crate::keepalive::NoProgress, tokio::time::sleep(Duration::from_millis(200)))
+            .await
+            .expect("cancelling is not an error");
+        let elapsed = started.elapsed();
+
+        assert!(outcome.is_none(), "the call was cancelled while its rescue waited: {outcome:?}");
+        assert!(elapsed < Duration::from_secs(1), "cancellation must interrupt the wait, took {elapsed:?}");
+        assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "nothing was spent");
+        assert_eq!(std::fs::read(env.root().join("watches").join("a.json")).unwrap(), file_before, "nothing was written");
+    });
+}
