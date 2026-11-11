@@ -2683,14 +2683,20 @@ async fn attention_that_was_never_delivered_is_still_delivered_when_the_watch_ex
 #[tokio::test(start_paused = true)]
 async fn attention_that_was_never_delivered_comes_before_the_terminal_event_when_the_watch_fires() {
     // why: review S6, the fire path of the same replacement (`tick` finishes
-    //      the watch). The change is written, 600 s pass so the tick is due,
-    //      and the call returns BOTH events: the attention first (redelivered),
-    //      then the ordinary terminal event, with distinct ids.
+    //      the watch). A call returns carried attention BEFORE it senses, so
+    //      the finish must come from a tick that lands while the outbox is
+    //      still unacknowledged: another process's tick, or a tick that was
+    //      already past the call's outbox inspection. That tick is driven
+    //      directly (`tick_due`) after the change is written and 600 s have
+    //      passed. The next call returns BOTH events: the attention first
+    //      (redelivered), then the ordinary terminal event, with distinct ids.
     // proves: CLAIM(S6), CLAIM(V3)
     let rig = Rig::new();
     let (vigil, id, path, event_id) = watch_with_undelivered_attention(&rig, "w", 7200).await;
     append_file(&path, "boom\n");
     tokio::time::advance(Duration::from_secs(600)).await;
+    let concurrent = rig.vigil(AgentEnv::default(), &quiet_probe());
+    assert_eq!(concurrent.tick_due(&id).await.unwrap(), crate::tick::TickOutcome::Ticked, "the concurrent tick fires the watch");
     let answer = call(&vigil, &id, Some(30), None).await;
     assert_eq!(answer["status"], "fired", "{answer}");
     let events = answer["events"].as_array().unwrap();
