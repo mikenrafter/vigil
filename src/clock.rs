@@ -13,6 +13,15 @@ impl Timestamp {
     pub fn plus_secs(self, secs: u64) -> Timestamp {
         Timestamp(self.0 + chrono::Duration::seconds(secs as i64))
     }
+    /// `self` plus a span with sub-second precision (the credit cadence of a
+    /// test is 200 ms).
+    pub fn plus_duration(self, span: std::time::Duration) -> Timestamp {
+        Timestamp(self.0 + chrono::Duration::from_std(span).unwrap_or(chrono::Duration::MAX))
+    }
+    /// The span from `earlier` to `self`, zero if `self` is earlier.
+    pub fn duration_since(self, earlier: Timestamp) -> std::time::Duration {
+        (self.0 - earlier.0).to_std().unwrap_or_default()
+    }
     pub fn minus_secs(self, secs: u64) -> Timestamp {
         Timestamp(self.0 - chrono::Duration::seconds(secs as i64))
     }

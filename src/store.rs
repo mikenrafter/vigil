@@ -242,6 +242,13 @@ pub struct WatchLock {
     file: File,
 }
 
+/// `<root>/credit.lock`, held (an exclusive `flock`) around a credit probe,
+/// the hook and the commit of `credit-state.json` (S9). Released on drop.
+#[must_use = "the lock is released when this is dropped"]
+pub struct CreditLock {
+    file: File,
+}
+
 /// What a successful [`Store::save`] did beyond writing (specs/disk-full.md
 /// DF4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -387,6 +394,61 @@ impl Store {
     /// `<root>/.reserve`, the ballast a full-disk rescue frees (DF4).
     pub fn reserve_path(&self) -> PathBuf {
         self.root.join(RESERVE_FILE)
+    }
+    /// `<root>/credit.lock` (S9).
+    pub fn credit_lock_path(&self) -> PathBuf {
+        self.root.join(crate::credit::CREDIT_LOCK_FILE)
+    }
+    /// `<root>/credit-state.json` (S2, S9).
+    pub fn credit_state_path(&self) -> PathBuf {
+        self.root.join(crate::credit::CREDIT_STATE_FILE)
+    }
+
+    /// Try the credit lock once. `Ok(None)`: someone holds it. An `Err` (the
+    /// file cannot be made or opened) means the check cannot be serialized, so
+    /// the caller skips it. No rescue: the credit bookkeeping never spends the
+    /// disk-full reserve.
+    pub fn try_lock_credit(&self) -> io::Result<Option<CreditLock>> {
+        let file = self.open_lock_file_once(&self.credit_lock_path())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(CreditLock { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// The recorded credit state (read without the lock to plan a cadence, and
+    /// under it to decide). A missing, torn or foreign-format file reads
+    /// as `None`: the next check is a baseline and rewrites it (S9).
+    pub fn load_credit_state(&self) -> Option<crate::credit::CreditStateFile> {
+        serde_json::from_slice(&std::fs::read(self.credit_state_path()).ok()?).ok()
+    }
+
+    /// Commit the credit state atomically (`<path>.tmp`, fsync, rename), through
+    /// the fault seam (`WriteKind::CreditState`, N4). It takes the lock as a
+    /// witness: a state is only ever written by the lock holder (S9). No
+    /// reserve and no retry: on failure the previous file stays and the hook is
+    /// run again at the next check (N4).
+    pub fn save_credit_state(&self, _held: &CreditLock, state: &crate::credit::CreditStateFile) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(state).map_err(|error| StoreError::Serialize(error.to_string()))?;
+        let path = self.credit_state_path();
+        std::fs::create_dir_all(&self.root).map_err(io_error)?;
+        let attempt = self.faults.begin(WriteKind::CreditState, &path);
+        write_staged(&path, &bytes, &attempt)
+            .map_err(|error| StoreError::write_failed(&error, WriteContext { path: path.clone(), state_root: Some(self.root.clone()), first_error: None }))
+    }
+
+    /// Best-effort save of `watch` for bookkeeping that must never cost the
+    /// call its answer or spend the disk-full reserve (AI4 `last_call_at`,
+    /// S6 acknowledgements): one write attempt through the fault seam, no
+    /// rescue, no upkeep. The caller ignores a failure.
+    pub fn save_quietly(&self, watch: &WatchFile) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec_pretty(watch).map_err(|error| StoreError::Serialize(error.to_string()))?;
+        let path = self.watch_path(&watch.spec.id);
+        std::fs::create_dir_all(self.watches_dir()).map_err(io_error)?;
+        let attempt = self.faults.begin(WriteKind::Watch, &path);
+        write_staged(&path, &bytes, &attempt)
+            .map_err(|error| StoreError::write_failed(&error, WriteContext { path: path.clone(), state_root: Some(self.root.clone()), first_error: None }))
     }
 
     /// Atomic save of one watch (creates `watches/` on demand). On a full disk

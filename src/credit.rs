@@ -7,7 +7,9 @@
 //! writes. A change of state ends the call with a `credit_state_changed`
 //! event and runs an optional operator hook.
 //!
-//! RED phase: every body is a stub returning a neutral value.
+//! Mating parts: `monitor.rs` (the engine side: cadence, lock, state file,
+//! hook, event) and the `testing` doubles `ScriptedCreditProbe` and
+//! `ScriptedHookRunner`.
 //!
 //! Round 2 (specs/auto-interval.md S1-S10): the verdict is tri-state (S5);
 //! the last applied state and check time live in `<root>/credit-state.json`,
@@ -23,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::Timestamp;
 use crate::config::Config;
 use crate::judge::BoxFuture;
+use crate::process::{lead_own_group, GroupGuard};
 
 /// A10: the `uw` call is abandoned (and the transcript fallback used) after this.
 pub const UW_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,6 +69,13 @@ pub struct CreditState {
     pub windows: Vec<serde_json::Value>,
 }
 
+impl CreditState {
+    /// No source could say (S5).
+    pub fn unknown(source: CreditSource) -> CreditState {
+        CreditState { on_credits: None, source, windows: Vec::new() }
+    }
+}
+
 /// The envelope's `cache.credit_check` (AI2'): the newest check of a long call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreditCheck {
@@ -91,7 +101,7 @@ pub struct CreditStateFile {
 /// real I/O (the same reason `InputReader` exists).
 pub trait CreditProbe: Send + Sync {
     /// One check at wall-clock `now`. Infallible: when no source can say, the
-    /// answer is "not on credits" from the transcript source.
+    /// answer is "unknown" (`on_credits: None`, S5) from the transcript source.
     fn check<'a>(&'a self, now: Timestamp) -> BoxFuture<'a, CreditState>;
 
     /// S7: the longest one `check` may take. The engine skips a check when
@@ -122,12 +132,27 @@ impl CreditHookRunner for ProcessHookRunner {
 }
 
 /// S8: the JSON object handed to the hook on stdin: `{on_credits, source, at,
-/// windows}`, serialized at most `MAX_HOOK_STDIN_BYTES` long. When the
-/// evidence does not fit, `windows` is cut to a prefix (order kept); the other
-/// three keys are never dropped.
+/// windows}`, serialized at most `MAX_HOOK_STDIN_BYTES - 1` long (the line the
+/// runner writes ends with a newline, R2-A8). When the evidence does not fit,
+/// `windows` is cut to a prefix (order kept); the other three keys are never
+/// dropped.
 pub fn hook_input(state: &CreditState, at: Timestamp) -> serde_json::Value {
-    let _ = (state, at);
-    serde_json::Value::Null // RED
+    let object = |windows: &[serde_json::Value]| {
+        serde_json::json!({"on_credits": state.on_credits, "source": state.source, "at": at, "windows": windows})
+    };
+    let limit = MAX_HOOK_STDIN_BYTES - 1;
+    let mut size = object(&[]).to_string().len();
+    let mut kept = 0;
+    for window in &state.windows {
+        let comma = usize::from(kept > 0);
+        let added = window.to_string().len() + comma;
+        if size + added > limit {
+            break;
+        }
+        size += added;
+        kept += 1;
+    }
+    object(&state.windows[..kept])
 }
 
 /// `uw --json status`, else recent transcripts (A10).
@@ -150,7 +175,54 @@ impl SystemCreditProbe {
 
 impl CreditProbe for SystemCreditProbe {
     fn check<'a>(&'a self, now: Timestamp) -> BoxFuture<'a, CreditState> {
-        Box::pin(async move { CreditState { on_credits: Some(false), source: CreditSource::Transcripts, windows: Vec::new() } }) // RED
+        Box::pin(async move {
+            match self.ask_uw().await {
+                Some(state) => state,
+                None => match &self.projects_dir {
+                    Some(dir) => transcript_credit_state(dir, now),
+                    None => CreditState::unknown(CreditSource::Transcripts),
+                },
+            }
+        })
+    }
+
+    fn timeout(&self) -> Duration {
+        self.uw_timeout
+    }
+}
+
+impl SystemCreditProbe {
+    /// `uw --json status` in its own process group, read through the byte cap
+    /// (S8) and the timeout (A10). `None`: missing, failed, slow, junk or too
+    /// long, so the transcripts decide. Dropping the future (a cancelled
+    /// call), the timeout and a rejected output all SIGKILL the whole group (S7).
+    async fn ask_uw(&self) -> Option<CreditState> {
+        use tokio::io::AsyncReadExt;
+        let mut command = tokio::process::Command::new(&self.uw_command);
+        command
+            .args(["--json", "status"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        lead_own_group(&mut command);
+        let mut child = command.spawn().ok()?;
+        let mut guard = GroupGuard::of(&child);
+        let mut stdout = child.stdout.take()?;
+        let run = async {
+            // ↳ CLAIM(S8-uw): one byte past the cap proves the output is too long; nothing more is read [spec S8; credit::uw_output_consumption_stops_at_64_kib_plus_one]
+            let mut output = Vec::new();
+            (&mut stdout).take(MAX_UW_OUTPUT_BYTES as u64 + 1).read_to_end(&mut output).await.ok()?;
+            crate::meter::note_read(&self.uw_command, None, output.len() as u64);
+            if output.len() > MAX_UW_OUTPUT_BYTES {
+                return None;
+            }
+            let status = child.wait().await.ok()?;
+            status.success().then_some(output)
+        };
+        let output = tokio::time::timeout(self.uw_timeout, run).await.ok().flatten();
+        guard.kill_now();
+        parse_uw_status(std::str::from_utf8(&output?).ok()?)
     }
 }
 
@@ -159,8 +231,22 @@ impl CreditProbe for SystemCreditProbe {
 /// `exceeded: true` means on credits (`on_credits: Some(..)` always).
 /// `None`: not JSON, or no `usage` array.
 pub fn parse_uw_status(json: &str) -> Option<CreditState> {
-    let _ = json;
-    None // RED
+    let status: serde_json::Value = serde_json::from_str(json).ok()?;
+    let usage = status.get("usage")?.as_array()?;
+    let windows: Vec<serde_json::Value> = usage
+        .iter()
+        .filter(|entry| entry.get("provider").and_then(serde_json::Value::as_str) == Some("ClaudeCode"))
+        .filter_map(|entry| entry.get("windows")?.as_array())
+        .flatten()
+        .map(|window| {
+            serde_json::json!({
+                "window": window.get("window").cloned().unwrap_or(serde_json::Value::Null),
+                "exceeded": window.get("exceeded").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect();
+    let exceeded = windows.iter().any(|window| window["exceeded"] == true);
+    Some(CreditState { on_credits: Some(exceeded), source: CreditSource::Uw, windows })
 }
 
 /// The transcript fallback (A10): any `<projects_dir>/*/*.jsonl` (never
@@ -171,12 +257,37 @@ pub fn parse_uw_status(json: &str) -> Option<CreditState> {
 /// S5: a projects dir that cannot be read at all is `on_credits: None`; a
 /// readable one with no evidence is `Some(false)`.
 pub fn transcript_credit_state(projects_dir: &Path, now: Timestamp) -> CreditState {
-    let _ = (projects_dir, now);
-    CreditState { on_credits: Some(false), source: CreditSource::Transcripts, windows: Vec::new() } // RED
+    if std::fs::read_dir(projects_dir).is_err() {
+        return CreditState::unknown(CreditSource::Transcripts);
+    }
+    let now_s = now.0.timestamp();
+    let mut recent: Vec<(i64, PathBuf)> = Vec::new();
+    for project in crate::cache::regular_subdirectories(projects_dir) {
+        let Ok(entries) = std::fs::read_dir(&project) else { continue };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "jsonl") || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else { continue };
+            let modified_s = modified.duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs() as i64);
+            if now_s - modified_s <= RECENT_TRANSCRIPT_S as i64 {
+                recent.push((modified_s, path));
+            }
+        }
+    }
+    recent.sort_by(|a, b| b.cmp(a));
+    recent.truncate(MAX_FALLBACK_TRANSCRIPTS);
+    let shifted = recent.iter().any(|(_, path)| {
+        let Ok(tail) = crate::cache::read_tail(path, crate::cache::TRANSCRIPT_TAIL_BYTES) else { return false };
+        let mut writes = crate::cache::cache_writes_newest_first(&tail);
+        writes.next() == Some(crate::cache::Ttl::FiveMinutes) && writes.any(|ttl| ttl == crate::cache::Ttl::OneHour)
+    });
+    CreditState { on_credits: Some(shifted), source: CreditSource::Transcripts, windows: Vec::new() }
 }
 
-/// What the hook did (AI8, A11).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What the hook did (AI8, A11). Wire: the event's `hook` object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookOutcome {
     pub command: String,
     /// `None` when the hook timed out or could not be started.
@@ -186,12 +297,71 @@ pub struct HookOutcome {
     pub output: String,
 }
 
+/// Read `stream` to its end but keep only the first `MAX_HOOK_OUTPUT_BYTES`:
+/// the rest is drained so a chatty hook never stalls on a full pipe.
+async fn drain_keeping_first_bytes<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => return kept,
+            Ok(count) => {
+                let room = MAX_HOOK_OUTPUT_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&buffer[..count.min(room)]);
+            }
+        }
+    }
+}
+
 /// Run `sh -c <command>` with `state` as one JSON line on stdin. After
-/// `timeout` the whole process group is killed. Never fails: every problem is
-/// in the outcome.
+/// `timeout` the whole process group is killed, and so it is when the future
+/// is dropped (S7). Never fails: every problem is in the outcome.
 pub async fn run_credit_hook(command: &str, state: &serde_json::Value, timeout: Duration) -> HookOutcome {
-    let _ = (state, timeout);
-    HookOutcome { command: command.to_string(), exit_code: None, timed_out: false, output: String::new() } // RED
+    use tokio::io::AsyncWriteExt;
+    let outcome = |exit_code: Option<i32>, timed_out: bool, output: String| HookOutcome { command: command.to_string(), exit_code, timed_out, output };
+    let mut shell = tokio::process::Command::new("sh");
+    shell
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    lead_own_group(&mut shell);
+    let mut child = match shell.spawn() {
+        Ok(child) => child,
+        Err(error) => return outcome(None, false, format!("cannot run the hook: {error}")),
+    };
+    let mut guard = GroupGuard::of(&child);
+    let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
+        return outcome(None, false, "cannot capture the hook's streams".to_string());
+    };
+    let mut line = state.to_string();
+    line.push('\n');
+    let run = async {
+        let feed = async {
+            // A hook that never reads stdin must not hold the check: the line
+            // is at most 4 KiB, which a pipe takes whole, and errors are ignored.
+            let _ = stdin.write_all(line.as_bytes()).await;
+            drop(stdin);
+        };
+        let ((), out, err, status) = tokio::join!(feed, drain_keeping_first_bytes(&mut stdout), drain_keeping_first_bytes(&mut stderr), child.wait());
+        (status, out, err)
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Ok((status, mut out, err)) => {
+            out.extend_from_slice(&err);
+            let text = String::from_utf8_lossy(&out).into_owned();
+            let exit_code = status.ok().and_then(|status| status.code());
+            outcome(exit_code, false, crate::tick::cap_bytes(&text, MAX_HOOK_OUTPUT_BYTES))
+        }
+        Err(_) => {
+            guard.kill_now();
+            let _ = child.wait().await;
+            outcome(None, true, String::new())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -647,7 +817,7 @@ mod tests {
         let slow = SystemCreditProbe { uw_command: uw, projects_dir: Some(projects.path().to_path_buf()), uw_timeout: Duration::from_secs(30) };
         let mut check = slow.check(spec_instant());
         let pid = tokio::select! {
-            _ = &mut check => { assert!(false, "the check returned before uw could be cancelled"); unreachable!() },
+            _ = &mut check => panic!("the check returned before uw could be cancelled"),
             pid = pid_written_to(&pid_file) => pid.expect("uw was run"),
         };
         drop(check);
@@ -666,7 +836,7 @@ mod tests {
         let state = hook_state();
         let mut run = Box::pin(run_credit_hook(&command, &state, Duration::from_secs(30)));
         let pid = tokio::select! {
-            _ = &mut run => { assert!(false, "the hook returned before it could be cancelled"); unreachable!() },
+            _ = &mut run => panic!("the hook returned before it could be cancelled"),
             pid = pid_written_to(&pid_file) => pid.expect("the hook was run"),
         };
         drop(run);

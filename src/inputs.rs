@@ -11,7 +11,6 @@
 //! group and the whole group is SIGKILLed and reaped on timeout and when the
 //! read future is dropped (V13).
 
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -268,34 +267,7 @@ fn read_glob(label: String, pattern: &str, report: GlobReport, previous: &InputS
 
 // ---- cmd (V12, V13) ----
 
-mod sys {
-    unsafe extern "C" {
-        pub fn setsid() -> i32;
-        pub fn kill(pid: i32, signal: i32) -> i32;
-    }
-    pub const SIGKILL: i32 = 9;
-}
-
-/// SIGKILL a whole process group. Errors (group already gone) are ignored.
-fn kill_group(pgid: i32) {
-    // SAFETY: kill(2) takes plain integers; a negative pid addresses the
-    // group `pgid`, which the child created for itself with setsid.
-    unsafe { sys::kill(-pgid, sys::SIGKILL) };
-}
-
-/// Kills the child's process group when the read future is dropped (V13).
-struct GroupKillOnDrop {
-    pgid: i32,
-    armed: bool,
-}
-
-impl Drop for GroupKillOnDrop {
-    fn drop(&mut self) {
-        if self.armed {
-            kill_group(self.pgid);
-        }
-    }
-}
+use crate::process::{kill_group, lead_own_group, GroupGuard as GroupKillOnDrop};
 
 /// After the group leader exits, wait this long for output still in the pipes
 /// before the rest of the group is killed.
@@ -359,23 +331,14 @@ async fn observe_cmd(argv: &[String], timeout_s: Option<f64>, cwd: Option<&Path>
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
-    // SAFETY: the closure runs between fork and exec and only calls setsid(2),
-    // which is async-signal-safe.
-    unsafe {
-        command.as_std_mut().pre_exec(|| {
-            if sys::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    lead_own_group(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return Observed::error(format!("cannot run {program}: {error}")),
     };
     // The child is its own session and group leader, so pgid == pid.
     let pgid = child.id().and_then(|pid| i32::try_from(pid).ok()).unwrap_or(0);
-    let mut guard = GroupKillOnDrop { pgid, armed: pgid > 0 };
+    let mut guard = GroupKillOnDrop::of(&child);
     let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Observed::error(format!("cannot capture output of {program}"));
     };
@@ -412,7 +375,7 @@ async fn observe_cmd(argv: &[String], timeout_s: Option<f64>, cwd: Option<&Path>
     let finished = tokio::time::timeout(limit, run).await.is_ok();
     // Descendants that outlive the leader or hold the pipes die with the group.
     kill_group(pgid);
-    guard.armed = false;
+    guard.disarm();
     if !finished {
         reap_killed(&mut child);
         return Observed::error(format!("timeout after {}s", limit.as_secs_f64()));
