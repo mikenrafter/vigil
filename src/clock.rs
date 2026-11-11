@@ -10,8 +10,13 @@ use serde::{Deserialize, Serialize};
 pub struct Timestamp(pub DateTime<Utc>);
 
 impl Timestamp {
+    /// `self` plus `secs`. CLAIM(S8-overflow): total. A span that does not fit
+    /// (a limit near `u64::MAX` read from a hand-edited file) saturates at the
+    /// latest representable instant, i.e. "never", instead of panicking or
+    /// wrapping to a negative span [review S8; attention::tests::limits_at_the_edge_of_u64_never_fire_and_never_panic].
     pub fn plus_secs(self, secs: u64) -> Timestamp {
-        Timestamp(self.0 + chrono::Duration::seconds(secs as i64))
+        let span = i64::try_from(secs).ok().and_then(chrono::Duration::try_seconds);
+        Timestamp(span.and_then(|span| self.0.checked_add_signed(span)).unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC))
     }
     /// `self` plus a span with sub-second precision (the credit cadence of a
     /// test is 200 ms).
@@ -22,8 +27,11 @@ impl Timestamp {
     pub fn duration_since(self, earlier: Timestamp) -> std::time::Duration {
         (self.0 - earlier.0).to_std().unwrap_or_default()
     }
+    /// `self` minus `secs`; total like [`Timestamp::plus_secs`] (saturates at
+    /// the earliest representable instant).
     pub fn minus_secs(self, secs: u64) -> Timestamp {
-        Timestamp(self.0 - chrono::Duration::seconds(secs as i64))
+        let span = i64::try_from(secs).ok().and_then(chrono::Duration::try_seconds);
+        Timestamp(span.and_then(|span| self.0.checked_sub_signed(span)).unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC))
     }
     /// Whole seconds from `earlier` to `self` (negative if `self` is earlier).
     pub fn secs_since(self, earlier: Timestamp) -> i64 {

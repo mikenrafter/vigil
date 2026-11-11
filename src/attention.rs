@@ -84,7 +84,8 @@ pub fn due_reasons(watch: &WatchFile, now: Timestamp, long_window: bool) -> Vec<
         };
         if let Some((stall_s, since)) = rule
             && activity.process_running
-            && now.secs_since(since) >= stall_s as i64
+            // ↳ CLAIM(S8-overflow): compared as unsigned seconds, so a huge limit is never reached and a clock that went backwards is no quiet time
+            && u64::try_from(now.secs_since(since)).is_ok_and(|quiet| quiet >= stall_s)
         {
             due.push(AttentionReason::Stalled);
         }

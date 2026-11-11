@@ -340,6 +340,10 @@ impl WatchSpec {
             if value == Some(0) {
                 return Err(CreateError::BelowOneSecond { field });
             }
+            // ↳ CLAIM(S8-overflow): refused here, and the arithmetic is total anyway
+            if let Some(value) = value.filter(|value| *value > MAX_DEADLINE_S) {
+                return Err(CreateError::AboveLongestWatch { field, max: MAX_DEADLINE_S, value });
+            }
         }
         let interval_s = request.interval_s.unwrap_or(DEFAULT_INTERVAL_S).clamp(MIN_INTERVAL_S, MAX_INTERVAL_S);
         for input in &request.inputs {

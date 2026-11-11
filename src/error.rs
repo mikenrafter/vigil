@@ -58,6 +58,11 @@ pub enum CreateError {
     /// would raise attention on the very first tick.
     #[error("{field} must be at least 1 second")]
     BelowOneSecond { field: &'static str },
+    /// AI5, review S8: `expect_s` and `stall_s` are at most `MAX_DEADLINE_S`
+    /// (604800): no watch lives longer, so a larger limit could never fire, and
+    /// values near `u64::MAX` overflow the time arithmetic.
+    #[error("{field} must be at most {max} seconds (the longest a watch can run), got {value}")]
+    AboveLongestWatch { field: &'static str, max: u64, value: u64 },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
