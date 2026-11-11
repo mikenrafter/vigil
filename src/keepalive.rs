@@ -127,6 +127,16 @@ impl CallRecord {
         self.saves.values().any(|record| matches!(record.persisted, Persisted::NotSaved(_)))
     }
 
+    /// The shortest `interval_s` among the covered watches whose save failed
+    /// (the pace of the hold, DF1a); `None` when every save worked.
+    fn shortest_unsaved_interval(&self) -> Option<u64> {
+        self.saves
+            .values()
+            .filter(|record| matches!(record.persisted, Persisted::NotSaved(_)))
+            .map(|record| record.watch.spec.interval_s)
+            .min()
+    }
+
     /// The in-memory watch of a covered watch whose save failed: the call
     /// answers from it, the file on disk is the previous one.
     fn unsaved_watch(&self, id: &WatchId) -> Option<&WatchFile> {
@@ -262,6 +272,12 @@ impl crate::engine::Vigil {
         let covered = self.covered_ids(request.watch_id.as_ref())?;
         let finish = async {
             let call = self.sense(&covered, budget_end, progress).await?;
+            let answer = self.keepalive_envelope(&covered, &call, started.elapsed().as_secs(), max_s)?;
+            // ↳ CLAIM(DF1a-hold): the one pacing for MCP, CLI keepalive and `wait` [spec DF1a revised, review T1; disk_full_tests a_quiet_tick_that_cannot_save_is_held_for_one_interval_and_not_ticked_again, mcp::tests the_mcp_call_is_held_one_interval_after_a_quiet_failed_save_and_a_cancel_ends_the_hold]
+            let Some(hold) = self.hold_after_unsaved_quiet_tick(&answer.0, &call, budget_end) else { return Ok(answer) };
+            tokio::time::sleep(hold).await;
+            // The watch may have passed its deadline while the call slept: the
+            // envelope describes it as it is now (V3), still without ticking.
             self.keepalive_envelope(&covered, &call, started.elapsed().as_secs(), max_s)
         };
         tokio::select! {
@@ -272,8 +288,9 @@ impl crate::engine::Vigil {
     }
 
     /// The blocking part of a call: tick covered watches until one finishes,
-    /// one cannot be saved (DF1a: the call ends at once with its answer rather
-    /// than ticking a full disk in a loop), or the budget ends. Returns what the
+    /// one cannot be saved (DF1a: the call stops sensing and answers rather
+    /// than ticking a full disk in a loop; a quiet answer is then held one
+    /// interval by the caller), or the budget ends. Returns what the
     /// call learned (V14, DF1).
     ///
     /// Each round ticks every due covered watch CONCURRENTLY inside the shared
@@ -387,6 +404,25 @@ impl crate::engine::Vigil {
         }
     }
 
+    /// DF1a (revised, review T1): how long to hold a call whose answer is
+    /// pending (no events, no terminal status) while a save failed in it. A
+    /// failed save leaves the watch due again at once, so a call that simply
+    /// returned would let an agent on a disk that stays full call back to back.
+    /// The hold is `min(interval, budget left)`, where the interval is the
+    /// shortest of the watches that could not be saved (the cadence a healthy
+    /// call would tick at), it does NOT tick again, and it runs inside the
+    /// cancellable call. `None`: return at once (nothing failed, or the
+    /// envelope has events or a terminal status the agent must act on, or no
+    /// budget is left).
+    fn hold_after_unsaved_quiet_tick(&self, envelope: &Envelope, call: &CallRecord, budget_end: Instant) -> Option<Duration> {
+        if envelope.status.is_finished() || !envelope.events.is_empty() {
+            return None;
+        }
+        let interval = call.shortest_unsaved_interval()?;
+        let hold = Duration::from_secs(interval).min(budget_end.saturating_duration_since(Instant::now()));
+        (!hold.is_zero()).then_some(hold)
+    }
+
     /// X4: true when the budget left is below the watch's tick reserve.
     fn reserve_blocks(&self, watch: &WatchFile, budget_end: Instant) -> bool {
         let reserve = tick_reserve(&watch.spec.inputs, matches!(watch.spec.fire, FireRule::Judge { .. }), self.config.judge_timeout);
@@ -404,13 +440,10 @@ impl crate::engine::Vigil {
                 envelope.max_s = None;
                 return Ok(envelope);
             }
-            if envelope.save_failed() {
-                // DF1a: a failed save ended that call at once and left the watch
-                // due again, so calling again now would spin on a full disk.
-                // One interval is the cadence a healthy `wait` ticks at.
-                let interval = self.load_watch(id)?.spec.interval_s;
-                tokio::time::sleep(Duration::from_secs(interval)).await;
-            }
+            // DF1a: a pending envelope whose save failed was already held one
+            // interval inside the call (`hold_after_unsaved_quiet_tick`), so
+            // calling again now does not spin on a full disk and `wait` adds
+            // no sleep of its own (that would tick every two intervals).
         }
     }
 

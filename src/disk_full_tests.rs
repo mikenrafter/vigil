@@ -1760,8 +1760,13 @@ fn a_file_redelivers_every_append_since_the_saved_baseline_up_to_the_64_kib_capt
 /// One quiet `cmd` watch `id` (interval 20 s, deadline 3600 s) whose probe
 /// `probe-<id>` answers `ok`, created by `vigil`.
 async fn probe_watch(env: &Env, vigil: &Vigil, id: &str) -> WatchId {
+    probe_watch_every(env, vigil, id, 20).await
+}
+
+/// `probe_watch` with its own interval.
+async fn probe_watch_every(env: &Env, vigil: &Vigil, id: &str, interval_s: u64) -> WatchId {
     env.reader.set_text(&format!("cmd:probe-{id}"), "ok");
-    let mut request = change_request(id, Path::new("/unused"), 20);
+    let mut request = change_request(id, Path::new("/unused"), interval_s);
     request.inputs = vec![crate::watch::Input::Cmd { argv: vec![format!("probe-{id}")], timeout_s: Some(1.0), cwd: None }];
     vigil.create(request).await.unwrap().watch_id
 }
@@ -1968,8 +1973,10 @@ where
 async fn watches_whose_rescues_all_wait_for_a_held_store_lock(env: &Env) -> (Vigil, crate::store::StoreLock) {
     let sentinel = env.dir.path().join("disk-is-full");
     let vigil = env.another_process().with_write_faults(failing_files_while(&sentinel, &[("a.json", 28), ("b.json", 28), ("c.json", 28)]));
+    // Interval 1 s (the minimum): this test runs on REAL time, and the call
+    // ends with the DF1a hold of one interval, which would be 20 s here.
     for id in ["a", "b", "c"] {
-        probe_watch(env, &vigil, id).await;
+        probe_watch_every(env, &vigil, id, 1).await;
     }
     assert!(env.root().join(".reserve").exists(), "precondition: a reserve exists, so each failed save asks for a rescue");
     std::fs::write(&sentinel, "").unwrap();
@@ -1989,7 +1996,8 @@ fn rescue_waits_of_different_watches_overlap_and_never_block_the_executor() {
     //      and gives up (reserve untouched, DF4e). Real time, single-threaded
     //      runtime. Expected, derived from DF4e and the round being
     //      concurrent (C1): the three 2 s waits overlap, so the call takes
-    //      about 2 s, not 3 x 2 s = 6 s (bound 4 s, halfway between), and a
+    //      about 2 s plus the 1 s DF1a hold (interval 1 s) = 3 s, not
+    //      3 x 2 s + 1 s = 7 s (bound 5 s, halfway between), and a
     //      heartbeat task that wakes every 10 ms keeps running through it
     //      (about 200 beats in 2 s; a parked thread gives 0 or 1; bound 30).
     //      The envelope is still the answer: pending, `persist` disk_full for
@@ -2027,7 +2035,7 @@ fn rescue_waits_of_different_watches_overlap_and_never_block_the_executor() {
         assert!(failure.get("first_error").is_none(), "the rescue timed out, nothing was retried: {envelope}");
         assert_ne!(failure.get("ok"), Some(&json!(true)), "{envelope}");
         assert!(elapsed >= Duration::from_millis(1900), "precondition: the rescues really waited for the lock (DF4e: 2 s), took {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(4), "the three 2 s waits must overlap (about 2 s), not add up to 6 s: took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "the three 2 s waits must overlap (about 2 s + the 1 s hold), not add up to 6 s + 1 s: took {elapsed:?}");
         assert!(beats.load(std::sync::atomic::Ordering::SeqCst) >= 30, "the executor was blocked: {} heartbeats in {elapsed:?}", beats.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "DF4e: a rescue that gave up touched nothing");
     });

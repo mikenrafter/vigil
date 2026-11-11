@@ -392,12 +392,12 @@ mod tests {
         let env = Env::with_clock(std::sync::Arc::new(TokioClock::new(spec_instant())));
         let path = env.input_path("w.log");
         write_file(&path, "old\n");
-        env.vigil.create(change_request("w", &path, 20)).await.unwrap();
+        let id = env.vigil.create(change_request("w", &path, 20)).await.unwrap().watch_id;
         let plan = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 28, When::Every), FaultRule::new(WriteKind::Reserve, 28, When::Every)]);
         let vigil = env.another_process().with_write_faults(plan);
 
         let started = tokio::time::Instant::now();
-        let envelope = run_keepalive(&vigil, KeepaliveRequest { watch_id: None, max_s: Some(30) }, std::future::pending::<()>(), |_update| std::future::ready(()))
+        let envelope = run_keepalive(&vigil, KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30) }, std::future::pending::<()>(), |_update| std::future::ready(()))
             .await
             .unwrap()
             .expect("not cancelled");
@@ -408,7 +408,7 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let cancel = async { tokio::time::sleep(std::time::Duration::from_secs(5)).await };
-        let cancelled = run_keepalive(&vigil, KeepaliveRequest { watch_id: None, max_s: Some(30) }, cancel, |_update| std::future::ready(())).await.unwrap();
+        let cancelled = run_keepalive(&vigil, KeepaliveRequest { watch_id: Some(id), max_s: Some(30) }, cancel, |_update| std::future::ready(())).await.unwrap();
         assert!(cancelled.is_none(), "the cancel ended the hold");
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
     }
