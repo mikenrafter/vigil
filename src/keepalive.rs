@@ -312,6 +312,7 @@ impl crate::engine::Vigil {
             });
             // C12: once a covered watch has a terminal result the round stops
             // waiting for unfinished ticks (they write nothing, C5).
+            // ↳ CLAIM(DF1a): so does a tick whose save failed, the moment it is absorbed: the other ticks of the round may be waiting on a lock held elsewhere, and the call must not wait for them [spec DF1a, review S1; disk_full_tests a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held]
             for_each_completed(ticks, |(id, outcome)| -> Result<bool, VigilError> {
                 let Ok(report) = outcome else { return Ok(false) };
                 let report = report?;
@@ -319,6 +320,7 @@ impl crate::engine::Vigil {
                 // The watch as the tick left it: saved or not, this is the truth.
                 let after = report.after.as_ref().map(|watch| (watch.tick, watch.status.is_finished()));
                 call.absorb(id, report);
+                let unsaved = call.any_unsaved();
                 if outcome == TickOutcome::Ticked {
                     ticks_in_call += 1;
                     let (tick, finished) = match after {
@@ -329,9 +331,9 @@ impl crate::engine::Vigil {
                         }
                     };
                     progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick });
-                    return Ok(finished);
+                    return Ok(finished || unsaved);
                 }
-                Ok(matches!(outcome, TickOutcome::Finished(_)))
+                Ok(matches!(outcome, TickOutcome::Finished(_)) || unsaved)
             })
             .await?;
             first_pass = false;
