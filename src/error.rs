@@ -1,6 +1,10 @@
 //! Error types. One enum per failure domain so callers can handle each case
 //! without reading bodies.
 
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
 use crate::watch::WatchId;
 
 /// Why `watch_create` refused a request (SPEC "watch_create").
@@ -54,21 +58,124 @@ pub enum CreateError {
     Store(#[from] StoreError),
 }
 
+/// What a person can do about a failed write (specs/disk-full.md DF2): free
+/// space (`DiskFull`: ENOSPC or EDQUOT) or look at the disk (`Io`: anything
+/// else). The wire names are `disk_full` and `io`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    DiskFull,
+    Io,
+}
+
+impl FailureKind {
+    /// How a person reads the kind: the start of a message.
+    pub fn label(self) -> &'static str {
+        match self {
+            FailureKind::DiskFull => "disk full",
+            FailureKind::Io => "io error",
+        }
+    }
+
+    /// CLAIM(DF2): `disk_full` is exactly ENOSPC (28) and EDQUOT (122) [spec
+    /// DF2; store tests `the_failed_save_is_described_in_persist_...`]. Linux
+    /// numbers; vigil is Linux only (flock, /proc).
+    pub fn of(error: &std::io::Error) -> FailureKind {
+        match error.raw_os_error() {
+            Some(28 | 122) => FailureKind::DiskFull,
+            _ => FailureKind::Io,
+        }
+    }
+}
+
+/// Where a failed write was aimed, so its message and the envelope's
+/// `persist` note can name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteContext {
+    /// The file that could not be written (a watch file, or a lock file).
+    pub path: PathBuf,
+    /// The state root (DF5b: the message names it); `None` for a bare
+    /// `write_atomic` that knows no root.
+    pub state_root: Option<PathBuf>,
+    /// DF3, S4: the first attempt's OS text when a retry was made and failed
+    /// too (then the failure is the retry's).
+    pub first_error: Option<String>,
+}
+
+/// An I/O failure. `write` is set when the failure is that of a write the
+/// store was asked to make; reads leave it `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoFailure {
+    /// The OS error text, e.g. `No space left on device (os error 28)`.
+    pub os_error: String,
+    pub write: Option<WriteContext>,
+}
+
+impl IoFailure {
+    /// `<what>: <where>: <OS text>`; `what` is `disk full` or `io error`
+    /// (DF5b: lowercase `disk full`, and the state root).
+    fn describe(&self, what: &str) -> String {
+        match &self.write {
+            None => format!("{what}: {}", self.os_error),
+            Some(write) => match &write.state_root {
+                Some(root) => format!("{what}: cannot write {} (state root {}): {}", write.path.display(), root.display(), self.os_error),
+                None => format!("{what}: cannot write {}: {}", write.path.display(), self.os_error),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
     #[error("watch {0} not found")]
     NotFound(String),
-    #[error("io error: {0}")]
-    Io(String),
-    /// ENOSPC or EDQUOT (specs/disk-full.md DF2, DF5). RED STUB: nothing
-    /// constructs it yet. The text names the state root and says the disk is
-    /// full.
-    #[error("disk full: {0}")]
-    DiskFull(String),
+    #[error("{}", .0.describe(FailureKind::Io.label()))]
+    Io(IoFailure),
+    /// ENOSPC or EDQUOT (specs/disk-full.md DF2, DF5).
+    #[error("{}", .0.describe(FailureKind::DiskFull.label()))]
+    DiskFull(IoFailure),
     #[error("serialization error: {0}")]
     Serialize(String),
     #[error("corrupt watch file: {0}")]
     Corrupt(String),
+}
+
+impl StoreError {
+    /// A failed read or other non-write I/O.
+    pub fn io(error: std::io::Error) -> StoreError {
+        StoreError::Io(IoFailure { os_error: error.to_string(), write: None })
+    }
+
+    /// A failed write, classified by its errno (DF2).
+    pub fn write_failed(error: std::io::Error, context: WriteContext) -> StoreError {
+        let failure = IoFailure { os_error: error.to_string(), write: Some(context) };
+        match FailureKind::of(&error) {
+            FailureKind::DiskFull => StoreError::DiskFull(failure),
+            FailureKind::Io => StoreError::Io(failure),
+        }
+    }
+
+    /// The failure of a write the store was asked to make, with what the
+    /// envelope's `persist` note needs; `None` for every other error (a read,
+    /// a missing watch, a corrupt file, a value that cannot be serialized).
+    pub fn write_failure(&self) -> Option<WriteFailure<'_>> {
+        let (kind, failure) = match self {
+            StoreError::DiskFull(failure) => (FailureKind::DiskFull, failure),
+            StoreError::Io(failure) => (FailureKind::Io, failure),
+            _ => return None,
+        };
+        let context = failure.write.as_ref()?;
+        Some(WriteFailure { kind, os_error: &failure.os_error, path: &context.path, first_error: context.first_error.as_deref() })
+    }
+}
+
+/// A borrowed view of a failed write, for building the `persist` note.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteFailure<'a> {
+    pub kind: FailureKind,
+    pub os_error: &'a str,
+    pub path: &'a std::path::Path,
+    pub first_error: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

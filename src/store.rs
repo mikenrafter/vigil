@@ -1,18 +1,64 @@
 //! Watch files under `<root>/watches/`, atomic writes, the per-watch locks
-//! under `<root>/locks/`, the short global namespace lock, pruning (X3).
+//! under `<root>/locks/`, the short store-wide namespace lock, the reserve that
+//! lets a write survive a full disk, pruning (X3).
+//!
+//! # Surviving a full disk (specs/disk-full.md DF4-DF6)
+//!
+//! Every write the store makes (a watch file, a lock file, the reserve itself)
+//! goes through one path. A write that fails with ENOSPC or EDQUOT while a
+//! `<root>/.reserve` exists is rescued: under the STORE-WIDE lock the reserve is
+//! deleted and the same write is tried once more. Everything else is a plain
+//! failure that is reported, never retried.
+//!
+//! * The reserve is 256 KiB of real zeros, fsynced. It is valid only if it is a
+//!   regular file of exactly that length with that much allocated (DF4b).
+//!   It is (re)created after any successful write when it is not valid
+//!   (best effort: a failure here is never an error), and never kept open.
+//! * Reserve upkeep, deletion and the retry run under the store-wide lock
+//!   (`<root>/lock`) so two processes cannot both spend or both re-make it
+//!   (DF4c). A caller that already holds that lock passes it in
+//!   ([`Store::save_under`]); nobody waits for themselves.
+//! * The lock FILE is made before any reserve is published, and a rescue needs
+//!   it: a missing store-wide lock file that cannot be created allows no rescue
+//!   and publishes no reserve (DF4d).
+//! * A rescue waits for the store-wide lock at most `min(2 s, the caller's
+//!   remaining call budget)`; after that it reports the first failure and
+//!   touches nothing (DF4e).
+//! * The rename of `<path>.tmp` over `<path>` is the commit point: before it the
+//!   old file is intact; a failed attempt removes its own `.tmp` (best effort,
+//!   and the write's error, not the cleanup's, is the one reported: N3). A
+//!   leftover `.tmp` is overwritten by that watch's next write; other `.tmp`
+//!   files are never swept (another process may be mid-write).
+//!
+//! Mating parts: `fault.rs` (the test seam every stage asks), `engine.rs` and
+//! `tick.rs` (turn a failed save into the envelope's `persist` note).
 
 use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::clock::Timestamp;
-use crate::error::StoreError;
-use crate::fault::FaultPlan;
+use crate::error::{StoreError, WriteContext};
+use crate::fault::{Attempt, FaultPlan, Stage, WriteKind};
 use crate::watch::{WatchFile, WatchId};
 
 /// Finished watches are deleted this long after they finish (D4).
 pub const PRUNE_AFTER_SECS: u64 = 7 * 24 * 3600;
+
+/// DF4/D1: the reserve is 256 KiB.
+pub const RESERVE_BYTES: u64 = 256 * 1024;
+const RESERVE_FILE: &str = ".reserve";
+
+/// DF4e: the longest a rescue waits for the store-wide lock.
+pub const RESCUE_LOCK_WAIT: Duration = Duration::from_secs(2);
+/// How long reserve upkeep after a healthy write waits for the store-wide lock
+/// before leaving the reserve for the next write. Short on purpose: upkeep must
+/// never slow a healthy tick down.
+const UPKEEP_LOCK_WAIT: Duration = Duration::from_millis(250);
+const LOCK_POLL: Duration = Duration::from_millis(2);
 
 /// `$XDG_STATE_HOME/vigil`, else `$HOME/.local/state/vigil`. An empty
 /// variable counts as unset (XDG Base Directory spec). `None` if neither.
@@ -27,39 +73,59 @@ pub fn state_root(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<Pa
     }
 }
 
-fn io_error(error: std::io::Error) -> StoreError {
-    StoreError::Io(error.to_string())
+fn io_error(error: io::Error) -> StoreError {
+    StoreError::io(error)
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Serialize `value` to JSON, write `<path>.tmp` beside it, fsync, rename over
 /// `path`. On any failure `path` keeps its previous content and no `.tmp`
-/// remains. (SPEC "State": writes are atomic.)
+/// remains. (SPEC "State": writes are atomic.) No reserve, no retry, no fault
+/// seam: that is [`Store::save`]. A full disk is still named as such.
 pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
-    use std::io::Write;
     // Serialize first: a failing value never creates a `.tmp`.
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| StoreError::Serialize(error.to_string()))?;
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    let written = (|| {
-        let mut file = File::create(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io_error(error));
-    }
-    Ok(())
+    let attempt = FaultPlan::none().begin(WriteKind::Watch, path);
+    write_staged(path, &bytes, &attempt)
+        .map_err(|error| StoreError::write_failed(error, WriteContext { path: path.to_path_buf(), state_root: None, first_error: None }))
 }
 
-/// Which lock file a [`StoreLock`] guards; decides whether X8 applies.
-fn open_lock_file(path: &Path) -> Result<File, StoreError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(io_error)?;
+/// One attempt at an atomic write, stage by stage (the seam asks `attempt` at
+/// each stage, see `fault.rs`). `Err` is the failing stage's own error; a
+/// failed cleanup of the `.tmp` never replaces it (N3).
+fn write_staged(path: &Path, bytes: &[u8], attempt: &Attempt) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = tmp_path(path);
+    attempt.at(Stage::Create)?;
+    let mut file = File::create(&tmp)?;
+    let written = (|| {
+        attempt.at(Stage::Write)?;
+        if let Err(injected) = attempt.at(Stage::ShortWrite) {
+            // A strict, non-empty prefix: the first half of the bytes.
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            return Err(injected);
+        }
+        file.write_all(bytes)?;
+        attempt.at(Stage::Sync)?;
+        file.sync_all()?;
+        // ↳ CLAIM(DF6): the rename is the commit point; every earlier failure leaves the old file whole [spec S4; store test a_failure_at_any_write_stage_keeps_the_old_file_and_leaves_no_tmp]
+        attempt.at(Stage::Rename)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        drop(file);
+        // Best effort: a `.tmp` that cannot be removed is overwritten by this
+        // watch's next write, and is not what the caller needs to hear about.
+        if attempt.at(Stage::Cleanup).is_ok() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
-    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).map_err(io_error)
+    written
 }
 
 /// X8: is the locked descriptor still the file the path names? False if the
@@ -73,29 +139,58 @@ fn is_same_file(file: &File, path: &Path) -> bool {
     }
 }
 
-/// Exclusive `flock`, released on drop. Two kinds (X3, superseding the
-/// single-lock rule of V4/V5):
+/// The STORE-WIDE exclusive `flock` on `<root>/lock`, released on drop. Held
+/// only for short namespace operations (reserving an id at create, prune,
+/// reserve upkeep and the full-disk rescue), NEVER during sensing (X3).
 ///
-/// * per-watch, `<root>/locks/<id>.lock`: held across a tick's sensing and
-///   write and across cancel (and across create's baseline reads);
-/// * global, `<root>/lock`: held only for short namespace operations
-///   (reserving an id at create, prune), NEVER during sensing.
-///
-/// Lock order is watch lock first, then global lock. Lock files are created
-/// on demand and are never deleted while their watch file exists (deleting
-/// one would let a waiter hold the old inode while another process locks a
-/// new one); prune deletes a lock file only after deleting its watch file.
+/// Lock order is watch lock first, then this lock. Lock files are created on
+/// demand and are never deleted while their watch file exists (deleting one
+/// would let a waiter hold the old inode while another process locks a new
+/// one); prune deletes a watch's lock file only after deleting its watch file,
+/// and never this one.
+#[must_use = "the lock is released when this is dropped"]
 pub struct StoreLock {
     file: File,
 }
 
+/// A per-watch exclusive `flock` on `<root>/locks/<id>.lock`, held across a
+/// tick's sensing and write and across cancel (X3). A different type from
+/// [`StoreLock`] so that code which needs "the store-wide lock is held"
+/// ([`Store::save_under`]) cannot be handed a watch lock by mistake.
+#[must_use = "the lock is released when this is dropped"]
+pub struct WatchLock {
+    file: File,
+}
+
 /// What a successful [`Store::save`] did beyond writing (specs/disk-full.md
-/// DF4). RED STUB: always the default.
+/// DF4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WriteOutcome {
     /// The first attempt hit a full disk, the reserve was deleted, and the
     /// retry succeeded.
     pub used_reserve: bool,
+}
+
+/// How a rescue or reserve upkeep gets the store-wide lock.
+#[derive(Clone, Copy)]
+enum StoreLockAccess<'held> {
+    /// The caller holds it: reuse, never wait for it again.
+    Held(&'held StoreLock),
+    /// Take it, waiting at most this long (DF4e).
+    Wait(Duration),
+}
+
+/// A write that failed even after the rescue: the error to report (the retry's
+/// when there was one) and, if a retry was made, the first attempt's text.
+struct WriteFailed {
+    error: io::Error,
+    first_error: Option<String>,
+}
+
+impl WriteFailed {
+    fn into_store_error(self, path: PathBuf, state_root: &Path) -> StoreError {
+        StoreError::write_failed(self.error, WriteContext { path, state_root: Some(state_root.to_path_buf()), first_error: self.first_error })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +221,7 @@ impl Store {
     pub fn watch_path(&self, id: &WatchId) -> PathBuf {
         self.watches_dir().join(format!("{}.json", id.as_str()))
     }
-    /// `<root>/lock`, the global namespace lock file (X3).
+    /// `<root>/lock`, the store-wide namespace lock file (X3).
     pub fn lock_path(&self) -> PathBuf {
         self.root.join("lock")
     }
@@ -138,22 +233,184 @@ impl Store {
     pub fn watch_lock_path(&self, id: &WatchId) -> PathBuf {
         self.locks_dir().join(format!("{}.lock", id.as_str()))
     }
-    /// Atomic save of one watch (creates `watches/` on demand).
+    /// `<root>/.reserve`, the ballast a full-disk rescue frees (DF4).
+    pub fn reserve_path(&self) -> PathBuf {
+        self.root.join(RESERVE_FILE)
+    }
+
+    /// Atomic save of one watch (creates `watches/` on demand). On a full disk
+    /// it frees the reserve and retries once (DF4); a rescue waits for the
+    /// store-wide lock at most [`RESCUE_LOCK_WAIT`]. The error of a write that
+    /// still fails is `DiskFull` (naming the state root) or `Io`.
     pub fn save(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
-        std::fs::create_dir_all(self.watches_dir()).map_err(io_error)?;
-        write_atomic(&self.watch_path(&watch.spec.id), watch)?;
-        Ok(WriteOutcome::default())
+        self.save_with(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT))
     }
-    /// `save` for a caller inside a call budget (specs/disk-full.md DF4e): a
-    /// rescue waits for the store-wide lock at most `min(2 s, budget_left)`.
-    /// RED STUB: delegates to `save`.
-    pub fn save_within(&self, watch: &WatchFile, budget_left: std::time::Duration) -> Result<WriteOutcome, StoreError> {
-        let _ = budget_left;
-        self.save(watch)
+
+    /// `save` for a caller inside a call budget (DF4e): a rescue waits for the
+    /// store-wide lock at most `min(2 s, budget_left)`; with nothing left it
+    /// does not wait at all.
+    pub fn save_within(&self, watch: &WatchFile, budget_left: Duration) -> Result<WriteOutcome, StoreError> {
+        self.save_with(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT)))
     }
+
+    /// `save` for a caller that already holds the store-wide lock (`create`
+    /// writes its placeholder under it): the rescue reuses `held` instead of
+    /// waiting for a lock its own process owns (DF4c).
+    pub fn save_under(&self, watch: &WatchFile, held: &StoreLock) -> Result<WriteOutcome, StoreError> {
+        self.save_with(watch, StoreLockAccess::Held(held))
+    }
+
+    fn save_with(&self, watch: &WatchFile, access: StoreLockAccess<'_>) -> Result<WriteOutcome, StoreError> {
+        let bytes = serde_json::to_vec_pretty(watch).map_err(|error| StoreError::Serialize(error.to_string()))?;
+        let path = self.watch_path(&watch.spec.id);
+        let attempt = || -> io::Result<()> {
+            std::fs::create_dir_all(self.watches_dir())?;
+            write_staged(&path, &bytes, &self.faults.begin(WriteKind::Watch, &path))
+        };
+        match self.attempt_with_rescue(access, attempt) {
+            Ok(((), spent_reserve)) => {
+                if !spent_reserve {
+                    self.upkeep_reserve(access);
+                }
+                Ok(WriteOutcome { used_reserve: spent_reserve })
+            }
+            Err(failed) => Err(failed.into_store_error(path, &self.root)),
+        }
+    }
+
+    /// Run `attempt`; if it fails with a full disk and a reserve exists, free
+    /// the reserve under the store-wide lock and run it once more (DF4).
+    /// `Ok((value, true))` means the retry succeeded on the reserve's space.
+    ///
+    /// Without a reserve file (DF4a), without the store-wide lock in time
+    /// (DF4e) or without a lock file to take (DF4d) nothing is touched and the
+    /// first error is returned. A failed retry returns the retry's error with
+    /// the first one's text (S4).
+    fn attempt_with_rescue<T>(&self, access: StoreLockAccess<'_>, mut attempt: impl FnMut() -> io::Result<T>) -> Result<(T, bool), WriteFailed> {
+        let first = match attempt() {
+            Ok(value) => return Ok((value, false)),
+            Err(error) => error,
+        };
+        if crate::error::FailureKind::of(&first) != crate::error::FailureKind::DiskFull || !self.reserve_present() {
+            return Err(WriteFailed { error: first, first_error: None });
+        }
+        // ↳ CLAIM(DF4c): delete + retry (+ upkeep after it) happen under the store-wide lock, so two processes never both spend the one reserve [spec S3; store tests two_rescues_*]
+        let rescued = self.with_store_lock(access, || {
+            // The reserve may have been spent by whoever held the lock before
+            // us: then there is nothing to free and no retry (DF4a).
+            if !self.reserve_present() {
+                return None;
+            }
+            // Deleting is best effort (DF4): a reserve that cannot be deleted
+            // does not turn the retry into an error.
+            let _ = std::fs::remove_file(self.reserve_path());
+            let retried = attempt();
+            if retried.is_ok() {
+                // A5: a successful retry is a successful write.
+                self.fill_reserve_under_lock();
+            }
+            Some(retried)
+        });
+        match rescued.flatten() {
+            None => Err(WriteFailed { error: first, first_error: None }),
+            Some(Ok(value)) => Ok((value, true)),
+            Some(Err(retry)) => Err(WriteFailed { error: retry, first_error: Some(first.to_string()) }),
+        }
+    }
+
+    /// Run `run` with the store-wide lock held, waiting for it as `access`
+    /// says. `None` when the lock could not be had in time, or its file does
+    /// not exist and cannot be made (DF4d): `run` did not run.
+    fn with_store_lock<T>(&self, access: StoreLockAccess<'_>, run: impl FnOnce() -> T) -> Option<T> {
+        let patience = match access {
+            StoreLockAccess::Held(_) => return Some(run()),
+            StoreLockAccess::Wait(patience) => patience,
+        };
+        // DF4d: the lock file is made first, once, with no rescue of its own (a
+        // rescue needs this lock, and the file is exactly what is missing).
+        let file = self.open_lock_file_once(&self.lock_path()).ok()?;
+        let end = Instant::now() + patience;
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    let _guard = StoreLock { file };
+                    return Some(run());
+                }
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < end => std::thread::sleep(LOCK_POLL),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn reserve_present(&self) -> bool {
+        std::fs::symlink_metadata(self.reserve_path()).is_ok()
+    }
+
+    /// DF4b, written from the spec: a regular file (not a symlink) of exactly
+    /// 262144 bytes with at least that much allocated, so a sparse stand-in
+    /// does not count.
+    fn reserve_is_valid(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(self.reserve_path()) {
+            Ok(metadata) => metadata.file_type().is_file() && metadata.len() == RESERVE_BYTES && metadata.blocks() * 512 >= RESERVE_BYTES,
+            Err(_) => false,
+        }
+    }
+
+    /// After a healthy write: make the reserve if it is not valid. Best effort
+    /// and quiet. The valid case costs one `stat`.
+    fn upkeep_reserve(&self, access: StoreLockAccess<'_>) {
+        if self.reserve_is_valid() {
+            return;
+        }
+        let access = match access {
+            StoreLockAccess::Wait(_) => StoreLockAccess::Wait(UPKEEP_LOCK_WAIT),
+            held => held,
+        };
+        // ↳ CLAIM(DF4d): `with_store_lock` makes the lock file before the reserve is published [spec N1; store test a_reserve_is_published_only_after_the_store_wide_lock_file_exists]
+        let _ = self.with_store_lock(access, || self.fill_reserve_under_lock());
+    }
+
+    /// Replace an invalid reserve with a valid one, under the store-wide lock.
+    /// Real zeros, fsynced, written in place (`create_new`: never through a
+    /// symlink); a half-written file is removed again. Best effort: any failure
+    /// leaves the next healthy write to try again.
+    fn fill_reserve_under_lock(&self) {
+        use std::io::Write;
+        if self.reserve_is_valid() {
+            return;
+        }
+        let path = self.reserve_path();
+        if self.reserve_present() && std::fs::remove_file(&path).is_err() {
+            return;
+        }
+        let attempt = self.faults.begin(WriteKind::Reserve, &path);
+        let zeros = [0u8; 64 * 1024];
+        let write_zeros = |file: &mut File, count: u64| -> io::Result<()> {
+            let mut left = count;
+            while left > 0 {
+                let chunk = left.min(zeros.len() as u64) as usize;
+                file.write_all(&zeros[..chunk])?;
+                left -= chunk as u64;
+            }
+            Ok(())
+        };
+        let written = (|| {
+            attempt.at(Stage::Create)?;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+            write_zeros(&mut file, RESERVE_BYTES / 2)?;
+            attempt.at(Stage::ShortWrite)?;
+            write_zeros(&mut file, RESERVE_BYTES - RESERVE_BYTES / 2)?;
+            file.sync_all()
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     pub fn load(&self, id: &WatchId) -> Result<WatchFile, StoreError> {
         let bytes = std::fs::read(self.watch_path(id)).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => StoreError::NotFound(id.as_str().to_string()),
+            io::ErrorKind::NotFound => StoreError::NotFound(id.as_str().to_string()),
             _ => io_error(error),
         })?;
         serde_json::from_slice(&bytes).map_err(|error| StoreError::Corrupt(format!("{id}: {error}")))
@@ -162,7 +419,7 @@ impl Store {
     pub fn list(&self) -> Result<Vec<WatchFile>, StoreError> {
         let entries = match std::fs::read_dir(self.watches_dir()) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(io_error(error)),
         };
         let mut watches: Vec<WatchFile> = entries
@@ -174,16 +431,39 @@ impl Store {
         watches.sort_by(|a: &WatchFile, b| a.spec.id.cmp(&b.spec.id));
         Ok(watches)
     }
-    /// Block until the GLOBAL exclusive lock is held (creates the lock file
+
+    /// Open (creating on demand) a lock file, once, with no rescue. Opening an
+    /// existing file needs no disk space and is not a write attempt for the
+    /// seam; creating one is (`WriteKind::Lock`).
+    fn open_lock_file_once(&self, path: &Path) -> io::Result<File> {
+        if !path.exists() {
+            self.faults.begin(WriteKind::Lock, path).at(Stage::Create)?;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)
+    }
+
+    /// `open_lock_file_once` through the same reserve-and-retry path as every
+    /// other write (DF5).
+    fn open_lock_file(&self, path: &Path) -> Result<File, StoreError> {
+        match self.attempt_with_rescue(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path)) {
+            Ok((file, _spent_reserve)) => Ok(file),
+            Err(failed) => Err(failed.into_store_error(path.to_path_buf(), &self.root)),
+        }
+    }
+
+    /// Block until the STORE-WIDE exclusive lock is held (creates the lock file
     /// and the root on demand). Short namespace operations only (X3).
     pub fn lock(&self) -> Result<StoreLock, StoreError> {
-        let file = open_lock_file(&self.lock_path())?;
+        let file = self.open_lock_file(&self.lock_path())?;
         file.lock().map_err(io_error)?;
         Ok(StoreLock { file })
     }
-    /// `Ok(None)` if another holder has the global lock.
+    /// `Ok(None)` if another holder has the store-wide lock.
     pub fn try_lock(&self) -> Result<Option<StoreLock>, StoreError> {
-        let file = open_lock_file(&self.lock_path())?;
+        let file = self.open_lock_file(&self.lock_path())?;
         match file.try_lock() {
             Ok(()) => Ok(Some(StoreLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -193,38 +473,38 @@ impl Store {
     /// `try_lock`, retried until `end`: a lock released a moment ago can look
     /// held while a forked child that has not yet exec'd still shares its open
     /// file description. `Ok(None)` once `end` has passed and it is still held.
-    fn try_lock_until(&self, end: std::time::Instant) -> Result<Option<StoreLock>, StoreError> {
+    fn try_lock_until(&self, end: Instant) -> Result<Option<StoreLock>, StoreError> {
         loop {
             if let Some(lock) = self.try_lock()? {
                 return Ok(Some(lock));
             }
-            if std::time::Instant::now() >= end {
+            if Instant::now() >= end {
                 return Ok(None);
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
     /// Block until the exclusive lock of watch `id` is held (creates
-    /// `locks/` and `locks/<id>.lock` on demand). Independent of the global
-    /// lock and of every other watch's lock (X3).
-    pub fn lock_watch(&self, id: &WatchId) -> Result<StoreLock, StoreError> {
+    /// `locks/` and `locks/<id>.lock` on demand). Independent of the
+    /// store-wide lock and of every other watch's lock (X3).
+    pub fn lock_watch(&self, id: &WatchId) -> Result<WatchLock, StoreError> {
         let path = self.watch_lock_path(id);
         loop {
-            let file = open_lock_file(&path)?;
+            let file = self.open_lock_file(&path)?;
             file.lock().map_err(io_error)?;
             if is_same_file(&file, &path) {
-                return Ok(StoreLock { file });
+                return Ok(WatchLock { file });
             }
             // X8: the lock file was replaced while we waited; lock the new one.
         }
     }
     /// `Ok(None)` if another holder has watch `id`'s lock.
-    pub fn try_lock_watch(&self, id: &WatchId) -> Result<Option<StoreLock>, StoreError> {
+    pub fn try_lock_watch(&self, id: &WatchId) -> Result<Option<WatchLock>, StoreError> {
         let path = self.watch_lock_path(id);
         loop {
-            let file = open_lock_file(&path)?;
+            let file = self.open_lock_file(&path)?;
             match file.try_lock() {
-                Ok(()) if is_same_file(&file, &path) => return Ok(Some(StoreLock { file })),
+                Ok(()) if is_same_file(&file, &path) => return Ok(Some(WatchLock { file })),
                 Ok(()) => continue, // X8: replaced under us; try the new file.
                 Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
                 Err(std::fs::TryLockError::Error(error)) => return Err(io_error(error)),
@@ -236,27 +516,27 @@ impl Store {
     /// it is `deadline_at` (V16); a pending watch whose deadline is still in
     /// the future is never deleted. X3: prune takes the locks itself (the
     /// caller must hold none of them): per candidate, its watch lock, then
-    /// the global lock, re-checks the candidate under both, deletes the watch
-    /// file, THEN that watch's lock file, and releases. A candidate whose
+    /// the store-wide lock, re-checks the candidate under both, deletes the
+    /// watch file, THEN that watch's lock file, and releases. A candidate whose
     /// watch lock is held by someone else is skipped or waited for (either is
-    /// allowed) but never deleted while held. A busy global lock also skips
+    /// allowed) but never deleted while held. A busy store-wide lock also skips
     /// the candidate (C10): prune only try-locks, so housekeeping never
-    /// blocks the command that runs it. The global lock file is never
+    /// blocks the command that runs it. The store-wide lock file is never
     /// deleted. Returns the deleted ids.
     pub fn prune(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
         let mut deleted = Vec::new();
-        let patience_ends = std::time::Instant::now() + PRUNE_LOCK_PATIENCE;
+        let patience_ends = Instant::now() + PRUNE_LOCK_PATIENCE;
         for candidate in self.list()? {
             if !is_prunable(&candidate, now) {
                 continue;
             }
             let id = candidate.spec.id;
-            // Lock order: watch lock, then global lock. A busy watch (a tick
+            // Lock order: watch lock, then store-wide lock. A busy watch (a tick
             // or cancel in flight) is skipped, never waited for.
             let Some(_watch_lock) = self.try_lock_watch(&id)? else {
                 continue;
             };
-            // Housekeeping never blocks (C10): a busy global lock means
+            // Housekeeping never blocks (C10): a busy store-wide lock means
             // someone is reserving an id; leave this candidate for the next run.
             let Some(_global_lock) = self.try_lock_until(patience_ends)? else {
                 continue;
@@ -274,9 +554,9 @@ impl Store {
     }
 }
 
-/// How long one `prune` call waits, in total, for a busy global lock before it
-/// skips the candidates it cannot lock (C10).
-const PRUNE_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long one `prune` call waits, in total, for a busy store-wide lock before
+/// it skips the candidates it cannot lock (C10).
+const PRUNE_LOCK_PATIENCE: Duration = Duration::from_millis(250);
 
 /// D4/V16: a finished watch, or a pending one past its deadline, is prunable
 /// once its finish time (`finished_at`, else `deadline_at`) is 7 days old.
@@ -293,7 +573,7 @@ fn is_prunable(watch: &WatchFile, now: Timestamp) -> bool {
 
 fn remove_if_present(path: &Path) -> Result<(), StoreError> {
     match std::fs::remove_file(path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_error(error)),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(io_error(error)),
         _ => Ok(()),
     }
 }

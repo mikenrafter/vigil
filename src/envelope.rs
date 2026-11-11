@@ -1,8 +1,11 @@
 //! The envelope returned to the agent on every `keepalive` return.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Timestamp;
+use crate::error::{FailureKind, WriteFailure};
 use crate::watch::{Event, JudgeStatus, WatchId, WatchStatus};
 
 /// Appended to a digest that was cut to `VIGIL_DIGEST_MAX_BYTES`.
@@ -35,6 +38,130 @@ pub struct OtherWatch {
     pub event_ids: Vec<String>,
 }
 
+/// A write that did not happen (specs/disk-full.md DF2): what this call's
+/// answer could not persist. The envelope itself is still complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistFailure {
+    pub kind: FailureKind,
+    /// The OS text, e.g. `No space left on device (os error 28)`.
+    pub error: String,
+    /// The file that could not be written.
+    pub path: PathBuf,
+    /// S4: the first attempt's OS text when a retry was made and failed too
+    /// (`error` is then the retry's). Present even when both texts match.
+    pub first_error: Option<String>,
+}
+
+impl From<WriteFailure<'_>> for PersistFailure {
+    fn from(failure: WriteFailure<'_>) -> PersistFailure {
+        PersistFailure {
+            kind: failure.kind,
+            error: failure.os_error.to_string(),
+            path: failure.path.to_path_buf(),
+            first_error: failure.first_error.map(str::to_string),
+        }
+    }
+}
+
+/// The envelope's `persist` field (DF2, DF3a, DF4). Absent when the save went
+/// through without the reserve, so the wire format of a healthy call is
+/// unchanged.
+///
+/// Wire shapes (the `ok`/`kind` pair is what an agent branches on):
+///
+/// * `{"ok": true, "used_reserve": true, "kind": "disk_full"}` - the save worked
+///   on the reserve's space; the disk is full.
+/// * `{"ok": false, "kind": "disk_full" | "io", "error", "path"}` plus
+///   `"first_error"` when a retry failed too and `"redelivery": true` when
+///   something is at risk - the save failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "PersistWire", try_from = "PersistWire")]
+pub enum PersistNote {
+    /// DF4: the reserve was spent and the retry saved the tick.
+    ReserveSpent,
+    /// DF1/DF2: the tick is answered but not saved.
+    NotSaved {
+        failure: PersistFailure,
+        /// DF3a: the envelope has events, or a terminal status (fired, expired,
+        /// cancelled) that was not saved, so the same result may come again.
+        redelivery: bool,
+    },
+}
+
+/// The wire form of [`PersistNote`]: one flat object, converted at the edge so
+/// the Rust type cannot hold a state the wire cannot express (an `ok: true`
+/// with an `error`).
+#[derive(Serialize, Deserialize)]
+struct PersistWire {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    used_reserve: Option<bool>,
+    kind: FailureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redelivery: Option<bool>,
+}
+
+impl From<PersistNote> for PersistWire {
+    fn from(note: PersistNote) -> PersistWire {
+        match note {
+            PersistNote::ReserveSpent => PersistWire {
+                ok: true,
+                used_reserve: Some(true),
+                kind: FailureKind::DiskFull,
+                error: None,
+                path: None,
+                first_error: None,
+                redelivery: None,
+            },
+            PersistNote::NotSaved { failure, redelivery } => PersistWire {
+                ok: false,
+                used_reserve: None,
+                kind: failure.kind,
+                error: Some(failure.error),
+                path: Some(failure.path),
+                first_error: failure.first_error,
+                redelivery: redelivery.then_some(true),
+            },
+        }
+    }
+}
+
+impl TryFrom<PersistWire> for PersistNote {
+    type Error = String;
+
+    fn try_from(wire: PersistWire) -> Result<PersistNote, String> {
+        if wire.ok {
+            return match (wire.used_reserve, wire.kind) {
+                (Some(true), FailureKind::DiskFull) => Ok(PersistNote::ReserveSpent),
+                _ => Err("persist.ok = true must say used_reserve = true and kind = disk_full".to_string()),
+            };
+        }
+        let (Some(error), Some(path)) = (wire.error, wire.path) else {
+            return Err("persist.ok = false needs `error` and `path`".to_string());
+        };
+        Ok(PersistNote::NotSaved {
+            failure: PersistFailure { kind: wire.kind, error, path, first_error: wire.first_error },
+            redelivery: wire.redelivery.unwrap_or(false),
+        })
+    }
+}
+
+/// S5 / DF2a: a covered watch other than the one the envelope describes whose
+/// save failed in this call. Exactly these four keys on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryFailure {
+    pub watch_id: WatchId,
+    pub kind: FailureKind,
+    pub error: String,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     /// V8: the watch every watch field below describes.
@@ -59,6 +186,21 @@ pub struct Envelope {
     /// absent from the wire otherwise (a quiet envelope stays small).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<OtherWatch>,
+    /// DF2, DF4: how this call's save went, when it did not simply work. Absent
+    /// from the wire on a healthy call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<PersistNote>,
+    /// S5: every other covered watch whose save failed in this call; absent
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persist_failures: Vec<SecondaryFailure>,
+}
+
+impl Envelope {
+    /// Did the save behind this envelope fail (`persist.ok = false`)?
+    pub fn save_failed(&self) -> bool {
+        matches!(self.persist, Some(PersistNote::NotSaved { .. }))
+    }
 }
 
 /// Cut `digest` so the WHOLE result, `DIGEST_CUT_MARKER` included, is at most
@@ -108,6 +250,8 @@ mod tests {
             judge_status: JudgeStatus::Skipped,
             next: Next::CallKeepaliveAgain,
             others: vec![],
+            persist: None,
+            persist_failures: vec![],
         }
     }
 

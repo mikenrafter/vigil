@@ -454,6 +454,12 @@ pub struct Event {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge: Option<BTreeMap<String, Answer>>,
+    /// S1: true on every event of a tick that follows a failed save in this
+    /// process, so the agent does not deduplicate by `event_id` (the tick
+    /// number did not advance, so an id can repeat with other content). Set
+    /// only on the copy placed in an envelope; a stored event never has it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redelivered: bool,
 }
 
 impl Event {
@@ -874,6 +880,7 @@ mod tests {
                 input: "file:/tmp/x".into(),
                 summary: summary.into(),
                 judge: None,
+                redelivered: false,
             }],
             digest: summary.into(),
         }

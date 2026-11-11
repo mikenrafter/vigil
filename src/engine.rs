@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Timestamp};
 use crate::config::Config;
-use crate::envelope::{cut_digest, Envelope, Next};
+use crate::envelope::{cut_digest, Envelope, Next, PersistFailure, PersistNote};
 use crate::error::{CreateError, StoreError, VigilError};
 use crate::inputs::{InputReader, Reading, SystemReader};
 use crate::judge::Judge;
-use crate::store::{Store, StoreLock};
+use crate::store::{Store, StoreLock, WatchLock};
 use crate::watch::{
     CreateRequest, FireRule, Input, InputState, Terminal, TerminalStatus, WatchFile, WatchId, WatchSpec, WatchStatus,
 };
@@ -57,6 +57,35 @@ pub(crate) struct Session {
     /// no-id `keepalive` stops covering them.
     pub returned: BTreeSet<WatchId>,
     pub session_ticks: u64,
+    /// Watches whose most recent save in THIS process failed (S1). A tick of
+    /// one of them follows a failed save, so its events are redeliveries. A
+    /// fresh process cannot know, which is why the flag is a process fact.
+    pub unsaved: BTreeSet<WatchId>,
+}
+
+/// How one save of a watch file went, for a caller that must not fail because
+/// the disk is full (DF1): the answer it holds is still good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Persisted {
+    /// Written; nothing to report (also: nothing needed writing).
+    Saved,
+    /// Written, but only after the reserve was spent (DF4): the disk is full.
+    SavedOnReserve,
+    /// Not written (DF2): the in-memory watch is the truth of this call, the
+    /// file on disk is the previous one (DF6).
+    NotSaved(PersistFailure),
+}
+
+impl Persisted {
+    /// The envelope note for this save. `redelivery` (DF3a): is anything at
+    /// risk, i.e. does the envelope carry events or a terminal status?
+    pub(crate) fn note(&self, redelivery: bool) -> Option<PersistNote> {
+        match self {
+            Persisted::Saved => None,
+            Persisted::SavedOnReserve => Some(PersistNote::ReserveSpent),
+            Persisted::NotSaved(failure) => Some(PersistNote::NotSaved { failure: failure.clone(), redelivery }),
+        }
+    }
 }
 
 pub struct Vigil {
@@ -134,17 +163,26 @@ impl Vigil {
         {
             // X3: the global lock only covers the id check and the placeholder
             // write that reserves the id; the baseline is read after it is gone.
-            let _global = self.lock_global().await?;
+            let global = self.lock_global().await?;
             if self.store.watch_path(&id).exists() {
                 return Err(CreateError::DuplicateId(id.to_string()).into());
             }
-            self.store.save(&watch)?;
+            // DF4c: this save may need the store-wide lock for a rescue; it is
+            // held right here, so the save reuses it instead of waiting for
+            // itself.
+            self.store.save_under(&watch, &global)?;
         }
         // V1: the baseline of every input is recorded now, not at the first tick.
         let baseline = vec![InputState::default(); watch.spec.inputs.len()];
         let readings = self.read_all(&watch.spec.inputs, &baseline).await;
         watch.input_states = readings.into_iter().map(|reading| reading.state).collect();
-        self.store.save(&watch)?;
+        if let Err(error) = self.store.save(&watch) {
+            // DF7: the placeholder reserved the id, and a create that fails
+            // must not burn it. Deleting works on a full disk. Best effort: a
+            // placeholder that stays is the pre-DF7 behaviour, not a new loss.
+            let _ = std::fs::remove_file(self.store.watch_path(&id));
+            return Err(error.into());
+        }
 
         self.session.lock().expect("session mutex poisoned").created.insert(id.clone());
         Ok(Created {
@@ -190,10 +228,13 @@ impl Vigil {
     pub async fn cancel(&self, id: &WatchId) -> Result<Envelope, VigilError> {
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
+        // DF5a: a cancel that cannot be saved is still answered; the envelope
+        // says so, never a silent success. Nothing needed writing: `Saved`.
+        let mut persisted = Persisted::Saved;
         if watch.is_overdue(now) {
             // W5: the deadline passed before the cancel arrived; expiry wins.
             watch = expired_if_overdue(watch, now);
-            self.store.save(&watch)?;
+            persisted = self.persist(&watch, None)?;
         } else if !watch.status.is_finished() {
             let terminal = Terminal {
                 status: TerminalStatus::Cancelled,
@@ -202,9 +243,45 @@ impl Vigil {
                 digest: watch.last_digest.clone(),
             };
             watch.finish(terminal).expect("a pending watch accepts its terminal result");
-            self.store.save(&watch)?;
+            persisted = self.persist(&watch, None)?;
         }
-        Ok(self.envelope_for(&watch, now))
+        let mut envelope = self.envelope_for(&watch, now);
+        // A cancel's envelope always has a terminal status: at risk if unsaved.
+        envelope.persist = persisted.note(true);
+        Ok(envelope)
+    }
+
+    /// Save `watch`, turning a failed WRITE into a value (DF1): the caller
+    /// keeps the answer it holds and reports the failure in the envelope.
+    /// Anything else the store can fail at (a value that cannot be serialized)
+    /// is a real error. A rescue inside the store waits for the store-wide
+    /// lock at most `min(2 s, the call budget left)` (DF4e). Also keeps the
+    /// process's memory of failed saves (S1).
+    pub(crate) fn persist(&self, watch: &WatchFile, budget_end: Option<tokio::time::Instant>) -> Result<Persisted, VigilError> {
+        let saved = match budget_end {
+            Some(end) => self.store.save_within(watch, end.saturating_duration_since(tokio::time::Instant::now())),
+            None => self.store.save(watch),
+        };
+        let persisted = match saved {
+            Ok(outcome) if outcome.used_reserve => Persisted::SavedOnReserve,
+            Ok(_) => Persisted::Saved,
+            Err(error) => match error.write_failure() {
+                Some(failure) => Persisted::NotSaved(failure.into()),
+                None => return Err(error.into()),
+            },
+        };
+        let mut session = self.session.lock().expect("session mutex poisoned");
+        match persisted {
+            Persisted::NotSaved(_) => session.unsaved.insert(watch.spec.id.clone()),
+            Persisted::Saved | Persisted::SavedOnReserve => session.unsaved.remove(&watch.spec.id),
+        };
+        Ok(persisted)
+    }
+
+    /// Did this process's last save of `id` fail? Then a tick of it now is a
+    /// redelivery (S1).
+    pub(crate) fn follows_failed_save(&self, id: &WatchId) -> bool {
+        self.session.lock().expect("session mutex poisoned").unsaved.contains(id)
     }
 
     /// Delete finished watches older than 7 days; returns deleted ids.
@@ -222,7 +299,7 @@ impl Vigil {
     }
 
     /// The watch's lock (X3), polled so the wait can be cancelled.
-    pub(crate) async fn lock_watch(&self, id: &WatchId) -> Result<StoreLock, VigilError> {
+    pub(crate) async fn lock_watch(&self, id: &WatchId) -> Result<WatchLock, VigilError> {
         loop {
             if let Some(lock) = self.store.try_lock_watch(id)? {
                 return Ok(lock);
@@ -243,7 +320,7 @@ impl Vigil {
     /// Take an existing watch's lock and read it under the lock. An unknown
     /// id fails before any lock file is created; a watch pruned while we
     /// waited is `NotFound` and its recreated lock file is removed again.
-    pub(crate) async fn lock_and_load(&self, id: &WatchId) -> Result<(StoreLock, WatchFile), VigilError> {
+    pub(crate) async fn lock_and_load(&self, id: &WatchId) -> Result<(WatchLock, WatchFile), VigilError> {
         self.load_watch(id)?;
         let lock = self.lock_watch(id).await?;
         match self.load_watch(id) {
@@ -300,6 +377,8 @@ impl Vigil {
                 WatchStatus::Expired | WatchStatus::Cancelled => Next::WatchEnded,
             },
             others: Vec::new(),
+            persist: None,
+            persist_failures: Vec::new(),
         }
     }
 }

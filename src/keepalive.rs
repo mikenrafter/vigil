@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::clock::Timestamp;
-use crate::engine::expired_if_overdue;
-use crate::envelope::{cut_digest, Envelope, OtherWatch};
+use crate::engine::{expired_if_overdue, Persisted};
+use crate::envelope::{cut_digest, Envelope, OtherWatch, PersistNote, SecondaryFailure};
 use crate::error::VigilError;
-use crate::tick::{digest_of, is_due, TickOutcome};
+use crate::tick::{digest_of, is_due, TickOutcome, TickReport};
 use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId, WatchStatus};
 
 pub const MIN_MAX_S: u64 = 30;
@@ -75,6 +77,87 @@ pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
         WatchStatus::Expired => Some(3),
         WatchStatus::Cancelled => Some(4),
         WatchStatus::Pending => None,
+    }
+}
+
+/// A save that needs saying: the watch as the call left it, and how its save
+/// went. Clean saves are not kept (the envelope of a healthy call has no
+/// `persist` field).
+struct SaveRecord {
+    watch: WatchFile,
+    persisted: Persisted,
+}
+
+/// Everything one blocking call learned that is not (or not yet) on disk:
+/// what changed (V14), how risky saves went (DF1, DF2, DF4), and which watches
+/// fired events that follow a failed save (S1).
+#[derive(Default)]
+struct CallRecord {
+    changed: Vec<ChangedInput>,
+    /// Watches whose save in this call spent the reserve or failed, by id.
+    saves: BTreeMap<WatchId, SaveRecord>,
+    /// S1: watches that ticked in this call right after a failed save.
+    redelivered: BTreeSet<WatchId>,
+}
+
+impl CallRecord {
+    /// Take in one finished tick of `id`.
+    fn absorb(&mut self, id: &WatchId, report: TickReport) {
+        if report.outcome == TickOutcome::Ticked {
+            self.changed.extend(report.changed);
+        }
+        if report.redelivered {
+            self.redelivered.insert(id.clone());
+        }
+        let Some(watch) = report.after else { return };
+        // A clean save says nothing; a reserve spent earlier in the call stays
+        // the note unless a later save fails.
+        let nothing_new = match report.persisted {
+            Persisted::Saved => true,
+            Persisted::SavedOnReserve => self.saves.contains_key(id),
+            Persisted::NotSaved(_) => false,
+        };
+        if !nothing_new {
+            self.saves.insert(id.clone(), SaveRecord { watch, persisted: report.persisted });
+        }
+    }
+
+    /// DF1a: a save that failed ends the call.
+    fn any_unsaved(&self) -> bool {
+        self.saves.values().any(|record| matches!(record.persisted, Persisted::NotSaved(_)))
+    }
+
+    /// The in-memory watch of a covered watch whose save failed: the call
+    /// answers from it, the file on disk is the previous one.
+    fn unsaved_watch(&self, id: &WatchId) -> Option<&WatchFile> {
+        self.saves.get(id).filter(|record| matches!(record.persisted, Persisted::NotSaved(_))).map(|record| &record.watch)
+    }
+
+    /// The `persist` note of the envelope that describes `primary`. Its own
+    /// save first; otherwise, if any covered watch had to spend the reserve,
+    /// that (the agent should learn the disk is full whichever watch noticed).
+    fn note_for(&self, primary: &WatchId, redelivery: bool) -> Option<PersistNote> {
+        if let Some(note) = self.saves.get(primary).and_then(|record| record.persisted.note(redelivery)) {
+            return Some(note);
+        }
+        self.saves.values().any(|record| record.persisted == Persisted::SavedOnReserve).then_some(PersistNote::ReserveSpent)
+    }
+
+    /// S5: every covered watch but `primary` whose save failed, in id order.
+    fn secondary_failures(&self, primary: &WatchId) -> Vec<SecondaryFailure> {
+        self.saves
+            .iter()
+            .filter(|(id, _)| *id != primary)
+            .filter_map(|(id, record)| match &record.persisted {
+                Persisted::NotSaved(failure) => Some(SecondaryFailure {
+                    watch_id: id.clone(),
+                    kind: failure.kind,
+                    error: failure.error.clone(),
+                    path: failure.path.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -178,8 +261,8 @@ impl crate::engine::Vigil {
         let budget_end = started + Duration::from_secs(max_s);
         let covered = self.covered_ids(request.watch_id.as_ref())?;
         let finish = async {
-            let changed_in_call = self.sense(&covered, budget_end, progress).await?;
-            self.keepalive_envelope(&covered, &changed_in_call, started.elapsed().as_secs(), max_s)
+            let call = self.sense(&covered, budget_end, progress).await?;
+            self.keepalive_envelope(&covered, &call, started.elapsed().as_secs(), max_s)
         };
         tokio::select! {
             biased;
@@ -188,16 +271,18 @@ impl crate::engine::Vigil {
         }
     }
 
-    /// The blocking part of a call: tick covered watches until one finishes or
-    /// the budget ends. Returns what changed during the call (V14).
+    /// The blocking part of a call: tick covered watches until one finishes,
+    /// one cannot be saved (DF1a: the call ends at once with its answer rather
+    /// than ticking a full disk in a loop), or the budget ends. Returns what the
+    /// call learned (V14, DF1).
     ///
     /// Each round ticks every due covered watch CONCURRENTLY inside the shared
     /// budget, each under its own watch lock (C1), so a slow watch cannot
     /// starve another. A tick runs only if the budget left covers its reserve
     /// (X4), except the one due when the call starts. Expiry never needs a
     /// reserve and its deadline wake is kept when sensing is skipped (C7).
-    async fn sense(&self, covered: &[WatchId], budget_end: Instant, progress: &dyn ProgressSink) -> Result<Vec<ChangedInput>, VigilError> {
-        let mut changed_in_call: Vec<ChangedInput> = Vec::new();
+    async fn sense(&self, covered: &[WatchId], budget_end: Instant, progress: &dyn ProgressSink) -> Result<CallRecord, VigilError> {
+        let mut call = CallRecord::default();
         let mut ticks_in_call = 0u64;
         let mut first_pass = true;
         loop {
@@ -206,7 +291,7 @@ impl crate::engine::Vigil {
             // is awaited, so a held lock elsewhere cannot hold it back.
             for id in covered {
                 if self.load_watch(id)?.status.is_finished() {
-                    return Ok(changed_in_call);
+                    return Ok(call);
                 }
             }
             let now = self.clock.now();
@@ -230,17 +315,30 @@ impl crate::engine::Vigil {
             for_each_completed(ticks, |(id, outcome)| -> Result<bool, VigilError> {
                 let Ok(report) = outcome else { return Ok(false) };
                 let report = report?;
-                if report.outcome == TickOutcome::Ticked {
+                let outcome = report.outcome;
+                // The watch as the tick left it: saved or not, this is the truth.
+                let after = report.after.as_ref().map(|watch| (watch.tick, watch.status.is_finished()));
+                call.absorb(id, report);
+                if outcome == TickOutcome::Ticked {
                     ticks_in_call += 1;
-                    changed_in_call.extend(report.changed);
-                    let watch = self.load_watch(id)?;
-                    progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick: watch.tick });
-                    return Ok(watch.status.is_finished());
+                    let (tick, finished) = match after {
+                        Some(after) => after,
+                        None => {
+                            let watch = self.load_watch(id)?;
+                            (watch.tick, watch.status.is_finished())
+                        }
+                    };
+                    progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick });
+                    return Ok(finished);
                 }
-                Ok(matches!(report.outcome, TickOutcome::Finished(_)))
+                Ok(matches!(outcome, TickOutcome::Finished(_)))
             })
             .await?;
             first_pass = false;
+            // ↳ CLAIM(DF1a): a tick whose save failed ends the call; no in-memory re-ticking, no spin [spec DF1a; disk_full_tests a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again]
+            if call.any_unsaved() {
+                return Ok(call);
+            }
 
             let now = self.clock.now();
             let mut any_finished = false;
@@ -257,11 +355,11 @@ impl crate::engine::Vigil {
                 next_wake = Some(next_wake.map_or(wake, |current| current.min(wake)));
             }
             if any_finished {
-                return Ok(changed_in_call);
+                return Ok(call);
             }
             let left = budget_end.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Ok(changed_in_call);
+                return Ok(call);
             }
             // Sleep to the next tick or deadline, or to the end of the budget.
             let until_wake = next_wake
@@ -288,6 +386,13 @@ impl crate::engine::Vigil {
                 envelope.max_s = None;
                 return Ok(envelope);
             }
+            if envelope.save_failed() {
+                // DF1a: a failed save ended that call at once and left the watch
+                // due again, so calling again now would spin on a full disk.
+                // One interval is the cadence a healthy `wait` ticks at.
+                let interval = self.load_watch(id)?.spec.interval_s;
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
         }
     }
 
@@ -313,18 +418,24 @@ impl crate::engine::Vigil {
         Ok(covered)
     }
 
-    /// Build the return value of a call (V8, V14, X1) and record what it
-    /// delivered.
+    /// Build the return value of a call (V8, V14, X1, S5) and record what it
+    /// delivered. A covered watch whose save failed in this call is read from
+    /// `call` (its file is the previous one); every other from disk.
     fn keepalive_envelope(
         &self,
         covered: &[WatchId],
-        changed_in_call: &[ChangedInput],
+        call: &CallRecord,
         waited_s: u64,
         max_s: u64,
     ) -> Result<(Envelope, Delivery), VigilError> {
         let now = self.clock.now();
-        let mut watches: Vec<WatchFile> =
-            covered.iter().map(|id| self.load_watch(id).map(|watch| expired_if_overdue(watch, now))).collect::<Result<_, _>>()?;
+        let mut watches: Vec<WatchFile> = covered
+            .iter()
+            .map(|id| match call.unsaved_watch(id) {
+                Some(unsaved) => Ok(expired_if_overdue(unsaved.clone(), now)),
+                None => self.load_watch(id).map(|watch| expired_if_overdue(watch, now)),
+            })
+            .collect::<Result<_, _>>()?;
         // V8: earliest finished first, ties by id; else the nearest deadline.
         let mut finished: Vec<&WatchFile> = watches.iter().filter(|watch| watch.status.is_finished()).collect();
         finished.sort_by(|a, b| (a.finished_at, &a.spec.id).cmp(&(b.finished_at, &b.spec.id)));
@@ -337,7 +448,14 @@ impl crate::engine::Vigil {
                 .clone(),
         };
 
-        let events: Vec<Event> = finished.iter().flat_map(|watch| watch.events.clone()).collect();
+        // S1: events of a tick that follows a failed save say so.
+        let events: Vec<Event> = finished
+            .iter()
+            .flat_map(|watch| {
+                let redelivered = call.redelivered.contains(&watch.spec.id);
+                watch.events.iter().map(move |event| Event { redelivered: event.redelivered || redelivered, ..event.clone() })
+            })
+            .collect();
         let others: Vec<OtherWatch> = finished
             .iter()
             .filter(|watch| watch.spec.id != primary.spec.id)
@@ -347,7 +465,9 @@ impl crate::engine::Vigil {
                 event_ids: watch.events.iter().map(|event| event.event_id.clone()).collect(),
             })
             .collect();
-        let delivered: Vec<WatchId> = finished.iter().map(|watch| watch.spec.id.clone()).collect();
+        // ↳ CLAIM(DF3): a result that could not be saved is not "returned", so the next no-id call covers it again [spec DF3, V7; disk_full_tests a_no_id_keepalive_does_not_count_an_unsaved_result_as_returned]
+        let delivered: Vec<WatchId> =
+            finished.iter().map(|watch| watch.spec.id.clone()).filter(|id| call.unsaved_watch(id).is_none()).collect();
 
         let mut envelope = self.envelope_for(&primary, now);
         // Not yet recorded: the caller commits once the envelope is really
@@ -358,8 +478,12 @@ impl crate::engine::Vigil {
         envelope.events = events;
         envelope.others = others;
         if !primary.status.is_finished() {
-            envelope.digest = cut_digest(&digest_of(changed_in_call), self.config.digest_max_bytes);
+            envelope.digest = cut_digest(&digest_of(&call.changed), self.config.digest_max_bytes);
         }
+        // DF3a: at risk when the envelope has events or a terminal status.
+        let at_risk = !envelope.events.is_empty() || envelope.status.is_finished();
+        envelope.persist = call.note_for(&primary.spec.id, at_risk);
+        envelope.persist_failures = call.secondary_failures(&primary.spec.id);
         watches.clear();
         Ok((envelope, Delivery(delivered)))
     }
@@ -463,6 +587,8 @@ mod tests {
             judge_status: JudgeStatus::Skipped,
             next: Next::ActOnEvents,
             others: vec![],
+            persist: None,
+            persist_failures: vec![],
         }
     }
 

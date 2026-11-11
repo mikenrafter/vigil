@@ -23,12 +23,12 @@ pub mod watch;
 pub use clock::{Clock, SystemClock, Timestamp};
 pub use config::Config;
 pub use engine::Vigil;
-pub use envelope::{Envelope, Next, OtherWatch};
-pub use error::{CreateError, StoreError, VigilError};
+pub use envelope::{Envelope, Next, OtherWatch, PersistFailure, PersistNote, SecondaryFailure};
+pub use error::{CreateError, FailureKind, StoreError, VigilError};
 pub use fault::{Attempt, FaultPlan, FaultRule, Stage, WriteKind};
 pub use judge::{Answer, Answers, Judge, JudgeError, JudgeRequest, JudgeRule, RuleTest};
 pub use keepalive::{KeepaliveRequest, ProgressSink};
-pub use store::{Store, WriteOutcome};
+pub use store::{Store, StoreLock, WatchLock, WriteOutcome};
 pub use tick::TickOutcome;
 pub use watch::{
     CreateRequest, Event, FireKind, FireRule, Input, JudgeStatus, WatchFile, WatchId, WatchSpec,

@@ -1,7 +1,7 @@
 //! One evaluation round of one watch (SPEC "Tick logic").
 
 use crate::clock::Timestamp;
-use crate::engine::{expired_if_overdue, Vigil};
+use crate::engine::{expired_if_overdue, Persisted, Vigil};
 use crate::error::VigilError;
 use crate::inputs::{Reading, TRUNCATED_MARKER};
 use crate::judge::{build_state, Answers, JudgeRequest};
@@ -26,16 +26,30 @@ pub enum TickOutcome {
 
 /// What one `tick_report` call did, for callers (the keepalive loop) that
 /// need more than the outcome: the content that changed during the tick, in
-/// input order, for the call-local digest (V14).
+/// input order, for the call-local digest (V14), and how the save went.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TickReport {
+pub(crate) struct TickReport {
     pub outcome: TickOutcome,
     pub changed: Vec<ChangedInput>,
+    /// The watch as this tick left it, when the tick wrote (or tried to write)
+    /// it. If `persisted` is `NotSaved` this copy is the only place the result
+    /// lives, and the caller answers from it (DF1).
+    pub after: Option<WatchFile>,
+    pub persisted: Persisted,
+    /// S1: this process's last save of the watch failed, so events this tick
+    /// fired are redeliveries.
+    pub redelivered: bool,
 }
 
 impl TickReport {
     fn without_changes(outcome: TickOutcome) -> TickReport {
-        TickReport { outcome, changed: Vec::new() }
+        TickReport { outcome, changed: Vec::new(), after: None, persisted: Persisted::Saved, redelivered: false }
+    }
+
+    /// A tick that wrote `after` (or failed to) and changed nothing the digest
+    /// reports: an expiry.
+    fn wrote(outcome: TickOutcome, after: WatchFile, persisted: Persisted) -> TickReport {
+        TickReport { outcome, changed: Vec::new(), after: Some(after), persisted, redelivered: false }
     }
 }
 
@@ -54,7 +68,7 @@ impl Vigil {
     }
 
     /// `tick_due` plus the content the tick found changed.
-    pub async fn tick_report(&self, id: &WatchId) -> Result<TickReport, VigilError> {
+    pub(crate) async fn tick_report(&self, id: &WatchId) -> Result<TickReport, VigilError> {
         self.tick_report_until(id, None).await
     }
 
@@ -70,6 +84,8 @@ impl Vigil {
         let out_of_budget = || budget_end.is_some_and(|end| tokio::time::Instant::now() > end);
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
+        // S1: decided before this tick's own save changes the answer.
+        let redelivered = self.follows_failed_save(id);
 
         if watch.status.is_finished() {
             return Ok(TickReport::without_changes(TickOutcome::Finished(watch.status)));
@@ -80,8 +96,8 @@ impl Vigil {
                 return Ok(TickReport::without_changes(TickOutcome::OutOfBudget));
             }
             let expired = expired_if_overdue(watch, now);
-            self.store.save(&expired)?;
-            return Ok(TickReport::without_changes(TickOutcome::Finished(expired.status)));
+            let persisted = self.persist(&expired, budget_end)?;
+            return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
         if !is_due(&watch, now) {
             return Ok(TickReport::without_changes(TickOutcome::NotDue));
@@ -125,8 +141,8 @@ impl Vigil {
         let after = self.clock.now();
         if unticked.is_overdue(after) {
             let expired = expired_if_overdue(unticked, after);
-            self.store.save(&expired)?;
-            return Ok(TickReport::without_changes(TickOutcome::Finished(expired.status)));
+            let persisted = self.persist(&expired, budget_end)?;
+            return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
 
         watch.tick = tick;
@@ -141,8 +157,11 @@ impl Vigil {
             };
             watch.finish(terminal).expect("a pending watch accepts its terminal result");
         }
-        self.store.save(&watch)?;
-        Ok(TickReport { outcome: TickOutcome::Ticked, changed })
+        // DF1: a write that fails is a value, not an error; the tick's answer is
+        // `watch`, saved or not. DF3: nothing was written, so the persisted
+        // baseline did not move and the next tick senses the change again.
+        let persisted = self.persist(&watch, budget_end)?;
+        Ok(TickReport { outcome: TickOutcome::Ticked, changed, after: Some(watch), persisted, redelivered })
     }
 
     /// PHASE 2 SEAM (judge). Called by `tick_report` for `fire = judge` only
@@ -252,6 +271,7 @@ fn judge_event(watch: &WatchFile, tick: u64, judged: &[ChangedInput], summary: O
         input: judged.iter().map(|input| input.label.as_str()).collect::<Vec<_>>().join(", "),
         summary,
         judge: answers,
+        redelivered: false,
     }
 }
 
@@ -285,6 +305,7 @@ fn change_events(watch: &WatchFile, tick: u64, readings: &[Reading]) -> Vec<Even
             input: reading.label.clone(),
             summary: summarize(input, &reading.text),
             judge: None,
+            redelivered: false,
         })
         .collect()
 }
@@ -315,6 +336,7 @@ fn condition_events(watch: &mut WatchFile, tick: u64, readings: &[Reading]) -> V
         input: labels,
         summary: cap_bytes(&format!("condition met: {summary}"), MAX_SUMMARY_BYTES),
         judge: None,
+        redelivered: false,
     }]
 }
 
