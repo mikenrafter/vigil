@@ -263,4 +263,108 @@ All cargo runs via qex.
   came back with `waited_s` 30 (the whole budget) instead of 0.
 * Fix: the `for_each_completed` callback in `sense` returns "stop" for any absorbed report whose
   call record has an unsaved save (it was only `Finished` or a finished `Ticked`). Completions already
-  ready in the same pass are still collected by the existing stop logic (C12). Commit: see below.
+  ready in the same pass are still collected by the existing stop logic (C12). Commit `eecf368e`.
+
+### S2: redelivery provenance lost (`engine.rs`, `keepalive.rs`)
+
+* Red tests (commit `896f715`; both failed on the literal `redelivered: true` missing from the event):
+  * `disk_full_tests::a_changed_event_another_process_saved_under_a_lost_event_id_comes_back_flagged_redelivered`:
+    MCP process P cannot save "boom"; a concurrent CLI process saves "boom2" under the same event id
+    `w:1:0`; P's next call replayed it with no flag.
+  * `disk_full_tests::a_retry_that_saved_keeps_its_redelivered_flag_until_the_envelope_is_really_delivered`:
+    P's retry saves, its response is dropped before `commit_delivery` (`keepalive_uncommitted`); `watch_status`
+    and the next call then replayed the stored event with no flag, because the first successful save had cleared
+    the memory.
+* Fix (commit `2713e32`): `Session::unsaved` became `Session::repeat_risk`, "this process may be repeating events
+  of this watch". It is set by a failed save, survives a successful save while the saved result is finished and
+  has events (the delivery is not committed yet), and is cleared only by `commit_delivery`. The one place that
+  hands stored events out, `Vigil::replayed_events`, flags them while the watch is in the set; `envelope_for`
+  (so `watch_status` and `cancel`) and `keepalive_envelope` both use it. The in-memory copy of an unsaved result
+  is still the first delivery and stays unflagged unless its own tick followed a failed save.
+  A deadlock I introduced on the way (the session lock taken twice in one struct literal) hung the first run; fixed
+  before the commit.
+* Guard (commit `c77541f`, passes before and after the S2 fix, killed by a mutation that never clears the set):
+  `the_redelivery_memory_is_released_when_its_envelope_is_delivered`. Decision to flag: after the commit the
+  replay of the same stored result is unflagged, as the brief says ("until delivery commits").
+
+### S3: lock waits blocked the executor (`store.rs`, `engine.rs`, `tick.rs`, `main.rs`)
+
+* Red tests (commit `d916f1c`, real time, single-threaded runtime):
+  * `disk_full_tests::rescue_waits_of_different_watches_overlap_and_never_block_the_executor`: three watches whose
+    rescues all wait for a held store-wide lock took 6.00 s (3 x 2 s) instead of about 2 s, and a heartbeat task
+    got no CPU. Bounds: 1.9 s <= call < 4 s, at least 30 heartbeats (about 200 expected).
+  * `disk_full_tests::a_cancel_during_a_rescue_wait_is_observed_at_once`: a cancel at 200 ms was only seen after the
+    whole 2 s wait (the call returned `Some(envelope)` instead of `None`).
+* Fix (commit `a6e69c2`): the waiting is written once, in `store.rs`, generic over `Patience`: `Blocking` (thread
+  sleep, for the CLI edge and the store tests, run by `block_on_ready` because each of its awaits is ready in its
+  first poll) and `Cooperative` (`tokio::time::sleep` on tokio's clock). The write, the retry and the reserve
+  work stay synchronous under the lock: there is no `.await` between taking the store-wide lock and the end of
+  `run`, so a dropped future never leaves a rescue half done. New async entry points: `save_async`,
+  `save_within_async`, `try_lock_async`, `try_lock_watch_async`, `prune_async` (and `Vigil::prune_async`, used by
+  `list` and by `main`). `Vigil::persist`, the engine's two lock-polling loops and `create`'s baseline save use
+  them. Every waiting site in the store goes through it: rescue, reserve upkeep, lock-file creation (a rescue in
+  disguise) and prune's short waits. The blocking `lock()`/`lock_watch()` keep their blocking `flock` (they are
+  sync-only API).
+* Two things the async wait forced: (1) a rescue inside a call stops `RESCUE_BUDGET_MARGIN` (100 ms) before the call
+  budget, because the call's own `timeout_at` can now fire while the wait runs and would drop the tick's answer
+  (DF1) if the wait ended at the same instant; `a_rescue_with_almost_no_budget_left_still_returns_the_answer`
+  pins it (mutation: margin 0 turns it red). (2) Upkeep waits `min(limit, 250 ms)`, never longer than the
+  caller's limit.
+* One existing test changed, and why: `a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_with_the_envelope`
+  asserted `>= 1.9 s of REAL time on a blocked thread`, which is the bug. It now measures the wait on the call's
+  clock (virtual under the paused test clock): world 1 is `1.9 s <= wait < 2.5 s` (the upper bound is new), world 2
+  is `29.8 s <= call < 30 s` (29.5 s read + 0.4 s wait); its other assertions are unchanged. It takes 0.1 s instead
+  of 2.5 s.
+* Store-level async twins (added with the fix, they could not compile before it):
+  `async_rescues_racing_on_one_root_spend_the_reserve_exactly_once` (40 rounds, multi-thread runtime),
+  `an_async_rescue_waits_without_parking_its_thread_and_gets_through_when_the_lock_is_released`,
+  `dropping_an_async_rescue_during_its_wait_leaves_the_reserve_and_the_file_untouched`.
+
+### Commits of this round
+
+| SHA | Message |
+|---|---|
+| `59d0f090` | vigil: red test for review S1 |
+| `eecf368e` | vigil: a failed save ends the round as soon as it is absorbed (review S1) |
+| `896f715` | vigil: red test for review S2 |
+| `2713e32` | vigil: keep redelivery provenance in the process until delivery commits (review S2) |
+| `d916f1c` | vigil: red test for review S3 |
+| `a6e69c2` | vigil: waits for a contended store lock yield to the executor (review S3) |
+| `c77541f` | vigil: pin that delivery releases the redelivery memory (review S2 guard) |
+| `2e3ea80` | vigil: the S3 overlap test accepts either watch's failure as the reported one |
+
+The report's own commit follows (the SHA is in the last line of the hand-off message).
+
+### Verification of this round (qex, foreground, `cargo test -j2 --no-fail-fast`)
+
+Code tree = `2e3ea80` (the report commit changes only this file). Three clean full runs:
+
+| Run | `--lib` | `src/main.rs` | `cli_e2e` | `mcp_e2e` | doc-tests | Failed |
+|---|---|---|---|---|---|---|
+| 1 | 319 passed | 0 | 40 passed | 14 passed | 0 | none |
+| 2 | 319 passed | 0 | 40 passed | 14 passed | 0 | none |
+| 3 | 319 passed | 0 | 40 passed | 14 passed | 0 | none |
+
+373 tests (319 + 40 + 14), up from 362: 11 added in `--lib` (S1 2, S2 3, S3 6: 3 engine + 3 store).
+Before these three clean runs, the full run just before `2e3ea80` had one flake, in a test of this round:
+`rescue_waits_of_different_watches_overlap_...` asserted that the failure shows as `persist`, but the three
+rescues give up microseconds apart and S1 ends the round at the first one absorbed, so it can instead sit in
+`persist_failures`. The test was over-specified, not the code; fixed in `2e3ea80` (time and heartbeat assertions
+unchanged). The old `engine::tests::listing_prunes_too` flake did not appear in any of the 8 runs of this session.
+
+`cargo clippy --all-targets --no-deps -- -D warnings` shows the same seven old lints (`testing.rs`, `watch.rs`) and
+nothing in code from this round (one new `manual_async_fn` in `store.rs` was fixed). `cargo fmt --check` was not
+re-run; the crate is still not rustfmt-formatted at the baseline.
+
+### Not done / caveats of this round
+
+* No MCP end-to-end test for S1: the smallest real call is 30 s, and the paused-clock engine test reproduces the
+  same code path (the held lock, the `waited_s`, the persist note) exactly.
+* S2's decision: replays after the commit are unflagged (see the guard). If the owner wants a replay lost on the
+  wire to stay flagged, drop the `remove` in `commit_delivery` (and the guard).
+* S3: a tick dropped by the budget during the post-write reserve upkeep wait (at most 250 ms and never longer
+  than the margin-trimmed limit) has saved its watch but loses its in-call report; the next call sees the saved
+  file, and the memory of a failed save is kept (conservative flagging), so nothing is lost.
+* The new real-time tests (S3 overlap about 2 s, cancel about 0.2 s, the store heartbeat test about 0.15 s)
+  use generous bounds (4 s against 2 s, 1 s against 0.2 s, 30 against about 200 beats); they were stable in
+  all 8 runs apart from the over-specified assertion above.
