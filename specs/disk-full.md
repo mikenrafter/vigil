@@ -135,3 +135,18 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
 - **S6 → doc only.** SPEC/skill state that `VIGIL_TEST_FAULT` is for tests,
   assumes a trusted process environment, and that inheriting it disables
   writes or (if malformed) stops vigil from starting.
+
+## Decisions after red round 3 (orchestrator, 2026-11-10)
+
+- `redelivered: true` is set by the process that failed to save (MCP server,
+  or `vigil wait`). A fresh CLI process cannot know, so its events are
+  unflagged; the skill tells agents to treat any event after an envelope with
+  `persist.ok = false` as possibly repeated.
+- `persist.first_error` is present whenever a retry was made and failed, even
+  if both errors match.
+- `create` holds the store-wide lock while saving its placeholder; the rescue
+  reuses the held lock (no self-deadlock).
+- A rescue waits for the store-wide lock, bounded by vigil's existing lock
+  timeout; on timeout it reports `disk_full` without retrying.
+- `.tmp` cleanup after a successful write covers only that watch's own file;
+  never sweep other `*.tmp` files (another process may be mid-write).
