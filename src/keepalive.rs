@@ -450,12 +450,17 @@ impl crate::engine::Vigil {
                 .clone(),
         };
 
-        // S1: events of a tick that follows a failed save say so.
+        // S1: events of a tick that follows a failed save say so. Review S2:
+        // so do stored events this process replays while it may be repeating
+        // them; the in-memory copy of an unsaved result is only a repeat if
+        // its own tick followed a failed save (it is the first delivery).
         let events: Vec<Event> = finished
             .iter()
             .flat_map(|watch| {
-                let redelivered = call.redelivered.contains(&watch.spec.id);
-                watch.events.iter().map(move |event| Event { redelivered: event.redelivered || redelivered, ..event.clone() })
+                let own_tick_followed_failed_save = call.redelivered.contains(&watch.spec.id);
+                let stored: Vec<Event> =
+                    if call.unsaved_watch(&watch.spec.id).is_some() { watch.events.clone() } else { self.replayed_events(watch) };
+                stored.into_iter().map(move |event| Event { redelivered: event.redelivered || own_tick_followed_failed_save, ..event })
             })
             .collect();
         let others: Vec<OtherWatch> = finished
@@ -495,6 +500,10 @@ impl crate::engine::Vigil {
     pub fn commit_delivery(&self, delivery: Delivery) {
         let mut session = self.session.lock().expect("session mutex poisoned");
         session.session_ticks += 1;
+        for id in &delivery.0 {
+            // Review S2: delivered, so nothing of it can be a repeat any more.
+            session.repeat_risk.remove(id);
+        }
         session.returned.extend(delivery.0);
     }
 }

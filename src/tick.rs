@@ -85,7 +85,7 @@ impl Vigil {
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
         // S1: decided before this tick's own save changes the answer.
-        let redelivered = self.follows_failed_save(id);
+        let redelivered = self.may_repeat(id);
 
         if watch.status.is_finished() {
             return Ok(TickReport::without_changes(TickOutcome::Finished(watch.status)));

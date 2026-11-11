@@ -15,7 +15,7 @@ use crate::inputs::{InputReader, Reading, SystemReader};
 use crate::judge::Judge;
 use crate::store::{Store, StoreLock, WatchLock};
 use crate::watch::{
-    CreateRequest, FireRule, Input, InputState, Terminal, TerminalStatus, WatchFile, WatchId, WatchSpec, WatchStatus,
+    CreateRequest, Event, FireRule, Input, InputState, Terminal, TerminalStatus, WatchFile, WatchId, WatchSpec, WatchStatus,
 };
 
 /// How often a contended lock is retried. Polling (not a blocking `flock`)
@@ -57,10 +57,15 @@ pub(crate) struct Session {
     /// no-id `keepalive` stops covering them.
     pub returned: BTreeSet<WatchId>,
     pub session_ticks: u64,
-    /// Watches whose most recent save in THIS process failed (S1). A tick of
-    /// one of them follows a failed save, so its events are redeliveries. A
-    /// fresh process cannot know, which is why the flag is a process fact.
-    pub unsaved: BTreeSet<WatchId>,
+    /// Watches whose events this process may be repeating (S1, review S2):
+    /// the most recent save of the watch failed, or it finished with events
+    /// after a failed save and the envelope that carries them has not been
+    /// delivered yet. A tick of such a watch follows a failed save, and stored
+    /// events of it that this process replays are repeats of an event id the
+    /// agent may already hold, possibly with other content. A fresh process
+    /// cannot know, which is why this is a process fact. Cleared for a watch
+    /// when a successful save leaves nothing to flag, or by `commit_delivery`.
+    pub repeat_risk: BTreeSet<WatchId>,
 }
 
 /// How one save of a watch file went, for a caller that must not fail because
@@ -271,17 +276,33 @@ impl Vigil {
             },
         };
         let mut session = self.session.lock().expect("session mutex poisoned");
+        // ↳ CLAIM(S2-provenance): the memory outlives a successful retry for as long as the events it saved are undelivered [review S2; disk_full_tests a_retry_that_saved_keeps_its_redelivered_flag_until_the_envelope_is_really_delivered]
+        let events_undelivered = watch.status.is_finished() && !watch.events.is_empty();
         match persisted {
-            Persisted::NotSaved(_) => session.unsaved.insert(watch.spec.id.clone()),
-            Persisted::Saved | Persisted::SavedOnReserve => session.unsaved.remove(&watch.spec.id),
-        };
+            Persisted::NotSaved(_) => {
+                session.repeat_risk.insert(watch.spec.id.clone());
+            }
+            Persisted::Saved | Persisted::SavedOnReserve => {
+                if !events_undelivered {
+                    session.repeat_risk.remove(&watch.spec.id);
+                }
+            }
+        }
         Ok(persisted)
     }
 
-    /// Did this process's last save of `id` fail? Then a tick of it now is a
-    /// redelivery (S1).
-    pub(crate) fn follows_failed_save(&self, id: &WatchId) -> bool {
-        self.session.lock().expect("session mutex poisoned").unsaved.contains(id)
+    /// May this process be repeating events of `id`? Then a tick of it now is
+    /// a redelivery (S1), and stored events of it that this process returns
+    /// are flagged (review S2).
+    pub(crate) fn may_repeat(&self, id: &WatchId) -> bool {
+        self.session.lock().expect("session mutex poisoned").repeat_risk.contains(id)
+    }
+
+    /// The events of a stored result as this process returns them: flagged
+    /// `redelivered` while it may be repeating them (review S2).
+    pub(crate) fn replayed_events(&self, watch: &WatchFile) -> Vec<Event> {
+        let repeating = self.may_repeat(&watch.spec.id);
+        watch.events.iter().map(|event| Event { redelivered: event.redelivered || repeating, ..event.clone() }).collect()
     }
 
     /// Delete finished watches older than 7 days; returns deleted ids.
@@ -358,6 +379,9 @@ impl Vigil {
     pub(crate) fn envelope_for(&self, watch: &WatchFile, now: Timestamp) -> Envelope {
         let end = watch.finished_at.unwrap_or(now);
         let terminal = watch.status.is_finished();
+        // Before the literal: the session lock taken for `session_ticks` below
+        // lives to the end of the statement, and `replayed_events` takes it too.
+        let events = self.replayed_events(watch);
         Envelope {
             watch_id: watch.spec.id.clone(),
             status: watch.status,
@@ -368,7 +392,7 @@ impl Vigil {
             deadline_in_s: watch.deadline_at.secs_since(end).max(0) as u64,
             waited_s: None,
             max_s: None,
-            events: watch.events.clone(),
+            events,
             digest: if terminal { cut_digest(&watch.last_digest, self.config.digest_max_bytes) } else { String::new() },
             judge_status: watch.judge_status,
             next: match watch.status {
