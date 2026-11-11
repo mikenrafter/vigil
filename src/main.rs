@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use vigil::judge::HttpJudge;
 use vigil::store::state_root;
 use vigil::keepalive::wait_exit_code;
-use vigil::{Config, CreateRequest, KeepaliveRequest, SystemClock, Vigil, WatchId};
+use vigil::{Config, CreateRequest, Envelope, KeepaliveRequest, PersistNote, SystemClock, Vigil, WatchId};
 
 #[derive(Debug, Parser)]
 #[command(name = "vigil", version, about = "Keep an agent's turn open while a cheap judge watches things")]
@@ -103,6 +103,30 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// DF2: the envelope on stdout is complete even when its save failed; stderr
+/// gets one line per failed save naming the state root, for the person
+/// watching the terminal. The envelope's `persist` note is what an agent reads.
+fn warn_about_unsaved(root: &std::path::Path, envelope: &Envelope) {
+    if let Some(PersistNote::NotSaved { failure, .. }) = &envelope.persist {
+        eprintln!(
+            "vigil: warning: {}: could not save {} (state root {}): {}; the result above is complete, free some space and keep calling",
+            failure.kind.label(),
+            failure.path.display(),
+            root.display(),
+            failure.error
+        );
+    }
+    for other in &envelope.persist_failures {
+        eprintln!(
+            "vigil: warning: {}: could not save {} (state root {}): {}",
+            other.kind.label(),
+            other.path.display(),
+            root.display(),
+            other.error
+        );
+    }
+}
+
 /// The process exit code on success.
 async fn run(cli: Cli) -> anyhow::Result<i32> {
     let vigil = build_vigil(cli.root)?;
@@ -126,15 +150,23 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Status { id } => print_json(&vigil.status(&WatchId::parse(&id)?).await?).map(|()| 0),
         Command::List => print_json(&vigil.list().await?).map(|()| 0),
-        Command::Cancel { id } => print_json(&vigil.cancel(&WatchId::parse(&id)?).await?).map(|()| 0),
+        Command::Cancel { id } => {
+            let envelope = vigil.cancel(&WatchId::parse(&id)?).await?;
+            print_json(&envelope)?;
+            warn_about_unsaved(vigil.store().root(), &envelope);
+            Ok(0)
+        }
         Command::Keepalive { id, max_s } => {
             let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s };
-            print_json(&vigil.keepalive(request).await?)?;
+            let envelope = vigil.keepalive(request).await?;
+            print_json(&envelope)?;
+            warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(0)
         }
         Command::Wait { id } => {
             let envelope = vigil.wait(&WatchId::parse(&id)?).await?;
             print_json(&envelope)?;
+            warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(wait_exit_code(&envelope).unwrap_or(0))
         }
         Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil)).await.map(|()| 0),
