@@ -576,11 +576,24 @@ impl crate::engine::Vigil {
     /// appended to the watch's outbox together with the once-per-reason flags
     /// in ONE save: either both are on disk or neither is (a failed save raises
     /// them again at the next pass, with the same ids).
+    ///
+    /// CLAIM(V2-attention): like every other wait in a call, the lock wait ends
+    /// at `budget_end`, and nothing is saved after it [review S1;
+    /// auto_interval_tests::attention_due_at_the_end_of_the_budget_does_not_wait_for_a_watch_lock_held_elsewhere].
+    /// An attention that could not be raised in time is still due, so the next
+    /// call raises it at once.
     async fn raise_attention(&self, id: &WatchId, long_window: bool, budget_end: Instant, call: &mut CallRecord) -> Result<(), VigilError> {
         if due_reasons(&self.load_watch(id)?, self.clock.now(), long_window).is_empty() {
             return Ok(());
         }
-        let (_lock, mut watch) = self.lock_and_load(id).await?;
+        // ↳ CLAIM(V2-attention)
+        let Ok(locked) = tokio::time::timeout_at(budget_end, self.lock_and_load(id)).await else { return Ok(()) };
+        let (_lock, mut watch) = locked?;
+        // The wait may have used the last of the budget: the same strict test a
+        // tick makes before it persists (C5).
+        if Instant::now() > budget_end {
+            return Ok(());
+        }
         let now = self.clock.now();
         let due = due_reasons(&watch, now, long_window);
         if due.is_empty() {
