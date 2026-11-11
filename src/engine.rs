@@ -91,6 +91,13 @@ impl Vigil {
         self
     }
 
+    /// Replace the store's write fault plan (tests, and `main` when
+    /// `VIGIL_TEST_FAULT` is set; see `fault.rs`).
+    pub fn with_write_faults(mut self, faults: crate::fault::FaultPlan) -> Vigil {
+        self.store = self.store.with_faults(faults);
+        self
+    }
+
     /// Replace the input reader (tests: `testing::ScriptedReader`).
     pub fn with_reader(mut self, reader: Arc<dyn InputReader>) -> Vigil {
         self.reader = reader;

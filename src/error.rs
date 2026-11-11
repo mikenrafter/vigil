@@ -60,6 +60,11 @@ pub enum StoreError {
     NotFound(String),
     #[error("io error: {0}")]
     Io(String),
+    /// ENOSPC or EDQUOT (specs/disk-full.md DF2, DF5). RED STUB: nothing
+    /// constructs it yet. The text names the state root and says the disk is
+    /// full.
+    #[error("disk full: {0}")]
+    DiskFull(String),
     #[error("serialization error: {0}")]
     Serialize(String),
     #[error("corrupt watch file: {0}")]

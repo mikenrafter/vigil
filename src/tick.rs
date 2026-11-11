@@ -1509,7 +1509,11 @@ mod tests {
             }
             assert!(file.starts_with(&state), "stray file outside the state root: {}", file.display());
             let relative = file.strip_prefix(&state).unwrap().to_string_lossy().to_string();
+            // DF4 (specs/disk-full.md): the one extra file is the reserve,
+            // and only at exactly 256 KiB. Optional here (its presence is
+            // pinned by the disk-full tests); anything else stays forbidden.
             let allowed = relative == "lock"
+                || (relative == ".reserve" && std::fs::metadata(file).unwrap().len() == 262_144)
                 || (relative.starts_with("watches/") && relative.ends_with(".json"))
                 || (relative.starts_with("locks/") && relative.ends_with(".lock"));
             assert!(allowed, "unexpected file under the state root: {relative}");

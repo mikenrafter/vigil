@@ -262,3 +262,80 @@ pub fn wait_for_pid(pid_file: &Path, limit: Duration) -> u32 {
 pub fn send_signal(signal: &str, pid: u32) {
     assert!(Command::new("kill").args([signal, &pid.to_string()]).status().unwrap().success());
 }
+
+// ---- disk full (specs/disk-full.md) ------------------------------------
+
+/// The seam a spawned `vigil` reads its write-fault plan from (src/fault.rs
+/// documents the syntax). Set on one command at a time, so a test chooses
+/// which PROCESS sees a full disk; unset, vigil behaves as in production.
+pub const FAULT_ENV: &str = "VIGIL_TEST_FAULT";
+
+/// A disk that is full and stays full, for the watch file and the reserve.
+pub const DISK_STAYS_FULL: &str = "watch:28:all,reserve:28:all";
+
+impl Sandbox {
+    pub fn reserve(&self) -> PathBuf {
+        self.state_root().join(".reserve")
+    }
+    pub fn watch_path(&self, id: &str) -> PathBuf {
+        self.state_root().join("watches").join(format!("{id}.json"))
+    }
+    pub fn watch_bytes(&self, id: &str) -> Vec<u8> {
+        std::fs::read(self.watch_path(id)).unwrap()
+    }
+    /// Every `.tmp` file under the state root (none when it does not exist).
+    pub fn tmp_files(&self) -> Vec<PathBuf> {
+        if !self.state_root().exists() {
+            return Vec::new();
+        }
+        list_files(&self.state_root()).into_iter().map(|(path, _)| path).filter(|path| path.to_string_lossy().ends_with(".tmp")).collect()
+    }
+    /// The plan text for a disk that is full only while the reserve exists and
+    /// cannot make a new one: only deleting the reserve lets a write through.
+    pub fn only_the_reserve_to_give(&self) -> String {
+        format!("watch:28:while={},reserve:28:all", self.reserve().display())
+    }
+    /// A `vigil` command whose store writes fail by `plan`.
+    pub fn faulted_command(&self, plan: &str) -> Command {
+        let mut command = self.command();
+        command.env(FAULT_ENV, plan);
+        command
+    }
+    pub fn tokio_faulted_command(&self, plan: &str) -> tokio::process::Command {
+        let mut command = self.tokio_command();
+        command.env(FAULT_ENV, plan);
+        command
+    }
+}
+
+/// Run `command` to completion (stdout and stderr captured) within `limit`.
+pub fn output_within(mut command: Command, limit: Duration) -> Output {
+    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    finish_within(command.spawn().unwrap(), limit)
+}
+
+/// Non-empty stderr lines.
+pub fn stderr_lines(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stderr).lines().filter(|line| !line.trim().is_empty()).map(str::to_string).collect()
+}
+
+/// The `persist` note of a failed write, field by field against the spec
+/// (DF2, DF3): exactly these five keys.
+pub fn assert_failed_persist(envelope: &serde_json::Value, kind: &str, os_text: &str, file: &Path) {
+    let persist = envelope.get("persist").unwrap_or_else(|| panic!("the envelope has no `persist` field: {envelope}"));
+    let object = persist.as_object().unwrap_or_else(|| panic!("persist is not an object: {persist}"));
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["error", "kind", "ok", "path", "redelivery"], "{persist}");
+    assert_eq!(persist["ok"], false, "{persist}");
+    assert_eq!(persist["kind"], kind, "{persist}");
+    assert_eq!(persist["redelivery"], true, "{persist}");
+    assert_eq!(persist["path"], file.to_str().unwrap(), "{persist}");
+    let error = persist["error"].as_str().unwrap_or_else(|| panic!("error is not a string: {persist}"));
+    assert!(error.contains(os_text), "error {error:?} should carry the OS message {os_text:?}");
+}
+
+/// DF4: the retry succeeded on the reserve's space: exactly these three keys.
+pub fn reserve_used_note() -> serde_json::Value {
+    serde_json::json!({"ok": true, "used_reserve": true, "kind": "disk_full"})
+}

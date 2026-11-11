@@ -156,6 +156,12 @@ fn nothing_is_written_outside_the_state_root() {
     assert!(root.join("watches").join("w.json").is_file(), "control: the watch file exists");
     let mut under_root: Vec<String> = list_files(&root).into_iter().map(|(p, _)| p.strip_prefix(&root).unwrap().to_string_lossy().to_string()).collect();
     under_root.sort();
+    // DF4 (specs/disk-full.md): the reserve is the one extra file, exactly
+    // 256 KiB when present (its presence is pinned by the disk-full tests).
+    if let Some(position) = under_root.iter().position(|name| name == ".reserve") {
+        under_root.remove(position);
+        assert_eq!(std::fs::metadata(root.join(".reserve")).unwrap().len(), 262_144);
+    }
     assert_eq!(under_root, vec!["lock", "locks/w.lock", "watches/w.json"], "only the lock files and the json file, no .tmp");
 
     append_once_raw(&input, "!");
@@ -850,4 +856,216 @@ fn sigterm_to_vigil_create_waiting_on_stdin_exits_143() {
     let output = finish_within(child, Duration::from_secs(2));
     drop(held_open);
     assert_eq!(output.status.code(), Some(143), "{:?}", output.status);
+}
+
+// ---- surviving a full disk (specs/disk-full.md DF1-DF6) -----------------
+//
+// The disk cannot really be filled from a test, so the spawned binary is told
+// to fail its own store writes through `VIGIL_TEST_FAULT` (src/fault.rs;
+// `Sandbox::faulted_command`). Only the command that gets the variable sees a
+// full disk, so "create healthy, then keepalive on a full disk, then keepalive
+// healthy" is three processes, as in life. Every run is bounded by
+// `output_within`.
+
+const RUN: Duration = Duration::from_secs(20);
+
+/// A pending `fire = change` watch "w" whose input has changed since create:
+/// the first tick fires. Returns the input path.
+fn change_ready(sandbox: &Sandbox) -> std::path::PathBuf {
+    let input = sandbox.input("w.log");
+    create_via_cli(sandbox, "w", &input);
+    append_once(&input, "boom");
+    input
+}
+
+fn run_with(sandbox: &Sandbox, plan: Option<&str>, args: &[&str]) -> std::process::Output {
+    let mut command = match plan {
+        Some(plan) => sandbox.faulted_command(plan),
+        None => sandbox.command(),
+    };
+    command.args(args);
+    output_within(command, RUN)
+}
+
+#[test]
+fn keepalive_on_a_full_disk_prints_the_envelope_exits_0_and_names_the_state_root_once_on_stderr() {
+    // why: DF1/DF2, the incident through the real binary: `vigil keepalive`
+    //      used to exit 1 with "io error: No space left on device" and print
+    //      nothing. Now: exit 0, the full fired envelope on stdout (tick 1,
+    //      event "w:1:0", summary "boom"), a persist note with the right kind
+    //      per errno (28 -> disk_full, 5 -> io), exactly ONE line on stderr
+    //      and that line names the state root. DF6: the watch file is
+    //      byte-identical and no .tmp remains.
+    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF6)
+    for (plan, kind, os_text) in [
+        (DISK_STAYS_FULL, "disk_full", "No space left on device"),
+        ("watch:5:all", "io", "Input/output error"),
+    ] {
+        let sandbox = Sandbox::new();
+        change_ready(&sandbox);
+        let before = sandbox.watch_bytes("w");
+
+        let output = run_with(&sandbox, Some(plan), &["keepalive", "w"]);
+
+        assert_eq!(output.status.code(), Some(0), "{plan}: stderr {:?}", String::from_utf8_lossy(&output.stderr));
+        let envelope = stdout_json(&output);
+        assert_eq!(envelope["status"], "fired", "{plan}");
+        assert_eq!(envelope["next"], "act on events");
+        assert_eq!(envelope["tick"], 1);
+        assert_eq!(envelope["events"][0]["event_id"], "w:1:0");
+        assert_eq!(envelope["events"][0]["summary"], "boom");
+        assert_failed_persist(&envelope, kind, os_text, &sandbox.watch_path("w"));
+        let lines = stderr_lines(&output);
+        assert_eq!(lines.len(), 1, "{plan}: exactly one stderr line, got {lines:?}");
+        assert!(lines[0].contains(sandbox.state_root().to_str().unwrap()), "{plan}: the line must name the state root: {:?}", lines[0]);
+        assert_eq!(sandbox.watch_bytes("w"), before, "{plan}: the failed save must not touch the file");
+        assert!(sandbox.tmp_files().is_empty(), "{plan}: {:?}", sandbox.tmp_files());
+    }
+}
+
+#[test]
+fn the_next_process_on_a_healthy_disk_reports_the_events_the_full_disk_run_could_not_save() {
+    // why: DF3 across separate CLI processes: process 1 fails to save and
+    //      exits 0; process 2 starts clean, senses the same change from the
+    //      unchanged file, and prints the same single event (same event_id and
+    //      summary), now persisted: no persist field, empty stderr, the file
+    //      says fired. Events are never silently dropped.
+    // proves: CLAIM(DF3)
+    let sandbox = Sandbox::new();
+    change_ready(&sandbox);
+    let lost = stdout_json(&run_with(&sandbox, Some(DISK_STAYS_FULL), &["keepalive", "w"]));
+    assert_eq!(lost["persist"]["ok"], false, "precondition: the first run could not save: {lost}");
+
+    let output = run_with(&sandbox, None, &["keepalive", "w"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let again = stdout_json(&output);
+    assert_eq!(again["status"], "fired");
+    assert_eq!(again["events"], lost["events"], "the same events again");
+    assert_eq!(again["events"].as_array().unwrap().len(), 1);
+    assert!(again.get("persist").is_none(), "{again}");
+    assert!(stderr_lines(&output).is_empty(), "{:?}", stderr_lines(&output));
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "fired");
+}
+
+#[test]
+fn wait_keeps_its_exit_code_when_the_final_save_fails() {
+    // why: DF1: "`wait` keeps its outcome code" (W6: fired 0, expired 3). The
+    //      envelope is printed with persist.ok=false and the exit code is the
+    //      one the outcome decides, not 1. Fired: the change is sensed on the
+    //      first tick. Expired: deadline_s 1, nothing changes, the expiry
+    //      write is the one that fails.
+    // proves: CLAIM(DF1), CLAIM(DF2)
+    let fired = Sandbox::new();
+    change_ready(&fired);
+    let output = run_with(&fired, Some(DISK_STAYS_FULL), &["wait", "w"]);
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "fired");
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &fired.watch_path("w"));
+
+    let expired = Sandbox::new();
+    let input = expired.input("e.log");
+    std::fs::write(&input, "boot\n").unwrap();
+    let short = serde_json::json!({"id": "e", "prompt": "", "inputs": [{"kind": "file", "path": input}], "interval_s": 1, "deadline_s": 1, "fire": "change"});
+    assert!(expired.run(&["create", &short.to_string()]).status.success());
+    let output = run_with(&expired, Some(DISK_STAYS_FULL), &["wait", "e"]);
+    assert_eq!(output.status.code(), Some(3), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "expired");
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &expired.watch_path("e"));
+}
+
+#[test]
+fn the_reserve_exists_after_a_healthy_run_and_saves_the_tick_when_the_disk_is_full() {
+    // why: DF4 end to end. A healthy `create` leaves `<root>/.reserve` of
+    //      256 KiB (262144 bytes). Then a keepalive on a disk that is full
+    //      except for that reserve: the reserve is deleted, the write is
+    //      retried and lands (the file on disk says fired), the process exits
+    //      0, and the envelope's persist is exactly
+    //      {"ok":true,"used_reserve":true,"kind":"disk_full"}.
+    // proves: CLAIM(DF4)
+    let sandbox = Sandbox::new();
+    change_ready(&sandbox);
+    let reserve = std::fs::metadata(sandbox.reserve()).unwrap_or_else(|error| panic!("create left no reserve at {}: {error}", sandbox.reserve().display()));
+    assert_eq!(reserve.len(), 262_144, "256 KiB = 256 * 1024");
+
+    let output = run_with(&sandbox, Some(&sandbox.only_the_reserve_to_give()), &["keepalive", "w"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "fired");
+    assert_eq!(envelope["persist"], common::reserve_used_note());
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "fired", "the retry persisted the tick");
+    assert!(!sandbox.reserve().exists(), "the reserve was spent");
+}
+
+#[test]
+fn a_healthy_run_prints_no_persist_field_and_nothing_on_stderr() {
+    // why: DF2: "wire format unchanged when all is well", and the CLI's extra
+    //      stderr line exists only for a failed write. Control for the tests
+    //      above, from the same scenario with no fault plan.
+    // proves: CLAIM(DF2)
+    let sandbox = Sandbox::new();
+    change_ready(&sandbox);
+    let output = run_with(&sandbox, None, &["keepalive", "w"]);
+    assert_eq!(output.status.code(), Some(0));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "fired");
+    assert!(envelope.get("persist").is_none(), "{envelope}");
+    assert!(stderr_lines(&output).is_empty(), "{:?}", stderr_lines(&output));
+}
+
+#[test]
+fn create_on_a_full_disk_exits_1_with_a_line_that_names_the_root_and_says_disk_full() {
+    // why: DF5: "A create that still fails returns an error whose message names
+    //      the state root and says the disk is full (not a bare `io error`)."
+    //      Through the binary: exit 1 (a real failure, nothing was created),
+    //      the stderr line names the root and says "disk full", and no watch
+    //      file or .tmp is left.
+    // proves: CLAIM(DF5)
+    let sandbox = Sandbox::new();
+    let input = sandbox.input("w.log");
+    std::fs::write(&input, "boot\n").unwrap();
+    let output = run_with(&sandbox, Some(DISK_STAYS_FULL), &["create", &change_watch_json("w", &input, 1)]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains(sandbox.state_root().to_str().unwrap()), "should name the state root: {stderr}");
+    assert!(stderr.to_lowercase().contains("disk full"), "should say the disk is full: {stderr}");
+    assert!(sandbox.watch_file("w").is_none());
+    assert!(sandbox.tmp_files().is_empty());
+}
+
+#[test]
+fn cancel_on_a_disk_that_only_has_the_reserve_to_give_is_saved_and_says_so() {
+    // why: DF5: cancel goes through the same reserve-and-retry path. The file
+    //      ends up cancelled, the reserve is spent, exit 0, and (inferred
+    //      from DF4, red report A3) the envelope carries the used_reserve note.
+    // proves: CLAIM(DF5), CLAIM(DF4)
+    let sandbox = Sandbox::new();
+    create_via_cli(&sandbox, "w", &sandbox.input("w.log"));
+    assert!(sandbox.reserve().exists(), "precondition: create left a reserve");
+
+    let output = run_with(&sandbox, Some(&sandbox.only_the_reserve_to_give()), &["cancel", "w"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "cancelled");
+    assert_eq!(envelope["persist"], common::reserve_used_note());
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "cancelled");
+    assert!(!sandbox.reserve().exists());
+}
+
+#[test]
+fn a_malformed_fault_plan_is_refused_loudly_instead_of_injecting_nothing() {
+    // why: the seam's own safety: if a typo in VIGIL_TEST_FAULT silently meant
+    //      "no faults", every test above would pass without the disk ever
+    //      being full. The binary must exit 1 and name the variable. Control:
+    //      the same command with no variable works.
+    // proves: CLAIM(DF-seam)
+    let sandbox = Sandbox::new();
+    let output = run_with(&sandbox, Some("this is not a fault plan"), &["list"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(FAULT_ENV), "{:?}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(run_with(&sandbox, None, &["list"]).status.code(), Some(0), "control");
 }

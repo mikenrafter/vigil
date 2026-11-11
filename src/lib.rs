@@ -10,6 +10,7 @@ pub mod config;
 pub mod engine;
 pub mod envelope;
 pub mod error;
+pub mod fault;
 pub mod inputs;
 pub mod judge;
 pub mod keepalive;
@@ -24,11 +25,15 @@ pub use config::Config;
 pub use engine::Vigil;
 pub use envelope::{Envelope, Next, OtherWatch};
 pub use error::{CreateError, StoreError, VigilError};
+pub use fault::{FaultPlan, FaultRule, WriteKind};
 pub use judge::{Answer, Answers, Judge, JudgeError, JudgeRequest, JudgeRule, RuleTest};
 pub use keepalive::{KeepaliveRequest, ProgressSink};
-pub use store::Store;
+pub use store::{Store, WriteOutcome};
 pub use tick::TickOutcome;
 pub use watch::{
     CreateRequest, Event, FireKind, FireRule, Input, JudgeStatus, WatchFile, WatchId, WatchSpec,
     WatchStatus,
 };
+
+#[cfg(test)]
+mod disk_full_tests;

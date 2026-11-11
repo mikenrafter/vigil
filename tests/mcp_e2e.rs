@@ -437,3 +437,115 @@ async fn sigterm_to_the_mcp_server_exits_it_and_kills_the_commands_it_was_runnin
     assert!(wait_until_async(Duration::from_secs(2), || proc_is_dead(server_pid)).await, "the server did not exit");
     assert!(wait_until_async(Duration::from_secs(2), || proc_is_dead(cmd_pid)).await, "the command outlived the server");
 }
+
+// ---- surviving a full disk (specs/disk-full.md DF1-DF5) ------------------
+//
+// The server process is started with `VIGIL_TEST_FAULT` (src/fault.rs), so
+// its store writes fail while the test's other processes (the CLI used to
+// create a watch) see a healthy disk.
+
+async fn connect_faulted(sandbox: &Sandbox, plan: &str) -> Client {
+    let transport = TokioChildProcess::new(sandbox.tokio_faulted_command(plan).configure(|c| {
+        c.arg("mcp");
+    }))
+    .unwrap();
+    ().serve(transport).await.expect("initialize handshake")
+}
+
+fn append_line(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+async fn keepalive_within(client: &Client, arguments: serde_json::Value) -> CallToolResult {
+    tokio::time::timeout(Duration::from_secs(10), call(client.peer(), "keepalive", arguments)).await.expect("keepalive should return, not wait out max_s")
+}
+
+#[tokio::test]
+async fn keepalive_over_mcp_on_a_full_disk_returns_the_envelope_with_persist_not_a_tool_error() {
+    // why: DF1/DF2 through real stdio MCP: the incident was a tool error
+    //      ("io error: No space left on device") with no envelope. Now the
+    //      call is NOT isError, carries the fired envelope (event "w:1:0",
+    //      summary "boom") and the persist note, and the watch file on disk is
+    //      byte-identical (DF6).
+    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF6)
+    let sandbox = Sandbox::new();
+    let input = sandbox.input("w.log");
+    std::fs::write(&input, "boot\n").unwrap();
+    assert!(sandbox.run(&["create", &change_watch_json("w", &input, 1)]).status.success());
+    append_line(&input, "boom");
+    let before = sandbox.watch_bytes("w");
+    let client = connect_faulted(&sandbox, DISK_STAYS_FULL).await;
+
+    let result = keepalive_within(&client, serde_json::json!({"watch_id": "w"})).await;
+
+    assert_ne!(result.is_error, Some(true), "a failed save is not a tool error: {result:?}");
+    let envelope = text_json(&result);
+    assert_eq!(envelope["status"], "fired");
+    assert_eq!(envelope["next"], "act on events");
+    assert_eq!(envelope["events"][0]["event_id"], "w:1:0");
+    assert_eq!(envelope["events"][0]["summary"], "boom");
+    assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"));
+    assert_eq!(sandbox.watch_bytes("w"), before);
+    assert!(sandbox.tmp_files().is_empty());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_same_mcp_server_delivers_an_unsaved_result_again_to_a_no_id_keepalive() {
+    // why: DF3 "in the MCP server": the agent's normal call has NO watch_id.
+    //      The disk is full only while a sentinel file exists, so one server
+    //      creates a watch (healthy), fails a tick (sentinel present), then
+    //      retries (sentinel gone). Call 2 must return the same event again,
+    //      with no persist field, not "no watches to cover". Control: call 3,
+    //      after a persisted delivery, IS "no watches to cover" (V7 once per
+    //      process still holds).
+    // proves: CLAIM(DF3)
+    let sandbox = Sandbox::new();
+    let input = sandbox.input("w.log");
+    std::fs::write(&input, "boot\n").unwrap();
+    let sentinel = sandbox.dir.path().join("disk-is-full");
+    let plan = format!("watch:28:while={0},reserve:28:while={0}", sentinel.display());
+    let client = connect_faulted(&sandbox, &plan).await;
+    let created = call(client.peer(), "watch_create", watch_args("w", &input)).await;
+    assert_ne!(created.is_error, Some(true), "create on a healthy disk: {created:?}");
+    append_line(&input, "boom");
+
+    std::fs::write(&sentinel, "").unwrap();
+    let lost = text_json(&keepalive_within(&client, serde_json::json!({})).await);
+    assert_eq!(lost["status"], "fired");
+    assert_eq!(lost["persist"]["ok"], false, "precondition: the save failed: {lost}");
+
+    std::fs::remove_file(&sentinel).unwrap();
+    let again = keepalive_within(&client, serde_json::json!({})).await;
+    assert_ne!(again.is_error, Some(true), "the unsaved result must still be covered: {again:?}");
+    let again = text_json(&again);
+    assert_eq!(again["events"], lost["events"]);
+    assert!(again.get("persist").is_none(), "{again}");
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "fired");
+
+    let nothing = keepalive_within(&client, serde_json::json!({})).await;
+    assert_eq!(nothing.is_error, Some(true), "control: delivered and saved, nothing left to cover");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn watch_create_over_mcp_on_a_full_disk_is_an_error_that_names_the_root_and_says_disk_full() {
+    // why: DF5 through MCP: the agent must be able to tell "the disk is full"
+    //      from a generic failure, and find which directory to free.
+    // proves: CLAIM(DF5)
+    let sandbox = Sandbox::new();
+    let input = sandbox.input("w.log");
+    std::fs::write(&input, "boot\n").unwrap();
+    let client = connect_faulted(&sandbox, DISK_STAYS_FULL).await;
+
+    let created = call(client.peer(), "watch_create", watch_args("w", &input)).await;
+
+    assert_eq!(created.is_error, Some(true), "{created:?}");
+    let text = created.content[0].as_text().expect("text content").text.clone();
+    assert!(text.contains(sandbox.state_root().to_str().unwrap()), "should name the state root: {text}");
+    assert!(text.to_lowercase().contains("disk full"), "should say the disk is full: {text}");
+    assert!(sandbox.watch_file("w").is_none());
+    client.cancel().await.unwrap();
+}

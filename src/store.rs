@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::clock::Timestamp;
 use crate::error::StoreError;
+use crate::fault::FaultPlan;
 use crate::watch::{WatchFile, WatchId};
 
 /// Finished watches are deleted this long after they finish (D4).
@@ -88,14 +89,33 @@ pub struct StoreLock {
     file: File,
 }
 
+/// What a successful [`Store::save`] did beyond writing (specs/disk-full.md
+/// DF4). RED STUB: always the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteOutcome {
+    /// The first attempt hit a full disk, the reserve was deleted, and the
+    /// retry succeeded.
+    pub used_reserve: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    /// Test seam (`fault.rs`); `FaultPlan::none()` in production.
+    faults: FaultPlan,
 }
 
 impl Store {
     pub fn new(root: impl Into<PathBuf>) -> Store {
-        Store { root: root.into() }
+        Store { root: root.into(), faults: FaultPlan::none() }
+    }
+    /// Replace the fault plan (tests, and `main` when `VIGIL_TEST_FAULT` is set).
+    pub fn with_faults(mut self, faults: FaultPlan) -> Store {
+        self.faults = faults;
+        self
+    }
+    pub fn faults(&self) -> &FaultPlan {
+        &self.faults
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -119,9 +139,10 @@ impl Store {
         self.locks_dir().join(format!("{}.lock", id.as_str()))
     }
     /// Atomic save of one watch (creates `watches/` on demand).
-    pub fn save(&self, watch: &WatchFile) -> Result<(), StoreError> {
+    pub fn save(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
         std::fs::create_dir_all(self.watches_dir()).map_err(io_error)?;
-        write_atomic(&self.watch_path(&watch.spec.id), watch)
+        write_atomic(&self.watch_path(&watch.spec.id), watch)?;
+        Ok(WriteOutcome::default())
     }
     pub fn load(&self, id: &WatchId) -> Result<WatchFile, StoreError> {
         let bytes = std::fs::read(self.watch_path(id)).map_err(|error| match error.kind() {
@@ -619,7 +640,10 @@ mod tests {
         let store = Store::new(dir.path());
         let names = |sub: &str| -> Vec<String> {
             let mut out: Vec<String> = match std::fs::read_dir(dir.path().join(sub)) {
-                Ok(entries) => entries.map(|e| e.unwrap().file_name().to_string_lossy().into()).collect(),
+                // DF4 (specs/disk-full.md): after a save the root also holds
+                // `.reserve`. It is not a lock file; its own tests are the
+                // "reserve" ones below. Changed from an unfiltered listing.
+                Ok(entries) => entries.map(|e| e.unwrap().file_name().to_string_lossy().into()).filter(|name: &String| name != ".reserve").collect(),
                 Err(_) => vec![],
             };
             out.sort();
@@ -801,5 +825,359 @@ mod tests {
         pruner.join().unwrap();
         store.prune(now).unwrap();
         assert!(!store.watch_path(&wid("old")).exists(), "control: prunable once the lock is free");
+    }
+
+    // ---- disk full (specs/disk-full.md DF2, DF4, DF5, DF6) ----
+
+    use crate::fault::{FaultPlan, FaultRule, When, WriteKind};
+
+    /// D1: the reserve is 256 KiB = 256 * 1024 bytes, at `<root>/.reserve`.
+    const RESERVE_BYTES: u64 = 262_144;
+    const DISK_FULL_ERRNOS: [i32; 2] = [28 /* ENOSPC */, 122 /* EDQUOT */];
+
+    fn rule(kind: WriteKind, errno: i32, when: When) -> FaultRule {
+        FaultRule { kind, errno, when }
+    }
+
+    fn reserve_path(root: &Path) -> PathBuf {
+        root.join(".reserve")
+    }
+
+    /// A store over `root` with the given faults.
+    fn faulted(root: &Path, rules: Vec<FaultRule>) -> (Store, FaultPlan) {
+        let plan = FaultPlan::from_rules(rules);
+        (Store::new(root).with_faults(plan.clone()), plan)
+    }
+
+    /// The disk is full while the reserve exists and cannot make a new reserve:
+    /// the model of DF4 (the retry can only succeed because the reserve was
+    /// deleted first).
+    fn full_until_reserve_is_freed(root: &Path, errno: i32) -> Vec<FaultRule> {
+        vec![rule(WriteKind::Watch, errno, When::WhileExists(reserve_path(root))), rule(WriteKind::Reserve, errno, When::Every)]
+    }
+
+    /// Every `.tmp` file anywhere under `dir`.
+    fn tmp_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(tmp_files(&path));
+            } else if path.to_string_lossy().ends_with(".tmp") {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// `sample("w")` with a different tick, so "the new content" is visible.
+    fn newer(mut watch: WatchFile) -> WatchFile {
+        watch.tick += 7;
+        watch
+    }
+
+    fn says_disk_full_naming(error: &StoreError, root: &Path) -> bool {
+        let text = error.to_string();
+        text.contains(root.to_str().unwrap()) && text.to_lowercase().contains("disk full")
+    }
+
+    #[test]
+    fn a_successful_save_leaves_a_256_kib_reserve_at_the_state_root_and_nothing_else_changes() {
+        // why: DF4/D1: after any successful write the store creates
+        //      `<root>/.reserve`, 256 KiB (256 * 1024 = 262144 bytes), when it
+        //      is absent. It sits in the root, not in `watches/`, so `list`
+        //      never mistakes it for a watch. A clean write reports
+        //      `used_reserve = false` (wire format unchanged when all is well).
+        // proves: CLAIM(DF4)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let outcome = store.save(&sample("w")).unwrap();
+        let reserve = reserve_path(dir.path());
+        let metadata = std::fs::metadata(&reserve).unwrap_or_else(|error| panic!("no reserve at {}: {error}", reserve.display()));
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), RESERVE_BYTES);
+        assert_eq!(outcome, WriteOutcome { used_reserve: false });
+        assert_eq!(store.list().unwrap().len(), 1, "the reserve is not a watch");
+        assert!(!store.watches_dir().join(".reserve").exists());
+    }
+
+    #[test]
+    fn an_existing_reserve_is_not_rewritten() {
+        // why: DF4: "created ... when absent". A reserve that is already there
+        //      (here a 10 byte stand-in, so a rewrite is visible by size and
+        //      by inode) must be left alone: rewriting 256 KiB on every tick
+        //      would be pointless disk traffic.
+        // proves: CLAIM(DF4)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(reserve_path(dir.path()), "0123456789").unwrap();
+        let before = lock_identity(&reserve_path(dir.path()));
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+        assert_eq!(std::fs::metadata(reserve_path(dir.path())).unwrap().len(), 10, "left as it was");
+        assert_eq!(lock_identity(&reserve_path(dir.path())), before, "same inode");
+    }
+
+    #[test]
+    fn failing_to_create_the_reserve_is_never_an_error() {
+        // why: DF4: "Failure to create or delete the reserve is never itself
+        //      an error." The reserve is created on a nearly full disk, where
+        //      it often cannot be. The watch write must still succeed and the
+        //      creation must actually have been tried (attempts), else this
+        //      only shows that nothing happened.
+        // proves: CLAIM(DF4)
+        let dir = tempfile::tempdir().unwrap();
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Reserve, 28, When::Every)]);
+        let watch = sample("w");
+        store.save(&watch).unwrap();
+        assert_eq!(store.load(&wid("w")).unwrap(), watch);
+        assert!(plan.attempts(WriteKind::Reserve) >= 1, "the store never tried to create the reserve");
+        assert!(!reserve_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn disk_full_on_the_first_attempt_frees_the_reserve_retries_once_and_says_it_used_it() {
+        // why: DF4 (the incident): on ENOSPC (28) or EDQUOT (122) the store
+        //      deletes `.reserve` and retries the same write ONCE. The fault is
+        //      "full while the reserve exists", so the retry can only succeed
+        //      if the reserve was deleted BEFORE it (order is proven, not
+        //      assumed). Reserve creation is also failing (no room to
+        //      recreate it), as on a real full disk. Result: new content on
+        //      disk, `used_reserve = true`, reserve gone, no .tmp, exactly two
+        //      Watch attempts.
+        // proves: CLAIM(DF4), CLAIM(DF6)
+        for errno in DISK_FULL_ERRNOS {
+            let dir = tempfile::tempdir().unwrap();
+            let before = sample("w");
+            Store::new(dir.path()).save(&before).unwrap();
+            assert!(reserve_path(dir.path()).exists(), "precondition: errno {errno}: a reserve exists");
+
+            let (store, plan) = faulted(dir.path(), full_until_reserve_is_freed(dir.path(), errno));
+            let after = newer(before);
+            let outcome = store.save(&after).unwrap_or_else(|error| panic!("errno {errno}: the retry should have succeeded: {error}"));
+
+            assert_eq!(outcome, WriteOutcome { used_reserve: true }, "errno {errno}");
+            assert_eq!(store.load(&wid("w")).unwrap(), after, "errno {errno}: the new content is on disk");
+            assert!(!reserve_path(dir.path()).exists(), "errno {errno}: the reserve was spent");
+            assert_eq!(plan.attempts(WriteKind::Watch), 2, "errno {errno}: one attempt, one retry");
+            assert!(tmp_files(dir.path()).is_empty(), "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn after_spending_the_reserve_a_new_one_is_made_as_soon_as_there_is_room() {
+        // why: DF4 says the reserve is created "after any successful write
+        //      when absent" and the retry is a successful write. Here the disk
+        //      had room for the retry AND for a new reserve (only the watch
+        //      write was blocked, by the old reserve), so the next write leaves
+        //      the store protected again. Pins the literal reading; see the red
+        //      report for the open question about a disk that is truly full.
+        // proves: CLAIM(DF4)
+        let dir = tempfile::tempdir().unwrap();
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+        let plan_rules = vec![rule(WriteKind::Watch, 28, When::WhileExists(reserve_path(dir.path())))];
+        let (store, _) = faulted(dir.path(), plan_rules);
+        assert!(store.save(&newer(sample("w"))).unwrap().used_reserve, "precondition: the reserve was spent");
+        assert_eq!(std::fs::metadata(reserve_path(dir.path())).unwrap().len(), RESERVE_BYTES);
+    }
+
+    #[test]
+    fn a_disk_that_stays_full_fails_after_exactly_one_retry_with_a_message_that_names_the_root() {
+        // why: DF4 ("retries the same write once") + DF5 (an error that names
+        //      the state root and says the disk is full, not a bare `io error`)
+        //      + DF6 (the previous file is intact, no .tmp). Both attempts
+        //      fail, so: two attempts, not one and not a loop; the reserve is
+        //      gone (it was deleted for the retry); the error is the DiskFull
+        //      variant.
+        // proves: CLAIM(DF4), CLAIM(DF5), CLAIM(DF6)
+        for errno in DISK_FULL_ERRNOS {
+            let dir = tempfile::tempdir().unwrap();
+            let before = sample("w");
+            Store::new(dir.path()).save(&before).unwrap();
+            let bytes_before = std::fs::read(Store::new(dir.path()).watch_path(&wid("w"))).unwrap();
+
+            let (store, plan) =
+                faulted(dir.path(), vec![rule(WriteKind::Watch, errno, When::Every), rule(WriteKind::Reserve, errno, When::Every)]);
+            let error = store.save(&newer(before.clone())).expect_err("both attempts fail");
+
+            assert!(matches!(error, StoreError::DiskFull(_)), "errno {errno}: got {error:?}");
+            assert!(says_disk_full_naming(&error, dir.path()), "errno {errno}: {error}");
+            assert_eq!(plan.attempts(WriteKind::Watch), 2, "errno {errno}: one retry, no loop");
+            assert!(!reserve_path(dir.path()).exists(), "errno {errno}: deleted for the retry");
+            assert_eq!(std::fs::read(store.watch_path(&wid("w"))).unwrap(), bytes_before, "errno {errno}: previous file byte-identical");
+            assert_eq!(store.load(&wid("w")).unwrap(), before);
+            assert!(tmp_files(dir.path()).is_empty(), "errno {errno}: no .tmp");
+        }
+    }
+
+    #[test]
+    fn errors_that_are_not_a_full_disk_neither_retry_nor_touch_the_reserve() {
+        // why: DF4: only disk_full deletes the reserve. EIO (5), EACCES (13)
+        //      and EROFS (30) would not be fixed by 256 KiB, and deleting the
+        //      reserve for them would spend the protection for nothing. One
+        //      attempt, reserve byte-for-byte present (same inode, full size),
+        //      error is the plain Io variant (DF2: kind `io`), old file intact.
+        //      Control: with the fault gone the same save works.
+        // proves: CLAIM(DF4), CLAIM(DF2)
+        for errno in [5, 13, 30] {
+            let dir = tempfile::tempdir().unwrap();
+            let before = sample("w");
+            Store::new(dir.path()).save(&before).unwrap();
+            assert!(reserve_path(dir.path()).exists(), "precondition: errno {errno}: a save leaves a reserve");
+            let reserve_before = lock_identity(&reserve_path(dir.path()));
+
+            let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, errno, When::Every)]);
+            let error = store.save(&newer(before.clone())).expect_err("the write fails");
+
+            assert!(matches!(error, StoreError::Io(_)), "errno {errno}: got {error:?}");
+            assert_eq!(plan.attempts(WriteKind::Watch), 1, "errno {errno}: no retry");
+            assert_eq!(lock_identity(&reserve_path(dir.path())), reserve_before, "errno {errno}: same reserve file");
+            assert_eq!(std::fs::metadata(reserve_path(dir.path())).unwrap().len(), RESERVE_BYTES);
+            assert_eq!(store.load(&wid("w")).unwrap(), before);
+            assert!(tmp_files(dir.path()).is_empty());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+        Store::new(dir.path()).save(&newer(sample("w"))).expect("control: no fault, no failure");
+    }
+
+    #[test]
+    fn a_reserve_that_cannot_be_deleted_does_not_turn_the_retry_into_an_error() {
+        // why: DF4: "Failure to create or delete the reserve is never itself
+        //      an error." `.reserve` is made a directory, so `remove_file`
+        //      fails (EISDIR). The first attempt fails once with ENOSPC; the
+        //      retry must still happen and succeed, and the directory is left
+        //      alone.
+        // proves: CLAIM(DF4)
+        let dir = tempfile::tempdir().unwrap();
+        let before = sample("w");
+        Store::new(dir.path()).save(&before).unwrap();
+        assert!(reserve_path(dir.path()).exists(), "precondition: a save leaves a reserve");
+        std::fs::remove_file(reserve_path(dir.path())).unwrap();
+        std::fs::create_dir(reserve_path(dir.path())).unwrap();
+
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let after = newer(before);
+        store.save(&after).expect("deleting the reserve failed, the retry still runs and succeeds");
+        assert_eq!(store.load(&wid("w")).unwrap(), after);
+        assert_eq!(plan.attempts(WriteKind::Watch), 2);
+        assert!(reserve_path(dir.path()).is_dir());
+    }
+
+    #[test]
+    fn a_failed_write_removes_its_tmp_file_and_keeps_the_previous_content() {
+        // why: DF6: the existing guarantee (store.rs `write_atomic`) must hold
+        //      for the new failure paths. The seam fires AFTER `w.json.tmp` is
+        //      created, so the cleanup is really exercised: an inotify log of
+        //      the watches directory must show that `.tmp` being deleted, and
+        //      afterwards only `w.json` is left, byte-identical to before.
+        //      Errors tried: ENOSPC and EIO (the retry path and the plain path).
+        // proves: CLAIM(DF6)
+        for errno in [28, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            Store::new(dir.path()).save(&sample("w")).unwrap();
+            let watches = dir.path().join("watches");
+            let bytes_before = std::fs::read(watches.join("w.json")).unwrap();
+            let log = DeletionLog::start(&[("watches", watches.as_path())]);
+
+            let (store, _) = faulted(dir.path(), vec![rule(WriteKind::Watch, errno, When::Every)]);
+            assert!(store.save(&newer(sample("w"))).is_err(), "precondition: errno {errno}: the write fails");
+
+            let deleted = log.drain();
+            assert!(deleted.contains(&"watches/w.json.tmp".to_string()), "errno {errno}: the tmp file was never created and removed: {deleted:?}");
+            let mut names: Vec<String> = std::fs::read_dir(&watches).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+            names.sort();
+            assert_eq!(names, vec!["w.json".to_string()], "errno {errno}");
+            assert_eq!(std::fs::read(watches.join("w.json")).unwrap(), bytes_before, "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn a_real_enospc_from_the_kernel_is_a_disk_full_error_and_still_atomic() {
+        // why: DF2/DF6 without the seam: `/dev/full` is a device that answers
+        //      every write with a real ENOSPC. `w.json.tmp` is a symlink to it,
+        //      so `write_all` fails with the kernel's own errno 28. This is
+        //      the independent check that the classification works on a real
+        //      error and not only on the one the seam builds. The old file must
+        //      be intact and the `.tmp` (the symlink) gone (passes today); the
+        //      error must be DiskFull, not a bare Io (red today).
+        // proves: CLAIM(DF2), CLAIM(DF6)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        write_atomic(&path, &serde_json::json!({"v": "old"})).unwrap();
+        let tmp = dir.path().join("w.json.tmp");
+        std::os::unix::fs::symlink("/dev/full", &tmp).unwrap();
+        // Control: this is a real ENOSPC, not just any failure.
+        let real = std::fs::write(&tmp, b"x").expect_err("/dev/full refuses writes");
+        assert_eq!(real.raw_os_error(), Some(28), "{real}");
+
+        let outcome = write_atomic(&path, &serde_json::json!({"v": "new"}));
+
+        assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap()["v"], "old");
+        assert!(std::fs::symlink_metadata(&tmp).is_err(), "the .tmp entry must be removed");
+        assert!(matches!(outcome, Err(StoreError::DiskFull(_))), "ENOSPC must classify as DiskFull, got {outcome:?}");
+    }
+
+    /// Take a lock through the named store entry point.
+    fn take(store: &Store, entry: &str) -> Result<(), StoreError> {
+        let id = wid("w");
+        match entry {
+            "lock" => store.lock().map(drop),
+            "try_lock" => store.try_lock().map(drop),
+            "lock_watch" => store.lock_watch(&id).map(drop),
+            "try_lock_watch" => store.try_lock_watch(&id).map(drop),
+            other => panic!("unknown entry {other}"),
+        }
+    }
+    const LOCK_ENTRIES: [&str; 4] = ["lock", "try_lock", "lock_watch", "try_lock_watch"];
+
+    #[test]
+    fn creating_a_lock_file_on_a_full_disk_goes_through_the_reserve_and_retry_on_every_entry_point() {
+        // why: DF5: "per-watch lock-file creation" uses the same
+        //      reserve-and-retry path. There are four ways to take a lock
+        //      (global/per-watch, blocking/try), all through `open_lock_file`;
+        //      each is checked, so a retry wired into only one of them fails
+        //      here. Rescue: full while the reserve exists, lock created after
+        //      the reserve is spent. Persistent: an error naming the root.
+        // proves: CLAIM(DF5)
+        for entry in LOCK_ENTRIES {
+            let dir = tempfile::tempdir().unwrap();
+            Store::new(dir.path()).save(&sample("w")).unwrap();
+            assert!(reserve_path(dir.path()).exists(), "precondition: {entry}: a save leaves a reserve");
+            let rescue = vec![
+                rule(WriteKind::Lock, 28, When::WhileExists(reserve_path(dir.path()))),
+                rule(WriteKind::Reserve, 28, When::Every),
+            ];
+            let (store, _) = faulted(dir.path(), rescue);
+            take(&store, entry).unwrap_or_else(|error| panic!("{entry}: the retry should have created the lock: {error}"));
+            assert!(!reserve_path(dir.path()).exists(), "{entry}: the reserve was spent");
+
+            // A reserve exists here too: whether a retry is made when there
+            // is nothing to free is left open (red report, A4), not pinned.
+            let stuck = tempfile::tempdir().unwrap();
+            Store::new(stuck.path()).save(&sample("w")).unwrap();
+            assert!(reserve_path(stuck.path()).exists(), "precondition: {entry}: a save leaves a reserve");
+            let (store, plan) = faulted(stuck.path(), vec![rule(WriteKind::Lock, 28, When::Every)]);
+            let error = take(&store, entry).expect_err("the lock file can never be created");
+            assert!(matches!(error, StoreError::DiskFull(_)), "{entry}: {error:?}");
+            assert!(says_disk_full_naming(&error, stuck.path()), "{entry}: {error}");
+            assert_eq!(plan.attempts(WriteKind::Lock), 2, "{entry}: one retry");
+        }
+    }
+
+    #[test]
+    fn taking_a_lock_whose_file_exists_needs_no_disk_space_and_is_never_faulted() {
+        // why: seam semantics (fault.rs): opening an existing lock file writes
+        //      nothing, so a full disk cannot fail it. Control for the test
+        //      above (it proves the Lock rule fires on CREATION, not on every
+        //      open) and for DF1: a tick on a full disk still gets its lock.
+        // proves: CLAIM(DF-seam), CLAIM(DF5)
+        let dir = tempfile::tempdir().unwrap();
+        for entry in LOCK_ENTRIES {
+            take(&Store::new(dir.path()), entry).unwrap_or_else(|error| panic!("{entry}: {error}"));
+        }
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Lock, 28, When::Every)]);
+        for entry in LOCK_ENTRIES {
+            take(&store, entry).unwrap_or_else(|error| panic!("{entry}: existing lock file, full disk: {error}"));
+        }
+        assert_eq!(plan.attempts(WriteKind::Lock), 0, "no creation was attempted");
     }
 }

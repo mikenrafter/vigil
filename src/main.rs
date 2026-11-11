@@ -80,7 +80,8 @@ async fn async_main(cli: Cli) -> i32 {
 }
 
 /// Environment is read here and nowhere else (the library takes explicit
-/// values): `XDG_STATE_HOME`, `HOME` and the `VIGIL_*` variables.
+/// values): `XDG_STATE_HOME`, `HOME` and the `VIGIL_*` variables (including the
+/// test-only `VIGIL_TEST_FAULT`).
 fn build_vigil(root: Option<PathBuf>) -> anyhow::Result<Vigil> {
     let root = match root {
         Some(root) => root,
@@ -89,7 +90,12 @@ fn build_vigil(root: Option<PathBuf>) -> anyhow::Result<Vigil> {
     };
     let config = Config::from_lookup(|name| std::env::var(name).ok());
     let judge = HttpJudge::new(&config.judge_url, config.judge_timeout, config.health_timeout);
-    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config))
+    // Test seam (fault.rs): unset in production, so the plan injects nothing.
+    let faults = match std::env::var(vigil::fault::ENV_VAR) {
+        Ok(spec) => vigil::FaultPlan::parse(&spec).map_err(|error| anyhow::anyhow!("invalid {}: {error}", vigil::fault::ENV_VAR))?,
+        Err(_) => vigil::FaultPlan::none(),
+    };
+    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
