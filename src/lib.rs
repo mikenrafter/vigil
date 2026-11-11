@@ -6,7 +6,7 @@
 //! `attention` (early wake rules), `credit` + `monitor` (the orchestrator's
 //! credit check and hook), `envelope` (what the agent reads), `mcp` (the
 //! server front), `fault`/`meter`/`testing` (test seams).
-#![allow(dead_code, unused_variables)] // phase 2-3 stubs remain
+#![allow(dead_code, unused_variables)] // fixtures in testing.rs and some seams are used only by tests
 
 pub mod attention;
 pub mod cache;
