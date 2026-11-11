@@ -2191,3 +2191,75 @@ fn a_tick_that_saved_keeps_its_report_when_the_reserve_upkeep_after_its_save_is_
         assert_persist_failure(&failures[0], "b", "io", "Input/output error", &env.root().join("watches").join("b.json"));
     });
 }
+
+// ---- review round 2 (Sol 4/10): S5 the rescue deadline was captured too early -
+
+/// A quiet watch "q" whose probe takes `read_takes` of virtual time and then
+/// reads `bad` (so its tick fires), and a process whose FIRST watch write of
+/// the call fails with ENOSPC only after `write_takes` (the seam's slow write),
+/// with the reserve present. Returns the process, the plan and the reserve's
+/// identity.
+async fn tick_with_a_slow_failing_write(env: &Env, read_takes: Duration, write_takes: Duration) -> (WatchId, Vigil, FaultPlan, (u64, u64)) {
+    let id = quiet_probe_watch(env).await;
+    let reserve_before = identity(&env.root().join(".reserve"));
+    env.reader.set_text("cmd:probe", "bad");
+    env.reader.set_sleep("cmd:probe", read_takes);
+    let plan = FaultPlan::from_rules(vec![rule(WriteKind::Watch, 28, When::Nth(1)).taking(write_takes), rule(WriteKind::Reserve, 28, When::Every)]);
+    let vigil = env.another_process().with_write_faults(plan.clone());
+    (id, vigil, plan, reserve_before)
+}
+
+#[test]
+fn a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_inside_its_budget() {
+    // why: review S5 (Sol round 2): "the remaining budget is captured before
+    //      the synchronous write; a slow failing write then starts a full
+    //      rescue wait and the outer timeout drops the tick." `persist` turned
+    //      the call's deadline into a DURATION when the save began, and the
+    //      store started counting it when the rescue began to wait, which is
+    //      after the write. Setup (30 s call, the budget's minimum): the read
+    //      takes 29 s, so the save starts with 1 s left; its first write fails
+    //      with ENOSPC after 0.95 s, so the rescue would begin at t = 29.95 s;
+    //      the store-wide lock is held. The rescue's cutoff is the deadline less
+    //      the 100 ms margin, t = 29.9 s, which has passed: no wait at all.
+    //      Expected, hand-derived: the call ends at t = 29.95 s (29 + 0.95), so
+    //      `waited_s` is 29 (before the fix the stale 0.9 s wait ran into the
+    //      30 s timeout: the call ended at exactly 30 s, `waited_s` 30, the tick
+    //      dropped), the fired envelope carries the plain failure (disk_full,
+    //      no retry, redelivery), the reserve is the same file, ONE watch
+    //      attempt in the call.
+    //      Control (same world, lock FREE): a passed cutoff forbids WAITING,
+    //      not rescuing; the rescue gets the lock at once, spends the reserve
+    //      and saves (`used_reserve`), on attempt 2.
+    // proves: CLAIM(DF4e), CLAIM(DF1), CLAIM(S5-cutoff)
+    scenario(|| async {
+        let env = paused_env();
+        let (id, vigil, plan, reserve_before) = tick_with_a_slow_failing_write(&env, Duration::from_secs(29), Duration::from_millis(950)).await;
+        let guard = vigil.store().lock().unwrap();
+        let attempts_before = plan.attempts(WriteKind::Watch);
+
+        let started = tokio::time::Instant::now();
+        let envelope = wire(&vigil.keepalive(by_id(&id, Some(30))).await.expect("a rescue that cannot get the lock still answers"));
+        let elapsed = started.elapsed();
+
+        drop(guard);
+        assert_eq!(envelope["status"], "fired", "{envelope}");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), true, Some(false));
+        assert!(elapsed >= Duration::from_millis(29_900), "precondition: the read (29 s) and the slow write (0.95 s) really ran: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(30), "the rescue must not wait once its cutoff has passed; the call took {elapsed:?}");
+        assert_eq!(envelope["waited_s"], 29, "{envelope}");
+        assert_eq!(plan.attempts(WriteKind::Watch) - attempts_before, 1, "no lock, no retry");
+        assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "the reserve is untouched");
+    });
+    scenario(|| async {
+        let env = paused_env();
+        let (id, vigil, plan, reserve_before) = tick_with_a_slow_failing_write(&env, Duration::from_secs(29), Duration::from_millis(950)).await;
+        let attempts_before = plan.attempts(WriteKind::Watch);
+
+        let envelope = wire(&vigil.keepalive(by_id(&id, Some(30))).await.unwrap());
+
+        assert_eq!(envelope["status"], "fired", "{envelope}");
+        assert_eq!(persist_of(&envelope), &json!({"ok": true, "used_reserve": true, "kind": "disk_full"}), "{envelope}");
+        assert_eq!(plan.attempts(WriteKind::Watch) - attempts_before, 2, "the free lock lets the rescue retry once");
+        assert_ne!(identity(&env.root().join(".reserve")), reserve_before, "the reserve was spent and re-made");
+    });
+}

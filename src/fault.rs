@@ -61,6 +61,21 @@
 //! watches were written first). [`FaultPlan::attempts`] counts every attempt
 //! of the kind, filtered or not.
 //!
+//! # Time taken by an injected failure (review S5)
+//!
+//! A real write that fails can take long (a stalled disk). Under a paused test
+//! clock a synchronous write takes no virtual time, so the budget arithmetic
+//! of a call (`engine.rs`: the cutoff of a rescue's wait) could not be tested
+//! against a slow write. [`FaultRule::taking`] makes the injected failure
+//! arrive "after" some time: the failing attempt reports it through
+//! [`Attempt::time_taken`], and the store lets that much time pass on the
+//! call's clock (an `.await`: virtual under a paused tokio clock, a thread
+//! sleep in the blocking entry points) right after the first attempt fails and
+//! before it decides about a rescue. Only the FIRST attempt of a save is
+//! delayed, and only when it fails; a plan without `taking` (and every plan
+//! parsed from the environment: there is no syntax for it) delays nothing, so
+//! production behaviour is unchanged.
+//!
 //! # Spec syntax of [`FaultPlan::parse`] (the environment variable)
 //!
 //! Rules separated by `,`, each `KIND[@STAGE]:ERRNO:WHEN[:FILE]`.
@@ -86,6 +101,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The environment variable a spawned `vigil` reads its [`FaultPlan`] from.
 pub const ENV_VAR: &str = "VIGIL_TEST_FAULT";
@@ -202,17 +218,25 @@ pub struct FaultRule {
     pub when: When,
     /// Only attempts whose target file NAME is this; `None`: every attempt.
     pub file: Option<String>,
+    /// How long the injected failure takes to arrive (review S5, see the module
+    /// docs). Zero for every rule parsed from the environment.
+    pub took: Duration,
 }
 
 impl FaultRule {
     /// A rule at the kind's default stage ([`WriteKind::default_stage`]) for
     /// every file.
     pub fn new(kind: WriteKind, errno: i32, when: When) -> FaultRule {
-        FaultRule { kind, stage: kind.default_stage(), errno, when, file: None }
+        FaultRule { kind, stage: kind.default_stage(), errno, when, file: None, took: Duration::ZERO }
     }
     /// The same rule at another stage.
     pub fn at(mut self, stage: Stage) -> FaultRule {
         self.stage = stage;
+        self
+    }
+    /// The same rule, its failure arriving only after `took` (review S5).
+    pub fn taking(mut self, took: Duration) -> FaultRule {
+        self.took = took;
         self
     }
     /// The same rule restricted to attempts whose target file name is `file`.
@@ -254,25 +278,34 @@ pub struct Attempt {
     /// `(rule index, this attempt's ordinal among the attempts the rule
     /// matches)`, fixed at `begin` so later attempts cannot shift it.
     candidates: Vec<(usize, u64)>,
+    /// The `took` of the rule whose failure this attempt last injected.
+    time_taken: std::cell::Cell<Duration>,
 }
 
 impl Attempt {
     /// `Err` is the failure injected at `stage` of this attempt.
     pub fn at(&self, stage: Stage) -> io::Result<()> {
         let mut state = self.plan.shared.lock().expect("fault plan mutex poisoned");
-        let errno = self
+        let fired = self
             .candidates
             .iter()
             .map(|(index, ordinal)| (&state.rules[*index], *ordinal))
             .find(|(rule, ordinal)| rule.stage == stage && rule.when.fails(*ordinal))
-            .map(|(rule, _)| rule.errno);
-        match errno {
+            .map(|(rule, _)| (rule.errno, rule.took));
+        match fired {
             None => Ok(()),
-            Some(errno) => {
+            Some((errno, took)) => {
                 *state.injected.entry((self.kind, stage)).or_default() += 1;
+                self.time_taken.set(took);
                 Err(io::Error::from_raw_os_error(errno))
             }
         }
+    }
+
+    /// How long the failure injected by this attempt took to arrive (review
+    /// S5); zero when nothing was injected or the rule has no `taking`.
+    pub fn time_taken(&self) -> Duration {
+        self.time_taken.get()
     }
 }
 
@@ -308,7 +341,7 @@ impl FaultPlan {
                 candidates.push((index, state.matched[index]));
             }
         }
-        Attempt { plan: self.clone(), kind, candidates }
+        Attempt { plan: self.clone(), kind, candidates, time_taken: std::cell::Cell::new(Duration::ZERO) }
     }
 
     /// How many attempts of `kind` were begun so far (all clones, every file).
@@ -354,7 +387,7 @@ fn parse_rule(text: &str) -> Result<FaultRule, String> {
         }
         Some(name) => Some((*name).to_string()),
     };
-    Ok(FaultRule { kind, stage, errno, when, file })
+    Ok(FaultRule { kind, stage, errno, when, file, took: Duration::ZERO })
 }
 
 fn parse_when(text: &str) -> Result<When, String> {
@@ -408,6 +441,31 @@ mod tests {
 
     fn one(kind: WriteKind, errno: i32, when: When) -> FaultPlan {
         FaultPlan::from_rules(vec![FaultRule::new(kind, errno, when)])
+    }
+
+    #[test]
+    fn a_failure_reports_the_time_it_took_and_only_that_failure_does() {
+        // why: review S5 needs a slow failing write under a paused clock (see
+        //      the module docs). The seam must report the time of the failure
+        //      it injected, only for that attempt, and none for an attempt that
+        //      does not fail or a rule without `taking`: otherwise the engine
+        //      test would wait on the wrong attempt or on every write.
+        // proves: CLAIM(DF-seam), CLAIM(S5-time)
+        let slow = Duration::from_millis(950);
+        let plan = FaultPlan::from_rules(vec![
+            FaultRule::new(WriteKind::Watch, 28, When::Nth(1)).taking(slow),
+            FaultRule::new(WriteKind::Watch, 5, When::Nth(2)),
+        ]);
+        let first = plan.begin(WriteKind::Watch, Path::new("/s/w.json"));
+        assert_eq!(first.time_taken(), Duration::ZERO, "nothing failed yet");
+        assert_eq!(errno_of(first.at(Stage::Create)), None);
+        assert_eq!(first.time_taken(), Duration::ZERO, "a stage that does not fail takes no time");
+        assert_eq!(errno_of(first.at(Stage::Write)), Some(28));
+        assert_eq!(first.time_taken(), slow);
+        let second = plan.begin(WriteKind::Watch, Path::new("/s/w.json"));
+        assert_eq!(errno_of(second.at(Stage::Write)), Some(5));
+        assert_eq!(second.time_taken(), Duration::ZERO, "a rule without `taking` fails at once");
+        assert_eq!(FaultPlan::parse("watch:28:all").unwrap().begin(WriteKind::Watch, Path::new("/s/w.json")).time_taken(), Duration::ZERO, "the environment syntax cannot delay");
     }
 
     #[test]

@@ -82,6 +82,9 @@ trait Patience: Send {
     fn start(limit: Duration) -> Self;
     fn is_over(&self) -> bool;
     fn pause(&self) -> impl Future<Output = ()> + Send;
+    /// Let `duration` pass on this patience's clock (the seam's slow write,
+    /// review S5; never called with zero).
+    fn elapse(duration: Duration) -> impl Future<Output = ()> + Send;
 }
 
 /// Parks the calling thread. For callers that are not on an executor.
@@ -100,6 +103,9 @@ impl Patience for Blocking {
     async fn pause(&self) {
         std::thread::sleep(LOCK_POLL)
     }
+    async fn elapse(duration: Duration) {
+        std::thread::sleep(duration)
+    }
 }
 
 /// Yields to the executor on tokio's clock (virtual under a paused test clock,
@@ -117,6 +123,9 @@ impl Patience for Cooperative {
     }
     fn pause(&self) -> impl Future<Output = ()> + Send {
         tokio::time::sleep(LOCK_POLL)
+    }
+    fn elapse(duration: Duration) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(duration)
     }
 }
 
@@ -262,6 +271,19 @@ pub enum Settled<'a> {
     Written,
 }
 
+/// A failed attempt: its error, and how long the seam says the failure took to
+/// arrive (zero in production, see `fault.rs`, review S5).
+struct Failed {
+    error: io::Error,
+    took: Duration,
+}
+
+impl From<io::Error> for Failed {
+    fn from(error: io::Error) -> Failed {
+        Failed { error, took: Duration::ZERO }
+    }
+}
+
 /// Nobody is listening (callers that have no result to protect).
 fn unobserved(_: Settled<'_>) {}
 
@@ -381,9 +403,10 @@ impl Store {
     ) -> Result<WriteOutcome, StoreError> {
         let bytes = serde_json::to_vec_pretty(watch).map_err(|error| StoreError::Serialize(error.to_string()))?;
         let path = self.watch_path(&watch.spec.id);
-        let attempt = || -> io::Result<()> {
+        let attempt = || -> Result<(), Failed> {
             std::fs::create_dir_all(self.watches_dir())?;
-            write_staged(&path, &bytes, &self.faults.begin(WriteKind::Watch, &path))
+            let attempt = self.faults.begin(WriteKind::Watch, &path);
+            write_staged(&path, &bytes, &attempt).map_err(|error| Failed { error, took: attempt.time_taken() })
         };
         let first_failed = |error: &io::Error| {
             let context = WriteContext { path: path.clone(), state_root: Some(self.root.clone()), first_error: None };
@@ -415,14 +438,20 @@ impl Store {
     async fn attempt_with_rescue<P: Patience, T>(
         &self,
         access: StoreLockAccess<'_>,
-        mut attempt: impl FnMut() -> io::Result<T>,
+        mut attempt: impl FnMut() -> Result<T, Failed>,
         first_failed: &(dyn Fn(&io::Error) + Sync),
     ) -> Result<(T, bool), WriteFailed> {
-        let first = match attempt() {
+        let Failed { error: first, took } = match attempt() {
             Ok(value) => return Ok((value, false)),
-            Err(error) => error,
+            Err(failed) => failed,
         };
         first_failed(&first);
+        // The seam's slow write (review S5): time passes between the failure
+        // and the decision about a rescue, as it does when a real write stalls
+        // before it fails. Zero, and no await, in production.
+        if !took.is_zero() {
+            P::elapse(took).await;
+        }
         if crate::error::FailureKind::of(&first) != crate::error::FailureKind::DiskFull || !self.reserve_present() {
             return Err(WriteFailed { error: first, first_error: None });
         }
@@ -436,7 +465,7 @@ impl Store {
             // Deleting is best effort (DF4): a reserve that cannot be deleted
             // does not turn the retry into an error.
             let _ = std::fs::remove_file(self.reserve_path());
-            let retried = attempt();
+            let retried = attempt().map_err(|failed| failed.error);
             if retried.is_ok() {
                 // A5: a successful retry is a successful write.
                 self.fill_reserve_under_lock();
@@ -585,7 +614,7 @@ impl Store {
     /// `open_lock_file_once` through the same reserve-and-retry path as every
     /// other write (DF5).
     async fn open_lock_file<P: Patience>(&self, path: &Path) -> Result<File, StoreError> {
-        match self.attempt_with_rescue::<P, _>(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path), &|_| {}).await {
+        match self.attempt_with_rescue::<P, _>(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path).map_err(Failed::from), &|_| {}).await {
             Ok((file, _spent_reserve)) => Ok(file),
             Err(failed) => Err(failed.into_store_error(path.to_path_buf(), &self.root)),
         }
