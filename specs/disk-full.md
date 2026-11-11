@@ -91,3 +91,47 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
 - **Seam.** `VIGIL_TEST_FAULT` stays an env var read in `main.rs`; it is
   documented as test-only, a malformed value is a hard error, unset changes
   nothing.
+
+## Amendments after spec review round 1 (Sol 6/10, bar 9; orchestrator, 2026-11-10)
+
+- **S1 → DF3 narrowed.** Guaranteed: this call's answer (DF1). Best effort
+  after a failed save: the next tick re-senses from the last saved baseline.
+  Inputs with durable history (`file` appends, `glob`) redeliver their content;
+  transient inputs (`cmd`, `url`, `port`, `process`) report their state at the
+  next sensing and may not repeat a vanished change; an expiry or a
+  cancellation saved by another process wins over redelivery. Event identity:
+  every event produced by a tick that follows a failed save carries
+  `"redelivered": true`; agents must not deduplicate by `event_id` across a
+  persist failure (the tick number did not advance, so ids can repeat with
+  different content). Tests assert literal event content (both lines in the
+  DF3b case), and cover a transient input that reverts, expiry, and a
+  concurrent saved cancel.
+- **S2 → DF4b.** A valid reserve is a regular file of 262144 bytes with at
+  least that much allocated (`st_blocks * 512 >= 262144`), written with real
+  zeros and fsynced. A short, sparse or unreadable reserve is replaced on the
+  next successful write (the ten-byte "preserve" control is reversed). The
+  rescue is best effort and the docs say so: a write larger than the reserve,
+  inode exhaustion, quotas, compression or a different filesystem can still
+  fail, and then DF1/DF2 apply.
+- **S3 → DF4c.** Reserve create, delete and the retry run under the
+  store-wide lock (taken after any watch lock, matching SPEC.md's lock order),
+  so two processes cannot both spend or re-create it mid-rescue. vigil never
+  keeps the reserve open. One threaded test races two rescues on one root:
+  exactly one consumes the reserve, the other reports `disk_full`.
+- **S4 → seam stages and DF6 precision.** The seam injects at each stage of
+  `write_atomic`: create (incl. ENOSPC on inode exhaustion), short write,
+  `sync_all`, `rename`; and for the reserve: create, short write. The rename
+  is the commit point: before it the old file is intact; a failed cleanup of
+  `.tmp` is best effort and the leftover is removed at the next successful
+  write. Retry-error precedence: the retry's error is reported, the first is
+  kept in `persist.first_error`. A crash after deleting the reserve and before
+  the retry leaves no reserve; the next successful write re-creates it.
+- **S5 → DF2a (several watches).** A keepalive covering several watches
+  reports `persist` for the watch whose envelope it returns, plus
+  `persist_failures: [{watch_id, kind, error, path}]` listing every other
+  covered watch whose save failed in that call (absent when empty). A quiet
+  failed save on a secondary watch is therefore visible. Tests: two watches,
+  one saved terminal and one unsaved; a secondary quiet failure; mixed kinds.
+- **S6 → doc only.** SPEC/skill state that `VIGIL_TEST_FAULT` is for tests,
+  assumes a trusted process environment, and that inheriting it disables
+  writes or (if malformed) stops vigil from starting.
