@@ -13,6 +13,7 @@ use crate::credit::CreditCheck;
 use crate::engine::{expired_if_overdue, Persisted};
 use crate::envelope::{cut_digest, ClockNote, Envelope, Next, OtherWatch, PersistNote, SecondaryFailure};
 use crate::error::VigilError;
+use crate::monitor::CreditPlan;
 use crate::tick::{digest_of, is_due, Retained, TickOutcome, TickReport};
 use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId, WatchStatus};
 
@@ -416,14 +417,17 @@ impl crate::engine::Vigil {
             }
         }
         if call.has_events_for_the_agent() {
+            self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
             return Ok(call);
         }
         loop {
             // C12: a covered watch that is already terminal (finished before
             // this call, or by another process) is returned before any round
             // is awaited, so a held lock elsewhere cannot hold it back.
+            // ↳ CLAIM(S3-credit): it still owes the orchestrator's due check
             for id in covered {
                 if self.load_watch(id)?.status.is_finished() {
+                    self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
                     return Ok(call);
                 }
             }
@@ -518,26 +522,20 @@ impl crate::engine::Vigil {
                 let wake = overdue_at(&watch).map_or(wake, |overdue| wake.min(overdue.max(now)));
                 next_wake = Some(next_wake.map_or(wake, |current| current.min(wake)));
             }
+            // AI2' / S2 / S3: the orchestrator's credit check, after the watches
+            // had their pass, on every way out of the call (a quiet pass, a
+            // finished watch, new attention): a call that always returns early
+            // would otherwise never monitor.
+            // ↳ CLAIM(S3-credit)
             if any_finished || call.raised_attention {
+                self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
                 return Ok(call);
             }
-            // AI2' / S2: the orchestrator's credit check, after the watches had
-            // their pass (a finished watch is never held back by a probe).
-            if let Some(credit) = credit.as_mut() {
-                if credit.is_due(self.clock.now()) {
-                    let anchor = self.load_watch(&covered[0])?;
-                    let step = self.run_credit_step(credit, budget_end, (&anchor.spec.id, anchor.tick)).await?;
-                    if step.check.is_some() {
-                        call.credit_check = step.check;
-                    }
-                    if let Some(event) = step.event {
-                        call.credit_events.push(event);
-                        return Ok(call);
-                    }
-                }
-                if let Some(due) = credit.next_due_at() {
-                    next_wake = Some(next_wake.map_or(due, |current| current.min(due)));
-                }
+            if self.due_credit_check(&mut credit, covered, budget_end, &mut call).await? {
+                return Ok(call);
+            }
+            if let Some(due) = credit.as_ref().and_then(CreditPlan::next_due_at) {
+                next_wake = Some(next_wake.map_or(due, |current| current.min(due)));
             }
             let left = budget_end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -549,6 +547,31 @@ impl crate::engine::Vigil {
                 .unwrap_or(left);
             tokio::time::sleep(until_wake.min(left)).await;
         }
+    }
+
+    /// AI2' / S2 / S3: make the orchestrator's credit check if the plan says one
+    /// is due now (a call that is not the orchestrator's has no plan and checks
+    /// nothing). The check is recorded in `call` for `cache.credit_check`; when
+    /// it saw a change, its event is added and `true` says the call ends. Never
+    /// fails the call because of the check itself (see `run_credit_step`).
+    ///
+    /// CLAIM(S3-credit): every return path of a blocking call runs this once
+    /// before it returns, so the cadence holds for calls that always end early
+    /// [review S3; auto_interval_tests::a_call_that_returns_carried_attention_still_makes_its_due_credit_check
+    /// and the three tests after it].
+    async fn due_credit_check(&self, credit: &mut Option<CreditPlan>, covered: &[WatchId], budget_end: Instant, call: &mut CallRecord) -> Result<bool, VigilError> {
+        let Some(credit) = credit.as_mut() else { return Ok(false) };
+        if !credit.is_due(self.clock.now()) {
+            return Ok(false);
+        }
+        let anchor = self.load_watch(&covered[0])?;
+        let step = self.run_credit_step(credit, budget_end, (&anchor.spec.id, anchor.tick)).await?;
+        if step.check.is_some() {
+            call.credit_check = step.check;
+        }
+        let changed = step.event.is_some();
+        call.credit_events.extend(step.event);
+        Ok(changed)
     }
 
     /// DF1a (revised, review T1): how long to hold a call whose answer is

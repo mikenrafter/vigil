@@ -631,6 +631,17 @@ fn transcript_sandbox() -> (Sandbox, std::path::PathBuf) {
     (sandbox, fake_uw)
 }
 
+/// Review S3: the first orchestrator call on a state root owes its due credit
+/// check even when its watch fires at once, so its `cache` also holds
+/// `credit_check` (the fake `uw` reports no credits). Returns `cache` without
+/// that key, after asserting it is there and says "not on credits".
+fn cache_without_credit_check(envelope: &serde_json::Value) -> serde_json::Value {
+    let mut cache = envelope["cache"].clone();
+    let check = cache.as_object_mut().expect("cache object").remove("credit_check").expect("S3: an orchestrator call that fires at once still makes its due credit check");
+    assert_eq!((&check["on_credits"], &check["source"]), (&serde_json::json!(false), &serde_json::json!("uw")), "{check}");
+    cache
+}
+
 async fn fired_keepalive(client: &Client, sandbox: &Sandbox, id: &str, extra_create: serde_json::Value, keepalive: serde_json::Value) -> serde_json::Value {
     let input = sandbox.input(&format!("{id}.log"));
     std::fs::write(&input, "boot\n").unwrap();
@@ -678,7 +689,7 @@ async fn an_mcp_orchestrator_call_gets_the_one_hour_window_and_a_plain_call_does
     let client = connect_with_env(&sandbox, &[("CLAUDE_CODE_SESSION_ID", "sess-1".as_ref()), ("VIGIL_UW_COMMAND", fake_uw.as_os_str())]).await;
     let long = fired_keepalive(&client, &sandbox, "a", serde_json::json!({}), serde_json::json!({"watch_id": "a", "orchestrator": true})).await;
     assert_eq!(long["max_s"], 3300);
-    assert_eq!(long["cache"], serde_json::json!({"ttl": "1h", "source": "claude-transcript", "interval_s": 3300}));
+    assert_eq!(cache_without_credit_check(&long), serde_json::json!({"ttl": "1h", "source": "claude-transcript", "interval_s": 3300}));
     assert!(long["clock"]["summary"].as_str().is_some_and(|line| !line.is_empty() && !line.contains('\n')), "{long}");
     let plain = fired_keepalive(&client, &sandbox, "b", serde_json::json!({}), serde_json::json!({"watch_id": "b"})).await;
     assert_eq!(plain["max_s"], 270);
@@ -711,7 +722,7 @@ async fn an_mcp_server_started_by_codex_never_exceeds_270_s() {
     let (sandbox, fake_uw) = transcript_sandbox();
     let client = connect_with_env(&sandbox, &[("AGENT", "codex".as_ref()), ("VIGIL_UW_COMMAND", fake_uw.as_os_str())]).await;
     let derived = fired_keepalive(&client, &sandbox, "a", serde_json::json!({}), serde_json::json!({"watch_id": "a", "orchestrator": true})).await;
-    assert_eq!(derived["cache"], serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
+    assert_eq!(cache_without_credit_check(&derived), serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
     let clamped = fired_keepalive(&client, &sandbox, "b", serde_json::json!({}), serde_json::json!({"watch_id": "b", "orchestrator": true, "max_s": 9999})).await;
     assert_eq!(clamped["max_s"], 270);
     client.cancel().await.unwrap();

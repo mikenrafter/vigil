@@ -1294,6 +1294,17 @@ fn fire_and_keepalive(sandbox: &Sandbox, fake_uw: &std::path::Path, id: &str, ar
     stdout_json(&output)
 }
 
+/// Review S3: the first orchestrator call on a state root owes its due credit
+/// check even when its watch fires at once, so its `cache` also holds
+/// `credit_check` (the fake `uw` reports no credits). Returns `cache` without
+/// that key, after asserting it is there and says "not on credits".
+fn cache_without_credit_check(envelope: &serde_json::Value) -> serde_json::Value {
+    let mut cache = envelope["cache"].clone();
+    let check = cache.as_object_mut().expect("cache object").remove("credit_check").expect("S3: an orchestrator call that fires at once still makes its due credit check");
+    assert_eq!((&check["on_credits"], &check["source"]), (&serde_json::json!(false), &serde_json::json!("uw")), "{check}");
+    cache
+}
+
 #[test]
 fn the_cli_orchestrator_flag_on_a_one_hour_cache_chooses_a_3300_s_window() {
     // why: AI1' + AI3 through the real binary: CLAUDE_CODE_SESSION_ID is read
@@ -1340,7 +1351,7 @@ fn an_explicit_max_s_beats_the_flag_and_the_cache() {
     assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
     let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &["--orchestrator", "--max-s", "60"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
     assert_eq!(envelope["max_s"], 60);
-    assert_eq!(envelope["cache"], serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 60}));
+    assert_eq!(cache_without_credit_check(&envelope), serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 60}));
 }
 
 #[test]
@@ -1366,7 +1377,7 @@ fn codex_is_recognised_from_the_environment_and_gets_the_codex_default() {
     let (sandbox, fake_uw) = auto_sandbox(true);
     assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
     let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &["--orchestrator"], &[("AGENT", "codex")]);
-    assert_eq!(envelope["cache"], serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
+    assert_eq!(cache_without_credit_check(&envelope), serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
 
     assert!(create_with(&sandbox, "v", serde_json::json!({})).status.success());
     let claude = fire_and_keepalive(&sandbox, &fake_uw, "v", &["--orchestrator"], &[("AGENT", "claude")]);
