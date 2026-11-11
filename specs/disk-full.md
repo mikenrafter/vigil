@@ -167,3 +167,12 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
   deadline → envelope returned, reserve intact, one attempt.
 - **N3.** The cleanup-precedence test injects different errnos for the write
   and the cleanup and asserts the returned error is the write's.
+
+## Amendment after tier-2 review (orchestrator, 2026-11-10)
+
+- **DF1a revised (T1).** When the returned envelope is pending (no events, no
+  terminal status) and its save failed, the call is held for
+  `min(interval_s, budget left)` without re-ticking, then returns. Envelopes
+  with events or a terminal status still return at once. The same pacing
+  serves MCP, CLI `keepalive` and `wait` (one shared path), so a disk that
+  stays full never turns into back-to-back agent turns.
