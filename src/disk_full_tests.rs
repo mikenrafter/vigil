@@ -1343,3 +1343,288 @@ fn one_terminal_result_saved_and_another_unsaved_are_both_answered_and_the_unsav
     });
 }
 
+// ---- final defaults: DF4d (N1), DF4e (N2), S1 qualified ---------------------
+
+#[test]
+fn without_a_store_wide_lock_file_that_can_be_made_there_is_no_rescue_and_the_reserve_is_left_alone() {
+    // why: DF4d (N1): "If the lock file is missing and cannot be created, no
+    //      rescue is attempted: the write reports `disk_full`, the reserve is
+    //      untouched." Through the real tick. The store-wide `lock` file is
+    //      removed (an admin cleaning the state root), the first watch write
+    //      fails once with ENOSPC (a one-shot fault, so a retry WOULD succeed
+    //      and hide the missing rescue), and the lock file cannot be created
+    //      (a Lock fault). Expected: the tick still answers (DF1), persist is
+    //      the plain failure (disk_full, no `used_reserve`, no `first_error`:
+    //      no retry), exactly ONE watch attempt, the reserve is the very same
+    //      valid file, and no lock file appeared. Control in the same test: with
+    //      the lock file creatable, the identical fault IS rescued (used_reserve,
+    //      two attempts, reserve spent), so the difference is the lock file.
+    // proves: CLAIM(DF4d), CLAIM(DF1)
+    scenario(|| async {
+        let rescued = Fixture::new().await;
+        let lock = rescued.env.root().join("lock");
+        std::fs::remove_file(&lock).expect("precondition: create left the store-wide lock file");
+        let (vigil, plan) = rescued.faulted(vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let envelope = wire(&vigil.keepalive(by_id(&rescued.id, None)).await.unwrap());
+        assert_eq!(persist_of(&envelope), &json!({"ok": true, "used_reserve": true, "kind": "disk_full"}), "control: a creatable lock file allows the rescue");
+        assert_eq!(plan.attempts(WriteKind::Watch), 2, "control");
+        assert!(!rescued.reserve().exists(), "control: spent");
+
+        let fixture = Fixture::new().await;
+        let lock = fixture.env.root().join("lock");
+        std::fs::remove_file(&lock).expect("precondition: create left the store-wide lock file");
+        assert!(fixture.reserve().exists(), "precondition: create left a reserve");
+        let reserve_before = identity(&fixture.reserve());
+        let before = fixture.watch_bytes();
+        let (vigil, plan) = fixture.faulted(vec![
+            rule(WriteKind::Watch, 28, When::Nth(1)),
+            rule(WriteKind::Reserve, 28, When::Every),
+            rule(WriteKind::Lock, 28, When::Every),
+        ]);
+
+        let envelope = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.expect("a failed save must not fail the call"));
+
+        assert_eq!(envelope["status"], "fired");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &fixture.watch_file(), true, Some(false));
+        assert!(persist_of(&envelope).get("used_reserve").is_none(), "{envelope}");
+        assert_eq!(plan.attempts(WriteKind::Watch), 1, "no rescue, so no retry");
+        assert!(plan.injected(WriteKind::Lock, crate::fault::Stage::Create) >= 1, "the lock file creation was really tried");
+        assert_eq!(identity(&fixture.reserve()), reserve_before, "the reserve is untouched");
+        assert_eq!(std::fs::metadata(fixture.reserve()).unwrap().len(), 262_144);
+        assert!(!lock.exists(), "the lock file could not be made");
+        assert_eq!(fixture.watch_bytes(), before);
+    });
+}
+
+#[test]
+fn a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_with_the_envelope() {
+    // why: DF4e (N2): "A rescue waits for the store-wide lock at most
+    //      min(2 s, remaining call budget); on timeout it reports `disk_full`,
+    //      leaves the reserve untouched and does not retry. Test: lock held
+    //      beyond the deadline -> envelope returned, reserve intact, one
+    //      attempt." The test holds the store-wide lock for the whole call and
+    //      the first write fails once with ENOSPC (a one-shot fault: a retry
+    //      would succeed and hide a missing deadline).
+    //      World 1, ample budget (270 s): the rescue waits the 2 s ceiling. It
+    //      returned (the scenario watchdog is 20 s, so an unbounded wait fails
+    //      loudly) and took at least 1.9 s of REAL time (the wait is a real
+    //      lock wait on a blocked thread: tokio's paused clock does not shorten
+    //      it).
+    //      World 2, the read takes 29.5 s of virtual time out of a 30 s call, so
+    //      0.5 s of budget is left when the save starts: the rescue waits about
+    //      0.5 s, so the call returns in well under the 2 s ceiling (< 1.8 s).
+    //      This is the "remaining call budget" half: it fails if the engine
+    //      does not pass its budget to the store.
+    //      Both: the envelope is the fired one with the plain failure note
+    //      (disk_full, no retry, so no `first_error`), the reserve is the same
+    //      valid file, ONE watch attempt, the watch file unchanged.
+    // proves: CLAIM(DF4e), CLAIM(DF1), CLAIM(DF4c)
+    scenario(|| async {
+        let fixture = Fixture::new().await;
+        let reserve_before = identity(&fixture.reserve());
+        let before = fixture.watch_bytes();
+        let (vigil, plan) = fixture.faulted(vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let guard = vigil.store().lock().unwrap();
+
+        let started = std::time::Instant::now();
+        let envelope = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.expect("a rescue that cannot get the lock still answers"));
+        let elapsed = started.elapsed();
+
+        drop(guard);
+        assert_eq!(envelope["status"], "fired");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &fixture.watch_file(), true, Some(false));
+        assert!(elapsed >= Duration::from_millis(1900), "the rescue waited only {elapsed:?} for the lock; the ceiling is 2 s");
+        assert_eq!(plan.attempts(WriteKind::Watch), 1, "no lock, no retry");
+        assert_eq!(identity(&fixture.reserve()), reserve_before, "the reserve is untouched");
+        assert_eq!(fixture.watch_bytes(), before);
+    });
+    scenario(|| async {
+        let env = paused_env();
+        let id = quiet_probe_watch(&env).await;
+        let reserve = env.root().join(".reserve");
+        let reserve_before = identity(&reserve);
+        env.reader.set_text("cmd:probe", "bad");
+        env.reader.set_sleep("cmd:probe", Duration::from_millis(29_500));
+        let plan = FaultPlan::from_rules(vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let vigil = env.another_process().with_write_faults(plan.clone());
+        let guard = vigil.store().lock().unwrap();
+
+        let started = std::time::Instant::now();
+        let envelope = wire(&vigil.keepalive(by_id(&id, Some(30))).await.expect("a rescue that cannot get the lock still answers"));
+        let elapsed = started.elapsed();
+
+        drop(guard);
+        assert_eq!(envelope["status"], "fired", "{envelope}");
+        assert_eq!(envelope["waited_s"], 29, "precondition: the read really used 29.5 s of the 30 s budget: {envelope}");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), true, Some(false));
+        assert!(elapsed < Duration::from_millis(1800), "the rescue waited {elapsed:?}; only ~0.5 s of the call budget was left, far below the 2 s ceiling");
+        assert_eq!(plan.attempts(WriteKind::Watch), 1);
+        assert_eq!(identity(&reserve), reserve_before, "the reserve is untouched");
+    });
+}
+
+/// A change watch "g" (interval 20 s) on the glob `<inputs>/*.txt`, created
+/// healthy by `env.vigil`; the empty directory is the saved baseline.
+async fn glob_watch(env: &Env) -> (WatchId, PathBuf, String) {
+    let dir = env.input_path("out");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pattern = format!("{}/*.txt", dir.display());
+    let mut request = change_request("g", Path::new("/unused"), 20);
+    request.inputs = vec![crate::watch::Input::Glob { pattern: pattern.clone(), report: crate::watch::GlobReport::Created }];
+    let id = env.vigil.create(request).await.unwrap().watch_id;
+    (id, dir, pattern)
+}
+
+/// The wire form of the one event the glob watch "g" fires at tick 1.
+fn glob_event(pattern: &str, summary: &str, redelivered: bool) -> Value {
+    let mut event = json!({
+        "event_id": "g:1:0",
+        "tick": 1,
+        "watch_id": "g",
+        "input": format!("glob:{pattern}"),
+        "summary": summary,
+    });
+    if redelivered {
+        event["redelivered"] = json!(true);
+    }
+    event
+}
+
+#[test]
+fn a_glob_redelivers_its_current_matches_and_never_a_match_that_has_vanished() {
+    // why: S1 qualified (final defaults): "`glob` reports current matches, like
+    //      other transient inputs" (redelivery covers `file` appends only). The
+    //      saved baseline is the EMPTY listing, so after a failed save the next
+    //      sensing reports every match that exists NOW as created, and nothing
+    //      that is gone. Expected, per world (summary = created paths joined by
+    //      " | ", in sorted order, X2):
+    //        both stay    a.txt appears (the lost tick), b.txt appears; the next
+    //                     call reports "a.txt | b.txt", flagged redelivered;
+    //        a vanishes   a.txt appears (lost), is deleted, b.txt appears; the
+    //                     next call reports ONLY "b.txt", flagged (a is nowhere
+    //                     in the event or the stored digest);
+    //        all vanish   a.txt appears (lost) and is deleted: the next call is a
+    //                     quiet saved `pending`: no event, no flag, no persist
+    //                     (the lost change is gone, the documented limit).
+    //      The lost call itself carries the first delivery, unflagged, with
+    //      persist.ok = false in every world.
+    // proves: CLAIM(S1)
+    let lost_save = || FaultPlan::from_rules(vec![rule(WriteKind::Watch, 28, When::Range { first: 1, last: Some(2) })]);
+    scenario(move || async move {
+        let env = paused_env();
+        let (id, dir, pattern) = glob_watch(&env).await;
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        write_file(&a, "");
+        let vigil = env.another_process().with_write_faults(lost_save());
+        let lost = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+        assert_eq!(persist_of(&lost)["ok"], false, "precondition: {lost}");
+        assert_eq!(lost["events"], json!([glob_event(&pattern, a.to_str().unwrap(), false)]), "the lost call's own event is a first delivery");
+
+        write_file(&b, "");
+        let again = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+
+        assert!(again.get("persist").is_none(), "{again}");
+        let both = format!("{} | {}", a.display(), b.display());
+        assert_eq!(again["events"], json!([glob_event(&pattern, &both, true)]), "both current matches, flagged");
+        assert_eq!(env.vigil.store().load(&id).unwrap().last_digest, format!("glob:{pattern}:\n{}\n{}", a.display(), b.display()));
+    });
+    scenario(move || async move {
+        let env = paused_env();
+        let (id, dir, pattern) = glob_watch(&env).await;
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        write_file(&a, "");
+        let vigil = env.another_process().with_write_faults(lost_save());
+        let lost = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+        assert_eq!(persist_of(&lost)["ok"], false, "precondition: {lost}");
+
+        std::fs::remove_file(&a).unwrap();
+        write_file(&b, "");
+        let again = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+
+        assert!(again.get("persist").is_none(), "{again}");
+        assert_eq!(again["events"], json!([glob_event(&pattern, b.to_str().unwrap(), true)]), "only what exists now");
+        assert!(!again.to_string().contains("a.txt"), "the vanished match must not be mentioned: {again}");
+        assert!(!env.vigil.store().load(&id).unwrap().last_digest.contains("a.txt"));
+    });
+    scenario(move || async move {
+        let env = paused_env();
+        let (id, dir, _pattern) = glob_watch(&env).await;
+        let a = dir.join("a.txt");
+        write_file(&a, "");
+        let vigil = env.another_process().with_write_faults(lost_save());
+        let lost = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+        assert_eq!((lost["status"].as_str(), persist_of(&lost)["ok"].as_bool()), (Some("fired"), Some(false)), "precondition: {lost}");
+
+        std::fs::remove_file(&a).unwrap();
+        let next = wire(&vigil.keepalive(by_id(&id, Some(30))).await.expect("the next call must work"));
+
+        assert_eq!(next["status"], "pending", "{next}");
+        assert_eq!(next["events"], json!([]), "the vanished match is not repeated: {next}");
+        assert!(next.get("persist").is_none(), "this write worked: {next}");
+        assert!(!next.to_string().contains("redelivered"), "{next}");
+        assert_eq!(env.vigil.store().load(&id).unwrap().status, WatchStatus::Pending);
+    });
+}
+
+/// `bytes` bytes of one line: `tag`, then `x`s, then a newline.
+fn line_of(tag: &str, bytes: usize) -> String {
+    format!("{tag}{}\n", "x".repeat(bytes - tag.len() - 1))
+}
+
+#[test]
+fn a_file_redelivers_every_append_since_the_saved_baseline_up_to_the_64_kib_capture_cap() {
+    // why: S1 qualified: "Redelivery covers `file` appends only, within the
+    //      existing 64 KiB pending-change cap (SPEC W7)". A file input has
+    //      durable history: the saved baseline is its byte offset, so a failed
+    //      save loses nothing the file still holds, up to the 64 KiB capture
+    //      cap of one read (V12, W4: the oldest bytes are skipped, the newest
+    //      kept, with `[truncated]`). The watch reads with `tail_bytes` 65536.
+    //      The stored `last_digest` (not cut by the 8 KiB envelope limit) is
+    //      the oracle. Lines: FIRST is 20000 or 40000 bytes (tag, x's, "\n"),
+    //      SECOND likewise, appended around the failed call.
+    //        within the cap   FIRST 20000 + SECOND 20000 = 40000 <= 65536: the
+    //                         digest is `file:<path>:\n` + FIRST + SECOND, every
+    //                         byte of both appends, no marker; the event
+    //                         summary is SECOND's first 200 bytes (newest line,
+    //                         X2); flagged redelivered.
+    //        over the cap     FIRST 40000 + SECOND 40000 = 80000 > 65536: the
+    //                         newest 65536 bytes are kept = all of SECOND (40000)
+    //                         and the last 25536 bytes of FIRST (25535 x's and its
+    //                         newline), so the digest is `file:<path>:\n` +
+    //                         `[truncated]\n` + those + SECOND: FIRST's tag, the
+    //                         oldest bytes, are gone. The documented limit.
+    // proves: CLAIM(S1)
+    for (first_bytes, second_bytes, over_the_cap) in [(20_000usize, 20_000usize, false), (40_000, 40_000, true)] {
+        scenario(move || async move {
+            let env = paused_env();
+            let input = env.input_path("big.log");
+            write_file(&input, "old\n");
+            let mut request = change_request("w", &input, 20);
+            request.inputs = vec![crate::watch::Input::File { path: input.clone(), tail_bytes: Some(65_536) }];
+            let id = env.vigil.create(request).await.unwrap().watch_id;
+            let (first, second) = (line_of("FIRST", first_bytes), line_of("SECOND", second_bytes));
+            append_file(&input, &first);
+            let vigil = env.another_process().with_write_faults(FaultPlan::from_rules(vec![rule(WriteKind::Watch, 28, When::Range { first: 1, last: Some(2) })]));
+            let lost = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+            assert_eq!(persist_of(&lost)["ok"], false, "precondition: {}", lost["status"]);
+
+            append_file(&input, &second);
+            let again = wire(&vigil.keepalive(by_id(&id, None)).await.unwrap());
+
+            assert!(again.get("persist").is_none(), "{}", again["status"]);
+            let event = &again["events"][0];
+            assert_eq!(event["redelivered"], true);
+            assert_eq!(event["summary"], format!("SECOND{}", "x".repeat(194)), "the newest line, cut to 200 bytes");
+            let expected_text = if over_the_cap {
+                // 65536 - 40000 = 25536 bytes of FIRST survive: 25535 x's and its "\n".
+                format!("[truncated]\n{}\n{second}", "x".repeat(25_535))
+            } else {
+                format!("{first}{second}")
+            };
+            let stored = env.vigil.store().load(&id).unwrap().last_digest;
+            assert_eq!(stored.len(), format!("file:{}:\n", input.display()).len() + expected_text.len(), "over_the_cap {over_the_cap}");
+            assert_eq!(stored, format!("file:{}:\n{expected_text}", input.display()), "over_the_cap {over_the_cap}");
+            assert_eq!(stored.contains("FIRST"), !over_the_cap, "FIRST's tag survives only while the appends fit the cap");
+        });
+    }
+}

@@ -144,6 +144,13 @@ impl Store {
         write_atomic(&self.watch_path(&watch.spec.id), watch)?;
         Ok(WriteOutcome::default())
     }
+    /// `save` for a caller inside a call budget (specs/disk-full.md DF4e): a
+    /// rescue waits for the store-wide lock at most `min(2 s, budget_left)`.
+    /// RED STUB: delegates to `save`.
+    pub fn save_within(&self, watch: &WatchFile, budget_left: std::time::Duration) -> Result<WriteOutcome, StoreError> {
+        let _ = budget_left;
+        self.save(watch)
+    }
     pub fn load(&self, id: &WatchId) -> Result<WatchFile, StoreError> {
         let bytes = std::fs::read(self.watch_path(id)).map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => StoreError::NotFound(id.as_str().to_string()),
@@ -1380,7 +1387,17 @@ mod tests {
         //      here. Rescue: full while the reserve exists, lock created after
         //      the reserve is spent. Persistent: an error naming the root.
         //      DF4a: with no reserve to free, the first failure is final.
-        // proves: CLAIM(DF5), CLAIM(DF4a)
+        //      DF4d (N1, changes the first leg for `lock` and `try_lock`): the
+        //      rescue runs under the store-wide lock, and for those two entry
+        //      points the file that is missing IS the store-wide lock file. A
+        //      missing store-wide lock file that cannot be created allows no
+        //      rescue: `DiskFull`, the reserve untouched (same inode, still
+        //      valid), no lock file made. The fault is the old rescue's
+        //      ("full while the reserve exists"), so an implementation that
+        //      deleted the reserve and retried would succeed here and fail the
+        //      `expect_err`. The per-watch entries keep the rescue leg: their
+        //      store-wide lock file exists (the setup save made it).
+        // proves: CLAIM(DF5), CLAIM(DF4a), CLAIM(DF4d)
         for entry in LOCK_ENTRIES {
             let dir = tempfile::tempdir().unwrap();
             Store::new(dir.path()).save(&sample("w")).unwrap();
@@ -1390,9 +1407,23 @@ mod tests {
                 rule(WriteKind::Lock, 28, When::WhileExists(reserve_path(dir.path()))),
                 rule(WriteKind::Reserve, 28, When::Every),
             ];
-            let (store, _) = faulted(dir.path(), rescue);
-            take(&store, entry).unwrap_or_else(|error| panic!("{entry}: the retry should have created the lock: {error}"));
-            assert!(!reserve_path(dir.path()).exists(), "{entry}: the reserve was spent");
+            let (store, plan) = faulted(dir.path(), rescue);
+            if matches!(entry, "lock" | "try_lock") {
+                let reserve_before = lock_identity(&reserve_path(dir.path()));
+                let error = take(&store, entry).expect_err("DF4d: no store-wide lock file, so no rescue");
+                assert!(matches!(error, StoreError::DiskFull(_)) && says_disk_full_naming(&error, dir.path()), "{entry}: {error:?}");
+                assert_eq!(lock_identity(&reserve_path(dir.path())), reserve_before, "{entry}: the reserve is untouched");
+                assert!(is_valid_reserve(&reserve_path(dir.path())), "{entry}: and still a valid reserve");
+                assert!(!store.lock_path().exists(), "{entry}: the lock file could not be made");
+                // The creation was tried (the fault fired) and the rescue made
+                // no second creation of the SAME file after freeing anything:
+                // one attempt, or two when the rescue tried to create the
+                // store-wide lock itself before giving up.
+                assert!((1..=2).contains(&plan.attempts(WriteKind::Lock)), "{entry}: got {} lock creation attempts", plan.attempts(WriteKind::Lock));
+            } else {
+                take(&store, entry).unwrap_or_else(|error| panic!("{entry}: the retry should have created the lock: {error}"));
+                assert!(!reserve_path(dir.path()).exists(), "{entry}: the reserve was spent");
+            }
 
             // A reserve exists here: the retry is made (2 attempts). DF4a
             // (nothing to free, no retry) is the third leg below.
@@ -1404,7 +1435,13 @@ mod tests {
             let error = take(&store, entry).expect_err("the lock file can never be created");
             assert!(matches!(error, StoreError::DiskFull(_)), "{entry}: {error:?}");
             assert!(says_disk_full_naming(&error, stuck.path()), "{entry}: {error}");
-            assert_eq!(plan.attempts(WriteKind::Lock), 2, "{entry}: one retry");
+            if matches!(entry, "lock" | "try_lock") {
+                // DF4d: the missing file is the store-wide lock itself, so there
+                // is no rescue; see the first leg for the attempt range.
+                assert!((1..=2).contains(&plan.attempts(WriteKind::Lock)), "{entry}: DF4d, no rescue, got {} attempts", plan.attempts(WriteKind::Lock));
+            } else {
+                assert_eq!(plan.attempts(WriteKind::Lock), 2, "{entry}: one retry");
+            }
 
             // DF4a: no reserve, no retry. The fault hits only the first
             // creation attempt, so a retry would have taken the lock.
@@ -1648,12 +1685,15 @@ mod tests {
             let bytes_before = std::fs::read(Store::new(dir.path()).watch_path(&wid("w"))).unwrap();
             let (store, plan) = faulted(
                 dir.path(),
-                vec![rule(WriteKind::Watch, 5, When::Every).at(stage), rule(WriteKind::Watch, 5, When::Every).at(Stage::Cleanup)],
+                // N3: the cleanup fails with a DIFFERENT errno (13, EACCES) from
+                // the write (5, EIO), so "the write's own error" is observable.
+                vec![rule(WriteKind::Watch, 5, When::Every).at(stage), rule(WriteKind::Watch, 13, When::Every).at(Stage::Cleanup)],
             );
 
             let error = store.save(&newer(before)).expect_err("the write fails");
 
             assert!(matches!(error, StoreError::Io(_)), "{stage:?}: the write's own error is reported, got {error:?}");
+            assert!(error.to_string().contains("Input/output error") && !error.to_string().contains("Permission denied"), "{stage:?}: N3: the write's errno, not the cleanup's: {error}");
             assert!(plan.injected(WriteKind::Watch, stage) >= 1, "{stage:?}: the stage fault fired");
             assert_eq!(plan.injected(WriteKind::Watch, Stage::Cleanup), 1, "{stage:?}: the cleanup was attempted once and failed");
             let leftovers = tmp_files(dir.path());
@@ -1741,5 +1781,186 @@ mod tests {
         assert_eq!(outcome, WriteOutcome { used_reserve: false });
         assert_valid_reserve(dir.path(), "after the next successful write");
         assert_eq!(Store::new(dir.path()).load(&wid("w")).unwrap(), newer(before));
+    }
+
+    // ---- final defaults: DF4d (N1), DF4e (N2), N3 ----
+
+    #[test]
+    fn a_reserve_is_published_only_after_the_store_wide_lock_file_exists() {
+        // why: DF4d (N1, lock bootstrap): "The store-wide lock file exists
+        //      before any reserve is published: the reserve is created only
+        //      after the lock file has been created successfully." Otherwise a
+        //      reserve could exist that no rescue can ever use (the rescue needs
+        //      the lock file, and on a full disk it can no longer be made).
+        //      World 1 (control): a fresh root saves, so `lock` AND a valid
+        //      reserve exist. World 2: the lock file cannot be created (a Lock
+        //      fault on every creation): the save still succeeds (reserve
+        //      failure is never an error), the creation was really tried
+        //      (`injected`), and there is NO reserve and no lock file. World 3:
+        //      the fault is gone: the next save repairs both.
+        // proves: CLAIM(DF4d), CLAIM(DF4)
+        let healthy = tempfile::tempdir().unwrap();
+        Store::new(healthy.path()).save(&sample("w")).unwrap();
+        assert!(Store::new(healthy.path()).lock_path().is_file(), "control: a healthy first save leaves the lock file");
+        assert_valid_reserve(healthy.path(), "control: a healthy first save leaves a reserve");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Lock, 28, When::Every)]);
+        let watch = sample("w");
+        store.save(&watch).expect("failing to make the reserve is never an error");
+        assert_eq!(store.load(&wid("w")).unwrap(), watch);
+        assert!(plan.injected(WriteKind::Lock, Stage::Create) >= 1, "the lock file creation was never tried, so the absence below proves nothing");
+        assert!(!store.lock_path().exists(), "the lock file could not be made");
+        assert!(std::fs::symlink_metadata(reserve_path(dir.path())).is_err(), "no lock file, so no reserve may be published");
+
+        Store::new(dir.path()).save(&newer(watch)).unwrap();
+        assert!(Store::new(dir.path()).lock_path().is_file());
+        assert_valid_reserve(dir.path(), "the next save with room repairs both");
+    }
+
+    /// Run `save_within` on a worker thread so a rescue that waits for a lock
+    /// forever fails the test (after `limit`) instead of hanging the run.
+    /// Returns the result and how long the call took in real time.
+    fn timed_save(store: &Store, watch: WatchFile, budget_left: Option<std::time::Duration>, limit: std::time::Duration) -> (Result<WriteOutcome, StoreError>, std::time::Duration) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = match budget_left {
+                Some(budget) => store.save_within(&watch, budget),
+                None => store.save(&watch),
+            };
+            let _ = sender.send((result, started.elapsed()));
+        });
+        receiver.recv_timeout(limit).unwrap_or_else(|_| panic!("the save did not return within {limit:?}: a rescue must not wait for the store-wide lock without bound"))
+    }
+
+    #[test]
+    fn a_rescue_waits_for_the_store_wide_lock_at_most_the_call_budget_and_then_gives_up_untouched() {
+        // why: DF4e (N2, rescue deadline): "A rescue waits for the store-wide
+        //      lock at most min(2 s, remaining call budget); on timeout it
+        //      reports disk_full, leaves the reserve untouched and does not
+        //      retry." The test holds the lock (`Store::lock`) for the whole
+        //      save and the first write fails with ENOSPC (a one-shot fault,
+        //      so a retry WOULD succeed and hide a missing deadline).
+        //      Budget 0: no waiting at all (returns at once). Budget 200 ms:
+        //      gives up after about 200 ms, well before the 2 s ceiling (< 1.8 s
+        //      leaves 1.6 s of jitter room). No budget given (`save`): the 2 s
+        //      ceiling, so >= 1.9 s and, as the lock is never released, < 10 s
+        //      by the channel limit. Always: DiskFull naming the root, ONE
+        //      attempt, the reserve is the very same file and still valid.
+        // proves: CLAIM(DF4e), CLAIM(DF4c)
+        use std::time::Duration;
+        let cases: [(&str, Option<Duration>, Duration, Duration); 3] = [
+            ("budget 0", Some(Duration::ZERO), Duration::ZERO, Duration::from_millis(1500)),
+            ("budget 200 ms", Some(Duration::from_millis(200)), Duration::from_millis(150), Duration::from_millis(1800)),
+            ("no budget: the 2 s ceiling", None, Duration::from_millis(1900), Duration::from_secs(8)),
+        ];
+        for (name, budget_left, at_least, below) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let before = sample("w");
+            Store::new(dir.path()).save(&before).unwrap();
+            assert_valid_reserve(dir.path(), name);
+            let reserve_before = lock_identity(&reserve_path(dir.path()));
+            let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+            let guard = store.lock().unwrap();
+
+            let (result, elapsed) = timed_save(&store, newer(before.clone()), budget_left, Duration::from_secs(10));
+
+            drop(guard);
+            let error = result.expect_err(name);
+            assert!(matches!(error, StoreError::DiskFull(_)) && says_disk_full_naming(&error, dir.path()), "{name}: {error:?}");
+            assert!(elapsed >= at_least && elapsed < below, "{name}: waited {elapsed:?}, expected within [{at_least:?}, {below:?})");
+            assert_eq!(plan.attempts(WriteKind::Watch), 1, "{name}: no retry without the lock");
+            assert_eq!(lock_identity(&reserve_path(dir.path())), reserve_before, "{name}: the reserve is untouched");
+            assert!(is_valid_reserve(&reserve_path(dir.path())), "{name}");
+            assert_eq!(store.load(&wid("w")).unwrap(), before, "{name}: the old file stays");
+            assert!(tmp_files(dir.path()).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_lock_released_within_the_budget_lets_the_rescue_through() {
+        // why: DF4e is a deadline, not a refusal: positive control for the test
+        //      above. The lock is held for about 300 ms (released by a second
+        //      thread), the budget is 5 s, so the rescue waits, wins the lock,
+        //      deletes the reserve and retries: saved, `used_reserve`, two
+        //      attempts. A rescue that gave up at once would fail this and pass
+        //      the "gives up" test, so together they pin the wait.
+        // proves: CLAIM(DF4e), CLAIM(DF4c)
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let before = sample("w");
+        Store::new(dir.path()).save(&before).unwrap();
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let guard = store.lock().unwrap();
+        let releaser = std::thread::spawn({
+            let plan = plan.clone();
+            move || {
+                // Release only after the save made its first attempt (it is now
+                // waiting for the lock), then a little later still.
+                wait_until(Duration::from_secs(10), || plan.attempts(WriteKind::Watch) >= 1);
+                std::thread::sleep(Duration::from_millis(300));
+                drop(guard);
+            }
+        });
+
+        let (result, _) = timed_save(&store, newer(before.clone()), Some(Duration::from_secs(5)), Duration::from_secs(10));
+
+        releaser.join().unwrap();
+        assert_eq!(result.expect("the lock came free inside the budget"), WriteOutcome { used_reserve: true });
+        assert_eq!(plan.attempts(WriteKind::Watch), 2);
+        assert_eq!(store.load(&wid("w")).unwrap(), newer(before));
+    }
+
+    #[test]
+    fn the_error_a_failed_write_returns_is_the_writes_own_never_the_cleanups() {
+        // why: N3: "The cleanup-precedence test injects different errnos for the
+        //      write and the cleanup and asserts the returned error is the
+        //      write's." If the cleanup's error replaced the write's, a plain
+        //      EIO would be reported as a full disk (and would spend the
+        //      reserve on a retry), and a full disk as a plain io error (and
+        //      the retry would not happen). Both directions, at every stage
+        //      that has a `.tmp` to clean (write, short write, sync, rename):
+        //        write EIO (5), cleanup ENOSPC (28) -> Io "Input/output error",
+        //          one attempt, reserve kept;
+        //        write ENOSPC (28), cleanup EIO (5) -> DiskFull "disk full"
+        //          naming the root, the retry's error (28, the reserve could
+        //          not be re-made so the retry fails alike), two attempts.
+        //      The cleanup fault must really fire (`injected`). OS texts are
+        //      glibc's.
+        // proves: CLAIM(N3), CLAIM(S4), CLAIM(DF2)
+        for stage in [Stage::Write, Stage::ShortWrite, Stage::Sync, Stage::Rename] {
+            // (write errno, cleanup errno, expected variant is DiskFull, text that must / must not appear, attempts)
+            let rows: [(i32, i32, bool, &str, &str, u64); 2] = [
+                (5, 28, false, "Input/output error", "No space left on device", 1),
+                (28, 5, true, "No space left on device", "Input/output error", 2),
+            ];
+            for (write_errno, cleanup_errno, disk_full, wanted, unwanted, attempts) in rows {
+                let context = format!("{stage:?}: write {write_errno}, cleanup {cleanup_errno}");
+                let dir = tempfile::tempdir().unwrap();
+                let before = sample("w");
+                Store::new(dir.path()).save(&before).unwrap();
+                let (store, plan) = faulted(
+                    dir.path(),
+                    vec![
+                        rule(WriteKind::Watch, write_errno, When::Every).at(stage),
+                        rule(WriteKind::Watch, cleanup_errno, When::Every).at(Stage::Cleanup),
+                        rule(WriteKind::Reserve, 28, When::Every),
+                    ],
+                );
+
+                let error = store.save(&newer(before)).expect_err(&context);
+
+                assert_eq!(matches!(error, StoreError::DiskFull(_)), disk_full, "{context}: {error:?}");
+                let text = error.to_string();
+                assert!(text.contains(wanted) && !text.contains(unwanted), "{context}: the write's error, not the cleanup's: {text}");
+                if disk_full {
+                    assert!(says_disk_full_naming(&error, dir.path()), "{context}: {text}");
+                }
+                assert_eq!(plan.attempts(WriteKind::Watch), attempts, "{context}");
+                assert!(plan.injected(WriteKind::Watch, Stage::Cleanup) >= 1, "{context}: the cleanup fault never fired");
+            }
+        }
     }
 }
