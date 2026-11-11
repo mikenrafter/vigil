@@ -2015,3 +2015,177 @@ fn the_redelivery_memory_is_released_when_its_envelope_is_delivered() {
         assert_eq!(status["events"], json!([change_event("w", 0, &input, "boom", false)]), "delivered, so the memory is released");
     });
 }
+
+// ---- review round 2 (Sol 4/10): S4 a dropped wait must not drop the answer --
+
+/// The `events` array a single quiet probe watch `id` fires when its probe
+/// turns `bad`, in a world where nothing fails: the oracle for what a damaged
+/// call must still carry for that watch (the event ids and contents are the
+/// engine's own, so they are not guessed here).
+async fn events_of_a_healthy_watch(id: &str) -> Value {
+    let env = paused_env();
+    let vigil = env.another_process();
+    let watch = probe_watch(&env, &vigil, id).await;
+    env.reader.set_text(&format!("cmd:probe-{id}"), "bad");
+    let events = wire(&vigil.keepalive(by_id(&watch, Some(30))).await.unwrap())["events"].clone();
+    assert_eq!(events.as_array().map(Vec::len), Some(1), "precondition: one probe change is one event: {events}");
+    events
+}
+
+/// `a` ++ `b` as the envelope lists them (V8: earliest finished first, ties by
+/// id).
+fn both(a: &Value, b: &Value) -> Value {
+    let mut events = a.as_array().unwrap().clone();
+    events.extend(b.as_array().unwrap().iter().cloned());
+    Value::Array(events)
+}
+
+/// Two quiet watches "a" and "b" whose probes have both turned `bad` (so both
+/// tick to a fired result), on a disk where `a.json` and `b.json` fail with
+/// the given errnos from the moment the sentinel exists. The reserve exists
+/// (so an ENOSPC wants a rescue), the sentinel is set and the STORE-WIDE lock
+/// is held by the test, so every rescue has to wait for it.
+async fn two_fired_watches_whose_saves_fail(env: &Env, a_errno: i32, b_errno: i32) -> (Vigil, FaultPlan, crate::store::StoreLock) {
+    let sentinel = env.dir.path().join("disk-is-full");
+    let plan = failing_files_while(&sentinel, &[("a.json", a_errno), ("b.json", b_errno)]);
+    let vigil = env.another_process().with_write_faults(plan.clone());
+    for id in ["a", "b"] {
+        probe_watch(env, &vigil, id).await;
+        env.reader.set_text(&format!("cmd:probe-{id}"), "bad");
+    }
+    assert!(env.root().join(".reserve").exists(), "precondition: a reserve exists, so an ENOSPC asks for a rescue");
+    std::fs::write(&sentinel, "").unwrap();
+    let held = env.vigil.store().lock().unwrap();
+    (vigil, plan, held)
+}
+
+#[test]
+fn a_rescue_waiting_for_the_store_lock_keeps_its_answer_when_another_watch_ends_the_round() {
+    // why: review S4 (Sol round 2), DF1/DF2: "A senses an event, gets ENOSPC,
+    //      awaits the held global lock; B returns EIO immediately; round
+    //      termination drops A before CallRecord receives A's event or
+    //      failure." The rescue wait is async since review S3, and the round
+    //      ends (S1) at the first unsaved tick it absorbs, dropping every
+    //      tick still unfinished, including a tick that already SENSED its
+    //      event and is only waiting to rescue its save. Setup: "a" (ENOSPC,
+    //      reserve present, store-wide lock held, so it waits) and "b" (EIO,
+    //      no rescue, answers at once); both fire. Expected, from DF1/DF2/V8:
+    //      the envelope is a's (tie on finish time, lowest id), carries BOTH
+    //      events (each equal to what the same watch fires in a healthy world),
+    //      `persist` is a's failure from its FIRST error (disk_full, a.json,
+    //      redelivery, no retry so no `first_error`), `persist_failures` is
+    //      b's (io, b.json), `others` lists b. The call returned at once
+    //      (`waited_s` 0): a's wait was dropped, not waited out. A dropped
+    //      rescue is not a half-done one: the reserve is the same file, both
+    //      watch files are byte-identical, no `.tmp`, one attempt per watch.
+    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF4c)
+    scenario(|| async {
+        let (a_events, b_events) = (events_of_a_healthy_watch("a").await, events_of_a_healthy_watch("b").await);
+
+        let env = paused_env();
+        let (vigil, plan, _held) = two_fired_watches_whose_saves_fail(&env, 28, 5).await;
+        let (a_file, b_file) = (env.root().join("watches").join("a.json"), env.root().join("watches").join("b.json"));
+        let (reserve_before, a_before, b_before) = (identity(&env.root().join(".reserve")), std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap());
+
+        let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
+
+        assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("fired")), "a's answer is lost: {envelope}");
+        assert_eq!(envelope["events"], both(&a_events, &b_events), "{envelope}");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &a_file, true, Some(false));
+        let failures = envelope["persist_failures"].as_array().unwrap_or_else(|| panic!("b's failure is not listed: {envelope}"));
+        assert_eq!(failures.len(), 1, "{envelope}");
+        assert_persist_failure(&failures[0], "b", "io", "Input/output error", &b_file);
+        assert_eq!(envelope["others"], json!([{"watch_id": "b", "status": "fired", "event_ids": ["b:1:0"]}]), "{envelope}");
+        assert_eq!(envelope["waited_s"], 0, "the round ended at once, it did not wait for a's rescue: {envelope}");
+
+        assert_eq!(plan.attempts(WriteKind::Watch), 2, "one attempt per watch, no retry");
+        assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "a dropped rescue leaves the reserve alone");
+        assert_eq!((std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap()), (a_before, b_before), "DF6");
+        assert!(tmp_files(&env.root()).is_empty(), "{:?}", tmp_files(&env.root()));
+    });
+}
+
+#[test]
+fn a_rescue_still_waiting_when_another_rescue_gives_up_keeps_its_answer() {
+    // why: review S4, the second half: "Same when one rescue times out before
+    //      others." Both watches get ENOSPC with the store-wide lock held, so
+    //      both rescues wait, but "b" starts its wait 0.5 s later (its read
+    //      takes 0.5 s of virtual time). At t = 2 s (DF4e ceiling) a's rescue
+    //      gives up with `disk_full`, S1 ends the round, and b is dropped
+    //      with 0.5 s of its wait left. Expected: both events in the envelope
+    //      (a's envelope: it finished first, at t = 0), a's failure as
+    //      `persist`, b's as `persist_failures`, both disk_full and neither
+    //      retried; the call took the 2 s of a's wait and no more
+    //      (`waited_s` 2). The reserve is untouched and the files are
+    //      byte-identical.
+    // proves: CLAIM(DF1), CLAIM(DF2), CLAIM(DF4e)
+    scenario(|| async {
+        let (a_events, b_events) = (events_of_a_healthy_watch("a").await, events_of_a_healthy_watch("b").await);
+
+        let env = paused_env();
+        let (vigil, plan, _held) = two_fired_watches_whose_saves_fail(&env, 28, 28).await;
+        env.reader.set_sleep("cmd:probe-b", Duration::from_millis(500));
+        let (a_file, b_file) = (env.root().join("watches").join("a.json"), env.root().join("watches").join("b.json"));
+        let (reserve_before, a_before, b_before) = (identity(&env.root().join(".reserve")), std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap());
+
+        let started = tokio::time::Instant::now();
+        let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
+        let elapsed = started.elapsed();
+
+        assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("fired")), "{envelope}");
+        assert_eq!(envelope["events"], both(&a_events, &b_events), "b was dropped in its rescue wait and its answer with it: {envelope}");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &a_file, true, Some(false));
+        let failures = envelope["persist_failures"].as_array().unwrap_or_else(|| panic!("b's failure is not listed: {envelope}"));
+        assert_eq!(failures.len(), 1, "{envelope}");
+        assert_persist_failure(&failures[0], "b", "disk_full", "No space left on device", &b_file);
+        assert_eq!(envelope["waited_s"], 2, "a's 2 s wait, then the call ends: {envelope}");
+        assert!(elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_millis(2500), "precondition: a's rescue really waited out the 2 s ceiling: {elapsed:?}");
+
+        assert_eq!(plan.attempts(WriteKind::Watch), 2, "no rescue got the lock, so no retry");
+        assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "DF4e: nobody spent the reserve");
+        assert_eq!((std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap()), (a_before, b_before), "DF6");
+        assert!(tmp_files(&env.root()).is_empty(), "{:?}", tmp_files(&env.root()));
+    });
+}
+
+#[test]
+fn a_tick_that_saved_keeps_its_report_when_the_reserve_upkeep_after_its_save_is_dropped() {
+    // why: review S4, the same class on the success side. After a healthy
+    //      write the store may wait (<= 250 ms) for the store-wide lock to
+    //      re-make a missing reserve; that wait is an await too, so the round
+    //      can drop it, and the tick's report (here: what changed during the
+    //      call, V14) was only handed over when the whole save returned. Setup:
+    //      "a" is a judge watch whose judge says no match, so its tick is
+    //      pending with `bad` as the change; the reserve is missing and the
+    //      store-wide lock is held, so a's upkeep waits; "b" fails with EIO at
+    //      once and ends the round. Expected: a's pending envelope (nearest
+    //      deadline, ties by id) whose digest names the change `bad` (V14),
+    //      no `persist` of its own (its write succeeded), b's failure in
+    //      `persist_failures`. a's file on disk is tick 1 (precondition).
+    // proves: CLAIM(V14), CLAIM(DF1)
+    scenario(|| async {
+        let env = paused_env();
+        let sentinel = env.dir.path().join("disk-is-full");
+        let vigil = env.another_process().with_write_faults(failing_files_while(&sentinel, &[("b.json", 5)]));
+        env.reader.set_text("cmd:probe-a", "ok");
+        let mut request = judge_request("a", Path::new("/unused"), 20);
+        request.inputs = vec![crate::watch::Input::Cmd { argv: vec!["probe-a".into()], timeout_s: Some(1.0), cwd: None }];
+        vigil.create(request).await.unwrap();
+        probe_watch(&env, &vigil, "b").await;
+        env.judge.set_fallback(Ok(noul_answers("failed", 0.0, 1.0)));
+        env.reader.set_text("cmd:probe-a", "bad");
+        std::fs::remove_file(env.root().join(".reserve")).expect("precondition: a reserve to remove");
+        std::fs::write(&sentinel, "").unwrap();
+        let _held = env.vigil.store().lock().unwrap();
+
+        let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
+
+        assert_eq!(env.vigil.store().load(&wid("a")).unwrap().tick, 1, "precondition: a's tick was saved");
+        assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("pending")), "{envelope}");
+        assert!(envelope["digest"].as_str().is_some_and(|digest| digest.contains("bad")), "a's change is missing from the digest: {envelope}");
+        assert!(envelope.get("persist").is_none(), "a's own write succeeded: {envelope}");
+        let failures = envelope["persist_failures"].as_array().unwrap_or_else(|| panic!("b's failure is not listed: {envelope}"));
+        assert_eq!(failures.len(), 1, "{envelope}");
+        assert_persist_failure(&failures[0], "b", "io", "Input/output error", &env.root().join("watches").join("b.json"));
+    });
+}
