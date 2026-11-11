@@ -150,3 +150,20 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
   timeout; on timeout it reports `disk_full` without retrying.
 - `.tmp` cleanup after a successful write covers only that watch's own file;
   never sweep other `*.tmp` files (another process may be mid-write).
+
+## Defaults after spec review round 2 (final round; Sol 6/10; orchestrator, 2026-11-10)
+
+- **S1 qualified.** Redelivery covers `file` appends only, within the existing
+  64 KiB pending-change cap (SPEC W7); `glob` reports current matches, like
+  other transient inputs.
+- **N1 → DF4d (lock bootstrap).** The store-wide lock file exists before any
+  reserve is published: the reserve is created only after the lock file has
+  been created successfully. If the lock file is missing and cannot be
+  created, no rescue is attempted: the write reports `disk_full`, the reserve
+  is untouched. (Changes the test that expected a rescue in that case.)
+- **N2 → DF4e (rescue deadline).** A rescue waits for the store-wide lock at
+  most `min(2 s, remaining call budget)`; on timeout it reports `disk_full`,
+  leaves the reserve untouched and does not retry. Test: lock held beyond the
+  deadline → envelope returned, reserve intact, one attempt.
+- **N3.** The cleanup-precedence test injects different errnos for the write
+  and the cleanup and asserts the returned error is the write's.
