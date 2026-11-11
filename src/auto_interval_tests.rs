@@ -2595,3 +2595,48 @@ async fn a_waiting_call_returns_attention_that_another_process_saved_but_could_n
     let next = call(&waiter, &id, Some(30), None).await;
     assert_eq!((&next["waited_s"], &next["events"]), (&json!(30), &json!([])), "the delivery was acknowledged: {next}");
 }
+
+// ---- review S5: the identity of an attention event survives a failed save ----
+
+#[tokio::test(start_paused = true)]
+async fn an_attention_event_keeps_its_id_when_a_tick_lands_between_a_failed_save_and_the_retry() {
+    // why: review S5. The id is `<watch>:<tick>:<n>`. A raise whose save fails
+    //      is delivered (the envelope carries it, `persist.ok` false); the
+    //      retry used to build the event again from the watch as it then was,
+    //      so a tick that landed in between gave it a NEW id (`w:1:0` ->
+    //      `w:2:0`): the agent was told "something new" and a consumer that
+    //      de-duplicates by id acted twice. The retry must be the same event:
+    //      same id, `redelivered: true` (even though the tick's own save
+    //      succeeded and cleared the process's memory of failed saves).
+    //      Setup: cadence 600 s, expect_s 60 (overdue at 90). Call A (healthy,
+    //      30 s) ticks once at 0 (tick 1). Call B (every write fails) raises
+    //      at 90: event `w:1:0`, first delivery, `persist.ok` false. Writes
+    //      recover, 600 s pass, so call C starts with a tick due (tick 2): it
+    //      must return `w:1:0` again, flagged. Call D is quiet.
+    // proves: CLAIM(S6), CLAIM(S5-identity)
+    let rig = Rig::new();
+    let probe = quiet_probe();
+    let healthy = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &healthy, "w", 600, 7200, |request| request.expect_s = Some(60)).await;
+    let a = call(&healthy, &id, Some(30), None).await;
+    assert_eq!((&a["tick"], &a["events"]), (&json!(1), &json!([])), "{a}");
+
+    let marker = rig.env.input_path("full");
+    write_file(&marker, "full");
+    let faults = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::WhileExists(marker.clone()))]);
+    let faulted = rig.vigil(AgentEnv::default(), &probe).with_write_faults(faults);
+    let b = call(&faulted, &id, None, None).await;
+    assert_eq!((&b["waited_s"], &b["persist"]["ok"]), (&json!(60), &json!(false)), "{b}");
+    let first_id = only_event(&b)["event_id"].as_str().unwrap().to_string();
+    assert_eq!(first_id, "w:1:0", "hand-derived: raised at tick 1, first reason");
+
+    std::fs::remove_file(marker).unwrap();
+    tokio::time::advance(Duration::from_secs(600)).await;
+    let c = call(&faulted, &id, None, None).await;
+    assert_eq!(c["tick"], 2, "control: a tick did land between the failed save and the retry: {c}");
+    let again = only_event(&c);
+    assert_eq!((again["event_id"].as_str(), &again["redelivered"]), (Some("w:1:0"), &json!(true)), "S5: the retry is the same event: {c}");
+    assert!(c.get("persist").is_none(), "{c}");
+    let d = call(&faulted, &id, None, None).await;
+    assert_eq!((&d["waited_s"], &d["events"]), (&json!(270), &json!([])), "saved this time, and acknowledged: {d}");
+}
