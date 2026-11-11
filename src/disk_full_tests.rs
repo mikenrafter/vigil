@@ -1628,3 +1628,96 @@ fn a_file_redelivers_every_append_since_the_saved_baseline_up_to_the_64_kib_capt
         });
     }
 }
+
+// ---- review round 1 (Sol 6/10): S1 failed-save early return ----------------
+
+/// One quiet `cmd` watch `id` (interval 20 s, deadline 3600 s) whose probe
+/// `probe-<id>` answers `ok`, created by `vigil`.
+async fn probe_watch(env: &Env, vigil: &Vigil, id: &str) -> WatchId {
+    env.reader.set_text(&format!("cmd:probe-{id}"), "ok");
+    let mut request = change_request(id, Path::new("/unused"), 20);
+    request.inputs = vec![crate::watch::Input::Cmd { argv: vec![format!("probe-{id}")], timeout_s: Some(1.0), cwd: None }];
+    vigil.create(request).await.unwrap().watch_id
+}
+
+#[test]
+fn a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held() {
+    // why: review S1 (Sol round 1): DF1a says "A tick whose save failed ends
+    //      the call and returns its envelope". `sense` only checked
+    //      `any_unsaved()` AFTER every tick of the round had finished, so a
+    //      quiet failed save on watch "a" waited for watch "b", whose watch
+    //      lock another process holds, up to the whole 30 s budget
+    //      (reproduced through MCP). A quiet failure carries no `Finished`
+    //      outcome, which is what stopped the round for a fired watch. Two
+    //      quiet watches "a" (nearer deadline, so the primary) and "b"; a's
+    //      save fails with EIO, b's lock is held for the whole call. Expected:
+    //      the envelope is a's pending envelope with `persist` (io, a's file),
+    //      it returned at once (`waited_s` 0, hand-derived: nothing sleeps in
+    //      this world once b's tick is dropped), and b was never read (still
+    //      only its baseline read). Control: with the lock free and no fault
+    //      the same call sees both watches tick (2 reads of each probe).
+    // proves: CLAIM(DF1a)
+    scenario(|| async {
+        let control = paused_env();
+        let vigil = control.another_process();
+        probe_watch(&control, &vigil, "a").await;
+        probe_watch(&control, &vigil, "b").await;
+        vigil.keepalive(no_id_for(30)).await.unwrap();
+        assert_eq!((control.reader.started_count("cmd:probe-a"), control.reader.started_count("cmd:probe-b")), (3, 3), "control: baseline + ticks at t=0 and t=20, both watches");
+
+        let env = paused_env();
+        let sentinel = env.dir.path().join("disk-is-full");
+        let vigil = env.another_process().with_write_faults(failing_files_while(&sentinel, &[("a.json", 5)]));
+        probe_watch(&env, &vigil, "a").await;
+        let b = probe_watch(&env, &vigil, "b").await;
+        std::fs::write(&sentinel, "").unwrap();
+        let _held = env.vigil.store().lock_watch(&b).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
+
+        assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("pending")), "{envelope}");
+        assert_failed_persist(&envelope, "io", "Input/output error", &env.root().join("watches").join("a.json"), false, Some(false));
+        assert_eq!(envelope["waited_s"], 0, "DF1a: the call ends at once, it does not wait for b's lock: {envelope}");
+        assert!(started.elapsed() < Duration::from_secs(1), "virtual time spent: {:?}", started.elapsed());
+        assert_eq!(env.reader.started_count("cmd:probe-b"), 1, "b was dropped before it read anything");
+        assert!(envelope.get("persist_failures").is_none(), "b did not fail, it was dropped: {envelope}");
+    });
+}
+
+#[test]
+fn a_failed_save_ends_the_call_at_once_but_keeps_the_saves_that_were_ready_with_it() {
+    // why: review S1: "signal round completion as soon as an absorbed report
+    //      is unsaved, preserving already-ready results". The early stop must
+    //      not throw away a tick that finished in the same pass. Red before the
+    //      fix for the reason of the test above (`waited_s` 30); its c/a file
+    //      assertions are what fail a fix that drops the rest of the pass
+    //      instead of collecting it. Three quiet watches: "a" fails to save (EIO),
+    //      "c" saves fine, "b"'s lock is held for the whole call. a is polled
+    //      before c, so the stop is signalled while c's completion is still to
+    //      be collected: c's tick must be on disk (tick 1, hand-derived: one
+    //      tick in a call that ended at once) and a's file must be unchanged
+    //      (tick 0). The envelope is a's (tie on deadline, lowest id), with
+    //      `persist`; c's success adds nothing to it; the call took no time.
+    // proves: CLAIM(DF1a)
+    scenario(|| async {
+        let env = paused_env();
+        let sentinel = env.dir.path().join("disk-is-full");
+        let vigil = env.another_process().with_write_faults(failing_files_while(&sentinel, &[("a.json", 5)]));
+        let a = probe_watch(&env, &vigil, "a").await;
+        let b = probe_watch(&env, &vigil, "b").await;
+        let c = probe_watch(&env, &vigil, "c").await;
+        std::fs::write(&sentinel, "").unwrap();
+        let _held = env.vigil.store().lock_watch(&b).unwrap();
+
+        let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
+
+        assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("pending")), "{envelope}");
+        assert_failed_persist(&envelope, "io", "Input/output error", &env.root().join("watches").join("a.json"), false, Some(false));
+        assert!(envelope.get("persist_failures").is_none(), "c saved and b was dropped: {envelope}");
+        assert_eq!(envelope["waited_s"], 0, "{envelope}");
+        assert_eq!(env.vigil.store().load(&c).unwrap().tick, 1, "c's tick was ready in the same pass and is saved");
+        assert_eq!(env.vigil.store().load(&a).unwrap().tick, 0, "a's save failed");
+        assert_eq!(env.vigil.store().load(&b).unwrap().tick, 0, "b never got its lock");
+    });
+}
