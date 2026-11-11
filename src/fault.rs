@@ -1,11 +1,10 @@
 //! Write fault injection for the store (specs/disk-full.md, "Test seam", and
 //! "Amendments after spec review round 1", S4).
 //!
-//! RED PHASE STUB. The types and signatures below are the contract the red
-//! tests compile against. `begin` / `Attempt::at` never fail, the counters
-//! count nothing and `parse` accepts everything, so with this stub the store
-//! behaves exactly as before; the green phase makes them real and wires them
-//! into the store.
+//! TEST-ONLY. The plan is read from `VIGIL_TEST_FAULT`, which assumes a trusted
+//! process environment: whoever can set it can make vigil's writes fail (or,
+//! if the value is malformed, stop vigil from starting). Never export it on a
+//! real host.
 //!
 //! Why a runtime plan and not `cfg(test)`: the end-to-end suites spawn the
 //! built `vigil` binary, and a `cfg(test)` or cargo-feature hook is invisible
@@ -17,7 +16,7 @@
 //! real host. It is named `..._TEST_...` and an unparseable value is a hard
 //! error, never silently ignored (S6: documented as test-only).
 //!
-//! # Contract of the seam (what the green phase must provide)
+//! # Contract of the seam
 //!
 //! One WRITE ATTEMPT is one call of [`FaultPlan::begin`]; the store then
 //! passes through the stages of that attempt and asks [`Attempt::at`] at each
@@ -111,6 +110,28 @@ impl WriteKind {
             WriteKind::Lock | WriteKind::Reserve => Stage::Create,
         }
     }
+
+    /// The stages the store asks about for this kind, in the order it passes
+    /// through them. A rule at any other stage could never fire, so [`parse`]
+    /// refuses it. CLAIM(S4): the lists are the module docs above [spec S4].
+    ///
+    /// [`parse`]: FaultPlan::parse
+    pub fn stages(self) -> &'static [Stage] {
+        match self {
+            WriteKind::Watch => &[Stage::Create, Stage::Write, Stage::ShortWrite, Stage::Sync, Stage::Rename, Stage::Cleanup],
+            WriteKind::Lock => &[Stage::Create],
+            WriteKind::Reserve => &[Stage::Create, Stage::ShortWrite],
+        }
+    }
+
+    fn from_name(name: &str) -> Option<WriteKind> {
+        match name {
+            "watch" => Some(WriteKind::Watch),
+            "lock" => Some(WriteKind::Lock),
+            "reserve" => Some(WriteKind::Reserve),
+            _ => None,
+        }
+    }
 }
 
 /// A step of one write attempt (see the module docs for the order and for
@@ -131,6 +152,20 @@ pub enum Stage {
     Cleanup,
 }
 
+impl Stage {
+    fn from_name(name: &str) -> Option<Stage> {
+        match name {
+            "create" => Some(Stage::Create),
+            "write" => Some(Stage::Write),
+            "short" => Some(Stage::ShortWrite),
+            "sync" => Some(Stage::Sync),
+            "rename" => Some(Stage::Rename),
+            "cleanup" => Some(Stage::Cleanup),
+            _ => None,
+        }
+    }
+}
+
 /// Which attempts of a kind a rule fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum When {
@@ -141,6 +176,20 @@ pub enum When {
     Range { first: u64, last: Option<u64> },
     /// Every attempt while this path exists.
     WhileExists(PathBuf),
+}
+
+impl When {
+    /// Does the rule fail attempt number `ordinal` (1-based, counted among the
+    /// attempts the rule matches)? `WhileExists` is asked at the stage, not at
+    /// `begin`, so a switch flipped between two stages of one attempt counts.
+    fn fails(&self, ordinal: u64) -> bool {
+        match self {
+            When::Every => true,
+            When::Nth(n) => ordinal == *n,
+            When::Range { first, last } => ordinal >= *first && last.is_none_or(|last| ordinal <= last),
+            When::WhileExists(switch) => switch.exists(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,12 +220,21 @@ impl FaultRule {
         self.file = Some(file.to_string());
         self
     }
+
+    /// Does this rule look at an attempt of `kind` on `target`?
+    fn matches(&self, kind: WriteKind, target: &Path) -> bool {
+        self.kind == kind && self.file.as_deref().is_none_or(|wanted| target.file_name().is_some_and(|name| name == wanted))
+    }
 }
 
 #[derive(Debug, Default)]
 struct FaultState {
     rules: Vec<FaultRule>,
+    /// Attempts begun per kind (every file): the number `attempts` reports.
     attempts: HashMap<WriteKind, u64>,
+    /// Per rule (same index as `rules`): attempts it matched so far. `Nth` and
+    /// `Range` count these, so a file filter counts only its own file.
+    matched: Vec<u64>,
     injected: HashMap<(WriteKind, Stage), u64>,
 }
 
@@ -193,14 +251,28 @@ pub struct FaultPlan {
 pub struct Attempt {
     plan: FaultPlan,
     kind: WriteKind,
-    target: PathBuf,
+    /// `(rule index, this attempt's ordinal among the attempts the rule
+    /// matches)`, fixed at `begin` so later attempts cannot shift it.
+    candidates: Vec<(usize, u64)>,
 }
 
 impl Attempt {
     /// `Err` is the failure injected at `stage` of this attempt.
     pub fn at(&self, stage: Stage) -> io::Result<()> {
-        let _ = (&self.plan, self.kind, &self.target, stage);
-        Ok(()) // STUB: green matches the rules for (kind, stage, file, attempt number).
+        let mut state = self.plan.shared.lock().expect("fault plan mutex poisoned");
+        let errno = self
+            .candidates
+            .iter()
+            .map(|(index, ordinal)| (&state.rules[*index], *ordinal))
+            .find(|(rule, ordinal)| rule.stage == stage && rule.when.fails(*ordinal))
+            .map(|(rule, _)| rule.errno);
+        match errno {
+            None => Ok(()),
+            Some(errno) => {
+                *state.injected.entry((self.kind, stage)).or_default() += 1;
+                Err(io::Error::from_raw_os_error(errno))
+            }
+        }
     }
 }
 
@@ -211,35 +283,100 @@ impl FaultPlan {
     }
 
     pub fn from_rules(rules: Vec<FaultRule>) -> FaultPlan {
-        FaultPlan { shared: Arc::new(Mutex::new(FaultState { rules, ..FaultState::default() })) }
+        let matched = vec![0; rules.len()];
+        FaultPlan { shared: Arc::new(Mutex::new(FaultState { rules, matched, ..FaultState::default() })) }
     }
 
     /// Parse the [`ENV_VAR`] syntax (see the module docs). `Err` carries a
-    /// message naming what is wrong.
+    /// message naming what is wrong. Nothing malformed is ever read as "no
+    /// faults": a typo that injected nothing would turn a failure test into a
+    /// vacuous pass.
     pub fn parse(spec: &str) -> Result<FaultPlan, String> {
-        let _ = spec;
-        Ok(FaultPlan::none()) // STUB: green parses and refuses malformed rules, stages included.
+        let rules = spec.split(',').map(parse_rule).collect::<Result<Vec<FaultRule>, String>>()?;
+        Ok(FaultPlan::from_rules(rules))
     }
 
     /// Start one write attempt of `kind` on `target` and count it. The store
     /// calls this once per attempt, never once per stage.
     pub fn begin(&self, kind: WriteKind, target: &Path) -> Attempt {
-        // STUB: green counts the attempt (kind, and target name for filtered rules).
-        Attempt { plan: self.clone(), kind, target: target.to_path_buf() }
+        let mut state = self.shared.lock().expect("fault plan mutex poisoned");
+        *state.attempts.entry(kind).or_default() += 1;
+        let mut candidates = Vec::new();
+        for index in 0..state.rules.len() {
+            if state.rules[index].matches(kind, target) {
+                state.matched[index] += 1;
+                candidates.push((index, state.matched[index]));
+            }
+        }
+        Attempt { plan: self.clone(), kind, candidates }
     }
 
     /// How many attempts of `kind` were begun so far (all clones, every file).
     pub fn attempts(&self, kind: WriteKind) -> u64 {
-        let _ = kind;
-        0 // STUB: green returns the counter.
+        self.shared.lock().expect("fault plan mutex poisoned").attempts.get(&kind).copied().unwrap_or(0)
     }
 
     /// How many failures were injected so far at `stage` of `kind` attempts
     /// (all clones). Lets a test show that its fault really fired where it
     /// meant to, instead of the write failing for some other reason.
     pub fn injected(&self, kind: WriteKind, stage: Stage) -> u64 {
-        let _ = (kind, stage);
-        0 // STUB: green returns the counter.
+        self.shared.lock().expect("fault plan mutex poisoned").injected.get(&(kind, stage)).copied().unwrap_or(0)
+    }
+}
+
+/// `KIND[@STAGE]:ERRNO:WHEN[:FILE]`
+fn parse_rule(text: &str) -> Result<FaultRule, String> {
+    let fields: Vec<&str> = text.split(':').collect();
+    if !(3..=4).contains(&fields.len()) {
+        return Err(format!("rule {text:?} must be KIND[@STAGE]:ERRNO:WHEN[:FILE] ({} fields, expected 3 or 4)", fields.len()));
+    }
+    let (kind_name, stage_name) = match fields[0].split_once('@') {
+        Some((kind, stage)) => (kind, Some(stage)),
+        None => (fields[0], None),
+    };
+    let kind = WriteKind::from_name(kind_name).ok_or_else(|| format!("rule {text:?}: unknown kind {kind_name:?} (watch, lock or reserve)"))?;
+    let stage = match stage_name {
+        None => kind.default_stage(),
+        Some(name) => {
+            let stage = Stage::from_name(name).ok_or_else(|| format!("rule {text:?}: unknown stage {name:?} (create, write, short, sync, rename or cleanup)"))?;
+            if !kind.stages().contains(&stage) {
+                return Err(format!("rule {text:?}: a {kind_name} write has no stage {name:?}, so the rule could never fire"));
+            }
+            stage
+        }
+    };
+    let errno: i32 = fields[1].parse().ok().filter(|errno| *errno > 0).ok_or_else(|| format!("rule {text:?}: errno {:?} must be a positive decimal number", fields[1]))?;
+    let when = parse_when(fields[2]).map_err(|problem| format!("rule {text:?}: {problem}"))?;
+    let file = match fields.get(3) {
+        None => None,
+        Some(name) if name.is_empty() || name.contains('/') => {
+            return Err(format!("rule {text:?}: the FILE field {name:?} must be a plain, non-empty file name"));
+        }
+        Some(name) => Some((*name).to_string()),
+    };
+    Ok(FaultRule { kind, stage, errno, when, file })
+}
+
+fn parse_when(text: &str) -> Result<When, String> {
+    let attempt_number = |digits: &str| -> Result<u64, String> {
+        digits.parse::<u64>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{digits:?} is not an attempt number (1 or more)"))
+    };
+    if text == "all" {
+        return Ok(When::Every);
+    }
+    if let Some(path) = text.strip_prefix("while=") {
+        return if path.is_empty() { Err("while= needs a path".to_string()) } else { Ok(When::WhileExists(PathBuf::from(path))) };
+    }
+    match text.split_once("..") {
+        None => Ok(When::Nth(attempt_number(text)?)),
+        Some((first, "")) => Ok(When::Range { first: attempt_number(first)?, last: None }),
+        Some((first, last)) => {
+            let (first, last) = (attempt_number(first)?, attempt_number(last)?);
+            if last < first {
+                return Err(format!("the range {text:?} ends before it starts"));
+            }
+            Ok(When::Range { first, last: Some(last) })
+        }
     }
 }
 
