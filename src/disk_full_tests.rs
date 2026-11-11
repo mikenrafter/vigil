@@ -1721,3 +1721,83 @@ fn a_failed_save_ends_the_call_at_once_but_keeps_the_saves_that_were_ready_with_
         assert_eq!(env.vigil.store().load(&b).unwrap().tick, 0, "b never got its lock");
     });
 }
+
+// ---- review round 1 (Sol 6/10): S2 redelivery provenance -------------------
+
+#[test]
+fn a_changed_event_another_process_saved_under_a_lost_event_id_comes_back_flagged_redelivered() {
+    // why: review S2: provenance lived only in the CURRENT call's record, so a
+    //      replay of stored events lost it. MCP process P senses "boom" at
+    //      tick 1 and cannot save (event "w:1:0", first delivery, no flag).
+    //      The tick number did not advance, so a concurrent CLI process C
+    //      senses the same file from the same saved baseline, with a NEWER
+    //      line "boom2" appended, and saves event "w:1:0" with that summary
+    //      (S1: "ids can repeat with different content"). P's next call finds
+    //      the watch finished on disk and replays C's event: it is the same id
+    //      the agent already got with other content, so it must say
+    //      `redelivered: true`. Before the fix the flag was absent, and an
+    //      agent that deduplicates by id (which S1 forbids but cannot enforce)
+    //      silently dropped "boom2". Expected values are literals (whole event
+    //      objects), the preconditions are asserted: P's save failed, C's
+    //      event has the same id and the new text, C saved it.
+    // proves: CLAIM(S1), CLAIM(DF3)
+    scenario(|| async {
+        let fixture = Fixture::new().await;
+        let input = fixture.env.input_path("w.log");
+        let (process_p, _) = fixture.faulted(disk_stays_full(5));
+        let lost = wire(&process_p.keepalive(by_id(&fixture.id, None)).await.unwrap());
+        assert_eq!(persist_of(&lost)["ok"], false, "precondition: P's save failed");
+        assert_eq!(lost["events"], json!([change_event("w", 0, &input, "boom", false)]), "the first delivery is not flagged");
+
+        append_file(&input, "boom2\n");
+        let saved = wire(&fixture.env.another_process().keepalive(by_id(&fixture.id, None)).await.unwrap());
+        assert_eq!(saved["events"], json!([change_event("w", 0, &input, "boom2", false)]), "precondition: C saved the same id with newer content");
+        let stored: Value = serde_json::from_slice(&fixture.watch_bytes()).unwrap();
+        assert_eq!(stored["status"], "fired", "precondition: C's result is on disk");
+
+        let replay = wire(&process_p.keepalive(by_id(&fixture.id, None)).await.unwrap());
+
+        assert_eq!(replay["status"], "fired", "{replay}");
+        assert_eq!(replay["events"], json!([change_event("w", 0, &input, "boom2", true)]), "same id, different content: the flag is the only warning");
+        assert!(replay.get("persist").is_none(), "P wrote nothing: {replay}");
+    });
+}
+
+#[test]
+fn a_retry_that_saved_keeps_its_redelivered_flag_until_the_envelope_is_really_delivered() {
+    // why: review S2: the process memory of a failed save was cleared the
+    //      moment a retry SAVED, but the retry's envelope may never reach the
+    //      agent (MCP cancels a call whose client went away; C2: the result is
+    //      not marked returned). The next call then replays the stored event
+    //      from disk and, with the memory gone, dropped the flag. Sequence in
+    //      one process: call 1 senses "boom" and cannot save (first delivery,
+    //      no flag); call 2 retries, saves, and is CANCELLED before delivery
+    //      (`keepalive_uncommitted`, the Delivery is dropped); then
+    //      `watch_status` and call 3 replay the stored event and both must
+    //      still say `redelivered: true`, because the agent has never seen
+    //      call 2's envelope. Call 2's own envelope is flagged before and
+    //      after the fix (precondition, so the test shows the flag was there
+    //      to lose). The first two writes fail (the write and its retry).
+    // proves: CLAIM(S1), CLAIM(DF3)
+    scenario(|| async {
+        let fixture = Fixture::new().await;
+        let input = fixture.env.input_path("w.log");
+        let (vigil, _) = fixture.faulted(vec![rule(WriteKind::Watch, 28, When::Range { first: 1, last: Some(2) })]);
+        let lost = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.unwrap());
+        assert_eq!(persist_of(&lost)["ok"], false, "precondition: call 1 could not save");
+
+        let (retried, undelivered) = vigil
+            .keepalive_uncommitted(by_id(&fixture.id, None), &crate::keepalive::NoProgress, std::future::pending::<()>())
+            .await
+            .unwrap()
+            .expect("not cancelled while sensing");
+        assert_eq!(wire(&retried)["events"], json!([change_event("w", 0, &input, "boom", true)]), "precondition: call 2 is flagged and saved");
+        assert!(wire(&retried).get("persist").is_none(), "precondition: call 2 saved");
+        drop(undelivered);
+
+        let status = wire(&vigil.status(&fixture.id).await.unwrap().envelope);
+        assert_eq!(status["events"], json!([change_event("w", 0, &input, "boom", true)]), "the stored event is still undelivered, so still flagged");
+        let replay = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.unwrap());
+        assert_eq!(replay["events"], json!([change_event("w", 0, &input, "boom", true)]), "call 3 replays what call 2 never delivered");
+    });
+}
