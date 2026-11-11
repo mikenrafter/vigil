@@ -6,7 +6,7 @@ use tokio::time::Instant;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::attention::{due_reasons, event_for, overdue_at, LONG_WINDOW_S};
+use crate::attention::{due_reasons, event_for, overdue_at, AttentionReason, LONG_WINDOW_S};
 use crate::cache::{choose_window, CacheNote, WindowRequest};
 use crate::clock::Timestamp;
 use crate::credit::CreditCheck;
@@ -630,19 +630,41 @@ impl crate::engine::Vigil {
             return Ok(());
         }
         let now = self.clock.now();
+        self.forget_unsaved_attention(id, &watch.attention_raised);
         let due = due_reasons(&watch, now, long_window);
         if due.is_empty() {
             return Ok(());
         }
         // S1, decided before this save changes the answer.
         let repeating = self.may_repeat(id);
+        // ↳ CLAIM(S5-identity): an event whose save failed was shown to the
+        // agent; the retry is that event, not a new one built from a watch a
+        // tick may have moved on [review S5;
+        // auto_interval_tests::an_attention_event_keeps_its_id_when_a_tick_lands_between_a_failed_save_and_the_retry].
+        // The remembered ones go in first so a new event's id (counted from
+        // what is already there) cannot collide with one of them.
+        let mut raised: Vec<(AttentionReason, Event)> = Vec::new();
+        let mut fresh: Vec<AttentionReason> = Vec::new();
         for reason in due {
+            match self.unsaved_attention(id, reason) {
+                Some(event) => raised.push((reason, event)),
+                None => fresh.push(reason),
+            }
+        }
+        let any_retried = !raised.is_empty();
+        for (reason, event) in &raised {
+            watch.events.push(event.clone());
+            watch.attention_raised.push(*reason);
+        }
+        for reason in fresh {
             let event = event_for(&watch, reason, now);
-            watch.events.push(event);
+            watch.events.push(event.clone());
             watch.attention_raised.push(reason);
+            raised.push((reason, event));
         }
         let persisted = self.persist(&watch, Some(budget_end)).await?;
-        if repeating {
+        self.remember_attention_save(id, &raised, &persisted);
+        if repeating || any_retried {
             call.redelivered.insert(id.clone());
         }
         call.raised_attention = true;

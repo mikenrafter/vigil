@@ -1,12 +1,13 @@
 //! `Vigil`: the deep module. Everything the CLI and the MCP front do goes
 //! through here, against one state root, one clock and one judge.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::attention::AttentionReason;
 use crate::clock::{Clock, Timestamp};
 use crate::config::Config;
 use crate::envelope::{cut_digest, Envelope, Next, PersistFailure, PersistNote};
@@ -72,6 +73,16 @@ pub(crate) struct Session {
     /// cannot know, which is why this is a process fact. Cleared for a watch
     /// when a successful save leaves nothing to flag, or by `commit_delivery`.
     pub repeat_risk: BTreeSet<WatchId>,
+    /// Review S5: the attention events this process built and could not save,
+    /// by watch and reason. The envelope that carried them reached the agent,
+    /// so the retry must be the SAME event (same id, same text): rebuilding it
+    /// from the watch as it is by then (a tick may have moved `tick` in
+    /// between) would give the agent a second notification for one fact.
+    /// Dropped when a save of the watch lands them, or when the reason is
+    /// found raised in the file (someone else saved it). A fresh process
+    /// cannot know what a dead one showed; that limit is the same as for
+    /// `repeat_risk`.
+    pub unsaved_attention: BTreeMap<(WatchId, AttentionReason), Event>,
 }
 
 /// How one save of a watch file went, for a caller that must not fail because
@@ -376,6 +387,38 @@ impl Vigil {
     /// are flagged (review S2).
     pub(crate) fn may_repeat(&self, id: &WatchId) -> bool {
         self.session.lock().expect("session mutex poisoned").repeat_risk.contains(id)
+    }
+
+    /// Review S5: the attention event of `reason` that this process built for
+    /// `id` and could not save, if there is one.
+    pub(crate) fn unsaved_attention(&self, id: &WatchId, reason: AttentionReason) -> Option<Event> {
+        self.session.lock().expect("session mutex poisoned").unsaved_attention.get(&(id.clone(), reason)).cloned()
+    }
+
+    /// Review S5: after one save of `id` that raised `raised`: a failed save
+    /// keeps the events (the agent holds them, the retry must repeat them), a
+    /// save that landed drops them.
+    pub(crate) fn remember_attention_save(&self, id: &WatchId, raised: &[(AttentionReason, Event)], persisted: &Persisted) {
+        let mut session = self.session.lock().expect("session mutex poisoned");
+        for (reason, event) in raised {
+            match persisted {
+                Persisted::NotSaved(_) => {
+                    session.unsaved_attention.insert((id.clone(), *reason), event.clone());
+                }
+                Persisted::Saved | Persisted::SavedOnReserve => {
+                    session.unsaved_attention.remove(&(id.clone(), *reason));
+                }
+            }
+        }
+    }
+
+    /// Review S5: `reasons` are already raised in `id`'s file (another process
+    /// saved them), so a copy of ours that never landed is moot.
+    pub(crate) fn forget_unsaved_attention(&self, id: &WatchId, reasons: &[AttentionReason]) {
+        let mut session = self.session.lock().expect("session mutex poisoned");
+        for reason in reasons {
+            session.unsaved_attention.remove(&(id.clone(), *reason));
+        }
     }
 
     /// The events of a stored result as this process returns them: flagged
