@@ -2425,3 +2425,124 @@ async fn a_uw_that_hangs_still_leaves_the_engine_time_to_read_the_transcripts() 
     assert_eq!((&event["kind"], &event["on_credits"], &event["source"]), (&json!("credit_state_changed"), &json!(true), &json!("transcripts")), "{answer}");
     assert_eq!(rig.read_credit_file()["on_credits"], true, "the verdict was recorded");
 }
+
+// ---- review S3: every return path of an orchestrator call owes its due check ----
+
+/// A rig whose last credit check is 300 s old (older than the 240 s cadence), so
+/// every orchestrator call owes an entry check, and a probe that says "off".
+fn rig_owing_a_credit_check() -> (Rig, Arc<ScriptedCreditProbe>) {
+    let rig = Rig::new();
+    rig.seed_credit_file(Some(false), 300);
+    (rig, quiet_probe())
+}
+
+/// The check this call made, as the agent reads it in `cache.credit_check`.
+fn assert_one_check_reported(answer: &Value, probe: &ScriptedCreditProbe, path: &str) {
+    assert_eq!(probe.asked_count(), 1, "{path}: the due entry check must run before this return: {answer}");
+    assert_eq!(answer["cache"]["credit_check"]["on_credits"], false, "{path}: {answer}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_that_returns_carried_attention_still_makes_its_due_credit_check() {
+    // why: review S3, path 1. Attention that was raised and saved but never
+    //      acknowledged (the transport died) is returned at once by the next
+    //      call, ahead of any sensing, and that return skipped the check: a
+    //      stream of such calls never monitored credit state. Call 1 is a
+    //      plain call that raises the attention (overdue at 90 s) and is
+    //      dropped uncommitted. Call 2 is the orchestrator's, the last check
+    //      is 300 s old: it must return the carried event (redelivered) AND
+    //      carry its check. Control: the same call without the orchestrator
+    //      flag asks nobody.
+    // proves: CLAIM(S2), CLAIM(S6)
+    let (rig, probe) = rig_owing_a_credit_check();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |request| request.expect_s = Some(60)).await;
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None };
+    let (_, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().unwrap();
+    drop(delivery);
+    assert_eq!(probe.asked_count(), 0, "control: a plain call checks nothing");
+
+    let answer = call(&vigil, &id, None, Some(true)).await;
+    assert_eq!((&answer["waited_s"], &only_event(&answer)["redelivered"]), (&json!(0), &json!(true)), "{answer}");
+    assert_one_check_reported(&answer, &probe, "carried attention");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_that_returns_an_existing_terminal_result_still_makes_its_due_credit_check() {
+    // why: review S3, path 2. A watch that finished before the call (here: by
+    //      another process) is returned before any round, and that return
+    //      skipped the check. Process 1 fires the watch with a plain call;
+    //      process 2 asks for it as the orchestrator.
+    // proves: CLAIM(S2)
+    let (rig, probe) = rig_owing_a_credit_check();
+    let first = rig.vigil(AgentEnv::default(), &probe);
+    let (id, path) = quiet_watch(&rig, &first, "w", 20, 3600, |_| {}).await;
+    append_file(&path, "boom\n");
+    assert_eq!(call(&first, &id, None, None).await["status"], "fired");
+    assert_eq!(probe.asked_count(), 0, "control: the plain call that fired it checked nothing");
+
+    let second = rig.vigil(AgentEnv::default(), &probe);
+    let answer = call(&second, &id, None, Some(true)).await;
+    assert_eq!(answer["status"], "fired", "{answer}");
+    assert_one_check_reported(&answer, &probe, "existing terminal result");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_in_which_a_watch_finishes_still_makes_its_due_credit_check_and_reports_a_change_beside_it() {
+    // why: review S3, path 3. A watch that fires during the call ends it, and
+    //      that return skipped the check: fast jobs bypassed credit
+    //      monitoring for good. (1) Probe says "off", file says "off": the
+    //      fire carries the check. (2) Probe says "on": the envelope is the
+    //      fire's (status fired, first event the ordinary one) with the
+    //      credit event beside it, and the state file moves. (3) Controls:
+    //      without the orchestrator flag no check; with a check made 100 s
+    //      ago (inside the 240 s cadence) no second one.
+    // proves: CLAIM(S2), CLAIM(AI8)
+    let (rig, probe) = rig_owing_a_credit_check();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (plain, plain_path) = quiet_watch(&rig, &vigil, "plain", 20, 3600, |_| {}).await;
+    append_file(&plain_path, "boom\n");
+    let control = call(&vigil, &plain, None, None).await;
+    assert_eq!((&control["status"], probe.asked_count()), (&json!("fired"), 0), "{control}");
+    assert!(control["cache"].get("credit_check").is_none(), "{control}");
+
+    let (quiet, quiet_path) = quiet_watch(&rig, &vigil, "quiet", 20, 3600, |_| {}).await;
+    append_file(&quiet_path, "boom\n");
+    let answer = call(&vigil, &quiet, None, Some(true)).await;
+    assert_eq!(answer["status"], "fired", "{answer}");
+    assert_one_check_reported(&answer, &probe, "newly finished");
+
+    rig.seed_credit_file(Some(false), 100);
+    let (recent, recent_path) = quiet_watch(&rig, &vigil, "recent", 20, 3600, |_| {}).await;
+    append_file(&recent_path, "boom\n");
+    let within_cadence = call(&vigil, &recent, None, Some(true)).await;
+    assert_eq!((&within_cadence["status"], probe.asked_count()), (&json!("fired"), 1), "a check 100 s ago is not repeated: {within_cadence}");
+
+    rig.seed_credit_file(Some(false), 300);
+    probe.push(credit_state(true, CreditSource::Uw));
+    let (changing, changing_path) = quiet_watch(&rig, &vigil, "changing", 20, 3600, |_| {}).await;
+    append_file(&changing_path, "boom\n");
+    let changed = call(&vigil, &changing, None, Some(true)).await;
+    assert_eq!((&changed["status"], &changed["next"]), (&json!("fired"), &json!("act on events")), "{changed}");
+    let events = changed["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "the fire plus the credit event: {changed}");
+    assert!(events[0].get("kind").is_none(), "the terminal event is an ordinary one, first: {changed}");
+    assert_eq!((&events[1]["kind"], &events[1]["on_credits"]), (&json!("credit_state_changed"), &json!(true)), "{changed}");
+    assert_eq!(rig.read_credit_file()["on_credits"], true);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_that_raises_attention_at_its_first_pass_still_makes_its_due_credit_check() {
+    // why: review S3, path 4. Attention that is already due when the call
+    //      starts is raised at the first pass and ends the call, and that
+    //      return skipped the check. Watch overdue at 30 s (expect_s 20), the
+    //      call starts at 40 s.
+    // proves: CLAIM(S2), CLAIM(AI5)
+    let (rig, probe) = rig_owing_a_credit_check();
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |request| request.expect_s = Some(20)).await;
+    tokio::time::advance(Duration::from_secs(40)).await;
+    let answer = call(&vigil, &id, None, Some(true)).await;
+    assert_attention(&answer, "overdue", 0);
+    assert_one_check_reported(&answer, &probe, "new attention");
+}
