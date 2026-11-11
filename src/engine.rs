@@ -23,6 +23,12 @@ use crate::watch::{
 /// parked on a lock it would later take and release.
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// A rescue inside a call waits for the store-wide lock until this long
+/// before the call budget ends (review S3). The wait is async now, so the
+/// budget's own timeout can fire while it runs; stopping short leaves the tick
+/// time to return its answer (DF1) instead of being dropped at the same instant.
+const RESCUE_BUDGET_MARGIN: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Created {
     pub watch_id: WatchId,
@@ -181,7 +187,7 @@ impl Vigil {
         let baseline = vec![InputState::default(); watch.spec.inputs.len()];
         let readings = self.read_all(&watch.spec.inputs, &baseline).await;
         watch.input_states = readings.into_iter().map(|reading| reading.state).collect();
-        if let Err(error) = self.store.save(&watch) {
+        if let Err(error) = self.store.save_async(&watch).await {
             // DF7: the placeholder reserved the id, and a create that fails
             // must not burn it. Deleting works on a full disk. Best effort: a
             // placeholder that stays is the pre-DF7 behaviour, not a new loss.
@@ -210,7 +216,7 @@ impl Vigil {
     /// `watch_list`: every watch in the state root, any session. Prunes.
     pub async fn list(&self) -> Result<Vec<WatchSummary>, VigilError> {
         // Pruning is housekeeping; a failure to prune must not hide the list.
-        let _ = self.prune();
+        let _ = self.prune_async().await;
         let now = self.clock.now();
         Ok(self
             .store
@@ -239,7 +245,7 @@ impl Vigil {
         if watch.is_overdue(now) {
             // W5: the deadline passed before the cancel arrived; expiry wins.
             watch = expired_if_overdue(watch, now);
-            persisted = self.persist(&watch, None)?;
+            persisted = self.persist(&watch, None).await?;
         } else if !watch.status.is_finished() {
             let terminal = Terminal {
                 status: TerminalStatus::Cancelled,
@@ -248,7 +254,7 @@ impl Vigil {
                 digest: watch.last_digest.clone(),
             };
             watch.finish(terminal).expect("a pending watch accepts its terminal result");
-            persisted = self.persist(&watch, None)?;
+            persisted = self.persist(&watch, None).await?;
         }
         let mut envelope = self.envelope_for(&watch, now);
         // A cancel's envelope always has a terminal status: at risk if unsaved.
@@ -261,11 +267,16 @@ impl Vigil {
     /// Anything else the store can fail at (a value that cannot be serialized)
     /// is a real error. A rescue inside the store waits for the store-wide
     /// lock at most `min(2 s, the call budget left)` (DF4e). Also keeps the
-    /// process's memory of failed saves (S1).
-    pub(crate) fn persist(&self, watch: &WatchFile, budget_end: Option<tokio::time::Instant>) -> Result<Persisted, VigilError> {
+    /// process's memory of failed saves (S1). Async because the rescue's wait
+    /// yields to the executor (review S3): the waits of several watches
+    /// overlap, and a call that is dropped stops waiting.
+    pub(crate) async fn persist(&self, watch: &WatchFile, budget_end: Option<tokio::time::Instant>) -> Result<Persisted, VigilError> {
         let saved = match budget_end {
-            Some(end) => self.store.save_within(watch, end.saturating_duration_since(tokio::time::Instant::now())),
-            None => self.store.save(watch),
+            Some(end) => {
+                let left = end.saturating_duration_since(tokio::time::Instant::now());
+                self.store.save_within_async(watch, left.saturating_sub(RESCUE_BUDGET_MARGIN)).await
+            }
+            None => self.store.save_async(watch).await,
         };
         let persisted = match saved {
             Ok(outcome) if outcome.used_reserve => Persisted::SavedOnReserve,
@@ -306,9 +317,15 @@ impl Vigil {
     }
 
     /// Delete finished watches older than 7 days; returns deleted ids.
-    /// Takes the locks itself (`Store::prune`).
+    /// Takes the locks itself (`Store::prune`); parks the calling thread while
+    /// it waits for one.
     pub fn prune(&self) -> Result<Vec<WatchId>, VigilError> {
         Ok(self.store.prune(self.clock.now())?)
+    }
+
+    /// `prune` for async callers: its waits yield to the executor (review S3).
+    pub async fn prune_async(&self) -> Result<Vec<WatchId>, VigilError> {
+        Ok(self.store.prune_async(self.clock.now()).await?)
     }
 
     /// Load a watch, naming the id in `NotFound`.
@@ -322,7 +339,7 @@ impl Vigil {
     /// The watch's lock (X3), polled so the wait can be cancelled.
     pub(crate) async fn lock_watch(&self, id: &WatchId) -> Result<WatchLock, VigilError> {
         loop {
-            if let Some(lock) = self.store.try_lock_watch(id)? {
+            if let Some(lock) = self.store.try_lock_watch_async(id).await? {
                 return Ok(lock);
             }
             tokio::time::sleep(LOCK_POLL).await;
@@ -331,7 +348,7 @@ impl Vigil {
 
     async fn lock_global(&self) -> Result<StoreLock, VigilError> {
         loop {
-            if let Some(lock) = self.store.try_lock()? {
+            if let Some(lock) = self.store.try_lock_async().await? {
                 return Ok(lock);
             }
             tokio::time::sleep(LOCK_POLL).await;

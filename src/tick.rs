@@ -96,7 +96,7 @@ impl Vigil {
                 return Ok(TickReport::without_changes(TickOutcome::OutOfBudget));
             }
             let expired = expired_if_overdue(watch, now);
-            let persisted = self.persist(&expired, budget_end)?;
+            let persisted = self.persist(&expired, budget_end).await?;
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
         if !is_due(&watch, now) {
@@ -141,7 +141,7 @@ impl Vigil {
         let after = self.clock.now();
         if unticked.is_overdue(after) {
             let expired = expired_if_overdue(unticked, after);
-            let persisted = self.persist(&expired, budget_end)?;
+            let persisted = self.persist(&expired, budget_end).await?;
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
 
@@ -160,7 +160,7 @@ impl Vigil {
         // DF1: a write that fails is a value, not an error; the tick's answer is
         // `watch`, saved or not. DF3: nothing was written, so the persisted
         // baseline did not move and the next tick senses the change again.
-        let persisted = self.persist(&watch, budget_end)?;
+        let persisted = self.persist(&watch, budget_end).await?;
         Ok(TickReport { outcome: TickOutcome::Ticked, changed, after: Some(watch), persisted, redelivered })
     }
 

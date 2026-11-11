@@ -132,7 +132,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     let vigil = build_vigil(cli.root)?;
     // D4: finished watches are deleted 7 days after they finish, by any run.
     // Housekeeping must not turn a working command into a failing one.
-    let _ = vigil.prune();
+    let _ = vigil.prune_async().await;
     match cli.command {
         Command::Create { json } => {
             let raw = match json {

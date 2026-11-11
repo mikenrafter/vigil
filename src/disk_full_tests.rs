@@ -1407,14 +1407,20 @@ fn a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_wi
     //      would succeed and hide a missing deadline).
     //      World 1, ample budget (270 s): the rescue waits the 2 s ceiling. It
     //      returned (the scenario watchdog is 20 s, so an unbounded wait fails
-    //      loudly) and took at least 1.9 s of REAL time (the wait is a real
-    //      lock wait on a blocked thread: tokio's paused clock does not shorten
-    //      it).
+    //      loudly) and the wait took 1.9 s to under 2.5 s of the call's clock.
+    //      Review S3 changed how that is measured: the wait is a poll loop on
+    //      tokio's clock now (it must not park the executor), so under the
+    //      paused test clock it is VIRTUAL time; the old assertion, 1.9 s of
+    //      REAL time on a blocked thread, was the bug. The 2.5 s upper bound
+    //      is new: the ceiling is 2 s plus one poll.
     //      World 2, the read takes 29.5 s of virtual time out of a 30 s call, so
-    //      0.5 s of budget is left when the save starts: the rescue waits about
-    //      0.5 s, so the call returns in well under the 2 s ceiling (< 1.8 s).
-    //      This is the "remaining call budget" half: it fails if the engine
-    //      does not pass its budget to the store.
+    //      0.5 s of budget is left when the save starts: the rescue waits the
+    //      budget less a 100 ms margin (0.4 s; the margin keeps the call's own
+    //      timeout from firing at the instant the wait ends and dropping the
+    //      answer), so the whole call ends at 29.9 s of virtual time, inside
+    //      the 30 s budget, and in well under the 2 s ceiling of real time
+    //      (< 1.8 s, unchanged). This is the "remaining call budget" half: it
+    //      fails if the engine does not pass its budget to the store.
     //      Both: the envelope is the fired one with the plain failure note
     //      (disk_full, no retry, so no `first_error`), the reserve is the same
     //      valid file, ONE watch attempt, the watch file unchanged.
@@ -1426,7 +1432,7 @@ fn a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_wi
         let (vigil, plan) = fixture.faulted(vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
         let guard = vigil.store().lock().unwrap();
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let envelope = wire(&vigil.keepalive(by_id(&fixture.id, None)).await.expect("a rescue that cannot get the lock still answers"));
         let elapsed = started.elapsed();
 
@@ -1434,6 +1440,7 @@ fn a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_wi
         assert_eq!(envelope["status"], "fired");
         assert_failed_persist(&envelope, "disk_full", "No space left on device", &fixture.watch_file(), true, Some(false));
         assert!(elapsed >= Duration::from_millis(1900), "the rescue waited only {elapsed:?} for the lock; the ceiling is 2 s");
+        assert!(elapsed < Duration::from_millis(2500), "the rescue waited {elapsed:?}; the ceiling is 2 s");
         assert_eq!(plan.attempts(WriteKind::Watch), 1, "no lock, no retry");
         assert_eq!(identity(&fixture.reserve()), reserve_before, "the reserve is untouched");
         assert_eq!(fixture.watch_bytes(), before);
@@ -1450,14 +1457,19 @@ fn a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_wi
         let guard = vigil.store().lock().unwrap();
 
         let started = std::time::Instant::now();
+        let started_virtual = tokio::time::Instant::now();
         let envelope = wire(&vigil.keepalive(by_id(&id, Some(30))).await.expect("a rescue that cannot get the lock still answers"));
         let elapsed = started.elapsed();
+        let elapsed_virtual = started_virtual.elapsed();
 
         drop(guard);
         assert_eq!(envelope["status"], "fired", "{envelope}");
         assert_eq!(envelope["waited_s"], 29, "precondition: the read really used 29.5 s of the 30 s budget: {envelope}");
         assert_failed_persist(&envelope, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), true, Some(false));
         assert!(elapsed < Duration::from_millis(1800), "the rescue waited {elapsed:?}; only ~0.5 s of the call budget was left, far below the 2 s ceiling");
+        // 29.5 s read + the 0.4 s wait (0.5 s left, less the 100 ms margin).
+        assert!(elapsed_virtual >= Duration::from_millis(29_800), "the rescue did not wait for the lock: the call took {elapsed_virtual:?}");
+        assert!(elapsed_virtual < Duration::from_secs(30), "the wait must end inside the 30 s budget, the call took {elapsed_virtual:?}");
         assert_eq!(plan.attempts(WriteKind::Watch), 1);
         assert_eq!(identity(&reserve), reserve_before, "the reserve is untouched");
     });
@@ -1932,5 +1944,42 @@ fn a_cancel_during_a_rescue_wait_is_observed_at_once() {
         assert!(elapsed < Duration::from_secs(1), "cancellation must interrupt the wait, took {elapsed:?}");
         assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "nothing was spent");
         assert_eq!(std::fs::read(env.root().join("watches").join("a.json")).unwrap(), file_before, "nothing was written");
+    });
+}
+
+#[test]
+fn a_rescue_with_almost_no_budget_left_still_returns_the_answer() {
+    // why: review S3, a hazard of the fix itself: the rescue wait is async now,
+    //      so the call's own budget timeout (V2, `timeout_at`) can fire while
+    //      it runs. A wait that ends exactly at the budget would race that
+    //      timeout and could lose the tick, i.e. the answer DF1 promises. The
+    //      read takes 29.95 s of virtual time out of a 30 s call, the first
+    //      write fails once with ENOSPC, the store-wide lock is held for the
+    //      whole call. Expected: the fired envelope with the plain failure
+    //      note (no retry), the reserve untouched, the call ended inside the
+    //      30 s budget. With the 100 ms margin (`RESCUE_BUDGET_MARGIN`) there
+    //      is no budget left to wait, so no wait happens at all.
+    // proves: CLAIM(DF1), CLAIM(DF4e)
+    scenario(|| async {
+        let env = paused_env();
+        let id = quiet_probe_watch(&env).await;
+        let reserve = env.root().join(".reserve");
+        let reserve_before = identity(&reserve);
+        env.reader.set_text("cmd:probe", "bad");
+        env.reader.set_sleep("cmd:probe", Duration::from_millis(29_950));
+        let plan = FaultPlan::from_rules(vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let vigil = env.another_process().with_write_faults(plan.clone());
+        let guard = vigil.store().lock().unwrap();
+
+        let started = tokio::time::Instant::now();
+        let envelope = wire(&vigil.keepalive(by_id(&id, Some(30))).await.expect("a rescue that cannot get the lock still answers"));
+        let elapsed = started.elapsed();
+
+        drop(guard);
+        assert_eq!(envelope["status"], "fired", "the tick's answer must survive the budget edge: {envelope}");
+        assert_failed_persist(&envelope, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), true, Some(false));
+        assert!(elapsed < Duration::from_secs(30), "the call must end inside its budget, took {elapsed:?}");
+        assert_eq!(plan.attempts(WriteKind::Watch), 1);
+        assert_eq!(identity(&reserve), reserve_before, "the reserve is untouched");
     });
 }

@@ -24,6 +24,14 @@
 //! * A rescue waits for the store-wide lock at most `min(2 s, the caller's
 //!   remaining call budget)`; after that it reports the first failure and
 //!   touches nothing (DF4e).
+//! * Waiting for a contended lock is the only slow step, and the store has ONE
+//!   algorithm for it ([`Patience`]): a blocking caller (the CLI edge, store
+//!   tests) parks its thread between polls, an async caller (the engine, in
+//!   the middle of a tick) yields to the executor with `tokio::time::sleep`,
+//!   so the waits of several watches overlap and a dropped call stops waiting
+//!   (review S3). Writes, retries and the lock they need stay synchronous and
+//!   uninterrupted: there is no `.await` between taking the lock and the end of
+//!   the retry.
 //! * The rename of `<path>.tmp` over `<path>` is the commit point: before it the
 //!   old file is intact; a failed attempt removes its own `.tmp` (best effort,
 //!   and the write's error, not the cleanup's, is the one reported: N3). A
@@ -34,6 +42,7 @@
 //! `tick.rs` (turn a failed save into the envelope's `persist` note).
 
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -59,6 +68,68 @@ pub const RESCUE_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// never slow a healthy tick down.
 const UPKEEP_LOCK_WAIT: Duration = Duration::from_millis(250);
 const LOCK_POLL: Duration = Duration::from_millis(2);
+
+/// How a wait for a contended lock lets time pass (review S3): one countdown
+/// of `limit` and a pause of one [`LOCK_POLL`] between two polls. The store's
+/// lock-waiting code is written once, generic over this, and run by either
+/// implementation, so the blocking and the async entry points cannot drift
+/// apart (mated parts; parity is the store tests run through both).
+///
+/// Invariants: `is_over` is monotonic; `pause` never holds a lock or a file
+/// across its await point (the caller holds none while it pauses), so a future
+/// dropped at the pause leaves nothing behind.
+trait Patience: Send {
+    fn start(limit: Duration) -> Self;
+    fn is_over(&self) -> bool;
+    fn pause(&self) -> impl Future<Output = ()> + Send;
+}
+
+/// Parks the calling thread. For callers that are not on an executor.
+struct Blocking {
+    end: Instant,
+}
+
+impl Patience for Blocking {
+    fn start(limit: Duration) -> Blocking {
+        Blocking { end: Instant::now() + limit }
+    }
+    fn is_over(&self) -> bool {
+        Instant::now() >= self.end
+    }
+    // Ready in its first poll: `block_on_ready` relies on it.
+    async fn pause(&self) {
+        std::thread::sleep(LOCK_POLL)
+    }
+}
+
+/// Yields to the executor on tokio's clock (virtual under a paused test clock,
+/// like every other budget of a call). Needs a tokio runtime.
+struct Cooperative {
+    end: tokio::time::Instant,
+}
+
+impl Patience for Cooperative {
+    fn start(limit: Duration) -> Cooperative {
+        Cooperative { end: tokio::time::Instant::now() + limit }
+    }
+    fn is_over(&self) -> bool {
+        tokio::time::Instant::now() >= self.end
+    }
+    fn pause(&self) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(LOCK_POLL)
+    }
+}
+
+/// Run a future whose awaits are all [`Blocking`] pauses: each is ready in its
+/// first poll, so so is the whole future. This is how the blocking entry
+/// points run the one shared algorithm.
+fn block_on_ready<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => unreachable!("a Blocking wait completes in its first poll"),
+    }
+}
 
 /// `$XDG_STATE_HOME/vigil`, else `$HOME/.local/state/vigil`. An empty
 /// variable counts as unset (XDG Base Directory spec). `None` if neither.
@@ -243,34 +314,46 @@ impl Store {
     /// store-wide lock at most [`RESCUE_LOCK_WAIT`]. The error of a write that
     /// still fails is `DiskFull` (naming the state root) or `Io`.
     pub fn save(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
-        self.save_with(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT)))
     }
 
     /// `save` for a caller inside a call budget (DF4e): a rescue waits for the
     /// store-wide lock at most `min(2 s, budget_left)`; with nothing left it
     /// does not wait at all.
     pub fn save_within(&self, watch: &WatchFile, budget_left: Duration) -> Result<WriteOutcome, StoreError> {
-        self.save_with(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT)))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT))))
     }
 
     /// `save` for a caller that already holds the store-wide lock (`create`
     /// writes its placeholder under it): the rescue reuses `held` instead of
-    /// waiting for a lock its own process owns (DF4c).
+    /// waiting for a lock its own process owns (DF4c). Never waits.
     pub fn save_under(&self, watch: &WatchFile, held: &StoreLock) -> Result<WriteOutcome, StoreError> {
-        self.save_with(watch, StoreLockAccess::Held(held))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Held(held)))
     }
 
-    fn save_with(&self, watch: &WatchFile, access: StoreLockAccess<'_>) -> Result<WriteOutcome, StoreError> {
+    /// `save` for async callers (review S3): the same writes and the same
+    /// rescue, but the wait for the store-wide lock yields to the executor and
+    /// ends when the future is dropped.
+    pub async fn save_async(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
+        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT)).await
+    }
+
+    /// `save_within` for async callers (review S3).
+    pub async fn save_within_async(&self, watch: &WatchFile, budget_left: Duration) -> Result<WriteOutcome, StoreError> {
+        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT))).await
+    }
+
+    async fn save_with<P: Patience>(&self, watch: &WatchFile, access: StoreLockAccess<'_>) -> Result<WriteOutcome, StoreError> {
         let bytes = serde_json::to_vec_pretty(watch).map_err(|error| StoreError::Serialize(error.to_string()))?;
         let path = self.watch_path(&watch.spec.id);
         let attempt = || -> io::Result<()> {
             std::fs::create_dir_all(self.watches_dir())?;
             write_staged(&path, &bytes, &self.faults.begin(WriteKind::Watch, &path))
         };
-        match self.attempt_with_rescue(access, attempt) {
+        match self.attempt_with_rescue::<P, _>(access, attempt).await {
             Ok(((), spent_reserve)) => {
                 if !spent_reserve {
-                    self.upkeep_reserve(access);
+                    self.upkeep_reserve::<P>(access).await;
                 }
                 Ok(WriteOutcome { used_reserve: spent_reserve })
             }
@@ -286,7 +369,11 @@ impl Store {
     /// (DF4e) or without a lock file to take (DF4d) nothing is touched and the
     /// first error is returned. A failed retry returns the retry's error with
     /// the first one's text (S4).
-    fn attempt_with_rescue<T>(&self, access: StoreLockAccess<'_>, mut attempt: impl FnMut() -> io::Result<T>) -> Result<(T, bool), WriteFailed> {
+    async fn attempt_with_rescue<P: Patience, T>(
+        &self,
+        access: StoreLockAccess<'_>,
+        mut attempt: impl FnMut() -> io::Result<T>,
+    ) -> Result<(T, bool), WriteFailed> {
         let first = match attempt() {
             Ok(value) => return Ok((value, false)),
             Err(error) => error,
@@ -295,7 +382,7 @@ impl Store {
             return Err(WriteFailed { error: first, first_error: None });
         }
         // ↳ CLAIM(DF4c): delete + retry (+ upkeep after it) happen under the store-wide lock, so two processes never both spend the one reserve [spec S3; store tests two_rescues_*]
-        let rescued = self.with_store_lock(access, || {
+        let rescued = self.with_store_lock::<P, _>(access, || {
             // The reserve may have been spent by whoever held the lock before
             // us: then there is nothing to free and no retry (DF4a).
             if !self.reserve_present() {
@@ -311,7 +398,7 @@ impl Store {
             }
             Some(retried)
         });
-        match rescued.flatten() {
+        match rescued.await.flatten() {
             None => Err(WriteFailed { error: first, first_error: None }),
             Some(Ok(value)) => Ok((value, true)),
             Some(Err(retry)) => Err(WriteFailed { error: retry, first_error: Some(first.to_string()) }),
@@ -321,22 +408,23 @@ impl Store {
     /// Run `run` with the store-wide lock held, waiting for it as `access`
     /// says. `None` when the lock could not be had in time, or its file does
     /// not exist and cannot be made (DF4d): `run` did not run.
-    fn with_store_lock<T>(&self, access: StoreLockAccess<'_>, run: impl FnOnce() -> T) -> Option<T> {
-        let patience = match access {
+    async fn with_store_lock<P: Patience, T>(&self, access: StoreLockAccess<'_>, run: impl FnOnce() -> T) -> Option<T> {
+        let limit = match access {
             StoreLockAccess::Held(_) => return Some(run()),
-            StoreLockAccess::Wait(patience) => patience,
+            StoreLockAccess::Wait(limit) => limit,
         };
         // DF4d: the lock file is made first, once, with no rescue of its own (a
         // rescue needs this lock, and the file is exactly what is missing).
         let file = self.open_lock_file_once(&self.lock_path()).ok()?;
-        let end = Instant::now() + patience;
+        let patience = P::start(limit);
         loop {
             match file.try_lock() {
                 Ok(()) => {
+                    // ↳ CLAIM(DF4c): no `.await` from here to the end of `run`, so the lock is held across the whole rescue and a dropped future never leaves it half done [spec S3, review S3]
                     let _guard = StoreLock { file };
                     return Some(run());
                 }
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < end => std::thread::sleep(LOCK_POLL),
+                Err(std::fs::TryLockError::WouldBlock) if !patience.is_over() => patience.pause().await,
                 Err(_) => return None,
             }
         }
@@ -359,16 +447,18 @@ impl Store {
 
     /// After a healthy write: make the reserve if it is not valid. Best effort
     /// and quiet. The valid case costs one `stat`.
-    fn upkeep_reserve(&self, access: StoreLockAccess<'_>) {
+    async fn upkeep_reserve<P: Patience>(&self, access: StoreLockAccess<'_>) {
         if self.reserve_is_valid() {
             return;
         }
         let access = match access {
-            StoreLockAccess::Wait(_) => StoreLockAccess::Wait(UPKEEP_LOCK_WAIT),
+            // Never longer than the caller's own limit (a call nearly out of
+            // budget does not spend it on upkeep).
+            StoreLockAccess::Wait(limit) => StoreLockAccess::Wait(limit.min(UPKEEP_LOCK_WAIT)),
             held => held,
         };
         // ↳ CLAIM(DF4d): `with_store_lock` makes the lock file before the reserve is published [spec N1; store test a_reserve_is_published_only_after_the_store_wide_lock_file_exists]
-        let _ = self.with_store_lock(access, || self.fill_reserve_under_lock());
+        let _ = self.with_store_lock::<P, _>(access, || self.fill_reserve_under_lock()).await;
     }
 
     /// Replace an invalid reserve with a valid one, under the store-wide lock.
@@ -447,8 +537,8 @@ impl Store {
 
     /// `open_lock_file_once` through the same reserve-and-retry path as every
     /// other write (DF5).
-    fn open_lock_file(&self, path: &Path) -> Result<File, StoreError> {
-        match self.attempt_with_rescue(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path)) {
+    async fn open_lock_file<P: Patience>(&self, path: &Path) -> Result<File, StoreError> {
+        match self.attempt_with_rescue::<P, _>(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path)).await {
             Ok((file, _spent_reserve)) => Ok(file),
             Err(failed) => Err(failed.into_store_error(path.to_path_buf(), &self.root)),
         }
@@ -457,31 +547,40 @@ impl Store {
     /// Block until the STORE-WIDE exclusive lock is held (creates the lock file
     /// and the root on demand). Short namespace operations only (X3).
     pub fn lock(&self) -> Result<StoreLock, StoreError> {
-        let file = self.open_lock_file(&self.lock_path())?;
+        let file = block_on_ready(self.open_lock_file::<Blocking>(&self.lock_path()))?;
         file.lock().map_err(io_error)?;
         Ok(StoreLock { file })
     }
     /// `Ok(None)` if another holder has the store-wide lock.
     pub fn try_lock(&self) -> Result<Option<StoreLock>, StoreError> {
-        let file = self.open_lock_file(&self.lock_path())?;
+        block_on_ready(self.try_lock_with::<Blocking>())
+    }
+    /// `try_lock` for async callers (review S3): creating a missing lock file
+    /// may need a rescue, whose wait must not park the executor.
+    pub async fn try_lock_async(&self) -> Result<Option<StoreLock>, StoreError> {
+        self.try_lock_with::<Cooperative>().await
+    }
+    async fn try_lock_with<P: Patience>(&self) -> Result<Option<StoreLock>, StoreError> {
+        let file = self.open_lock_file::<P>(&self.lock_path()).await?;
         match file.try_lock() {
             Ok(()) => Ok(Some(StoreLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(io_error(error)),
         }
     }
-    /// `try_lock`, retried until `end`: a lock released a moment ago can look
-    /// held while a forked child that has not yet exec'd still shares its open
-    /// file description. `Ok(None)` once `end` has passed and it is still held.
-    fn try_lock_until(&self, end: Instant) -> Result<Option<StoreLock>, StoreError> {
+    /// `try_lock`, retried until `patience` is over: a lock released a moment
+    /// ago can look held while a forked child that has not yet exec'd still
+    /// shares its open file description. `Ok(None)` once it is over and the
+    /// lock is still held.
+    async fn try_lock_until<P: Patience>(&self, patience: &P) -> Result<Option<StoreLock>, StoreError> {
         loop {
-            if let Some(lock) = self.try_lock()? {
+            if let Some(lock) = self.try_lock_with::<P>().await? {
                 return Ok(Some(lock));
             }
-            if Instant::now() >= end {
+            if patience.is_over() {
                 return Ok(None);
             }
-            std::thread::sleep(Duration::from_millis(2));
+            patience.pause().await;
         }
     }
     /// Block until the exclusive lock of watch `id` is held (creates
@@ -490,7 +589,7 @@ impl Store {
     pub fn lock_watch(&self, id: &WatchId) -> Result<WatchLock, StoreError> {
         let path = self.watch_lock_path(id);
         loop {
-            let file = self.open_lock_file(&path)?;
+            let file = block_on_ready(self.open_lock_file::<Blocking>(&path))?;
             file.lock().map_err(io_error)?;
             if is_same_file(&file, &path) {
                 return Ok(WatchLock { file });
@@ -500,9 +599,16 @@ impl Store {
     }
     /// `Ok(None)` if another holder has watch `id`'s lock.
     pub fn try_lock_watch(&self, id: &WatchId) -> Result<Option<WatchLock>, StoreError> {
+        block_on_ready(self.try_lock_watch_with::<Blocking>(id))
+    }
+    /// `try_lock_watch` for async callers (review S3).
+    pub async fn try_lock_watch_async(&self, id: &WatchId) -> Result<Option<WatchLock>, StoreError> {
+        self.try_lock_watch_with::<Cooperative>(id).await
+    }
+    async fn try_lock_watch_with<P: Patience>(&self, id: &WatchId) -> Result<Option<WatchLock>, StoreError> {
         let path = self.watch_lock_path(id);
         loop {
-            let file = self.open_lock_file(&path)?;
+            let file = self.open_lock_file::<P>(&path).await?;
             match file.try_lock() {
                 Ok(()) if is_same_file(&file, &path) => return Ok(Some(WatchLock { file })),
                 Ok(()) => continue, // X8: replaced under us; try the new file.
@@ -524,8 +630,16 @@ impl Store {
     /// blocks the command that runs it. The store-wide lock file is never
     /// deleted. Returns the deleted ids.
     pub fn prune(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
+        block_on_ready(self.prune_with::<Blocking>(now))
+    }
+    /// `prune` for async callers (review S3): its short waits yield to the
+    /// executor.
+    pub async fn prune_async(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
+        self.prune_with::<Cooperative>(now).await
+    }
+    async fn prune_with<P: Patience>(&self, now: Timestamp) -> Result<Vec<WatchId>, StoreError> {
         let mut deleted = Vec::new();
-        let patience_ends = Instant::now() + PRUNE_LOCK_PATIENCE;
+        let patience = P::start(PRUNE_LOCK_PATIENCE);
         for candidate in self.list()? {
             if !is_prunable(&candidate, now) {
                 continue;
@@ -533,12 +647,12 @@ impl Store {
             let id = candidate.spec.id;
             // Lock order: watch lock, then store-wide lock. A busy watch (a tick
             // or cancel in flight) is skipped, never waited for.
-            let Some(_watch_lock) = self.try_lock_watch(&id)? else {
+            let Some(_watch_lock) = self.try_lock_watch_with::<P>(&id).await? else {
                 continue;
             };
             // Housekeeping never blocks (C10): a busy store-wide lock means
             // someone is reserving an id; leave this candidate for the next run.
-            let Some(_global_lock) = self.try_lock_until(patience_ends)? else {
+            let Some(_global_lock) = self.try_lock_until(&patience).await? else {
                 continue;
             };
             // Re-check under both locks: the file may have changed since list().
@@ -2242,5 +2356,127 @@ mod tests {
                 assert!(plan.injected(WriteKind::Watch, Stage::Cleanup) >= 1, "{context}: the cleanup fault never fired");
             }
         }
+    }
+    // ---- review S3: the async twins of the rescue (same algorithm, `Cooperative`) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_rescues_racing_on_one_root_spend_the_reserve_exactly_once() {
+        // why: review S3 / DF4c, parity with `two_rescues_racing_on_one_root_...`:
+        //      the async entry point must keep the delete + retry under the
+        //      store-wide lock, so two tasks cannot both spend the one
+        //      reserve. Same construction as the blocking twin (two stores over
+        //      one root, a barrier, a per-file first-write ENOSPC, no room for
+        //      a new reserve): exactly one `used_reserve`, exactly one
+        //      `DiskFull`, three watch attempts. The multi-thread runtime gives
+        //      the two tasks real parallelism.
+        // proves: CLAIM(DF4c), CLAIM(DF4a)
+        for round in 0..40 {
+            let dir = tempfile::tempdir().unwrap();
+            let healthy = Store::new(dir.path());
+            healthy.save(&sample("a")).unwrap();
+            healthy.save(&sample("b")).unwrap();
+            let plan = FaultPlan::from_rules(vec![
+                rule(WriteKind::Watch, 28, When::Nth(1)).only("a.json"),
+                rule(WriteKind::Watch, 28, When::Nth(1)).only("b.json"),
+                rule(WriteKind::Reserve, 28, When::Every),
+            ]);
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let tasks: Vec<_> = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    let store = Store::new(dir.path()).with_faults(plan.clone());
+                    let barrier = barrier.clone();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        (id, store.save_async(&newer(sample(id))).await)
+                    })
+                })
+                .collect();
+            let mut results = Vec::new();
+            for task in tasks {
+                results.push(task.await.unwrap());
+            }
+
+            let spent = results.iter().filter(|(_, result)| matches!(result, Ok(outcome) if outcome.used_reserve)).count();
+            let refused = results.iter().filter(|(_, result)| matches!(result, Err(StoreError::DiskFull(_)))).count();
+            assert_eq!((spent, refused), (1, 1), "round {round}: exactly one rescue consumes the reserve, got {results:?}");
+            assert_eq!(plan.attempts(WriteKind::Watch), 3, "round {round}: two first attempts and ONE retry");
+            assert!(!reserve_path(dir.path()).exists(), "round {round}: spent");
+            assert!(tmp_files(dir.path()).is_empty(), "round {round}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_async_rescue_waits_without_parking_its_thread_and_gets_through_when_the_lock_is_released() {
+        // why: review S3 + positive control for the async wait. The test holds
+        //      the store-wide lock; an async save whose first write fails with
+        //      ENOSPC must wait for it WITHOUT parking the only thread of the
+        //      runtime (a heartbeat task keeps beating, 10 ms apart, while the
+        //      save waits: at least 5 beats in the 150 ms before the release;
+        //      a parked thread gives none) and then, once the lock is
+        //      released, finish the rescue: `used_reserve`, the reserve gone,
+        //      the new content saved. Real time, bounded: the release comes
+        //      after 150 ms, well inside the 2 s ceiling.
+        // proves: CLAIM(DF4c), CLAIM(DF4e)
+        let dir = tempfile::tempdir().unwrap();
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let held = Store::new(dir.path()).lock().unwrap();
+        let beats = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat = {
+            let beats = beats.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+        let saving = {
+            let (store, watch) = (store.clone(), newer(sample("w")));
+            tokio::spawn(async move { store.save_async(&watch).await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let beats_while_waiting = beats.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(!saving.is_finished(), "the rescue must still be waiting for the held lock");
+        assert!(reserve_path(dir.path()).exists(), "and must not have touched the reserve");
+        drop(held);
+        let outcome = saving.await.unwrap().expect("the lock came free inside the ceiling");
+        heartbeat.abort();
+
+        assert!(beats_while_waiting >= 5, "the thread was parked: {beats_while_waiting} heartbeats in 150 ms");
+        assert_eq!(outcome, WriteOutcome { used_reserve: true });
+        assert!(!reserve_path(dir.path()).exists());
+        assert_eq!(plan.attempts(WriteKind::Watch), 2, "the write and one retry");
+        assert_eq!(Store::new(dir.path()).load(&wid("w")).unwrap(), newer(sample("w")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_async_rescue_during_its_wait_leaves_the_reserve_and_the_file_untouched() {
+        // why: review S3, "cancellation must still be observed": the wait is
+        //      a poll loop with a yield, so dropping the future (what a
+        //      cancelled call or an elapsed budget does) ends it. The store-wide
+        //      lock is held; a `timeout` of 100 ms drops the save mid-wait.
+        //      Expected: the timeout elapsed (the save did not finish), the
+        //      reserve is the same inode, the watch file is byte-identical, no
+        //      `.tmp`; afterwards, with the lock released, the same save
+        //      works (nothing was left locked or half done).
+        // proves: CLAIM(DF4c), CLAIM(DF6)
+        let dir = tempfile::tempdir().unwrap();
+        Store::new(dir.path()).save(&sample("w")).unwrap();
+        let (store, _) = faulted(dir.path(), vec![rule(WriteKind::Watch, 28, When::Nth(1)), rule(WriteKind::Reserve, 28, When::Every)]);
+        let reserve_before = lock_identity(&reserve_path(dir.path()));
+        let file_before = std::fs::read(store.watch_path(&wid("w"))).unwrap();
+        let held = Store::new(dir.path()).lock().unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), store.save_async(&newer(sample("w")))).await;
+
+        assert!(outcome.is_err(), "the save was waiting for the lock, so the timeout must win: {outcome:?}");
+        assert_eq!(lock_identity(&reserve_path(dir.path())), reserve_before, "the reserve is untouched");
+        assert_eq!(std::fs::read(store.watch_path(&wid("w"))).unwrap(), file_before, "the watch file is untouched");
+        assert!(tmp_files(dir.path()).is_empty());
+        drop(held);
+        assert_eq!(store.save_async(&newer(sample("w"))).await.unwrap(), WriteOutcome { used_reserve: false }, "the fault was one-shot; nothing is left locked");
     }
 }
