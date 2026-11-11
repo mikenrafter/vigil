@@ -702,5 +702,6 @@ the symlink-write guard.
 
 ## Commit
 
-Round 3 red commit: see the one-file follow-up that records its SHA below
-(a report cannot hold the SHA of the commit that contains it).
+Round 3 red commit `86cda52` (`86cda52e0a712f4ba0586ffa27580537ad13dcf5`), message `vigil: red tests for
+spec-review amendments (S1-S5)`. A report cannot hold the SHA of the commit that
+contains it, so this line was added in a one-file follow-up commit.
