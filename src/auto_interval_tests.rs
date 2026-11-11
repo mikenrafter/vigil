@@ -2748,3 +2748,31 @@ async fn a_terminal_envelope_reports_the_gap_since_the_last_call() {
     assert_eq!(expired["clock"]["since_last_call_s"], 500, "S7: {expired}");
     assert!(!expired["clock"]["summary"].as_str().unwrap().contains("first call"), "{expired}");
 }
+
+// ---- review S8: expect_s / stall_s at the edge of u64 -------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_watch_file_with_u64_max_attention_limits_neither_panics_nor_fires() {
+    // why: review S8. `create` now refuses such values, but a watch file can
+    //      still hold them (hand-edited, or written by another version), and
+    //      the arithmetic on them used to overflow: `expect_s` u64::MAX made
+    //      the overdue moment a negative duration (a panic), `stall_s` u64::MAX
+    //      cast to -1 and fired at the first tick. Both are written into a
+    //      stored watch with a live process; a 30 s call must neither panic nor
+    //      raise anything (a limit that large is "never").
+    // proves: CLAIM(AI5), CLAIM(S8-overflow)
+    let rig = Rig::new();
+    let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
+    let sleeper = Sleeper::start();
+    let (id, _) = judge_watch(&rig, &vigil, "w", 10, 3600, |request| request.inputs.push(Input::Process { pid: sleeper.pid(), want: None })).await;
+    let file = rig.env.root().join("watches").join("w.json");
+    let mut stored = stored_watch(&rig, &id);
+    stored["expect_s"] = json!(u64::MAX);
+    stored["stall_s"] = json!(u64::MAX);
+    std::fs::write(&file, stored.to_string()).unwrap();
+
+    let guarded = tokio::spawn(async move { call(&vigil, &id, Some(30), None).await }).await;
+    assert!(guarded.is_ok(), "S8: the call panicked on a u64::MAX limit: {guarded:?}");
+    let answer = guarded.unwrap();
+    assert_eq!((&answer["status"], &answer["waited_s"], &answer["events"]), (&json!("pending"), &json!(30), &json!([])), "{answer}");
+}

@@ -157,4 +157,31 @@ mod tests {
         // proves: CLAIM(AI5-threshold)
         assert_eq!((OVERDUE_EXTRA_CAP_S, DEFAULT_STALL_S, LONG_WINDOW_S), (540, 900, 270));
     }
+
+    #[test]
+    fn limits_at_the_edge_of_u64_never_fire_and_never_panic() {
+        // why: review S8. `plus_secs(overdue_after_s(u64::MAX))` wrapped to a
+        //      negative duration (a panic), and `stall_s as i64` made u64::MAX
+        //      -1 ("stalled for -1 s" is always true). A limit that cannot be
+        //      reached is "never": with a live process, a created-at far in the
+        //      past and a `now` 100 years later, neither reason is due. Control
+        //      with the same watch and a 1 s limit: both are.
+        // proves: CLAIM(AI5), CLAIM(S8-overflow)
+        use crate::testing::{at, change_request};
+        let created = at("2026-10-29T14:00:00Z");
+        let now = at("2126-10-29T14:00:00Z");
+        let watch_with = |limit: u64| {
+            let mut spec = crate::watch::WatchSpec::parse(change_request("w", std::path::Path::new("/tmp/x.log"), 20)).unwrap();
+            (spec.expect_s, spec.stall_s) = (Some(limit), Some(limit));
+            let mut watch = WatchFile::new(spec, created);
+            watch.activity = Some(Activity { last_change_at: created, last_output_change_at: created, process_running: true });
+            watch
+        };
+        assert_eq!(due_reasons(&watch_with(1), now, false), vec![AttentionReason::Overdue, AttentionReason::Stalled], "control");
+        for limit in [u64::MAX, u64::MAX / 2, i64::MAX as u64, i64::MAX as u64 + 1] {
+            let watch = watch_with(limit);
+            let _ = overdue_at(&watch);
+            assert_eq!(due_reasons(&watch, now, false), Vec::new(), "limit {limit}");
+        }
+    }
 }

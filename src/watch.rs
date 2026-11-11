@@ -717,6 +717,31 @@ mod tests {
         assert!(serde_json::from_str::<WatchId>("\"../etc\"").is_err());
     }
 
+    #[test]
+    fn expect_s_and_stall_s_longer_than_the_longest_watch_are_refused_with_a_clear_error() {
+        // why: review S8. Values near u64::MAX overflowed the attention
+        //      arithmetic; no watch lives longer than MAX_DEADLINE_S (604800 s),
+        //      so a limit above it could never fire and is refused at create,
+        //      naming the field and the bound. The bound itself is accepted
+        //      (boundary), 604801 and u64::MAX are not.
+        // proves: CLAIM(AI5), CLAIM(S8-overflow)
+        for field in ["expect_s", "stall_s"] {
+            let with = |value: u64| {
+                let mut request = change_request("w", Path::new("/tmp/x.log"), 20);
+                match field {
+                    "expect_s" => request.expect_s = Some(value),
+                    _ => request.stall_s = Some(value),
+                }
+                WatchSpec::parse(request)
+            };
+            assert!(with(604_800).is_ok(), "{field}: the longest watch is allowed");
+            for too_long in [604_801, u64::MAX / 2, u64::MAX] {
+                let message = with(too_long).expect_err(&format!("{field} {too_long} must be refused")).to_string();
+                assert!(message.contains(field) && message.contains("604800"), "{field} {too_long}: unclear error {message:?}");
+            }
+        }
+    }
+
     // ---- interval / deadline ----
 
     fn parsed_interval(requested: Option<u64>) -> u64 {
