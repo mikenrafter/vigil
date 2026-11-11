@@ -53,6 +53,33 @@ impl TickReport {
     }
 }
 
+/// Where a tick leaves what it has already learned before it waits on
+/// anything a dropped call could cut short (review S4). The sensing loop of a
+/// call owns one per tick it starts; if the tick's future is dropped (the round
+/// ended, the budget ran out) the loop collects whatever is left here, so the
+/// tick's answer and the outcome of its save are not lost with it.
+///
+/// Invariants: holds a report only while the tick is inside its save; the tick
+/// clears it when the save returns, so a tick that completed is never collected
+/// twice. The report says what the files on disk are (`Persisted`).
+#[derive(Default)]
+pub(crate) struct Retained(std::sync::Mutex<Option<TickReport>>);
+
+impl Retained {
+    fn keep(&self, report: TickReport) {
+        *self.0.lock().expect("retained report mutex poisoned") = Some(report);
+    }
+
+    fn clear(&self) {
+        self.0.lock().expect("retained report mutex poisoned").take();
+    }
+
+    /// The report of a tick that was dropped inside its save, if it was.
+    pub(crate) fn take(&self) -> Option<TickReport> {
+        self.0.lock().expect("retained report mutex poisoned").take()
+    }
+}
+
 impl Vigil {
     /// Run the watch's tick if `last_tick_at + interval_s` is due (the first
     /// tick is due immediately, and compares against the baseline recorded at
@@ -78,6 +105,17 @@ impl Vigil {
         id: &WatchId,
         budget_end: Option<tokio::time::Instant>,
     ) -> Result<TickReport, VigilError> {
+        self.tick_report_retaining(id, budget_end, &Retained::default()).await
+    }
+
+    /// `tick_report_until` that leaves its report in `retained` while it is
+    /// inside its save (review S4), for a caller that may drop it there.
+    pub(crate) async fn tick_report_retaining(
+        &self,
+        id: &WatchId,
+        budget_end: Option<tokio::time::Instant>,
+        retained: &Retained,
+    ) -> Result<TickReport, VigilError> {
         // C5: the budget is checked by the tick itself, right before it
         // persists. `timeout_at` alone polls the inner future first, so a tick
         // resumed after the budget with its readings ready would still write.
@@ -96,7 +134,8 @@ impl Vigil {
                 return Ok(TickReport::without_changes(TickOutcome::OutOfBudget));
             }
             let expired = expired_if_overdue(watch, now);
-            let persisted = self.persist(&expired, budget_end).await?;
+            let report = |persisted| TickReport::wrote(TickOutcome::Finished(expired.status), expired.clone(), persisted);
+            let persisted = self.persist_retaining(retained, budget_end, &expired, report).await?;
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
         if !is_due(&watch, now) {
@@ -141,7 +180,8 @@ impl Vigil {
         let after = self.clock.now();
         if unticked.is_overdue(after) {
             let expired = expired_if_overdue(unticked, after);
-            let persisted = self.persist(&expired, budget_end).await?;
+            let report = |persisted| TickReport::wrote(TickOutcome::Finished(expired.status), expired.clone(), persisted);
+            let persisted = self.persist_retaining(retained, budget_end, &expired, report).await?;
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
 
@@ -160,8 +200,32 @@ impl Vigil {
         // DF1: a write that fails is a value, not an error; the tick's answer is
         // `watch`, saved or not. DF3: nothing was written, so the persisted
         // baseline did not move and the next tick senses the change again.
-        let persisted = self.persist(&watch, budget_end).await?;
+        // ↳ CLAIM(S4-retained): the sensed answer is left in `retained` before the save can wait, so a dropped tick still has an answer [review S4; disk_full_tests a_rescue_waiting_for_the_store_lock_keeps_its_answer_when_another_watch_ends_the_round]
+        let report = |persisted| TickReport {
+            outcome: TickOutcome::Ticked,
+            changed: changed.clone(),
+            after: Some(watch.clone()),
+            persisted,
+            redelivered,
+        };
+        let persisted = self.persist_retaining(retained, budget_end, &watch, report).await?;
         Ok(TickReport { outcome: TickOutcome::Ticked, changed, after: Some(watch), persisted, redelivered })
+    }
+
+    /// Save `watch` for a tick. `report` builds the tick's report for a given
+    /// outcome of the save; it is left in `retained` before the save waits on
+    /// anything (review S4) and cleared when the save returns.
+    async fn persist_retaining(
+        &self,
+        retained: &Retained,
+        budget_end: Option<tokio::time::Instant>,
+        watch: &WatchFile,
+        report: impl Fn(Persisted) -> TickReport + Sync,
+    ) -> Result<Persisted, VigilError> {
+        let settled = |persisted: Persisted| retained.keep(report(persisted));
+        let result = self.persist_observed(watch, budget_end, &settled).await;
+        retained.clear();
+        result
     }
 
     /// PHASE 2 SEAM (judge). Called by `tick_report` for `fire = judge` only

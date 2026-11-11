@@ -146,10 +146,12 @@ impl StoreError {
         StoreError::Io(IoFailure { os_error: error.to_string(), write: None })
     }
 
-    /// A failed write, classified by its errno (DF2).
-    pub fn write_failed(error: std::io::Error, context: WriteContext) -> StoreError {
+    /// A failed write, classified by its errno (DF2). Borrows the error: the
+    /// store describes a first failure to a caller before it knows whether a
+    /// rescue will replace it (review S4).
+    pub fn write_failed(error: &std::io::Error, context: WriteContext) -> StoreError {
         let failure = IoFailure { os_error: error.to_string(), write: Some(context) };
-        match FailureKind::of(&error) {
+        match FailureKind::of(error) {
             FailureKind::DiskFull => StoreError::DiskFull(failure),
             FailureKind::Io => StoreError::Io(failure),
         }

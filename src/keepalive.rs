@@ -10,7 +10,7 @@ use crate::clock::Timestamp;
 use crate::engine::{expired_if_overdue, Persisted};
 use crate::envelope::{cut_digest, Envelope, OtherWatch, PersistNote, SecondaryFailure};
 use crate::error::VigilError;
-use crate::tick::{digest_of, is_due, TickOutcome, TickReport};
+use crate::tick::{digest_of, is_due, Retained, TickOutcome, TickReport};
 use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId, WatchStatus};
 
 pub const MIN_MAX_S: u64 = 30;
@@ -307,15 +307,15 @@ impl crate::engine::Vigil {
             }
             // V2: a tick that cannot finish in the budget is dropped before it
             // writes anything (it also checks the deadline itself, C5).
-            let ticks = round.into_iter().map(|id| async move {
-                (id, tokio::time::timeout_at(budget_end, self.tick_report_until(id, Some(budget_end))).await)
+            // Review S4: each tick leaves what it has sensed in its own slot
+            // before its save can wait, so a tick dropped inside that wait
+            // (the budget, or the round ending below) still has an answer.
+            let retained: Vec<Retained> = round.iter().map(|_| Retained::default()).collect();
+            let ticks = round.iter().zip(&retained).map(|(&id, slot)| async move {
+                (id, tokio::time::timeout_at(budget_end, self.tick_report_retaining(id, Some(budget_end), slot)).await)
             });
-            // C12: once a covered watch has a terminal result the round stops
-            // waiting for unfinished ticks (they write nothing, C5).
-            // ↳ CLAIM(DF1a): so does a tick whose save failed, the moment it is absorbed: the other ticks of the round may be waiting on a lock held elsewhere, and the call must not wait for them [spec DF1a, review S1; disk_full_tests a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held]
-            for_each_completed(ticks, |(id, outcome)| -> Result<bool, VigilError> {
-                let Ok(report) = outcome else { return Ok(false) };
-                let report = report?;
+            // Take in one finished or retained tick report; `Ok(true)` ends the round.
+            let mut take_in = |id: &WatchId, report: TickReport| -> Result<bool, VigilError> {
                 let outcome = report.outcome;
                 // The watch as the tick left it: saved or not, this is the truth.
                 let after = report.after.as_ref().map(|watch| (watch.tick, watch.status.is_finished()));
@@ -334,8 +334,24 @@ impl crate::engine::Vigil {
                     return Ok(finished || unsaved);
                 }
                 Ok(matches!(outcome, TickOutcome::Finished(_)) || unsaved)
+            };
+            // C12: once a covered watch has a terminal result the round stops
+            // waiting for unfinished ticks (they write nothing, C5).
+            // ↳ CLAIM(DF1a): so does a tick whose save failed, the moment it is absorbed: the other ticks of the round may be waiting on a lock held elsewhere, and the call must not wait for them [spec DF1a, review S1; disk_full_tests a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held]
+            for_each_completed(ticks, |(id, outcome)| -> Result<bool, VigilError> {
+                let Ok(report) = outcome else { return Ok(false) };
+                take_in(id, report?)
             })
             .await?;
+            // ↳ CLAIM(S4-retained): a tick dropped inside its save (the round ended, or the budget did) is not lost: its slot still holds what it had sensed and how the write stood [review S4; disk_full_tests a_rescue_still_waiting_when_another_rescue_gives_up_keeps_its_answer]
+            for (&id, slot) in round.iter().zip(&retained) {
+                if let Some(report) = slot.take() {
+                    if let Some(after) = &report.after {
+                        self.remember_save(after, &report.persisted);
+                    }
+                    take_in(id, report)?;
+                }
+            }
             first_pass = false;
             // ↳ CLAIM(DF1a): a tick whose save failed ends the call; no in-memory re-ticking, no spin [spec DF1a; disk_full_tests a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again]
             if call.any_unsaved() {

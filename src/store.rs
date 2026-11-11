@@ -163,7 +163,7 @@ pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErr
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| StoreError::Serialize(error.to_string()))?;
     let attempt = FaultPlan::none().begin(WriteKind::Watch, path);
     write_staged(path, &bytes, &attempt)
-        .map_err(|error| StoreError::write_failed(error, WriteContext { path: path.to_path_buf(), state_root: None, first_error: None }))
+        .map_err(|error| StoreError::write_failed(&error, WriteContext { path: path.to_path_buf(), state_root: None, first_error: None }))
 }
 
 /// One attempt at an atomic write, stage by stage (the seam asks `attempt` at
@@ -242,6 +242,29 @@ pub struct WriteOutcome {
     pub used_reserve: bool,
 }
 
+/// What a save has already settled at the moment it is about to WAIT (for the
+/// store-wide lock, to rescue the write or to re-make the reserve). A wait is
+/// an `.await`, and the future can be dropped there (the round ended, the
+/// call's budget ran out); a caller that holds a result it must not lose, a
+/// tick's answer, records it from this report, which comes before the wait and
+/// is made without awaiting. (Review S4; mating part: `Vigil::persist_observed`
+/// in `engine.rs`.)
+///
+/// Invariant: whatever is reported here is true of the files on disk when the
+/// future is dropped, because the only writes after the report (the retry and
+/// the reserve upkeep) run under the lock with no `.await` between taking it and
+/// finishing (CLAIM(DF4c)): a drop leaves the watch file as the report says.
+pub enum Settled<'a> {
+    /// The first attempt failed. A rescue may follow, and if the future is
+    /// dropped before it ends, this failure is the save's outcome.
+    FirstAttemptFailed(&'a StoreError),
+    /// The write went through; only the reserve upkeep may still wait.
+    Written,
+}
+
+/// Nobody is listening (callers that have no result to protect).
+fn unobserved(_: Settled<'_>) {}
+
 /// How a rescue or reserve upkeep gets the store-wide lock.
 #[derive(Clone, Copy)]
 enum StoreLockAccess<'held> {
@@ -260,7 +283,7 @@ struct WriteFailed {
 
 impl WriteFailed {
     fn into_store_error(self, path: PathBuf, state_root: &Path) -> StoreError {
-        StoreError::write_failed(self.error, WriteContext { path, state_root: Some(state_root.to_path_buf()), first_error: self.first_error })
+        StoreError::write_failed(&self.error, WriteContext { path, state_root: Some(state_root.to_path_buf()), first_error: self.first_error })
     }
 }
 
@@ -314,46 +337,62 @@ impl Store {
     /// store-wide lock at most [`RESCUE_LOCK_WAIT`]. The error of a write that
     /// still fails is `DiskFull` (naming the state root) or `Io`.
     pub fn save(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
-        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT)))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT), &unobserved))
     }
 
     /// `save` for a caller inside a call budget (DF4e): a rescue waits for the
     /// store-wide lock at most `min(2 s, budget_left)`; with nothing left it
     /// does not wait at all.
     pub fn save_within(&self, watch: &WatchFile, budget_left: Duration) -> Result<WriteOutcome, StoreError> {
-        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT))))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT)), &unobserved))
     }
 
     /// `save` for a caller that already holds the store-wide lock (`create`
     /// writes its placeholder under it): the rescue reuses `held` instead of
     /// waiting for a lock its own process owns (DF4c). Never waits.
     pub fn save_under(&self, watch: &WatchFile, held: &StoreLock) -> Result<WriteOutcome, StoreError> {
-        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Held(held)))
+        block_on_ready(self.save_with::<Blocking>(watch, StoreLockAccess::Held(held), &unobserved))
     }
 
     /// `save` for async callers (review S3): the same writes and the same
     /// rescue, but the wait for the store-wide lock yields to the executor and
     /// ends when the future is dropped.
     pub async fn save_async(&self, watch: &WatchFile) -> Result<WriteOutcome, StoreError> {
-        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT)).await
+        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(RESCUE_LOCK_WAIT), &unobserved).await
     }
 
-    /// `save_within` for async callers (review S3).
-    pub async fn save_within_async(&self, watch: &WatchFile, budget_left: Duration) -> Result<WriteOutcome, StoreError> {
-        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT))).await
+    /// `save_within` for async callers (review S3). `settled` hears what the
+    /// save has decided before each wait it may make (review S4, see
+    /// [`Settled`]): a caller whose future can be dropped keeps its result there.
+    pub async fn save_within_async(
+        &self,
+        watch: &WatchFile,
+        budget_left: Duration,
+        settled: &(dyn Fn(Settled<'_>) + Sync),
+    ) -> Result<WriteOutcome, StoreError> {
+        self.save_with::<Cooperative>(watch, StoreLockAccess::Wait(budget_left.min(RESCUE_LOCK_WAIT)), settled).await
     }
 
-    async fn save_with<P: Patience>(&self, watch: &WatchFile, access: StoreLockAccess<'_>) -> Result<WriteOutcome, StoreError> {
+    async fn save_with<P: Patience>(
+        &self,
+        watch: &WatchFile,
+        access: StoreLockAccess<'_>,
+        settled: &(dyn Fn(Settled<'_>) + Sync),
+    ) -> Result<WriteOutcome, StoreError> {
         let bytes = serde_json::to_vec_pretty(watch).map_err(|error| StoreError::Serialize(error.to_string()))?;
         let path = self.watch_path(&watch.spec.id);
         let attempt = || -> io::Result<()> {
             std::fs::create_dir_all(self.watches_dir())?;
             write_staged(&path, &bytes, &self.faults.begin(WriteKind::Watch, &path))
         };
-        match self.attempt_with_rescue::<P, _>(access, attempt).await {
+        let first_failed = |error: &io::Error| {
+            let context = WriteContext { path: path.clone(), state_root: Some(self.root.clone()), first_error: None };
+            settled(Settled::FirstAttemptFailed(&StoreError::write_failed(error, context)));
+        };
+        match self.attempt_with_rescue::<P, _>(access, attempt, &first_failed).await {
             Ok(((), spent_reserve)) => {
                 if !spent_reserve {
-                    self.upkeep_reserve::<P>(access).await;
+                    self.upkeep_reserve::<P>(access, || settled(Settled::Written)).await;
                 }
                 Ok(WriteOutcome { used_reserve: spent_reserve })
             }
@@ -369,15 +408,21 @@ impl Store {
     /// (DF4e) or without a lock file to take (DF4d) nothing is touched and the
     /// first error is returned. A failed retry returns the retry's error with
     /// the first one's text (S4).
+    ///
+    /// `first_failed` hears the first failure before anything is awaited
+    /// (review S4): the rescue's wait for the lock can be dropped, and the
+    /// caller must then still know that its write failed.
     async fn attempt_with_rescue<P: Patience, T>(
         &self,
         access: StoreLockAccess<'_>,
         mut attempt: impl FnMut() -> io::Result<T>,
+        first_failed: &(dyn Fn(&io::Error) + Sync),
     ) -> Result<(T, bool), WriteFailed> {
         let first = match attempt() {
             Ok(value) => return Ok((value, false)),
             Err(error) => error,
         };
+        first_failed(&first);
         if crate::error::FailureKind::of(&first) != crate::error::FailureKind::DiskFull || !self.reserve_present() {
             return Err(WriteFailed { error: first, first_error: None });
         }
@@ -446,11 +491,13 @@ impl Store {
     }
 
     /// After a healthy write: make the reserve if it is not valid. Best effort
-    /// and quiet. The valid case costs one `stat`.
-    async fn upkeep_reserve<P: Patience>(&self, access: StoreLockAccess<'_>) {
+    /// and quiet. The valid case costs one `stat`. `about_to_wait` runs once,
+    /// before the wait, and only when there is something to make.
+    async fn upkeep_reserve<P: Patience>(&self, access: StoreLockAccess<'_>, about_to_wait: impl FnOnce()) {
         if self.reserve_is_valid() {
             return;
         }
+        about_to_wait();
         let access = match access {
             // Never longer than the caller's own limit (a call nearly out of
             // budget does not spend it on upkeep).
@@ -538,7 +585,7 @@ impl Store {
     /// `open_lock_file_once` through the same reserve-and-retry path as every
     /// other write (DF5).
     async fn open_lock_file<P: Patience>(&self, path: &Path) -> Result<File, StoreError> {
-        match self.attempt_with_rescue::<P, _>(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path)).await {
+        match self.attempt_with_rescue::<P, _>(StoreLockAccess::Wait(RESCUE_LOCK_WAIT), || self.open_lock_file_once(path), &|_| {}).await {
             Ok((file, _spent_reserve)) => Ok(file),
             Err(failed) => Err(failed.into_store_error(path.to_path_buf(), &self.root)),
         }

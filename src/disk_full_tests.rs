@@ -2087,6 +2087,7 @@ fn a_rescue_waiting_for_the_store_lock_keeps_its_answer_when_another_watch_ends_
         let (a_file, b_file) = (env.root().join("watches").join("a.json"), env.root().join("watches").join("b.json"));
         let (reserve_before, a_before, b_before) = (identity(&env.root().join(".reserve")), std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap());
 
+        let attempts_before = plan.attempts(WriteKind::Watch);
         let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
 
         assert_eq!((envelope["watch_id"].as_str(), envelope["status"].as_str()), (Some("a"), Some("fired")), "a's answer is lost: {envelope}");
@@ -2098,7 +2099,7 @@ fn a_rescue_waiting_for_the_store_lock_keeps_its_answer_when_another_watch_ends_
         assert_eq!(envelope["others"], json!([{"watch_id": "b", "status": "fired", "event_ids": ["b:1:0"]}]), "{envelope}");
         assert_eq!(envelope["waited_s"], 0, "the round ended at once, it did not wait for a's rescue: {envelope}");
 
-        assert_eq!(plan.attempts(WriteKind::Watch), 2, "one attempt per watch, no retry");
+        assert_eq!(plan.attempts(WriteKind::Watch) - attempts_before, 2, "one attempt per watch in the call, no retry");
         assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "a dropped rescue leaves the reserve alone");
         assert_eq!((std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap()), (a_before, b_before), "DF6");
         assert!(tmp_files(&env.root()).is_empty(), "{:?}", tmp_files(&env.root()));
@@ -2128,6 +2129,7 @@ fn a_rescue_still_waiting_when_another_rescue_gives_up_keeps_its_answer() {
         let (a_file, b_file) = (env.root().join("watches").join("a.json"), env.root().join("watches").join("b.json"));
         let (reserve_before, a_before, b_before) = (identity(&env.root().join(".reserve")), std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap());
 
+        let attempts_before = plan.attempts(WriteKind::Watch);
         let started = tokio::time::Instant::now();
         let envelope = wire(&vigil.keepalive(no_id_for(30)).await.expect("a failed save never fails the call"));
         let elapsed = started.elapsed();
@@ -2141,7 +2143,7 @@ fn a_rescue_still_waiting_when_another_rescue_gives_up_keeps_its_answer() {
         assert_eq!(envelope["waited_s"], 2, "a's 2 s wait, then the call ends: {envelope}");
         assert!(elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_millis(2500), "precondition: a's rescue really waited out the 2 s ceiling: {elapsed:?}");
 
-        assert_eq!(plan.attempts(WriteKind::Watch), 2, "no rescue got the lock, so no retry");
+        assert_eq!(plan.attempts(WriteKind::Watch) - attempts_before, 2, "one attempt per watch in the call: no rescue got the lock, so no retry");
         assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "DF4e: nobody spent the reserve");
         assert_eq!((std::fs::read(&a_file).unwrap(), std::fs::read(&b_file).unwrap()), (a_before, b_before), "DF6");
         assert!(tmp_files(&env.root()).is_empty(), "{:?}", tmp_files(&env.root()));

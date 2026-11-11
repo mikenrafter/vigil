@@ -368,3 +368,25 @@ re-run; the crate is still not rustfmt-formatted at the baseline.
 * The new real-time tests (S3 overlap about 2 s, cancel about 0.2 s, the store heartbeat test about 0.15 s)
   use generous bounds (4 s against 2 s, 1 s against 0.2 s, 30 against about 200 beats); they were stable in
   all 8 runs apart from the over-specified assertion above.
+
+## Review round 2 fixes (Sol 4/10, bar 9)
+
+STATUS: in progress (this section is kept current as the round goes). Two findings,
+both caused by the async rescue wait added for S3. Work order S4, S5. Cargo runs via
+qex, foreground. Deviation from the brief: `--mem 1.1GB` instead of `1.7GB`, because
+other sessions outside the queue left the machine 2.2 GB of usable memory and a
+1.7 GB claim (plus qex's 1 GB reserve) waited for 19 minutes with no job running; the
+measured use of the test run is about 0.8 GB.
+
+### S4: a dropped rescue wait took the sensed answer with it (`store.rs`, `engine.rs`, `tick.rs`, `keepalive.rs`)
+
+* Red tests, commit `711bc6a`. All three fail on the answer that is missing:
+  * `disk_full_tests::a_rescue_waiting_for_the_store_lock_keeps_its_answer_when_another_watch_ends_the_round`:
+    "a" ENOSPC with the store-wide lock held, "b" EIO at once. Before the fix the envelope was b's
+    (`watch_id` b, one event `b:1:0`, `persist` io); a's event and failure were gone.
+  * `disk_full_tests::a_rescue_still_waiting_when_another_rescue_gives_up_keeps_its_answer`:
+    both ENOSPC, b starts its wait 0.5 s later; a gives up at 2 s and the round drops b. Before the fix
+    `events` held only `a:1:0`.
+  * `disk_full_tests::a_tick_that_saved_keeps_its_report_when_the_reserve_upkeep_after_its_save_is_dropped`:
+    the same class on the success side (a judge watch saved, its reserve upkeep waits for the lock, b's EIO
+    ends the round). Before the fix `digest` was empty instead of naming the change `bad`.

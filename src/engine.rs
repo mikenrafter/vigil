@@ -13,7 +13,7 @@ use crate::envelope::{cut_digest, Envelope, Next, PersistFailure, PersistNote};
 use crate::error::{CreateError, StoreError, VigilError};
 use crate::inputs::{InputReader, Reading, SystemReader};
 use crate::judge::Judge;
-use crate::store::{Store, StoreLock, WatchLock};
+use crate::store::{Settled, Store, StoreLock, WatchLock};
 use crate::watch::{
     CreateRequest, Event, FireRule, Input, InputState, Terminal, TerminalStatus, WatchFile, WatchId, WatchSpec, WatchStatus,
 };
@@ -271,10 +271,39 @@ impl Vigil {
     /// yields to the executor (review S3): the waits of several watches
     /// overlap, and a call that is dropped stops waiting.
     pub(crate) async fn persist(&self, watch: &WatchFile, budget_end: Option<tokio::time::Instant>) -> Result<Persisted, VigilError> {
+        self.persist_observed(watch, budget_end, &|_| {}).await
+    }
+
+    /// [`Vigil::persist`] that tells `settled` how the save stands before each
+    /// wait it may still make (review S4). The wait can be dropped with the
+    /// future, so a caller holding a result (a tick) keeps it there: `settled`
+    /// gets `NotSaved` the moment the first write fails, before the rescue
+    /// waits for the lock, and `Saved` before reserve upkeep waits. If the
+    /// future is dropped, the last thing `settled` heard is what happened to
+    /// the file (CLAIM(DF4c): nothing after it is half done). The process's
+    /// memory of failed saves is NOT touched by a report (a rescue that then
+    /// succeeds must not flag its events as repeats); whoever collects a report
+    /// from a dropped save applies [`Vigil::remember_save`] itself.
+    pub(crate) async fn persist_observed(
+        &self,
+        watch: &WatchFile,
+        budget_end: Option<tokio::time::Instant>,
+        settled: &(dyn Fn(Persisted) + Sync),
+    ) -> Result<Persisted, VigilError> {
+        let on_settled = |point: Settled<'_>| {
+            let persisted = match point {
+                Settled::Written => Persisted::Saved,
+                Settled::FirstAttemptFailed(error) => match error.write_failure() {
+                    Some(failure) => Persisted::NotSaved(failure.into()),
+                    None => return,
+                },
+            };
+            settled(persisted);
+        };
         let saved = match budget_end {
             Some(end) => {
                 let left = end.saturating_duration_since(tokio::time::Instant::now());
-                self.store.save_within_async(watch, left.saturating_sub(RESCUE_BUDGET_MARGIN)).await
+                self.store.save_within_async(watch, left.saturating_sub(RESCUE_BUDGET_MARGIN), &on_settled).await
             }
             None => self.store.save_async(watch).await,
         };
@@ -286,6 +315,14 @@ impl Vigil {
                 None => return Err(error.into()),
             },
         };
+        self.remember_save(watch, &persisted);
+        Ok(persisted)
+    }
+
+    /// The process's memory of failed saves (S1), after one save of `watch`:
+    /// applied at the end of a save, and by whoever collects the report of a
+    /// save that was dropped before its end (the end never ran). Idempotent.
+    pub(crate) fn remember_save(&self, watch: &WatchFile, persisted: &Persisted) {
         let mut session = self.session.lock().expect("session mutex poisoned");
         // ↳ CLAIM(S2-provenance): the memory outlives a successful retry for as long as the events it saved are undelivered [review S2; disk_full_tests a_retry_that_saved_keeps_its_redelivered_flag_until_the_envelope_is_really_delivered]
         let events_undelivered = watch.status.is_finished() && !watch.events.is_empty();
@@ -299,7 +336,6 @@ impl Vigil {
                 }
             }
         }
-        Ok(persisted)
     }
 
     /// May this process be repeating events of `id`? Then a tick of it now is
