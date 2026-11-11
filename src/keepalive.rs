@@ -73,9 +73,11 @@ impl ProgressSink for NoProgress {
     fn progress(&self, _update: &ProgressUpdate) {}
 }
 
-/// Process exit code of `vigil wait` (W6): fired 0, expired 3, cancelled 4.
-/// 1 is an error and 2 a usage error (clap); neither is returned here, and a
-/// still-pending envelope has no code.
+/// Process exit code of `vigil wait` (W6, S3): fired 0, expired 3, cancelled 4,
+/// and 5 for a still-pending envelope that `wait` returned because of an
+/// `attention` or `credit_state_changed` event ("attention; the watch is still
+/// live"). 1 is an error and 2 a usage error (clap); neither is returned here,
+/// and any other pending envelope has no code. RED: 5 is not returned yet.
 pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
     match envelope.status {
         WatchStatus::Fired => Some(0),
@@ -434,10 +436,22 @@ impl crate::engine::Vigil {
         budget_end.saturating_duration_since(Instant::now()) < reserve
     }
 
-    /// `vigil wait`: like keepalive for one watch but with no 270 s ceiling:
-    /// returns only when the watch is finished, with ONE final envelope that
-    /// holds the whole event batch (no streaming, R8/V21).
+    /// `wait_with` for a caller that is not the orchestrator (270 s windows).
     pub async fn wait(&self, id: &WatchId) -> Result<Envelope, VigilError> {
+        self.wait_with(id, false).await
+    }
+
+    /// `vigil wait` (S1, S3): like keepalive for one watch but with no 270 s
+    /// ceiling: returns when the watch is finished, or when a call ends on an
+    /// `attention` or `credit_state_changed` event (the watch is then still
+    /// pending: exit code 5), with ONE final envelope that holds the whole
+    /// event batch (no streaming, R8/V21). With `orchestrator` the internal
+    /// calls use the TTL-derived window and run the credit checks. The final
+    /// envelope carries `cache` (from its last internal call) and a `clock`
+    /// that measures the whole wait. RED: the stub loops on attention and
+    /// ignores `orchestrator`.
+    pub async fn wait_with(&self, id: &WatchId, orchestrator: bool) -> Result<Envelope, VigilError> {
+        let _ = orchestrator;
         loop {
             let mut envelope = self.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(MAX_MAX_S), orchestrator: None }).await?;
             if envelope.status.is_finished() {
@@ -673,6 +687,44 @@ mod tests {
         for status in [WatchStatus::Fired, WatchStatus::Expired, WatchStatus::Cancelled] {
             assert!(!matches!(wait_exit_code(&envelope_with(status)), Some(1 | 2)), "{status:?} must not collide with error (1) or usage (2)");
         }
+    }
+
+    fn envelope_json(status: &str, next: &str, events: serde_json::Value) -> Envelope {
+        serde_json::from_value(serde_json::json!({
+            "watch_id": "w", "status": status, "now": "2026-10-29T14:03:11Z", "tick": 3, "session_ticks": 1, "elapsed_s": 90,
+            "deadline_in_s": 100, "events": events, "digest": "", "judge_status": "skipped", "next": next,
+        }))
+        .expect("a well-formed envelope")
+    }
+
+    #[test]
+    fn wait_exits_5_for_a_pending_envelope_that_carries_an_attention_or_credit_event() {
+        // why: S3. `vigil wait` returns early on `attention` and
+        //      `credit_state_changed`, with the watch still live; the exit code
+        //      for that is 5 ("attention; the watch is still live"), and 0/3/4
+        //      stay as they are. Table, from the spec: pending + attention -> 5;
+        //      pending + credit_state_changed -> 5; pending + no event -> None
+        //      (wait would not have returned it); a terminal status keeps its
+        //      own code even with an attention event beside it (terminal is
+        //      primary, S10): fired+attention -> 0, expired+credit -> 3. The
+        //      positive control for "kind decides" is the pending envelope with
+        //      an event without a kind: not 5.
+        // proves: CLAIM(S3)
+        let event = |kind: Option<&str>| {
+            let mut event = serde_json::json!({"event_id": "w:3:0", "tick": 3, "watch_id": "w", "input": "", "summary": "s"});
+            if let Some(kind) = kind {
+                event["kind"] = kind.into();
+            }
+            event
+        };
+        let attention = serde_json::json!([event(Some("attention"))]);
+        let credit = serde_json::json!([event(Some("credit_state_changed"))]);
+        assert_eq!(wait_exit_code(&envelope_json("pending", "act on events", attention.clone())), Some(5));
+        assert_eq!(wait_exit_code(&envelope_json("pending", "act on events", credit.clone())), Some(5));
+        assert_eq!(wait_exit_code(&envelope_json("pending", "call keepalive again", serde_json::json!([]))), None);
+        assert_eq!(wait_exit_code(&envelope_json("pending", "act on events", serde_json::json!([event(None)]))), None, "an event with no kind is not attention");
+        assert_eq!(wait_exit_code(&envelope_json("fired", "act on events", attention)), Some(0));
+        assert_eq!(wait_exit_code(&envelope_json("expired", "watch ended; create a new watch if still needed", credit)), Some(3));
     }
 
     // ---- blocking window (V26) ----

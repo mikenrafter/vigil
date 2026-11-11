@@ -34,12 +34,21 @@ enum Command {
         id: String,
         #[arg(long)]
         max_s: Option<u64>,
+        /// This call is the main orchestrator session's (AI1').
+        #[arg(long)]
+        orchestrator: bool,
     },
     /// Block with no ceiling until the watch finishes; print ONE final
     /// envelope JSON (all events in it; no streaming, R8/V21).
     ///
-    /// Exit codes: 0 fired, 1 error, 2 usage, 3 expired, 4 cancelled.
-    Wait { id: String },
+    /// Exit codes: 0 fired, 1 error, 2 usage, 3 expired, 4 cancelled,
+    /// 5 attention (the watch is still live).
+    Wait {
+        id: String,
+        /// Use the orchestrator window and credit checks (AI1', S3).
+        #[arg(long)]
+        orchestrator: bool,
+    },
 }
 
 fn main() {
@@ -154,15 +163,15 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(0)
         }
-        Command::Keepalive { id, max_s } => {
-            let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s, orchestrator: None };
+        Command::Keepalive { id, max_s, orchestrator } => {
+            let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s, orchestrator: orchestrator.then_some(true) };
             let envelope = vigil.keepalive(request).await?;
             print_json(&envelope)?;
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(0)
         }
-        Command::Wait { id } => {
-            let envelope = vigil.wait(&WatchId::parse(&id)?).await?;
+        Command::Wait { id, orchestrator } => {
+            let envelope = vigil.wait_with(&WatchId::parse(&id)?, orchestrator).await?;
             print_json(&envelope)?;
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(wait_exit_code(&envelope).unwrap_or(0))

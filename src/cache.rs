@@ -26,6 +26,8 @@ pub const MIN_WINDOW_S: u64 = 30;
 pub const CODEX_MAX_WINDOW_S: u64 = 270;
 /// AI1' / D4: only this much of a transcript's end is read.
 pub const TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
+/// S8: a transcript line longer than this is skipped, not parsed.
+pub const MAX_TRANSCRIPT_LINE_BYTES: usize = 64 * 1024;
 
 /// The prompt-cache TTL as vigil knows it. Wire: `"1h"`, `"5m"`, `"unknown"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +102,9 @@ pub fn choose_window(request: &WindowRequest<'_>) -> CacheNote {
 /// The TTL of the newest usable cache write in `tail` (A6): complete JSON
 /// lines only, `type == "assistant"`, not `isSidechain`, top-level
 /// `message.usage.cache_creation` with a nonzero write; `ephemeral_1h` is
-/// checked before `ephemeral_5m`. `None`: no usable write (unknown).
+/// checked before `ephemeral_5m`. S8: a line longer than
+/// `MAX_TRANSCRIPT_LINE_BYTES` is skipped like any other unusable line.
+/// `None`: no usable write (unknown).
 pub fn newest_cache_write(tail: &[u8]) -> Option<Ttl> {
     let _ = tail;
     None // RED
@@ -115,9 +119,20 @@ pub fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     Ok(Vec::new()) // RED
 }
 
+/// S8: `read_tail` over any `Read + Seek`: seek to `len - max_bytes - 1` (the
+/// byte before the cut says whether it falls on a line start), read to the
+/// end, drop a partial first line. At most `max_bytes + 1` bytes are ever
+/// read, and none from before that offset, however long the source is.
+pub fn read_tail_from<R: std::io::Read + std::io::Seek>(reader: &mut R, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let _ = (reader, max_bytes);
+    Ok(Vec::new()) // RED
+}
+
 /// `<projects_dir>/*/<session_id>.jsonl` (A5): one level deep, never under a
 /// `subagents` directory, newest mtime wins; an id outside
-/// `[A-Za-z0-9_-]{1,64}` finds nothing.
+/// `[A-Za-z0-9_-]{1,64}` finds nothing. S8: regular files only; a symlink
+/// (to a file or to a project directory) or a FIFO is not a transcript and is
+/// never opened.
 pub fn find_session_transcript(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
     let _ = (projects_dir, session_id);
     None // RED
@@ -394,7 +409,7 @@ mod tests {
         // why: A3 / AI1: Claude by CLAUDE_CODE_SESSION_ID; Codex by AGENT=codex
         //      or any CODEX_* name. `AGENT=claude` (set on the dev machine)
         //      and an empty session id are not signals. Both present: both
-        //      fields set, the resolution (Claude wins) is choose_window's.
+        //      fields set; what that means (ambiguous, S4) is choose_window's.
         // proves: CLAIM(AI1')
         assert_eq!(env_of(&[]), AgentEnv { claude_session_id: None, codex: false });
         assert_eq!(env_of(&[("CLAUDE_CODE_SESSION_ID", "abc-1")]), AgentEnv { claude_session_id: Some("abc-1".into()), codex: false });
@@ -450,8 +465,9 @@ mod tests {
         //        orchestrator, no usable write / no file / unreadable -> 270, unknown/default
         //        orchestrator on Codex                    -> 270, 5m/codex-default
         //        orchestrator, neither agent              -> 270, unknown/default
-        //        Claude id AND codex flag                 -> Claude path (A3)
-        // proves: CLAIM(AI1'), CLAIM(AI3)
+        //        Claude id AND codex flag                 -> 270, unknown/default (S4:
+        //                                                   ambiguous identity; reverses A3)
+        // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(S4)
         use Transcript::*;
         use Ttl::*;
         use TtlSource::*;
@@ -464,7 +480,7 @@ mod tests {
             ("orchestrator, unreadable", choose(None, true, true, false, Unreadable), note(Unknown, Default, 270)),
             ("orchestrator, codex", choose(None, true, false, true, Absent), note(FiveMinutes, CodexDefault, 270)),
             ("orchestrator, neither", choose(None, true, false, false, Absent), note(Unknown, Default, 270)),
-            ("orchestrator, claude and codex", choose(None, true, true, true, OneHourWrite), note(OneHour, ClaudeTranscript, 3300)),
+            ("orchestrator, claude and codex", choose(None, true, true, true, OneHourWrite), note(Unknown, Default, 270)),
             ("subagent, codex", choose(None, false, false, true, Absent), note(Unknown, Default, 270)),
         ];
         for (name, got, want) in cases {
@@ -516,5 +532,180 @@ mod tests {
             assert_eq!(serde_json::to_string(&value).unwrap(), wire);
             assert_eq!(serde_json::from_str::<CacheNote>(wire).unwrap(), value);
         }
+    }
+
+    // ---- S4: ambiguous identity ----
+
+    #[test]
+    fn a_claude_session_id_together_with_a_codex_signal_is_ambiguous_and_gets_270_s() {
+        // why: S4 (reverses red default A3). A Claude Code started from a Codex
+        //      shell inherits CODEX_*; a Codex started from a Claude Code shell
+        //      inherits CLAUDE_CODE_SESSION_ID. vigil cannot tell which one is
+        //      calling, and guessing Claude hands a Codex session a 3300 s call
+        //      that its 300 s tool timeout kills. Both nesting directions, each
+        //      with an orchestrator flag and a transcript whose newest write is
+        //      1h: the window stays 270 s, unknown / default, and the
+        //      transcript is not trusted. Positive control: the same transcript
+        //      with only the Claude signal gives 3300 s, so the 270 comes from
+        //      the second signal and not from a broken transcript reader.
+        // proves: CLAIM(S4)
+        let root = tempfile::tempdir().unwrap();
+        write_transcript(root.path(), "p", "sess-1", &[assistant_line(0, 500), assistant_line(900, 0)]);
+        let window_for = |pairs: &[(&str, &str)]| {
+            let agent = env_of(pairs);
+            (agent.clone(), choose_window(&WindowRequest { explicit_s: None, orchestrator: true, agent: &agent, projects_dir: Some(root.path()) }))
+        };
+        let (claude_only, note_claude) = window_for(&[("CLAUDE_CODE_SESSION_ID", "sess-1")]);
+        assert_eq!(claude_only, AgentEnv { claude_session_id: Some("sess-1".into()), codex: false });
+        assert_eq!(note_claude, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3300), "control: Claude alone is trusted");
+
+        let nestings = [
+            ("claude started from a codex shell (CODEX_HOME)", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("CODEX_HOME", "/x")]),
+            ("claude started from a codex shell (CODEX_THREAD_ID)", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("CODEX_THREAD_ID", "t")]),
+            ("codex started from a claude shell (AGENT=codex)", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("AGENT", "codex")]),
+        ];
+        for (name, pairs) in nestings {
+            let (agent, got) = window_for(&pairs);
+            assert_eq!(agent, AgentEnv { claude_session_id: Some("sess-1".into()), codex: true }, "{name}: both signals are kept");
+            assert_eq!(got, note(Ttl::Unknown, TtlSource::Default, 270), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_max_s_under_an_ambiguous_identity_keeps_the_codex_ceiling() {
+        // why: S4 + A2. If the caller may be Codex its 300 s tool timeout is a
+        //      hard limit, so an explicit 9999 under both signals is clamped to
+        //      270 (not 3300) and an explicit 60 stays 60. Default taken, the
+        //      spec only says "ambiguous -> 270 s" (report: R2-A1). Control:
+        //      Claude alone gets 3300 for 9999.
+        // proves: CLAIM(S4)
+        use Transcript::*;
+        assert_eq!(choose(Some(9999), true, true, false, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 3300), "control: Claude alone");
+        assert_eq!(choose(Some(9999), true, true, true, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 270));
+        assert_eq!(choose(Some(60), true, true, true, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 60));
+    }
+
+    // ---- S8: bounded reads ----
+
+    /// The lines `000000xxx...\n`, `000001xxx...\n`, ... each `line_bytes` long.
+    fn expected_lines(range: std::ops::Range<usize>, line_bytes: usize) -> Vec<u8> {
+        numbered_lines(range.end, line_bytes)[range.start * line_bytes..].to_vec()
+    }
+
+    #[test]
+    fn read_tail_from_pulls_only_the_last_512_kib_out_of_a_huge_file() {
+        // why: S8 "assert bytes READ via the seam, not just bytes returned". A
+        //      reader that reads the whole 5 MiB file and then keeps the last
+        //      512 KiB returns the right bytes and defeats the bound. The
+        //      source is a CountingReader. 5120 lines x 1024 B = 5 242 880 B;
+        //      tail cap 524 288 = exactly 512 lines, so the cut is a line start
+        //      and the result is lines 4608..5120 (4608 = 5120 - 512). At most
+        //      cap + 1 bytes may be read (the byte before the cut says whether
+        //      it is a line start) and none before offset 5 242 880 - 524 289 =
+        //      4 718 591.
+        // proves: CLAIM(S8-tail)
+        let bytes = numbered_lines(5120, 1024);
+        assert_eq!(bytes.len(), 5_242_880);
+        let mut reader = CountingReader::new(bytes);
+        let got = read_tail_from(&mut reader, TRANSCRIPT_TAIL_BYTES).unwrap();
+        assert_eq!(got, expected_lines(4608..5120, 1024), "the tail bytes");
+        assert!(reader.bytes_read() <= 524_289, "read {} bytes of a 5 MiB file", reader.bytes_read());
+        assert!(reader.lowest_offset().expect("something was read") >= 4_718_591, "read from offset {:?}", reader.lowest_offset());
+    }
+
+    #[test]
+    fn read_tail_from_a_cut_inside_a_line_still_reads_at_most_the_cap_plus_one() {
+        // why: S8 + A6. 4000 lines x 1000 B = 4 000 000 B; tail 524 288 starts at
+        //      3 475 712 = inside line 3475 (3 475 000 .. 3 476 000), so that
+        //      partial line is dropped and the result is lines 3476..4000 = 524
+        //      lines. The partial line costs no extra reading beyond the +1.
+        // proves: CLAIM(S8-tail)
+        let mut reader = CountingReader::new(numbered_lines(4000, 1000));
+        let got = read_tail_from(&mut reader, TRANSCRIPT_TAIL_BYTES).unwrap();
+        assert_eq!(got, expected_lines(3476..4000, 1000));
+        assert!(reader.bytes_read() <= 524_289, "read {} bytes", reader.bytes_read());
+        assert!(reader.lowest_offset().expect("something was read") >= 3_475_711, "read from offset {:?}", reader.lowest_offset());
+    }
+
+    #[test]
+    fn read_tail_from_a_small_file_reads_it_once_and_whole() {
+        // why: S8 control for the two tests above: below the cap the whole file
+        //      comes back (first line included) and no more bytes are read than
+        //      the file has (10 lines x 100 B = 1000), so "reads at most cap+1"
+        //      is not a reader that always reads a fixed block.
+        // proves: CLAIM(S8-tail)
+        let bytes = numbered_lines(10, 100);
+        let mut reader = CountingReader::new(bytes.clone());
+        assert_eq!(read_tail_from(&mut reader, TRANSCRIPT_TAIL_BYTES).unwrap(), bytes);
+        assert_eq!(reader.bytes_read(), 1000);
+        assert_eq!(reader.lowest_offset(), Some(0));
+    }
+
+    #[test]
+    fn a_transcript_line_over_64_kib_is_skipped_not_parsed() {
+        // why: S8 "lines over 64 KiB skipped". One main-session record carries a
+        //      5m write but is 65 537 bytes long (1 over 64 KiB = 65 536); the
+        //      older 1h write beside it is normal. The long line must not be
+        //      parsed, so the answer is the older 1h. Boundary control: the same
+        //      record at exactly 65 536 bytes IS parsed and wins as the newest
+        //      (5m). A parser that buffers and parses every line gives 5m for
+        //      both.
+        // proves: CLAIM(S8-line)
+        let older = assistant_line(900, 0);
+        let over = assistant_line_of_len(0, 500, 65_537);
+        let exactly = assistant_line_of_len(0, 500, 65_536);
+        assert_eq!(newest_cache_write(&tail(&[older.clone(), exactly])), Some(Ttl::FiveMinutes), "65 536 bytes is within the bound");
+        assert_eq!(newest_cache_write(&tail(&[older, over])), Some(Ttl::OneHour), "65 537 bytes is skipped");
+    }
+
+    /// Run `work` on a thread and fail the test, not hang it, when it blocks.
+    fn within_5_s<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_else(|_| panic!("{what} did not return in 5 s"))
+    }
+
+    #[test]
+    fn a_symlinked_transcript_or_project_dir_is_not_followed() {
+        // why: S8 "regular files only, symlinks not followed" (threat model: a
+        //      planted link under ~/.claude/projects must not make vigil read
+        //      an arbitrary file). (1) A link named S1.jsonl pointing at a real
+        //      transcript elsewhere finds nothing; (2) a project dir that is a
+        //      link to a dir holding S2.jsonl finds nothing. Positive control:
+        //      a regular S3.jsonl in a regular project dir is found.
+        // proves: CLAIM(S8-symlink)
+        let outside = tempfile::tempdir().unwrap();
+        let real = write_transcript(outside.path(), "x", "real", &[assistant_line(900, 0)]);
+        let real_dir = write_transcript(outside.path(), "dir", "S2", &[assistant_line(900, 0)]);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("proj")).unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("proj/S1.jsonl")).unwrap();
+        std::os::unix::fs::symlink(real_dir.parent().unwrap(), root.path().join("linked-project")).unwrap();
+        let regular = write_transcript(root.path(), "proj", "S3", &[assistant_line(900, 0)]);
+        assert_eq!(find_session_transcript(root.path(), "S3"), Some(regular));
+        assert_eq!(find_session_transcript(root.path(), "S1"), None, "a symlinked file");
+        assert_eq!(find_session_transcript(root.path(), "S2"), None, "a file under a symlinked project dir");
+        assert_eq!(ttl_of_session(root.path(), "S1"), None);
+    }
+
+    #[test]
+    fn a_fifo_named_like_a_transcript_is_skipped_without_blocking() {
+        // why: S8 "regular files only": opening a FIFO for reading blocks until a
+        //      writer shows up, which would hang every keepalive call. The FIFO
+        //      is `proj/S4.jsonl`. Both lookups must return None inside 5 s.
+        //      Control: a regular file next to it is found.
+        // proves: CLAIM(S8-symlink)
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("proj")).unwrap();
+        let fifo = root.path().join("proj/S4.jsonl");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status().expect("mkfifo is available").success();
+        assert!(made, "mkfifo failed");
+        let regular = write_transcript(root.path(), "proj", "S5", &[assistant_line(900, 0)]);
+        assert_eq!(find_session_transcript(root.path(), "S5"), Some(regular), "control");
+        let dir = root.path().to_path_buf();
+        let (found, ttl) = within_5_s("looking up a FIFO transcript", move || (find_session_transcript(&dir, "S4"), ttl_of_session(&dir, "S4")));
+        assert_eq!((found, ttl), (None, None));
     }
 }

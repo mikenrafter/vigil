@@ -114,6 +114,8 @@ pub struct Vigil {
     pub(crate) agent: crate::cache::AgentEnv,
     /// A9: every credit check goes through this (tests: `ScriptedCreditProbe`).
     pub(crate) credit_probe: Arc<dyn crate::credit::CreditProbe>,
+    /// S7: the operator hook runs through this (tests: `ScriptedHookRunner`).
+    pub(crate) hook_runner: Arc<dyn crate::credit::CreditHookRunner>,
 }
 
 impl Vigil {
@@ -130,6 +132,7 @@ impl Vigil {
             session: Mutex::new(Session::default()),
             agent: crate::cache::AgentEnv::default(),
             credit_probe,
+            hook_runner: Arc::new(crate::credit::ProcessHookRunner),
         }
     }
 
@@ -143,6 +146,12 @@ impl Vigil {
     /// Replace the credit probe (tests: `testing::ScriptedCreditProbe`).
     pub fn with_credit_probe(mut self, probe: Arc<dyn crate::credit::CreditProbe>) -> Vigil {
         self.credit_probe = probe;
+        self
+    }
+
+    /// Replace the hook runner (tests: `testing::ScriptedHookRunner`).
+    pub fn with_hook_runner(mut self, runner: Arc<dyn crate::credit::CreditHookRunner>) -> Vigil {
+        self.hook_runner = runner;
         self
     }
 

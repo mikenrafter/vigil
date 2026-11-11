@@ -759,7 +759,131 @@ pub fn credit_state(on_credits: bool, source: crate::credit::CreditSource) -> cr
         crate::credit::CreditSource::Uw => vec![serde_json::json!({"window": {"Rolling": {"minutes": 10080}}, "exceeded": on_credits})],
         crate::credit::CreditSource::Transcripts => Vec::new(),
     };
-    crate::credit::CreditState { on_credits, source, windows }
+    crate::credit::CreditState { on_credits: Some(on_credits), source, windows }
+}
+
+/// S5: a check that could not say.
+pub fn credit_unknown(source: crate::credit::CreditSource) -> crate::credit::CreditState {
+    crate::credit::CreditState { on_credits: None, source, windows: Vec::new() }
+}
+
+/// `n` `uw`-style windows, all `exceeded` as given (an oversized evidence list).
+pub fn credit_state_with_windows(on_credits: bool, count: usize) -> crate::credit::CreditState {
+    let windows = (0..count).map(|n| serde_json::json!({"window": {"Rolling": {"minutes": 60 + n}}, "exceeded": on_credits})).collect();
+    crate::credit::CreditState { on_credits: Some(on_credits), source: crate::credit::CreditSource::Uw, windows }
+}
+
+/// One run of the hook as `ScriptedHookRunner` saw it.
+#[derive(Debug, Clone)]
+pub struct HookCall {
+    /// Tokio time (virtual under `start_paused`) when the hook was started.
+    pub at: tokio::time::Instant,
+    pub command: String,
+    /// The JSON the engine would have put on the hook's stdin.
+    pub input: serde_json::Value,
+    /// The timeout the engine allowed.
+    pub timeout: Duration,
+}
+
+type HookEffect = Box<dyn Fn(&serde_json::Value) + Send + Sync>;
+
+/// A `CreditHookRunner` for paused-time tests: records every run, optionally
+/// takes `delay` of tokio time and calls `effect` with the stdin JSON (a test's
+/// stand-in for "the hook edits settings and Claude Code reacts").
+pub struct ScriptedHookRunner {
+    calls: Mutex<Vec<HookCall>>,
+    effect: Mutex<Option<HookEffect>>,
+    delay: Mutex<Duration>,
+}
+
+impl ScriptedHookRunner {
+    pub fn new() -> Arc<ScriptedHookRunner> {
+        Arc::new(ScriptedHookRunner { calls: Mutex::new(Vec::new()), effect: Mutex::new(None), delay: Mutex::new(Duration::ZERO) })
+    }
+    pub fn set_effect(&self, effect: impl Fn(&serde_json::Value) + Send + Sync + 'static) {
+        *self.effect.lock().unwrap() = Some(Box::new(effect));
+    }
+    pub fn set_delay(&self, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+    }
+    pub fn calls(&self) -> Vec<HookCall> {
+        self.calls.lock().unwrap().clone()
+    }
+    /// Seconds after `start` (tokio time) of each run, in order.
+    pub fn offsets_from(&self, start: tokio::time::Instant) -> Vec<u64> {
+        self.calls.lock().unwrap().iter().map(|call| call.at.duration_since(start).as_secs()).collect()
+    }
+}
+
+impl crate::credit::CreditHookRunner for ScriptedHookRunner {
+    fn run<'a>(&'a self, command: &'a str, input: &'a serde_json::Value, timeout: Duration) -> BoxFuture<'a, crate::credit::HookOutcome> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(HookCall { at: tokio::time::Instant::now(), command: command.to_string(), input: input.clone(), timeout });
+            let delay = *self.delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if let Some(effect) = self.effect.lock().unwrap().as_ref() {
+                effect(input);
+            }
+            crate::credit::HookOutcome { command: command.to_string(), exit_code: Some(0), timed_out: false, output: String::new() }
+        })
+    }
+}
+
+/// S8: a `Read + Seek` over in-memory bytes that remembers what was really
+/// read: the number of bytes handed out and the lowest file offset any read
+/// started at. "Bytes returned" is what a function gives back; this is what
+/// it pulled from the file.
+pub struct CountingReader {
+    inner: std::io::Cursor<Vec<u8>>,
+    bytes_read: u64,
+    lowest_offset: Option<u64>,
+}
+
+impl CountingReader {
+    pub fn new(bytes: Vec<u8>) -> CountingReader {
+        CountingReader { inner: std::io::Cursor::new(bytes), bytes_read: 0, lowest_offset: None }
+    }
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+    /// The lowest offset a read began at; `None` if nothing was read.
+    pub fn lowest_offset(&self) -> Option<u64> {
+        self.lowest_offset
+    }
+}
+
+impl std::io::Read for CountingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let at = self.inner.position();
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.bytes_read += n as u64;
+            self.lowest_offset = Some(self.lowest_offset.map_or(at, |lowest| lowest.min(at)));
+        }
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for CountingReader {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+/// An assistant record exactly `total_len` bytes long (without the newline),
+/// padded through an extra `pad` field: for the 64 KiB line-length bound.
+/// Panics if the record cannot be that short.
+pub fn assistant_line_of_len(one_hour_tokens: u64, five_minute_tokens: u64, total_len: usize) -> String {
+    let mut record: serde_json::Value = serde_json::from_str(&assistant_line(one_hour_tokens, five_minute_tokens)).unwrap();
+    record["pad"] = serde_json::Value::String(String::new());
+    let base = record.to_string().len();
+    assert!(total_len >= base, "a record needs at least {base} bytes");
+    record["pad"] = serde_json::Value::String("p".repeat(total_len - base));
+    let line = record.to_string();
+    assert_eq!(line.len(), total_len);
+    line
 }
 
 /// A `CreditProbe` that answers from a script (then a steady verdict) and

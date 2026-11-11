@@ -15,6 +15,14 @@
 //!
 //! RED phase: all of these fail against the stubs (no `cache`/`clock` fields,
 //! no attention, no credit events), except the few marked "guard".
+//!
+//! Round 2 (spec review amendments S1-S10) adds, in this file: `wait` (S1, S3),
+//! the automatic 1h -> credits -> 5m -> credits end -> 1h sequence and the
+//! cadence kept in `credit-state.json` (S2, S9), identity (S4), tri-state (S5),
+//! attention events as ordinary events (S6), bounded probes and hook (S7),
+//! two processes on one root (S9) and no-id multi-watch calls (S10). The hook
+//! is run through `ScriptedHookRunner` where time is paused, and as a real
+//! `sh` (real clock, `credit_check_every` of 200 ms) where the process matters.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +32,7 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 
 use crate::cache::AgentEnv;
+use crate::clock::Timestamp;
 use crate::config::Config;
 use crate::credit::CreditSource;
 use crate::fault::{FaultPlan, FaultRule, When, WriteKind};
@@ -62,6 +71,28 @@ impl Rig {
     /// A fresh "process" over the rig's state root with the given agent and probe.
     fn vigil(&self, agent: AgentEnv, probe: &Arc<ScriptedCreditProbe>) -> Vigil {
         self.env.another_process().with_agent_env(agent).with_credit_probe(probe.clone())
+    }
+
+    /// `vigil` with a scripted hook runner (paused-time hook sequences).
+    fn vigil_with_hook(&self, agent: AgentEnv, probe: &Arc<ScriptedCreditProbe>, hook: &Arc<ScriptedHookRunner>) -> Vigil {
+        self.vigil(agent, probe).with_hook_runner(hook.clone())
+    }
+
+    /// `<root>/credit-state.json` (S2/S9).
+    fn credit_file(&self) -> PathBuf {
+        self.env.root().join("credit-state.json")
+    }
+
+    /// Write `credit-state.json` as another process would have left it: the
+    /// last applied state and a last check `age_s` before the rig's clock.
+    fn seed_credit_file(&self, on_credits: Option<bool>, age_s: i64) {
+        let checked_at = Timestamp(self.env.clock.now().0 - chrono::Duration::seconds(age_s));
+        std::fs::create_dir_all(self.env.root()).unwrap();
+        std::fs::write(self.credit_file(), json!({"on_credits": on_credits, "checked_at": checked_at}).to_string()).unwrap();
+    }
+
+    fn read_credit_file(&self) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(self.credit_file()).expect("credit-state.json exists")).expect("credit-state.json is JSON")
     }
 
     /// The session transcript `sess-1` under project `p`.
@@ -108,6 +139,12 @@ async fn judge_watch(rig: &Rig, vigil: &Vigil, id: &str, interval_s: u64, deadli
 
 async fn call(vigil: &Vigil, id: &WatchId, max_s: Option<u64>, orchestrator: Option<bool>) -> Value {
     let envelope = vigil.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator }).await.unwrap();
+    serde_json::to_value(&envelope).unwrap()
+}
+
+/// A no-id call (covers this process's pending watches, V7).
+async fn call_noid(vigil: &Vigil, max_s: Option<u64>, orchestrator: Option<bool>) -> Value {
+    let envelope = vigil.keepalive(KeepaliveRequest { watch_id: None, max_s, orchestrator }).await.unwrap();
     serde_json::to_value(&envelope).unwrap()
 }
 
@@ -381,26 +418,31 @@ async fn a_fired_envelope_also_gets_cache_and_clock_and_nothing_else_new() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn only_blocking_returns_carry_cache_and_clock() {
-    // why: A12. `watch_status`,
-    //      `watch_cancel` and `wait`'s final envelope have no call window, so
-    //      like `waited_s`/`max_s` today they carry neither new field.
-    // proves: CLAIM(AI6)
+async fn only_envelopes_that_come_from_a_call_carry_cache_and_clock() {
+    // why: A12 as amended by S1. `watch_status` and `watch_cancel` have no
+    //      call, so they carry neither `cache` nor `clock`. `wait` does: its
+    //      final envelope carries both (S1, the assertion of absence here was
+    //      wrong), but still no top-level `waited_s`/`max_s` (those are the
+    //      window of ONE call; the clock block holds the wait's total). The
+    //      full contents of wait's block are pinned in the next tests.
+    //      Positive control: a blocking keepalive carries both, so the
+    //      absence on status and cancel means something.
+    // proves: CLAIM(AI6), CLAIM(S1)
     let rig = Rig::new();
     let probe = quiet_probe();
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, path) = quiet_watch(&rig, &vigil, "w", 20, 3600, |_| {}).await;
     let status = serde_json::to_value(vigil.status(&id).await.unwrap()).unwrap();
     assert!(status.get("cache").is_none() && status.get("clock").is_none(), "{status}");
-    // Positive control: a blocking call does carry both, so absence above means something.
     let (blocking, _) = quiet_watch(&rig, &vigil, "blocking", 20, 3600, |_| {}).await;
     let blocking = call(&vigil, &blocking, Some(30), None).await;
     assert!(blocking.get("cache").is_some() && blocking.get("clock").is_some(), "{blocking}");
     append_file(&path, "boom\n");
     let waited = serde_json::to_value(vigil.wait(&id).await.unwrap()).unwrap();
     assert_eq!(waited["status"], "fired");
-    for key in ["cache", "clock", "waited_s", "max_s"] {
-        assert!(waited.get(key).is_none(), "wait's final envelope must not carry {key}: {waited}");
+    assert!(waited.get("cache").is_some() && waited.get("clock").is_some(), "S1: wait's final envelope carries cache and clock: {waited}");
+    for key in ["waited_s", "max_s"] {
+        assert!(waited.get(key).is_none(), "wait's final envelope has no per-call {key}: {waited}");
     }
     let (other, _) = quiet_watch(&rig, &vigil, "x", 20, 3600, |_| {}).await;
     let cancelled = serde_json::to_value(vigil.cancel(&other).await.unwrap()).unwrap();
@@ -835,7 +877,7 @@ async fn credits_ending_is_reported_too_and_the_same_state_is_reported_only_once
     //      on: check 0 is the baseline (on), the script flips to off at 240 ->
     //      event on_credits false at 240. A second call over the same Vigil
     //      with the state still off runs its full 3300 s with no event (the
-    //      previous state is remembered across calls in one process), and a
+    //      previous state is remembered in credit-state.json, S9), and a
     //      third where it flips on again at 480 ends at 480 with on_credits
     //      true.
     // proves: CLAIM(AI8)
@@ -861,10 +903,11 @@ async fn credits_ending_is_reported_too_and_the_same_state_is_reported_only_once
 
 #[tokio::test(start_paused = true)]
 async fn the_first_check_a_process_makes_is_a_baseline_never_a_change() {
-    // why: A9. Credits have been on since before vigil started: the first
-    //      check says on, and so does every later one. No event may be
-    //      invented because "there was no previous state"; the call runs its
-    //      full window and records on_credits true.
+    // why: A9, kept by S9 for a state root that has no credit-state.json yet.
+    //      Credits have been on since before vigil started: the first check
+    //      says on, and so does every later one. No event may be invented
+    //      because "there was no previous state"; the call runs its full
+    //      window and records on_credits true.
     // proves: CLAIM(AI8)
     let rig = Rig::new();
     let probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
