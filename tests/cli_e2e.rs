@@ -1495,3 +1495,175 @@ fn cli_both_agent_signals_cap_both_nesting_directions_at_270() {
         assert_eq!(answer["cache"]["source"], "default", "{id}");
     }
 }
+
+// ---- N1: two real processes, one credit change, one hook ----
+
+/// `credit.lock` is held by someone else right now (a non-blocking flock probe
+/// from outside, independent of how vigil takes it).
+fn credit_lock_is_held(root: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(root.join("credit.lock")) else { return false };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+fn lines_of(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |text| text.lines().count())
+}
+
+#[test]
+fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_state_update() {
+    // why: N1 / S9 through the real binary. Both processes are orchestrators on
+    //      watches of their own, credit-state.json says off, a fake `uw` says
+    //      on. Process A takes `credit.lock` and runs the hook, which parks on
+    //      a barrier file (`release`); B is started while A is inside the hook.
+    //      Then A is frozen a second time, by the test-only fault seam, AFTER
+    //      the hook and BEFORE the commit of credit-state.json
+    //      (`credit@rename:hold=commit`). Looked at from outside, at both
+    //      points: `credit.lock` is held (a non-blocking flock from the test
+    //      fails), the hook has run once and only once, B has not run it, and
+    //      the state file still says off. A lock released after the hook but
+    //      before the state update would show here as a free lock and, a moment
+    //      later, as a second hook run by B. At the end exactly one process
+    //      reports the change, the hook ran once, and the file says on.
+    // proves: CLAIM(N1), CLAIM(S9)
+    let (sandbox, fake_uw) = auto_sandbox(false);
+    vigil::testing::write_script(&fake_uw, "echo '{\"usage\":[{\"provider\":\"ClaudeCode\",\"windows\":[{\"window\":\"weekly\",\"exceeded\":true}]}]}'");
+    assert!(create_with(&sandbox, "a", serde_json::json!({})).status.success());
+    assert!(create_with(&sandbox, "b", serde_json::json!({"deadline_s": 12})).status.success());
+    std::fs::write(sandbox.state_root().join("credit-state.json"), r#"{"on_credits":false,"checked_at":"2020-01-01T00:00:00Z"}"#).unwrap();
+
+    let barrier = sandbox.dir.path().join("barrier");
+    std::fs::create_dir_all(&barrier).unwrap();
+    let (log, entered, release, done, commit) =
+        (barrier.join("hook.log"), barrier.join("entered"), barrier.join("release"), barrier.join("done"), barrier.join("commit"));
+    let hook = barrier.join("hook.sh");
+    vigil::testing::write_script(
+        &hook,
+        &format!(
+            "echo \"$$\" >> '{}'\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n: > '{}'",
+            log.display(),
+            entered.display(),
+            release.display(),
+            done.display()
+        ),
+    );
+    let spawn = |id: &str| {
+        let mut command = sandbox.command();
+        command
+            .args(["keepalive", id, "--orchestrator"])
+            .env("CLAUDE_CODE_SESSION_ID", SESSION)
+            .env("VIGIL_UW_COMMAND", &fake_uw)
+            .env("VIGIL_ON_CREDIT_CHANGE", &hook)
+            .env("VIGIL_TEST_FAULT", format!("credit@rename:hold={}:all", commit.display()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().unwrap()
+    };
+
+    let mut a = spawn("a");
+    assert!(wait_until(Duration::from_secs(8), || entered.exists()), "process A should have started the credit hook");
+    assert!(credit_lock_is_held(&sandbox.state_root()), "credit.lock must be held while the hook runs");
+    let mut b = spawn("b");
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(lines_of(&log), 1, "B must wait for the lock, not run its own hook");
+    assert!(matches!(b.try_wait(), Ok(None)), "B is still waiting for the lock");
+
+    std::fs::write(&release, "").unwrap();
+    assert!(wait_until(Duration::from_secs(8), || done.exists()), "the hook should finish once released");
+    assert!(
+        wait_until(Duration::from_secs(8), || barrier.join("commit.waiting").exists()),
+        "A should reach the commit of credit-state.json after the hook"
+    );
+    assert!(credit_lock_is_held(&sandbox.state_root()), "credit.lock must still be held between the hook and the state commit");
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sandbox.state_root().join("credit-state.json")).unwrap()).unwrap();
+    assert_eq!(recorded["on_credits"], false, "the state is not committed yet");
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(lines_of(&log), 1, "B must not run the hook while A has not recorded the change");
+    assert!(matches!(a.try_wait(), Ok(None)) && matches!(b.try_wait(), Ok(None)), "both are parked, A at the commit, B at the lock");
+
+    std::fs::write(&commit, "").unwrap();
+    let (out_a, out_b) = (finish_within(a, Duration::from_secs(15)), finish_within(b, Duration::from_secs(20)));
+    assert!(out_a.status.success() && out_b.status.success(), "{} / {}", String::from_utf8_lossy(&out_a.stderr), String::from_utf8_lossy(&out_b.stderr));
+    let (env_a, env_b) = (stdout_json(&out_a), stdout_json(&out_b));
+    let changes = |envelope: &serde_json::Value| envelope["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "credit_state_changed").count();
+    assert_eq!((changes(&env_a), changes(&env_b)), (1, 0), "exactly one process reports the change: {env_a} / {env_b}");
+    assert_eq!(env_b["status"], "expired", "B carried on quietly until its watch ran out");
+    assert_eq!(lines_of(&log), 1, "the hook ran once in all");
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sandbox.state_root().join("credit-state.json")).unwrap()).unwrap();
+    assert_eq!(recorded["on_credits"], true);
+    assert!(!credit_lock_is_held(&sandbox.state_root()), "the lock is released at the end");
+}
+
+// ---- N3: print, then commit ----
+
+/// `vigil <args>` whose standard output is closed (fd 1 not open at all).
+fn run_with_closed_stdout(sandbox: &Sandbox, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg("exec \"$@\" >&-").arg("sh").arg(vigil_bin()).args(args);
+    sandbox.configure(&mut command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    finish_within(command.spawn().unwrap(), Duration::from_secs(12))
+}
+
+/// `vigil <args>` whose standard output is `/dev/full` (every write fails with ENOSPC).
+fn run_with_full_stdout(sandbox: &Sandbox, args: &[&str]) -> std::process::Output {
+    let mut command = sandbox.command();
+    command.args(args).stdout(Stdio::from(std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap())).stderr(Stdio::piped());
+    finish_within(command.spawn().unwrap(), Duration::from_secs(12))
+}
+
+#[test]
+fn a_failed_stdout_write_leaves_the_event_uncommitted_and_the_next_call_replays_it() {
+    // why: N3. The CLI prints the envelope, THEN commits its delivery. An
+    //      attention event (watch `expect_s: 2`, due after 3 s) is persisted
+    //      with the watch until a delivery is committed. Case 1: stdout is
+    //      closed; case 2: stdout is /dev/full. Either way the process must
+    //      fail (non-zero, a line on stderr naming stdout), and the NEXT
+    //      keepalive must return the same attention event at once, flagged
+    //      `redelivered: true` (the agent may or may not have seen it). Control:
+    //      with a working stdout the event is delivered once and a later call
+    //      (the watch has since expired) does not replay it. Rust's own stdout
+    //      swallows a closed descriptor silently, so a naive println! passes
+    //      the "closed" case as a success and commits an undelivered event.
+    // proves: CLAIM(N3)
+    let sandbox = Sandbox::new();
+    for (id, run) in [
+        ("closed", run_with_closed_stdout as fn(&Sandbox, &[&str]) -> std::process::Output),
+        ("full", run_with_full_stdout),
+    ] {
+        assert!(create_with(&sandbox, id, serde_json::json!({"expect_s": 2, "deadline_s": 600})).status.success());
+        let failed = run(&sandbox, &["keepalive", id]);
+        assert!(!failed.status.success(), "{id}: a failed stdout write must fail the command, it exited {:?}", failed.status.code());
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("stdout"), "{id}: stderr should name stdout: {:?}", String::from_utf8_lossy(&failed.stderr));
+
+        let started = std::time::Instant::now();
+        let replay = finish_within(piped({
+            let mut command = sandbox.command();
+            command.args(["keepalive", id, "--max-s", "30"]);
+            command
+        }), Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(8), "{id}: the replay must not wait out a window");
+        let answer = stdout_json(&replay);
+        assert_eq!((&answer["status"], &answer["next"]), (&serde_json::json!("pending"), &serde_json::json!("act on events")), "{id}: {answer}");
+        let events = answer["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{id}: {answer}");
+        assert_eq!((&events[0]["kind"], &events[0]["reason"], &events[0]["redelivered"]), (&serde_json::json!("attention"), &serde_json::json!("overdue"), &serde_json::json!(true)), "{id}: {answer}");
+    }
+
+    assert!(create_with(&sandbox, "ok", serde_json::json!({"expect_s": 2, "deadline_s": 7})).status.success());
+    let first = finish_within(piped({
+        let mut command = sandbox.command();
+        command.args(["keepalive", "ok"]);
+        command
+    }), Duration::from_secs(10));
+    let first = stdout_json(&first);
+    assert_eq!(first["events"][0]["kind"], "attention", "control: {first}");
+    assert!(first["events"][0].get("redelivered").is_none(), "control: the first delivery is not a redelivery: {first}");
+    let later = finish_within(piped({
+        let mut command = sandbox.command();
+        command.args(["keepalive", "ok", "--max-s", "30"]);
+        command
+    }), Duration::from_secs(12));
+    let later = stdout_json(&later);
+    assert_eq!(later["status"], "expired", "control: {later}");
+    assert_eq!(later["events"], serde_json::json!([]), "control: a delivered event is not replayed: {later}");
+}

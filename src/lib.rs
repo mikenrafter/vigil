@@ -16,6 +16,7 @@ pub mod error;
 pub mod fault;
 pub mod inputs;
 pub mod judge;
+pub mod meter;
 pub mod keepalive;
 pub mod mcp;
 pub mod store;

@@ -708,4 +708,43 @@ mod tests {
         let (found, ttl) = within_5_s("looking up a FIFO transcript", move || (find_session_transcript(&dir, "S4"), ttl_of_session(&dir, "S4")));
         assert_eq!((found, ttl), (None, None));
     }
+
+    // ---- N2: consumption on the production path ----
+
+    #[test]
+    fn choosing_a_window_consumes_at_most_the_tail_of_a_huge_real_transcript() {
+        // why: N2. `read_tail_from_*` above prove the reader on an in-memory
+        //      source; this proves the PRODUCTION path (`choose_window` ->
+        //      `ttl_of_session` -> the real file) through the read meter, which
+        //      counts the bytes the code really pulled from the file. A 3 MB
+        //      transcript (a 5m write first, 3000 lines of ~1 KB filler, the 1h
+        //      write last): the answer is 1h, at most 512 KiB + 1 byte
+        //      (524 289) were consumed, none from before offset len - 524 289,
+        //      and only that file was opened. Control in the same test: a
+        //      small transcript is consumed whole from offset 0, so the meter
+        //      sees real reads and the bound above is not "the meter saw
+        //      nothing".
+        // proves: CLAIM(N2), CLAIM(S8-tail)
+        let root = tempfile::tempdir().unwrap();
+        let mut lines = vec![assistant_line(0, 500)];
+        lines.extend((0..3000).map(|i| user_line_quoting(&format!("filler {i} {}", "x".repeat(900)))));
+        lines.push(assistant_line(900, 0));
+        let big = write_transcript(root.path(), "p", "sess-1", &lines);
+        let len = std::fs::metadata(&big).unwrap().len();
+        assert!(len > 2_500_000, "the fixture must dwarf the cap, it is {len} bytes");
+        let tap = crate::meter::ReadTap::on(root.path());
+        let agent = AgentEnv { claude_session_id: Some("sess-1".into()), codex: false };
+        let got = choose_window(&WindowRequest { explicit_s: None, orchestrator: true, agent: &agent, projects_dir: Some(root.path()) });
+        assert_eq!(got, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3300));
+        let tally = tap.of(&big);
+        assert!(tally.bytes_read > 0, "the meter must see the production read: {tally:?}");
+        assert!(tally.bytes_read <= 524_289, "consumed {} bytes of a {len}-byte transcript", tally.bytes_read);
+        assert!(tally.lowest_offset.expect("a read happened") >= len - 524_289, "read from offset {:?} of {len}", tally.lowest_offset);
+        assert_eq!((tally.opens, tap.files_opened()), (1, 1), "only the session's transcript is opened");
+
+        let small = write_transcript(root.path(), "q", "sess-2", &[assistant_line(900, 0)]);
+        assert_eq!(ttl_of_session(root.path(), "sess-2"), Some(Ttl::OneHour));
+        let small_len = std::fs::metadata(&small).unwrap().len();
+        assert_eq!((tap.of(&small).bytes_read, tap.of(&small).lowest_offset), (small_len, Some(0)), "control: a small file is read whole, once");
+    }
 }

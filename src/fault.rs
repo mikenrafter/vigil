@@ -47,6 +47,9 @@
 //! * [`WriteKind::Lock`]: only when a lock file has to be CREATED (opening an
 //!   existing one needs no disk space and is not an attempt). Stage
 //!   [`Stage::Create`] only. `begin`'s target is the lock file.
+//! * [`WriteKind::CreditState`]: one `write_atomic` of `<root>/credit-state.json`
+//!   (specs/auto-interval.md S9, N4). The same six stages as a watch file.
+//!   `begin`'s target is `credit-state.json`.
 //! * [`WriteKind::Reserve`]: the best-effort creation of `<root>/.reserve`.
 //!   Stages [`Stage::Create`] (before the file is created) and
 //!   [`Stage::ShortWrite`] (the first half of the zeros is written, then the
@@ -96,6 +99,17 @@
 //! * `FILE`: optional, a plain file name (no `/`, not empty).
 //!
 //! Paths in `while=` and file names must not contain `:` or `,`.
+//!
+//! # Holding a stage (specs/auto-interval.md N1)
+//!
+//! A rule may HOLD a stage instead of failing it: in the `ERRNO` position write
+//! `hold=PATH`. When an attempt the rule selects reaches the stage, it creates
+//! `PATH.waiting` (so a test knows the process is parked there) and blocks the
+//! calling thread until `PATH` exists (at most [`HOLD_LIMIT`]), then goes on as
+//! if nothing happened. A test uses it to freeze a process at a precise point
+//! (for example between a hook's side effect and the commit of
+//! `credit-state.json`) and look at the world from outside. Same trust model as
+//! the failures above: test-only, trusted environment.
 
 use std::collections::HashMap;
 use std::io;
@@ -106,6 +120,10 @@ use std::time::Duration;
 /// The environment variable a spawned `vigil` reads its [`FaultPlan`] from.
 pub const ENV_VAR: &str = "VIGIL_TEST_FAULT";
 
+/// The longest a [`FaultRule::holding`] rule parks a stage (a test that never
+/// releases it must not hang the process for ever).
+pub const HOLD_LIMIT: Duration = Duration::from_secs(60);
+
 /// What a store write is for; a rule selects by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WriteKind {
@@ -115,6 +133,8 @@ pub enum WriteKind {
     Lock,
     /// Creation of `<root>/.reserve`.
     Reserve,
+    /// `<root>/credit-state.json` (specs/auto-interval.md S9).
+    CreditState,
 }
 
 impl WriteKind {
@@ -122,7 +142,7 @@ impl WriteKind {
     /// meaning of each kind).
     pub fn default_stage(self) -> Stage {
         match self {
-            WriteKind::Watch => Stage::Write,
+            WriteKind::Watch | WriteKind::CreditState => Stage::Write,
             WriteKind::Lock | WriteKind::Reserve => Stage::Create,
         }
     }
@@ -134,7 +154,9 @@ impl WriteKind {
     /// [`parse`]: FaultPlan::parse
     pub fn stages(self) -> &'static [Stage] {
         match self {
-            WriteKind::Watch => &[Stage::Create, Stage::Write, Stage::ShortWrite, Stage::Sync, Stage::Rename, Stage::Cleanup],
+            WriteKind::Watch | WriteKind::CreditState => {
+                &[Stage::Create, Stage::Write, Stage::ShortWrite, Stage::Sync, Stage::Rename, Stage::Cleanup]
+            }
             WriteKind::Lock => &[Stage::Create],
             WriteKind::Reserve => &[Stage::Create, Stage::ShortWrite],
         }
@@ -145,6 +167,7 @@ impl WriteKind {
             "watch" => Some(WriteKind::Watch),
             "lock" => Some(WriteKind::Lock),
             "reserve" => Some(WriteKind::Reserve),
+            "credit" => Some(WriteKind::CreditState),
             _ => None,
         }
     }
@@ -221,13 +244,21 @@ pub struct FaultRule {
     /// How long the injected failure takes to arrive (review S5, see the module
     /// docs). Zero for every rule parsed from the environment.
     pub took: Duration,
+    /// N1: when set, the rule HOLDS the stage until this path exists instead of
+    /// failing it (see the module docs); `errno` is then unused.
+    pub hold_until: Option<PathBuf>,
 }
 
 impl FaultRule {
     /// A rule at the kind's default stage ([`WriteKind::default_stage`]) for
     /// every file.
     pub fn new(kind: WriteKind, errno: i32, when: When) -> FaultRule {
-        FaultRule { kind, stage: kind.default_stage(), errno, when, file: None, took: Duration::ZERO }
+        FaultRule { kind, stage: kind.default_stage(), errno, when, file: None, took: Duration::ZERO, hold_until: None }
+    }
+    /// A rule that parks `stage` of the attempts it selects until `until`
+    /// exists, then lets them go on (N1). Writes `until.waiting` on arrival.
+    pub fn holding(kind: WriteKind, stage: Stage, until: PathBuf, when: When) -> FaultRule {
+        FaultRule { kind, stage, errno: 0, when, file: None, took: Duration::ZERO, hold_until: Some(until) }
     }
     /// The same rule at another stage.
     pub fn at(mut self, stage: Stage) -> FaultRule {
@@ -260,6 +291,8 @@ struct FaultState {
     /// `Range` count these, so a file filter counts only its own file.
     matched: Vec<u64>,
     injected: HashMap<(WriteKind, Stage), u64>,
+    /// Attempts parked by a `holding` rule, per kind and stage (N1).
+    held: HashMap<(WriteKind, Stage), u64>,
 }
 
 /// The faults to inject. Clones share rules and counters (the store is
@@ -291,10 +324,16 @@ impl Attempt {
             .iter()
             .map(|(index, ordinal)| (&state.rules[*index], *ordinal))
             .find(|(rule, ordinal)| rule.stage == stage && rule.when.fails(*ordinal))
-            .map(|(rule, _)| (rule.errno, rule.took));
+            .map(|(rule, _)| (rule.errno, rule.took, rule.hold_until.clone()));
         match fired {
             None => Ok(()),
-            Some((errno, took)) => {
+            Some((_, _, Some(until))) => {
+                *state.held.entry((self.kind, stage)).or_default() += 1;
+                drop(state);
+                hold_until(&until);
+                Ok(())
+            }
+            Some((errno, took, None)) => {
                 *state.injected.entry((self.kind, stage)).or_default() += 1;
                 self.time_taken.set(took);
                 Err(io::Error::from_raw_os_error(errno))
@@ -361,6 +400,12 @@ impl FaultPlan {
         self.shared.lock().expect("fault plan mutex poisoned").attempts.get(&kind).copied().unwrap_or(0)
     }
 
+    /// How many attempts a `holding` rule has parked so far at `stage` of `kind`
+    /// (all clones).
+    pub fn held(&self, kind: WriteKind, stage: Stage) -> u64 {
+        self.shared.lock().expect("fault plan mutex poisoned").held.get(&(kind, stage)).copied().unwrap_or(0)
+    }
+
     /// How many failures were injected so far at `stage` of `kind` attempts
     /// (all clones). Lets a test show that its fault really fired where it
     /// meant to, instead of the write failing for some other reason.
@@ -369,7 +414,19 @@ impl FaultPlan {
     }
 }
 
-/// `KIND[@STAGE]:ERRNO:WHEN[:FILE]`
+/// Park the calling thread until `until` exists (N1). Leaves `until.waiting`
+/// behind so the test that set the trap can see it was sprung.
+fn hold_until(until: &Path) {
+    let mut marker = until.as_os_str().to_owned();
+    marker.push(".waiting");
+    let _ = std::fs::write(PathBuf::from(marker), b"");
+    let started = std::time::Instant::now();
+    while !until.exists() && started.elapsed() < HOLD_LIMIT {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `KIND[@STAGE]:ERRNO:WHEN[:FILE]`, where `ERRNO` may be `hold=PATH`.
 fn parse_rule(text: &str) -> Result<FaultRule, String> {
     let fields: Vec<&str> = text.split(':').collect();
     if !(3..=4).contains(&fields.len()) {
@@ -379,7 +436,7 @@ fn parse_rule(text: &str) -> Result<FaultRule, String> {
         Some((kind, stage)) => (kind, Some(stage)),
         None => (fields[0], None),
     };
-    let kind = WriteKind::from_name(kind_name).ok_or_else(|| format!("rule {text:?}: unknown kind {kind_name:?} (watch, lock or reserve)"))?;
+    let kind = WriteKind::from_name(kind_name).ok_or_else(|| format!("rule {text:?}: unknown kind {kind_name:?} (watch, lock, reserve or credit)"))?;
     let stage = match stage_name {
         None => kind.default_stage(),
         Some(name) => {
@@ -390,7 +447,14 @@ fn parse_rule(text: &str) -> Result<FaultRule, String> {
             stage
         }
     };
-    let errno: i32 = fields[1].parse().ok().filter(|errno| *errno > 0).ok_or_else(|| format!("rule {text:?}: errno {:?} must be a positive decimal number", fields[1]))?;
+    let (errno, hold_until) = match fields[1].strip_prefix("hold=") {
+        Some("") => return Err(format!("rule {text:?}: hold= needs a path")),
+        Some(path) => (0, Some(PathBuf::from(path))),
+        None => {
+            let errno: i32 = fields[1].parse().ok().filter(|errno| *errno > 0).ok_or_else(|| format!("rule {text:?}: errno {:?} must be a positive decimal number (or hold=PATH)", fields[1]))?;
+            (errno, None)
+        }
+    };
     let when = parse_when(fields[2]).map_err(|problem| format!("rule {text:?}: {problem}"))?;
     let file = match fields.get(3) {
         None => None,
@@ -399,7 +463,7 @@ fn parse_rule(text: &str) -> Result<FaultRule, String> {
         }
         Some(name) => Some((*name).to_string()),
     };
-    Ok(FaultRule { kind, stage, errno, when, file, took: Duration::ZERO })
+    Ok(FaultRule { kind, stage, errno, when, file, took: Duration::ZERO, hold_until })
 }
 
 fn parse_when(text: &str) -> Result<When, String> {
@@ -503,7 +567,7 @@ mod tests {
         //      kind and the stage.
         // proves: CLAIM(DF-seam-inert)
         let plan = FaultPlan::none();
-        for kind in [WriteKind::Watch, WriteKind::Lock, WriteKind::Reserve] {
+        for kind in [WriteKind::Watch, WriteKind::Lock, WriteKind::Reserve, WriteKind::CreditState] {
             for stage in ALL_STAGES {
                 assert_eq!(run_at(&plan, kind, stage, "/state/x", 2), vec![None, None], "{kind:?} {stage:?}");
             }
@@ -759,5 +823,65 @@ mod tests {
             assert!(FaultPlan::parse(&spec).is_err(), "{spec:?} must be refused: the store never asks for that stage");
         }
         assert_eq!(accepted.len() + refused.len(), 18, "3 kinds x 6 stages");
+    }
+
+    #[test]
+    fn the_credit_kind_has_the_six_watch_stages_and_a_hold_rule_parses() {
+        // why: specs/auto-interval.md N1/N4 inject at the `credit-state.json`
+        //      write. Every one of the six stages of `write_atomic` must be
+        //      addressable (`credit@STAGE`), the bare kind targets the default
+        //      `write` stage like a watch file, and `hold=PATH` takes the
+        //      place of the errno. A hold with no path, and a credit rule at a
+        //      stage the store never asks for, are typos and are refused.
+        // proves: CLAIM(DF-seam), CLAIM(N1), CLAIM(N4)
+        for stage in ["create", "write", "short", "sync", "rename", "cleanup"] {
+            assert!(FaultPlan::parse(&format!("credit@{stage}:5:1")).is_ok(), "credit@{stage}");
+            assert!(FaultPlan::parse(&format!("credit@{stage}:hold=/tmp/go:all")).is_ok(), "credit@{stage} hold");
+        }
+        assert!(FaultPlan::parse("credit:5:all").is_ok());
+        for bad in ["credit@nope:5:1", "credit:hold=:all", "credit:hold:all", "credit:0:all"] {
+            assert!(FaultPlan::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+        let plan = FaultPlan::parse("credit:5:2").unwrap();
+        let outcomes: Vec<_> = (0..3).map(|_| errno_of(plan.begin(WriteKind::CreditState, Path::new("/s/credit-state.json")).at(Stage::Write))).collect();
+        assert_eq!(outcomes, [None, Some(5), None], "attempt numbers count credit writes only");
+        assert_eq!(errno_of(plan.begin(WriteKind::Watch, Path::new("/s/w.json")).at(Stage::Write)), None, "a credit rule leaves watch writes alone");
+    }
+
+    #[test]
+    fn a_hold_rule_parks_the_stage_until_the_file_exists_and_says_it_is_parked() {
+        // why: N1 needs a process frozen at an exact point (after the hook,
+        //      before the commit of credit-state.json) so a test can look at
+        //      the lock from outside. Proven here on the seam itself: the
+        //      attempt must (1) not return while the release file is missing,
+        //      (2) leave `<release>.waiting` the moment it parks, (3) return
+        //      Ok (it does not fail the write) once the file exists, and
+        //      (4) park only the stage and attempts the rule selects: another
+        //      stage of the same attempt passes at once.
+        // proves: CLAIM(N1)
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("go");
+        let spec = format!("credit@rename:hold={}:all", release.display());
+        let plan = FaultPlan::parse(&spec).unwrap();
+        let attempt = plan.begin(WriteKind::CreditState, Path::new("/s/credit-state.json"));
+        assert_eq!(errno_of(attempt.at(Stage::Sync)), None);
+        assert_eq!(plan.held(WriteKind::CreditState, Stage::Rename), 0, "other stages are not parked");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = attempt.at(Stage::Rename);
+            sender.send(result.is_ok()).unwrap();
+        });
+        let waiting = dir.path().join("go.waiting");
+        let started = std::time::Instant::now();
+        while !waiting.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(waiting.exists(), "the parked attempt must announce itself");
+        assert!(receiver.recv_timeout(Duration::from_millis(200)).is_err(), "it must not pass before the release file exists");
+        std::fs::write(&release, "").unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(true), "released, the write goes on");
+        worker.join().unwrap();
+        assert_eq!(plan.held(WriteKind::CreditState, Stage::Rename), 1);
+        assert_eq!(plan.injected(WriteKind::CreditState, Stage::Rename), 0, "a hold is not an injected failure");
     }
 }

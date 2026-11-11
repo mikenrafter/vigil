@@ -806,4 +806,77 @@ mod tests {
         assert_eq!(build(100), Some(true), "control: the 1h write is inside the tail");
         assert_eq!(build(700), Some(false), "the 1h write is beyond 512 KiB");
     }
+
+    // ---- N2: consumption on the production paths ----
+
+    #[test]
+    fn the_fallback_scan_consumes_at_most_20_files_and_the_last_512_kib_of_each() {
+        // why: N2 + S8. The scan's bounds asserted on what the PRODUCTION code
+        //      consumed (read meter), not on its verdict alone. 24 recent main
+        //      transcripts, 1..=24 s old, each a 1h write plus 640 lines of
+        //      ~1 KB filler (~660 KB, over the 512 KiB tail). Only the 20th
+        //      newest (20 s old) ends with a real 1h -> 5m shift, so the verdict
+        //      (on credits) is only reachable by reading that file's tail; the
+        //      four oldest (21..24 s) hold the same shift and must stay
+        //      untouched. Expected: exactly 20 files opened (ages 1..=20), each
+        //      read at most 524 289 bytes (cap + 1) and none from before
+        //      len - 524 289.
+        // proves: CLAIM(N2), CLAIM(S8-scan), CLAIM(S8-tail)
+        let filler: Vec<String> = (0..640).map(|i| user_line_quoting(&format!("filler {i} {}", "x".repeat(900)))).collect();
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for age in 1..=24u64 {
+            let mut lines = vec![assistant_line(900, 0)];
+            lines.extend(filler.clone());
+            if age >= 20 {
+                lines.extend([assistant_line(900, 0), assistant_line(0, 500)]);
+            }
+            paths.push((age, fresh(root.path(), "p", &format!("s{age:02}"), &lines, age)));
+        }
+        let tap = crate::meter::ReadTap::on(root.path());
+        assert_eq!(transcript_credit_state(root.path(), spec_instant()).on_credits, Some(true), "the 20th newest shows the shift");
+        for (age, path) in &paths {
+            let len = std::fs::metadata(path).unwrap().len();
+            let tally = tap.of(path);
+            if *age <= 20 {
+                assert!(tally.opens >= 1 && tally.bytes_read > 0, "age {age}: the 20 newest are looked at: {tally:?}");
+                assert!(tally.bytes_read <= 524_289, "age {age}: consumed {} of {len} bytes", tally.bytes_read);
+                assert!(tally.lowest_offset.expect("read") >= len - 524_289, "age {age}: read from {:?} of {len}", tally.lowest_offset);
+            } else {
+                assert_eq!(tally.opens + tally.bytes_read, 0, "age {age}: beyond the 20 newest, never opened");
+            }
+        }
+        assert_eq!(tap.files_opened(), 20);
+    }
+
+    #[tokio::test]
+    async fn uw_output_consumption_stops_at_64_kib_plus_one() {
+        // why: N2 + S8. A `uw` that prints 1 MiB must not be read to the end:
+        //      the production read of its stdout is metered (keyed by the
+        //      command path) and consumed at most 65 537 bytes (cap + 1, the
+        //      byte that proves the output is over the cap), the verdict
+        //      falls back to the transcripts. Control: a 10 240-byte valid
+        //      output is consumed whole (10 240 bytes) and trusted (source uw),
+        //      so the meter really sees the pipe.
+        // proves: CLAIM(N2), CLAIM(S8-uw)
+        let dir = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let json = uw_json(&[true], false);
+        let tap = crate::meter::ReadTap::on(dir.path());
+        let mut consumed = Vec::new();
+        for (total, name) in [(10_240, "small"), (1 << 20, "1 MiB")] {
+            let data = dir.path().join(format!("out-{total}.json"));
+            std::fs::write(&data, json_of_len(total, &json)).unwrap();
+            let sub = dir.path().join(format!("d{total}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            let uw = fake_uw(&sub, &format!("cat '{}'", data.display()));
+            let state = SystemCreditProbe { uw_command: uw.clone(), projects_dir: Some(projects.path().to_path_buf()), uw_timeout: Duration::from_secs(5) }
+                .check(spec_instant())
+                .await;
+            consumed.push((name, state.source, tap.of(&uw).bytes_read));
+        }
+        assert_eq!(consumed[0], ("small", CreditSource::Uw, 10_240), "control: the whole small output is consumed and trusted");
+        assert_eq!((consumed[1].0, consumed[1].1), ("1 MiB", CreditSource::Transcripts));
+        assert!(consumed[1].2 > 0 && consumed[1].2 <= 65_537, "consumed {} bytes of a 1 MiB output", consumed[1].2);
+    }
 }

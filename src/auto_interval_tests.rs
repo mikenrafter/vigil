@@ -35,7 +35,7 @@ use crate::cache::AgentEnv;
 use crate::clock::Timestamp;
 use crate::config::Config;
 use crate::credit::CreditSource;
-use crate::fault::{FaultPlan, FaultRule, When, WriteKind};
+use crate::fault::{FaultPlan, FaultRule, Stage, When, WriteKind};
 use crate::keepalive::KeepaliveRequest;
 use crate::testing::*;
 use crate::watch::{CreateRequest, Input, WatchId};
@@ -2287,3 +2287,52 @@ async fn two_engines_share_a_real_credit_flock_and_run_the_change_hook_once() {
     assert_eq!(probe.asked_count(), 1, "second engine rereads checked_at under flock");
     assert_eq!(rig.read_credit_file()["on_credits"], true);
 }
+
+// ------------------------------------------------ N4: at-least-once hook ----
+
+#[tokio::test(start_paused = true)]
+async fn a_hook_whose_state_write_failed_runs_again_at_the_next_check() {
+    // why: N4 / S9. Hook delivery is AT-LEAST-ONCE: a change counts as applied
+    //      only after credit-state.json commits. The state file says off, the
+    //      probe says on, and the FIRST write of credit-state.json fails (EIO,
+    //      injected after the hook's side effect has already happened).
+    //      Call 1: the hook ran once, the agent still learns of the change,
+    //      the file is untouched (still off, and still old, so the next
+    //      orchestrator call is due to check). Call 2 (same process): the
+    //      change is seen again, the hook runs a SECOND time (that is the
+    //      at-least-once price, hooks must be idempotent), the write works, the
+    //      file says on. Call 3 and 4: nothing new, the hook stays at two
+    //      runs, so deduplication works again once the write has committed
+    //      (call 4 starts 270 s after the commit, so its check is due and finds
+    //      on == recorded).
+    // proves: CLAIM(N4), CLAIM(S9)
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.on_credit_change = Some("apply-policy".into()));
+    rig.seed_credit_file(Some(false), 600);
+    let probe = ScriptedCreditProbe::new(credit_state(true, CreditSource::Uw));
+    let hook = ScriptedHookRunner::new();
+    let faults = FaultPlan::from_rules(vec![FaultRule::new(WriteKind::CreditState, 5, When::Nth(1))]);
+    let vigil = rig.vigil_with_hook(AgentEnv::default(), &probe, &hook).with_write_faults(faults.clone());
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
+
+    let first = call(&vigil, &id, Some(270), Some(true)).await;
+    assert_eq!(hook.calls().len(), 1, "the hook ran: {first}");
+    assert_eq!(faults.injected(WriteKind::CreditState, Stage::Write), 1, "the injected failure must have fired at the state write");
+    assert_eq!(only_event(&first)["kind"], "credit_state_changed", "the agent learns at once: {first}");
+    assert_eq!(rig.read_credit_file()["on_credits"], false, "the failed write left the old state");
+    assert_eq!(rig.read_credit_file()["checked_at"], serde_json::to_value(spec_instant().minus_secs(600)).unwrap(), "and the old check time, so the next call is due");
+
+    let second = call(&vigil, &id, Some(270), Some(true)).await;
+    assert_eq!(hook.calls().len(), 2, "the next check re-runs the hook: {second}");
+    assert_eq!(hook.calls()[1].input["on_credits"], true);
+    let event = only_event(&second);
+    assert_eq!((&event["kind"], &event["on_credits"]), (&json!("credit_state_changed"), &json!(true)), "{second}");
+    assert_eq!(rig.read_credit_file()["on_credits"], true, "committed this time");
+
+    let third = call(&vigil, &id, Some(270), Some(true)).await;
+    assert_eq!((&third["events"], &third["waited_s"]), (&json!([]), &json!(270)), "{third}");
+    let fourth = call(&vigil, &id, Some(270), Some(true)).await;
+    assert_eq!(fourth["events"], json!([]), "{fourth}");
+    assert_eq!(probe.asked_count(), 3, "calls 1, 2 and 4 were due; call 3 started right after the commit");
+    assert_eq!(hook.calls().len(), 2, "after the commit the change is deduplicated again");
+}
+
