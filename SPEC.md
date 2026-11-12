@@ -164,8 +164,9 @@ All tools return a JSON text block (the envelope or a subset) and set
   `orchestrator` are optional; see "Cache-aware window, time and early
   attention".
 - `fire` is `"judge"` (fire when `judge_rule` matches the judge's answer),
-  `"change"` (fire on any input change, no model call), or `"condition"`
-  (fire when every input that has a `want` meets it, no model call).
+  `"change"` (fire on any input change, no model call), `"condition"`
+  (fire when every input that has a `want` meets it, no model call), or
+  `"hold"` (fire when every input, all of them work, has ended; see "Holds").
 - `judge_questions` is passed to Laya unchanged, in Laya's own schema
   (`FINDINGS.md` §1): an object keyed by question id, types `noul`, `choice`,
   `score`. vigil checks only that it is a non-empty object and that the
@@ -177,7 +178,8 @@ All tools return a JSON text block (the envelope or a subset) and set
 - `judge_questions` and `judge_rule` are required with `fire = "judge"` and
   rejected otherwise. `condition` requires at least one input with `want`.
 - Inputs are the wait primitives from mcp-await (file, URL, port, process),
-  re-implemented in vigil, plus `glob` and `cmd`. vigil does not
+  re-implemented in vigil, plus `glob` and `cmd`, and the four work inputs
+  `qex`, `qex_idle`, `path_exists` and `until` (see "Holds"). vigil does not
   proxy to a separate mcp-await server: an MCP server cannot easily call
   another one, and the primitives are about 200 lines.
 - Writes the watch file and returns
@@ -790,13 +792,12 @@ Claims `H1`-`H12`. Built 2026-11-12 at the owner's request (PLAN W36). Proof:
 (engine, virtual time), `tests/cli_e2e.rs` and `tests/mcp_e2e.rs` (binary).
 
 **Why.** An orchestrator holds its prompt cache by always having a vigil call
-in flight. A hand-made "hold" (a dummy watch on pid 1, a 24 h deadline) was
-cancelled when some other event arrived and not re-armed, and the session fell
-out of cache (one lost 1h35). A hold now has the work itself as its inputs, so
-it ends exactly when the work ends, and it is one object the agent never has to
-re-arm while work is live. Every keepalive also returns `advice` and checks
-usage credits, so an orchestrator holds with vigil even when nothing else is
-watchable (only a subagent running): `vigil hold` with no work.
+in flight. A hand-made dummy watch (pid 1, a 24 h deadline) was cancelled when
+another event arrived and not re-armed, and the session fell out of cache. A
+hold has the work itself as its inputs, so it ends when the work ends, and the
+agent has nothing to re-arm while work is live. With no work to watch (only a
+subagent running) `vigil hold` with no work still holds, and every keepalive
+returns `advice` and checks usage credits.
 
 **A hold is a watch (H1).** `fire = "hold"` is a fourth fire rule beside
 `judge`, `change` and `condition`. Its inputs are *work* inputs; the watch fires
@@ -810,21 +811,36 @@ watches (`judge`, `change`, `condition`) read and behave exactly as before
 
 | front-door spec | input | ended when | reading text |
 |---|---|---|---|
-| `qex:<job-id>` | `{"kind":"qex","job":ID}` | `qex status ID --json --no-logs` shows a state other than `queued`, `starting`, `running`; or qex no longer knows the job (`gone`) | the state name, `gone`, or `error: ...` |
+| `qex:<job>` (id, id prefix or name) | `{"kind":"qex","job":ID}` (always the full id, see H3) | `qex status ID --json --no-logs` shows one of the eight ended states; or qex has no record of the job (`gone`) | the state name, `gone`, or `error: ...` |
 | `pid:<pid>` | `{"kind":"process","pid":N,"want":"exited"}` | the pid is gone, a zombie, or reused (V17) | `running` / `exited` |
 | `file:<path>` | `{"kind":"path_exists","path":P}` | the path exists (a done-marker another program writes) | `missing` / `present` |
 | `until:<RFC3339>` | `{"kind":"until","at":T}` | the wall clock is at or past `T` | `waiting` / `reached` |
-| `idle:<dir>` | `{"kind":"qex_idle","dir":D}` | no qex job under `D` is `queued`, `starting` or `running` | `idle` / `busy: N active` |
+| `idle:<dir>` | `{"kind":"qex_idle","dir":D}` | `qex list --under D --state active --json` lists no job | `idle` / `busy: N active` |
 
-- A read that fails (qex missing, a timeout, unparsable output) reads
-  `error: <why>` and is **not ended**: a hold errs towards staying live, because
-  the cost of an early release is the lost cache. The one exception is qex's own
-  "there is no job" answer, which is `gone` and ended (qex prunes old jobs), so
-  a hold does not outlive its job's record. `vigil hold` and the `hold` tool refuse `gone` at creation
-  (`qex job X not found`; `watch_create` does not check), so a typo is an error at once, not a hold that lives
-  7 days (CLAIM(H3)).
+- A read that fails (qex missing, a timeout, unparsable output, a `--under`
+  directory that no longer exists) reads `error: <why>` and is **not ended**: a
+  hold errs towards staying live, because the cost of an early release is the
+  lost cache. Two answers from qex end the work and read `gone` (CLAIM(H2)):
+  qex's sentence "there is no job ..." (no record and no history of it), and
+  its removed-record sentence for this job's id, "the job ID (NAME) existed ...
+  Something deleted its record" (`qex clean`, or the history prune, ran between
+  two ticks; the job's final state is in that sentence, but the hold only needs
+  that it is over). Both come with exit 127, as does an **ambiguous** name
+  ("`NAME` names N jobs"), which is *not* an end: the exit code alone decides
+  nothing, the sentence does. Because a hold stores the full id (H3), the
+  ambiguous case cannot arise for a hold made through `vigil hold`.
+- H3: `vigil hold` and the `hold` tool resolve every `qex:<job>` to the full job
+  id with one `qex status` and store that id, so a name that is reused later
+  cannot make the hold read another job or go ambiguous. They refuse, writing
+  nothing: a job qex does not know (`qex job X not found`), a name or prefix that
+  names several jobs (`... is ambiguous ...; hold on the full job id`), and a
+  name or prefix when qex cannot answer (it has no identity to store). A full id
+  whose record was already removed is accepted, since it is a real job that
+  ended: its first tick releases. A full id is also accepted when qex cannot
+  answer at creation. `watch_create` stores the `job` it is given as is.
 - qex states: ended = `completed failed killed timeout expired oom cancelled
-  skipped`; live = `queued starting running`. A job that fails and is queued for
+  skipped`. `queued starting running` are live, and so is any other state word
+  (a newer qex's): only the eight end a hold. A job that fails and is queued for
   a retry reads live again; the hold is evaluated afresh at every tick.
 - Not senseable from here, said plainly: a **T3 task / delegate** (its state is
   in the T3 server, not on this host) and a **`boat exec` run** as a Boat job.
@@ -842,11 +858,12 @@ watches (`judge`, `change`, `condition`) read and behave exactly as before
 - at most 16 inputs.
 
 **No re-arming, bounded (H5).** A hold's `deadline_s` defaults to 604800 s (7
-days, the longest any watch lives) and may be lowered, never raised. This is the
-whole "renewal": the deadline is already the sane maximum, so a hold cannot lapse
-on a short fixed deadline while its work is live, and no sliding renewal exists
-to go wrong. A hold that outlives 7 days expires like any watch
-(`next: "watch ended; create a new watch if still needed"`); re-arm it then.
+days, the longest any watch lives) and may be lowered, never raised. There is no
+sliding renewal: the deadline is already the longest any watch lives, so a short
+fixed deadline cannot cut a hold off. It still ends if it is cancelled or when
+the 7 days are up, and then the agent makes a new one (a new id: an ended id
+stays reserved for seven days). An expired hold gives
+`next: "watch ended; create a new watch if still needed"`.
 A hold with **no work** (a bare `vigil hold`) never fires: it stays live until
 cancelled or the 7 days are up.
 
@@ -866,15 +883,19 @@ prompt cache (and the credit checks). `"orchestrator": false` at creation, or
 created, holds included.
 
 **`vigil hold --until-idle` (H10).** `idle:<dir>` with `<dir>` the creating cwd:
-live until no qex job whose cwd is that directory or below is `queued`,
-`starting` or `running` (`qex list --under DIR --all --json`). Scope decision:
-by *directory*, because qex records each job's cwd and the queue is the user's
-own. Consequences, stated: a session that runs jobs from a worktree outside its
-cwd must hold `--for idle:<worktree>` too; with no active job under the
-directory the hold releases at its first tick ("hold released: ... idle"), which
-is the correct answer to "is anything running?". Deferred: scoping by the
-submitting process tree (qex records `submitter` pids), which would follow a
-session into its worktrees; the data is there, the rule is not decided.
+live while any qex job whose cwd is that directory or below has not ended. The
+query is `qex list --under DIR --state active --json` (`active` is every state
+that has not ended): never the history, which is megabytes on a long-lived host
+against the 64 KiB command capture (CLAIM(H10)). Every job the query returns
+counts as active unless its record names an ended state. If the list is still
+longer than the capture, it is read for the job ids it holds and reads `busy:
+N+ active`, never an error. Scope decision: by *directory*, because qex records
+each job's cwd and the queue is the user's own. A session that runs jobs from a
+worktree outside its cwd must hold `--for idle:<worktree>` too; with no active
+job under the directory the hold releases at its first tick ("hold released: ...
+idle"), the correct answer to "is anything running?". A directory that no longer
+exists is an `error:` reading (the hold stays live): cancel it. Deferred:
+scoping by the submitting process tree (qex records `submitter` pids).
 
 **CLI (H11).** `vigil hold [--id ID] [--for SPEC]... [--until-idle]
 [--deadline-s N] [--expect-s N] [--orchestrator BOOL]`. `--for` repeats, one spec per use. Prints the created watch like `vigil
@@ -886,9 +907,10 @@ deadline_s?, expect_s?, orchestrator?}`, same errors as `watch_create`.
 `vigil hold` with neither `--for` nor `--until-idle` is the bare hold (H5).
 
 **Wire compatibility (H12).** `fire: "hold"` and the new `kind`s are additions.
-A new binary reads every existing watch file unchanged; an old binary does not
-understand a watch file with `fire: "hold"` (it reports the file as unreadable),
-so run the new binary on every host that shares a state root.
+A new binary reads every existing watch file unchanged. An old binary does not
+understand a watch file with `fire: "hold"`: `status` and `keepalive` naming it
+report the file as unreadable, while `list` and prune skip it silently and leave
+it alone. Run the new binary on every host that shares a state root.
 
 ## Advisories
 

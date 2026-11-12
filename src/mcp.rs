@@ -53,7 +53,11 @@ pub struct CreateArgs {
     /// What the judge should look for (at most 1024 bytes).
     #[serde(default)]
     pub prompt: String,
-    /// Inputs: {kind: file|glob|cmd|url|port|process, ...} (at most 16).
+    /// Inputs: {kind: file|glob|cmd|url|port|process, ...} (at most 16). The
+    /// work kinds {kind: qex, job}, {kind: qex_idle, dir}, {kind: path_exists,
+    /// path} and {kind: until, at} each end by themselves, so `condition` and
+    /// `hold` take them without a `want`; `hold` takes only these (and a
+    /// process with want = exited).
     /// Typed as objects so clients do not send each input as a JSON string.
     #[schemars(with = "Vec<serde_json::Map<String, Value>>")]
     pub inputs: Vec<Value>,
@@ -63,7 +67,9 @@ pub struct CreateArgs {
     /// Seconds until the watch expires, 1..=604800 (default 3600).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline_s: Option<u64>,
-    /// "judge", "change" or "condition".
+    /// "judge", "change", "condition" or "hold" (fires when every input, all
+    /// work, has ended; no judge fields, no stall_s; deadline defaults to
+    /// 604800 and orchestrator to true). The `hold` tool is the easy way.
     pub fire: String,
     /// How long the job should take, in seconds (at least 1). vigil raises one
     /// `attention` event when the watch has run 1.5x this long (or 9 minutes
@@ -300,7 +306,7 @@ impl VigilServer {
         VigilServer { vigil, tool_router: Self::tool_router() }
     }
 
-    #[tool(description = "Create a watch: inputs to sense, an interval, a deadline, and a fire rule (judge, change or condition). No tick runs until keepalive.")]
+    #[tool(description = "Create a watch: inputs to sense, an interval, a deadline, and a fire rule (judge, change, condition or hold). No tick runs until keepalive.")]
     async fn watch_create(&self, Parameters(args): Parameters<CreateArgs>, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
         let request = serde_json::to_value(&args)
             .and_then(serde_json::from_value::<CreateRequest>)
