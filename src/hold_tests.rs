@@ -16,7 +16,7 @@ use crate::hold::HoldRequest;
 use crate::keepalive::KeepaliveRequest;
 use crate::testing::*;
 use crate::watch::{CreateRequest, FireKind, FireRule, Input, ProcessWant, WatchFile, WatchId};
-use crate::Vigil;
+use crate::{SystemClock, Vigil};
 
 const WEEK: u64 = 604_800;
 
