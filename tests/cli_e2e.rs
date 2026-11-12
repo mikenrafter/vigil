@@ -1878,10 +1878,16 @@ fn an_idle_hold_reads_only_active_jobs_so_a_long_history_cannot_blind_it() {
     assert!(busy.len() > 64 * 1024);
     qex.set_list(&format!("--under {} --state active --json", cwd.display()), &busy);
     assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "busy", "--until-idle"]).status.success());
-    let held = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "busy", "--max-s", "2"]));
-    assert_eq!((held["status"].as_str(), held["events"].as_array().map(Vec::len)), (Some("pending"), Some(0)), "{held}");
-    // (That the truncated list reads `busy: N+`, not `error:`, is pinned on the reading itself in
-    // `hold::tests`: both are `pending` here.)
+    // A pending keepalive blocks for its whole window, so it is started, let tick, and killed.
+    let mut command = sandbox.command();
+    command.args(["keepalive", "busy"]).env("PATH", qex.path());
+    let mut child = piped(command);
+    let active_query = format!("list --under {} --state active --json", cwd.display());
+    assert!(wait_until(Duration::from_secs(10), || qex.calls().iter().any(|call| *call == active_query)), "the hold ticked: {:?}", qex.calls());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let status = stdout_json(&run_with_qex(&sandbox, &qex, &["status", "busy"]));
+    assert_eq!(status["status"], "pending", "{status}");
     assert!(qex.calls().iter().all(|call| !call.contains("--all")), "the history is never asked for: {:?}", qex.calls());
 }
 
