@@ -15,9 +15,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::advisory_store::AdvisorySet;
+use crate::advisory::{probe_body, Advisory, FAILURE_CACHE_S};
+use crate::advisory_store::{AdvisorySet, Entry};
 use crate::clock::{Clock, Timestamp};
 use crate::inputs::InputReader;
+use crate::watch::InputState;
 
 /// A probe that has not answered after this long is a failure (the cmd's own
 /// timeout is at most 19 s; this also bounds `url` and a stuck reader).
@@ -49,10 +51,98 @@ impl Advice {
     }
 }
 
+/// What one probe run learned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Outcome {
+    Value { value: f64 },
+    Failed { reason: String },
+}
+
+/// `<cache dir>/<id>.json`: one probe result and when and for what it was taken.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CacheRecord {
+    fingerprint: String,
+    fetched_at: Timestamp,
+    outcome: Outcome,
+}
+
+impl CacheRecord {
+    /// CLAIM(advisory-cache) ↳ younger than the time to live, and not from the future
+    fn is_current(&self, advisory: &Advisory, now: Timestamp) -> bool {
+        let time_to_live = match self.outcome {
+            Outcome::Value { .. } => advisory.cache_s(),
+            Outcome::Failed { .. } => advisory.cache_s().min(FAILURE_CACHE_S),
+        };
+        let age = now.secs_since(self.fetched_at);
+        self.fingerprint == advisory.fingerprint() && age >= 0 && (age as u64) < time_to_live
+    }
+}
+
+fn cache_file(cache_dir: &Path, advisory: &Advisory) -> std::path::PathBuf {
+    cache_dir.join(format!("{}.json", advisory.id()))
+}
+
+fn read_cache(cache_dir: &Path, advisory: &Advisory) -> Option<CacheRecord> {
+    serde_json::from_slice(&std::fs::read(cache_file(cache_dir, advisory)).ok()?).ok()
+}
+
+/// Best effort: a cache that cannot be written costs the next call a probe.
+fn write_cache(cache_dir: &Path, advisory: &Advisory, record: &CacheRecord) {
+    let target = cache_file(cache_dir, advisory);
+    let tmp = target.with_extension(format!("json.{}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(cache_dir)?;
+        std::fs::write(&tmp, serde_json::to_vec(record)?)?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+async fn probe(advisory: &Advisory, reader: &dyn InputReader) -> Outcome {
+    let failed = |reason: String| Outcome::Failed { reason };
+    let reading = match tokio::time::timeout(PROBE_DEADLINE, reader.read(advisory.probe(), &InputState::default())).await {
+        Ok(reading) => reading,
+        Err(_) => return failed(format!("probe did not answer within {}s", PROBE_DEADLINE.as_secs())),
+    };
+    match probe_body(advisory.probe(), &reading).and_then(|body| advisory.extract_value(&body)) {
+        Ok(value) => Outcome::Value { value },
+        Err(reason) => failed(reason),
+    }
+}
+
+async fn advise_one(advisory: &Advisory, reader: &dyn InputReader, clock: &dyn Clock, cache_dir: &Path) -> Advice {
+    let now = clock.now();
+    let record = match read_cache(cache_dir, advisory).filter(|record| record.is_current(advisory, now)) {
+        Some(record) => record,
+        None => {
+            // The probe's own time is taken after it ran: `checked_at` is when the answer was true.
+            let outcome = probe(advisory, reader).await;
+            let record = CacheRecord { fingerprint: advisory.fingerprint(), fetched_at: clock.now(), outcome };
+            write_cache(cache_dir, advisory, &record);
+            record
+        }
+    };
+    let id = advisory.id().as_str();
+    match record.outcome {
+        // CLAIM(advisory-immediate) ↳ params, condition and messages are applied to the cached number now
+        Outcome::Value { value } => Advice { id: id.to_string(), kind: AdviceKind::Advice, message: advisory.judge(value).message, checked_at: record.fetched_at, value: Some(value) },
+        Outcome::Failed { reason } => Advice::unavailable(id, &reason, record.fetched_at),
+    }
+}
+
 /// Evaluate every entry of `set`, in file order.
 pub async fn advise(set: &AdvisorySet, reader: &dyn InputReader, clock: &dyn Clock, cache_dir: &Path) -> Vec<Advice> {
-    let _ = (set, reader, clock, cache_dir);
-    Vec::new()
+    let mut advice = Vec::with_capacity(set.entries.len());
+    for entry in &set.entries {
+        advice.push(match entry {
+            Entry::Broken { id, reason } => Advice::unavailable(id, reason, clock.now()),
+            Entry::Ready(advisory) => advise_one(advisory, reader, clock, cache_dir).await,
+        });
+    }
+    advice
 }
 
 #[cfg(test)]

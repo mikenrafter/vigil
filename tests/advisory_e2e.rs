@@ -109,7 +109,7 @@ fn set_threshold_changes_the_advice_immediately_with_no_new_probe() {
     assert!(only(&rig.advice_json())["message"].as_str().unwrap().contains("boat-run"));
     let set = rig.run(&["advisory", "set", "boat-budget", "threshold=90"]);
     assert!(set.status.success(), "{}", stderr_of(&set));
-    assert_eq!(stdout_json(&set)["params"]["threshold"], 90.0);
+    assert_eq!(stdout_json(&set)["spec"]["params"]["threshold"], 90.0);
     let message = only(&rig.advice_json())["message"].as_str().unwrap().to_string();
     assert!(message.contains("qex") && message.contains("86.2") && message.contains("90"), "{message}");
     assert_eq!(rig.probe_runs(), 1);
@@ -122,15 +122,17 @@ fn set_threshold_changes_the_advice_immediately_with_no_new_probe() {
 #[test]
 fn a_probe_that_fails_gives_an_unavailable_entry_not_silence() {
     // why: owner item 4: "advisory <id> unavailable: <reason>". The fake boat
-    //      is removed, so the probe cannot run; `vigil advice` still exits 0
-    //      (hooks must not break) and says why.
+    //      is removed, so the probe (run through `env`) exits 127 with env's
+    //      message; `vigil advice` still exits 0 (hooks must not break) and
+    //      says why.
     // proves: CLAIM(advisory-unavailable)
     let rig = Rig::new(479.01);
     std::fs::remove_file(rig.sandbox.home().join(".local/bin/boat")).unwrap();
     let output = rig.run(&["advice"]);
     assert!(output.status.success(), "{}", stderr_of(&output));
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(text.starts_with("boat-budget: advisory boat-budget unavailable: cannot run"), "{text}");
+    assert!(text.starts_with("boat-budget: advisory boat-budget unavailable: probe exited with 127: env:"), "{text}");
+    assert!(text.contains("No such file"), "{text}");
     let json = rig.advice_json();
     assert_eq!(only(&json)["kind"], "unavailable");
 }
@@ -200,7 +202,9 @@ fn add_show_list_and_rm_round_trip() {
     assert_eq!(stdout_json(&rig.run(&["advisory", "list"])).as_array().unwrap().len(), 1);
     // add also reads stdin when no JSON argument is given
     let mut child = rig.command().args(["advisory", "add", "mem"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-    std::io::Write::write_all(child.stdin.as_mut().unwrap(), spec.to_string().as_bytes()).unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut stdin, spec.to_string().as_bytes()).unwrap();
+    drop(stdin); // end of input
     let output = finish_within(child, Duration::from_secs(30));
     assert!(output.status.success(), "{}", stderr_of(&output));
 }

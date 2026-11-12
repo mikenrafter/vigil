@@ -200,6 +200,8 @@ pub enum VigilError {
     /// `keepalive` with no id and no pending watch created by this process.
     #[error("no watches to cover")]
     NothingToCover,
+    #[error(transparent)]
+    Advisory(#[from] crate::advisory::AdvisoryError),
 }
 
 impl VigilError {

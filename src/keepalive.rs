@@ -320,7 +320,12 @@ impl crate::engine::Vigil {
         progress: &dyn ProgressSink,
         cancel: impl std::future::Future<Output = ()>,
     ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
-        self.blocking_call(request, progress, cancel, true).await
+        let mut outcome = self.blocking_call(request, progress, cancel, true).await?;
+        if let Some((envelope, _)) = outcome.as_mut() {
+            // CLAIM(advisory-delivery) ↳ every blocking return of keepalive carries `advice`
+            envelope.advice = self.envelope_advice().await;
+        }
+        Ok(outcome)
     }
 
     /// One blocking call. `remember_call` is whether the watch files record
@@ -725,6 +730,8 @@ impl crate::engine::Vigil {
             let waited_s = started.elapsed().as_secs();
             let since_last_call_s = last_call_before.map(|at| envelope.now.secs_since(at).max(0) as u64);
             envelope.clock = Some(ClockNote::new(waited_s, envelope.elapsed_s, since_last_call_s));
+            // CLAIM(advisory-delivery) ↳ the final envelope of `wait` carries `advice`
+            envelope.advice = self.envelope_advice().await;
             if !envelope.status.is_finished() {
                 self.remember_last_call(std::slice::from_ref(id), &CallRecord::default(), envelope.now).await;
             }

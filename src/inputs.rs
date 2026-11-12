@@ -118,7 +118,7 @@ impl Observed {
     }
 }
 
-fn hash_hex(text: &str) -> String {
+pub(crate) fn hash_hex(text: &str) -> String {
     Sha256::digest(text.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

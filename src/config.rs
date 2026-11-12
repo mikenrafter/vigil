@@ -82,8 +82,14 @@ impl Config {
             on_credit_change: non_empty("VIGIL_ON_CREDIT_CHANGE"),
             credit_check_every: DEFAULT_CREDIT_CHECK_EVERY,
             credit_hook_timeout: DEFAULT_CREDIT_HOOK_TIMEOUT,
-            advisories_file: None,
-            home: None,
+            advisories_file: match non_empty("VIGIL_ADVISORIES_FILE") {
+                Some(setting) if setting == "off" => None,
+                Some(path) => Some(PathBuf::from(path)),
+                None => non_empty("XDG_CONFIG_HOME")
+                    .map(|dir| PathBuf::from(dir).join("vigil/advisories.toml"))
+                    .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".config/vigil/advisories.toml"))),
+            },
+            home: non_empty("HOME"),
         }
     }
 }

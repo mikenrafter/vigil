@@ -70,9 +70,10 @@ async fn initialize_sends_short_instructions_that_teach_the_loop() {
 }
 
 #[tokio::test]
-async fn exactly_the_five_spec_tools_are_listed_with_descriptions() {
+async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     // why: SPEC "MCP tools": watch_create, keepalive, watch_status,
-    //      watch_list, watch_cancel - no more, no fewer. keepalive's schema
+    //      watch_list, watch_cancel, and "Advisories": advice, advisory_* - no
+    //      more, no fewer. keepalive's schema
     //      exposes watch_id and max_s.
     // proves: CLAIM(tool-list)
     let sandbox = Sandbox::new();
@@ -80,7 +81,8 @@ async fn exactly_the_five_spec_tools_are_listed_with_descriptions() {
     let tools = client.list_all_tools().await.unwrap();
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    assert_eq!(names, vec!["keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
+    // The five watch tools of the SPEC plus the six advisory tools (SPEC "Advisories").
+    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
     for tool in &tools {
         assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()), "{} has no description", tool.name);
     }

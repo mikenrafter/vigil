@@ -195,7 +195,10 @@ impl Vigil {
 
     /// The advisories file, or `Disabled` when advisories are off.
     pub fn advisory_store(&self) -> Result<crate::advisory_store::AdvisoryStore, crate::advisory::AdvisoryError> {
-        Err(crate::advisory::AdvisoryError::Disabled)
+        match &self.config.advisories_file {
+            Some(path) => Ok(crate::advisory_store::AdvisoryStore::new(path.clone(), self.config.home.clone())),
+            None => Err(crate::advisory::AdvisoryError::Disabled),
+        }
     }
 
     /// Where probe results are cached: `<state root>/advisory-cache`.
@@ -207,7 +210,19 @@ impl Vigil {
     /// `Err(Disabled)` when advisories are off; a file that cannot be read is
     /// an error here (the CLI reports it).
     pub async fn advice(&self) -> Result<Vec<crate::advisory_eval::Advice>, crate::advisory::AdvisoryError> {
-        Err(crate::advisory::AdvisoryError::Disabled)
+        let set = self.advisory_store()?.load()?;
+        Ok(crate::advisory_eval::advise(&set, self.reader.as_ref(), self.clock.as_ref(), &self.advisory_cache_dir()).await)
+    }
+
+    /// The `advice` of an envelope: `None` when advisories are off. A file that
+    /// cannot be read is one explicit `unavailable` entry, never silence and
+    /// never a failure of the call it rides on (CLAIM(advisory-unavailable)).
+    pub async fn envelope_advice(&self) -> Option<Vec<crate::advisory_eval::Advice>> {
+        match self.advice().await {
+            Ok(advice) => Some(advice),
+            Err(crate::advisory::AdvisoryError::Disabled) => None,
+            Err(error) => Some(vec![crate::advisory_eval::Advice::unavailable("advisories", &error.to_string(), self.clock.now())]),
+        }
     }
 
     /// `watch_create`. Validates (V12, V19), resolves relative inputs against

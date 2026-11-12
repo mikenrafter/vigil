@@ -40,7 +40,9 @@ context the agent expects on wake.
   a `keepalive` call is running. Between calls nothing watches; that is
   acceptable because the agent calls `keepalive` again at once.
 - Never writes inside the working tree or any repository. All files live
-  under `$XDG_STATE_HOME/vigil/`.
+  under `$XDG_STATE_HOME/vigil/`, with one exception: the advisories file
+  under `$XDG_CONFIG_HOME` (see "Advisories"), which only `vigil advisory` and
+  the first-use seed write.
 
 ## Terms
 
@@ -68,8 +70,8 @@ mcp` (new session, harness restart) picks up where the file says.
 
 - `vigil mcp`: stdio MCP server. Runs ticks only inside a `keepalive` call,
   in-process.
-- `vigil` CLI subcommands (`create`, `status`, `list`, `cancel`, `keepalive`)
-  run the same code against the same files. Programmatic monitors, with no
+- `vigil` CLI subcommands (`create`, `status`, `list`, `cancel`, `keepalive`,
+  `wait`, `advice`, `advisory`) run the same code against the same files. Programmatic monitors, with no
   agent involved, use these; `vigil keepalive` blocks in the shell the same
   way.
 
@@ -241,6 +243,10 @@ Non-blocking reads and cancel. `watch_status` also reports judge reachability
   `"clock": {"waited_s", "watch_age_s", "since_last_call_s" (null on the first call), "summary"}`.
   `summary` is one plain line, e.g. `waited 55m 0s this call; watching for
   2h 10m; last call 55m ago`.
+- `advice` rides on every blocking return (with `cache` and `clock`) when
+  advisories are on: a list of `{id, kind: "advice"|"unavailable", message,
+  checked_at, value?}`; see "Advisories". Absent when advisories are off or on
+  status and cancel; `[]` when on with none configured.
 - An event with a `kind` key is not about an input: `attention` (with
   `reason` `overdue` | `stalled`) or `credit_state_changed` (`on_credits`,
   `source`, `windows`, optional `hook`). Either one ends the call with
@@ -292,7 +298,8 @@ Failure rules:
 ## State
 
 Files only, under `$XDG_STATE_HOME/vigil/` (default `~/.local/state/vigil/`).
-Nothing is written to the working tree, `$XDG_CONFIG_HOME` or any repository.
+Nothing is written to the working tree or any repository, and nothing to
+`$XDG_CONFIG_HOME` except the advisories file (see "Advisories").
 
 - `watches/<id>.json`: the watch as created (paths already absolute, see
   V11), plus `status`, `created_at`, `deadline_at` (absolute UTC),
@@ -769,3 +776,128 @@ ENOSPC) exits 1 and leaves the events to be replayed by the next call.
 `VIGIL_UW_COMMAND`; `VIGIL_ON_CREDIT_CHANGE`. `VIGIL_TEST_FAULT` gains the write
 kind `credit` and `hold=PATH` rules (test-only, trusted environment).
 
+
+## Advisories
+
+Rules the operator programs at runtime that tell agents what to do, delivered
+wherever vigil talks to an agent. Built 2026-11-12 at the owner's request. Proof:
+`src/advisory*.rs` (unit), `src/advisory_tests.rs` (engine), `tests/advisory_e2e.rs`
+(binary, CLI and MCP). Claim ids below are the `CLAIM(...)` ids in code and tests.
+
+**Why.** An agent cannot see Boat's remaining hours or the host's memory; the
+operator can write down once what to do about them, and every agent reads it
+where it already looks: the keepalive result. The first rule: prefer Boat
+(cloud sandboxes) for all heavy work; when Boat's remaining hours are at or below
+a threshold (default 10%), use `qex` on the local host.
+
+**An advisory** is `{probe, extract, params, condition, message_when_true,
+message_when_false, cache_s}` under an id `[A-Za-z0-9_-]{1,64}`:
+
+- `probe`: a `cmd` (argv), `url` (http) or `file` input, the same shapes as a
+  watch input (cmd `timeout_s` 0.1..=19). A `cmd` must exit 0 and a `url` answer
+  2xx, else the probe failed. `port`, `process` and `glob` cannot give text and
+  are refused.
+- `extract`: how to get one number from the probe's output. Either
+  `json = "a.b.0.c"` (dotted path; array indices; a numeric string counts), with
+  optional `of = "a.d"` (divide by that path; a zero denominator is a failure)
+  and `scale = 100` (multiply last); or `regex = "..."` (group 1, else the whole
+  match; at most 256 bytes). `name` (default `value`) is what the number is
+  called in the condition and messages; `value` always works as an alias.
+- `params`: named finite numbers (at most 16; letters, digits, `_`; not a setting
+  name; not the extract name).
+- `condition`: `<operand> <op> <operand>`, op one of `<= < >= > == !=`, an operand
+  a known name or a number literal, at least one a name (at most 128 bytes).
+- `message_when_true` / `message_when_false`: one line, at most 512 bytes;
+  `{name}` is the extracted number or a param, printed with at most one decimal
+  and no trailing `.0` (`7.3`, `10`); `{{` and `}}` are literal braces. An unknown
+  name is an error when written, never printed.
+- `cache_s`: how long a probe result is reused (default 600; 0 = probe every
+  call; at most 86400).
+
+Everything is checked once, in `Advisory::new`, whichever door it came through
+(CLAIM(advisory-valid)). At most 32 advisories. Unknown fields are errors.
+
+**The file (CLAIM(advisory-file), advisory-reread, advisory-seed, advisory-lock).**
+`$VIGIL_ADVISORIES_FILE`, else `$XDG_CONFIG_HOME/vigil/advisories.toml`, else
+`~/.config/vigil/advisories.toml`. `VIGIL_ADVISORIES_FILE=off` turns advisories
+off (no `advice` key anywhere; the test sandboxes use it). One table per
+advisory:
+
+```toml
+[advisories.boat-budget]
+probe = { kind = "cmd", argv = ["env", "BOAT_NO_UPDATE=1", "/home/user/.local/bin/boat", "limits", "--json"], timeout_s = 15 }
+extract = { name = "pct", json = "planIncluded.vmHoursRemaining", of = "planIncluded.vmHours", scale = 100 }
+condition = "pct <= threshold"
+message_when_true = "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): ..."
+message_when_false = "Boat has {pct}% ... prefer Boat ... via edge.research/bin/boat-run; ..."
+cache_s = 600
+[advisories.boat-budget.params]
+threshold = 10
+```
+
+The file is read on every call, so a hand edit takes effect with no restart.
+`vigil advisory ...` edits it in place under `<file>.lock` (an `flock` held across
+read, check and rename), keeping the operator's comments, and writes
+tmp + fsync + rename; a refused edit leaves the bytes untouched. A file that does
+not exist is created with the default `boat-budget`; a file that exists is never
+given defaults back (so `rm boat-budget` sticks). A table that no longer
+validates is reported as its own `unavailable` entry and does not hide the others;
+a file that is not TOML is an error naming it and is never rewritten.
+
+**Evaluation (CLAIM(advisory-cache), advisory-immediate, advisory-unavailable).**
+Per advisory: use the cached probe result if it is younger than `cache_s` (a
+failed probe: at most 30 s), it was taken for the same probe and extraction
+(a hash), and its time is not in the future; else run the probe through the
+engine's input reader (deadline 20 s), take the number, and cache the outcome in
+`<state root>/advisory-cache/<id>.json` (atomic, best effort), so separate
+`vigil` processes share it. The condition and message are applied to the cached
+number on every call, so `advisory set ... threshold=15` shows on the very next
+return with no new probe. Every failure (probe exit code, timeout, HTTP status,
+missing field, not JSON, regex no match, bad file) becomes the entry
+`advisory <id> unavailable: <reason>`; a value older than its cache time is never
+shown, and nothing is silent. Probes run one after another, so many slow
+advisories add up (at most 32 x 20 s; keep probes cheap).
+
+**Delivery (CLAIM(advisory-delivery)).** `advice` is on the final envelope of
+every `keepalive` (CLI and MCP) and of `wait`, evaluated when the call returns
+(a probe adds at most its own time, only on a cache miss). `vigil advice` prints
+one `id: message` line per advisory (`--json`: `{"advice": [...]}`) for hooks
+and scripts; it exits 0 even when a probe failed (the failure is a line), and 1
+only when advisories are off. The MCP server `instructions` say results carry
+`advice`.
+
+**CLI.** `vigil advice [--json]`; `vigil advisory list|show ID|add ID [JSON]
+[--replace]|set ID NAME=VALUE...|rm ID`. Output is JSON (`list`: an array;
+`show`/`add`/`set`: `{id, spec}`, `show` plus the current `advice`; `rm`:
+`{removed}`); errors are one line on stderr, exit 1. `set` takes a parameter name
+or one of `cache_s`, `condition`, `message_when_true`, `message_when_false`; a
+name that is none of those is an error listing the parameters, and all
+assignments apply together or not at all (CLAIM(advisory-set)). Settings can
+change values, not add parameters: use `add --replace` for that.
+
+**MCP tools.** `advice`, `advisory_list`, `advisory_show {id}`,
+`advisory_add {id, spec, replace?}`, `advisory_set {id, settings: {name: number|string}}`,
+`advisory_rm {id}`: the same operations as the CLI (`src/advisory_ops.rs`), errors
+as `isError` with the CLI's message.
+
+**Default advisory `boat-budget` (CLAIM(advisory-boat-budget)).** Probe `env
+BOAT_NO_UPDATE=1 <home>/.local/bin/boat limits --json` (read-only; `env` keeps the
+CLI from self-updating, and the absolute path survives a PATH without
+`~/.local/bin`; `boat` alone when HOME is unknown). `pct =
+planIncluded.vmHoursRemaining / planIncluded.vmHours * 100`, `threshold = 10`,
+true when `pct <= threshold` (exactly 10% counts): use `qex` on this host for
+heavy jobs; false: prefer Boat via `edge.research/bin/boat-run` for builds and
+test runs, `qex` locally only for one or two quick runs. To change the threshold:
+`vigil advisory set boat-budget threshold=15` (or the MCP tool `advisory_set`, or
+edit the file).
+
+**Trust.** The model is an untrusted caller of `advisory_add` and `advisory_set`,
+but `watch_create` already lets it run any `cmd` input, so an advisory probe adds
+no new power; it adds persistence (the probe reruns, cached, on later calls
+until removed). Text read from a probe never reaches an agent: only the extracted
+number, formatted, is placed in the operator-written message. Bounds above cap
+what a caller can make vigil store or run.
+
+**Hook.** agent-integration's Claude/Codex PreToolUse hook runs `vigil advice`
+before heavy Bash commands (flutter test, edge-test, cargo build/test, gradle,
+nix build, qex submit) and injects the lines as additional context; it fails open.

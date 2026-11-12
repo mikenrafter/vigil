@@ -1,4 +1,4 @@
-//! stdio MCP front: five tools over `Vigil`.
+//! stdio MCP front: the five watch tools and the advisory tools over `Vigil`.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -28,11 +28,10 @@ use crate::watch::{CreateRequest, WatchId};
 /// exactly "call keepalive again" ("act on events" means act on them; the
 /// ended text means create a new watch only if still needed).
 pub fn server_instructions() -> String {
-    "vigil keeps your turn open while a cheap judge watches things. Call watch_create to say what to watch, \
-     then call keepalive again and again. Read `next` in each result. While it is exactly \"call keepalive again\", \
-     call keepalive again. Otherwise stop calling it: \"act on events\" means act on the events; \
-     \"watch ended; create a new watch if still needed\" means the watch expired or was cancelled. \
-     watch_status, watch_list and watch_cancel inspect or end watches."
+    "vigil keeps your turn open while a cheap judge watches things. watch_create says what to watch; then call \
+     keepalive again and again. Read `next`: while it is exactly \"call keepalive again\", call it again; otherwise stop \
+     (\"act on events\": act on them; \"watch ended; create a new watch if still needed\": expired or cancelled). \
+     Results carry `advice`: operator rules to follow; advisory_set changes them."
         .to_string()
 }
 
@@ -98,6 +97,36 @@ pub struct KeepaliveArgs {
     pub max_s: Option<u64>,
     /// True only for the main orchestrator session; a subagent never sets it.
     pub orchestrator: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AdvisoryIdArgs {
+    /// The advisory's id, e.g. `boat-budget`.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AdvisorySetArgs {
+    /// The advisory's id, e.g. `boat-budget`.
+    pub id: String,
+    /// Names and new values: a parameter by name (`{"threshold": 15}`), or
+    /// `cache_s`, `condition`, `message_when_true`, `message_when_false`.
+    #[schemars(with = "serde_json::Map<String, Value>")]
+    pub settings: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AdvisoryAddArgs {
+    /// New advisory id, `[A-Za-z0-9_-]{1,64}`.
+    pub id: String,
+    /// The advisory: {probe: {kind: cmd|url|file, ...}, extract: {name?, json?, of?, scale?, regex?},
+    /// params?: {name: number}, condition: "<name> <op> <name or number>", message_when_true,
+    /// message_when_false (use {name} for the value and params), cache_s?}.
+    #[schemars(with = "serde_json::Map<String, Value>")]
+    pub spec: Value,
+    /// Replace an advisory that already has this id.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -222,6 +251,23 @@ fn reply<T: Serialize>(outcome: Result<T, VigilError>) -> CallToolResult {
     }
 }
 
+/// Advisory results: the JSON value, or `isError` with the message.
+fn advisory_reply(outcome: Result<Value, crate::advisory::AdvisoryError>) -> CallToolResult {
+    reply(outcome.map_err(VigilError::from))
+}
+
+/// `{"threshold": 15, "condition": "pct < threshold"}` -> `["condition=pct < threshold", "threshold=15"]`.
+fn assignments_of(settings: &serde_json::Map<String, Value>) -> Result<Vec<String>, crate::advisory::AdvisoryError> {
+    settings
+        .iter()
+        .map(|(name, value)| match value {
+            Value::Number(number) => Ok(format!("{name}={number}")),
+            Value::String(text) => Ok(format!("{name}={text}")),
+            other => Err(crate::advisory::AdvisoryError::invalid(&format!("settings.{name}"), format!("must be a number or a string, got {other}"))),
+        })
+        .collect()
+}
+
 fn parse_id(raw: &str) -> Result<WatchId, VigilError> {
     Ok(WatchId::parse(raw)?)
 }
@@ -280,6 +326,36 @@ impl VigilServer {
             Ok(Some(envelope)) => reply(Ok(envelope)),
             Err(error) => reply::<()>(Err(error)),
         })
+    }
+
+    #[tool(description = "The current advice: operator rules for agents, each with an id and a message to follow. Same list every keepalive result carries.")]
+    async fn advice(&self) -> Result<CallToolResult, ErrorData> {
+        Ok(advisory_reply(self.vigil.advice_report().await))
+    }
+
+    #[tool(description = "List advisories: id, status, parameters (e.g. threshold), condition and cache time.")]
+    async fn advisory_list(&self) -> Result<CallToolResult, ErrorData> {
+        Ok(advisory_reply(self.vigil.advisory_list()))
+    }
+
+    #[tool(description = "One advisory: its full spec and its current evaluation.")]
+    async fn advisory_show(&self, Parameters(args): Parameters<AdvisoryIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(advisory_reply(self.vigil.advisory_show(&args.id).await))
+    }
+
+    #[tool(description = "Add an advisory (a probe command, how to extract a number, params, a condition and two messages). Unknown or malformed fields are errors.")]
+    async fn advisory_add(&self, Parameters(args): Parameters<AdvisoryAddArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(advisory_reply(self.vigil.advisory_add(&args.id, args.spec, args.replace)))
+    }
+
+    #[tool(description = "Change an advisory at runtime, e.g. id boat-budget, settings {\"threshold\": 15}. Applies at once. Unknown parameters and bad values are errors and change nothing.")]
+    async fn advisory_set(&self, Parameters(args): Parameters<AdvisorySetArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(advisory_reply(assignments_of(&args.settings).and_then(|assignments| self.vigil.advisory_set(&args.id, &assignments))))
+    }
+
+    #[tool(description = "Remove an advisory.")]
+    async fn advisory_rm(&self, Parameters(args): Parameters<AdvisoryIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(advisory_reply(self.vigil.advisory_remove(&args.id)))
     }
 
     #[tool(description = "Non-blocking: the current envelope of one watch, plus judge reachability. Does not tick.")]

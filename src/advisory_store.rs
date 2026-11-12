@@ -18,9 +18,13 @@
 //! and rename, so concurrent edits do not lose each other. A refused edit
 //! leaves the file's bytes untouched.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::advisory::{Advisory, AdvisoryError, AdvisoryId, AdvisorySpec};
+use serde_json::Value;
+use toml_edit::{DocumentMut, Item, Table, TableLike};
+
+use crate::advisory::{default_boat_budget, Advisory, AdvisoryError, AdvisoryId, AdvisorySpec, MAX_ADVISORIES};
 
 /// One table of the file: a usable advisory, or why it is not (a hand edit
 /// that no longer validates must not hide the other advisories).
@@ -57,6 +61,12 @@ pub struct AdvisoryStore {
     home: Option<String>,
 }
 
+const TABLE: &str = "advisories";
+
+const SEED_HEADER: &str = "# vigil advisories: rules that tell agents what to do, delivered on every keepalive/wait\n\
+# envelope and by `vigil advice`. vigil re-reads this file on every call, so edits apply at once.\n\
+# Change a number at runtime:  vigil advisory set boat-budget threshold=15\n\n";
+
 impl AdvisoryStore {
     pub fn new(path: PathBuf, home: Option<String>) -> AdvisoryStore {
         AdvisoryStore { path, home }
@@ -64,31 +74,305 @@ impl AdvisoryStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    fn file_error(&self, reason: impl std::fmt::Display) -> AdvisoryError {
+        AdvisoryError::File { path: self.path.display().to_string(), reason: reason.to_string() }
+    }
+
+    /// The text of the file we would seed.
+    fn seed_text(&self) -> String {
+        let (id, spec) = default_boat_budget(self.home.as_deref());
+        let mut doc = DocumentMut::new();
+        let mut advisories = Table::new();
+        advisories.set_implicit(true);
+        advisories.insert(id.as_str(), Item::Table(spec_to_table(&spec)));
+        doc.insert(TABLE, Item::Table(advisories));
+        format!("{SEED_HEADER}{doc}")
+    }
+
     /// Read the file now. A missing file yields (and writes, best effort) the
     /// default advisory. A file that is not valid TOML is an error; a table
     /// that is not a valid advisory is a `Broken` entry.
     pub fn load(&self) -> Result<AdvisorySet, AdvisoryError> {
-        Ok(AdvisorySet::default())
+        // CLAIM(advisory-reread) ↳ the file is read here, on every call
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.seed()?,
+            Err(error) => return Err(self.file_error(error)),
+        };
+        Ok(AdvisorySet { entries: entries_of(&self.parse(&text)?) })
     }
+
+    /// CLAIM(advisory-seed): under the lock, write the default only if the file
+    /// is still absent; whatever is there afterwards is what is returned. A
+    /// file that cannot be written (read-only config) still gives the default
+    /// in memory: an advisory that cannot be seeded is better than none.
+    fn seed(&self) -> Result<String, AdvisoryError> {
+        let seed = self.seed_text();
+        let seeded = (|| -> std::io::Result<String> {
+            let _lock = self.lock()?;
+            match std::fs::read_to_string(&self.path) {
+                Ok(existing) => Ok(existing),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.write_atomically(&seed)?;
+                    Ok(seed.clone())
+                }
+                Err(error) => Err(error),
+            }
+        })();
+        Ok(seeded.unwrap_or(seed))
+    }
+
+    fn parse(&self, text: &str) -> Result<DocumentMut, AdvisoryError> {
+        text.parse::<DocumentMut>().map_err(|error| self.file_error(error))
+    }
+
+    fn lock(&self) -> std::io::Result<std::fs::File> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.path.with_file_name(name))?;
+        file.lock()?;
+        Ok(file)
+    }
+
+    /// tmp + fsync + rename: readers see the old file or the new one.
+    fn write_atomically(&self, text: &str) -> std::io::Result<()> {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".tmp");
+        let tmp = self.path.with_file_name(name);
+        let written = (|| {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &self.path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
+    }
+
+    /// CLAIM(advisory-lock): read, check, change and rename all under one
+    /// lock; a refused change writes nothing.
+    fn edit<T>(&self, change: impl FnOnce(&mut DocumentMut) -> Result<T, AdvisoryError>) -> Result<T, AdvisoryError> {
+        let _lock = self.lock().map_err(|error| self.file_error(error))?;
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.seed_text(),
+            Err(error) => return Err(self.file_error(error)),
+        };
+        let mut doc = self.parse(&text)?;
+        let outcome = change(&mut doc)?;
+        self.write_atomically(&doc.to_string()).map_err(|error| self.file_error(error))?;
+        Ok(outcome)
+    }
+
     /// Add `spec` as `id`. An existing id is an error unless `replace`.
     pub fn add(&self, id: &str, spec: AdvisorySpec, replace: bool) -> Result<Advisory, AdvisoryError> {
-        let _ = (id, spec, replace);
-        Err(AdvisoryError::Disabled)
+        let advisory = Advisory::new(AdvisoryId::parse(id)?, spec)?;
+        self.edit(|doc| {
+            let table = table_mut(doc, &self.path)?;
+            let exists = table.contains_key(id);
+            if exists && !replace {
+                return Err(AdvisoryError::Exists(id.to_string()));
+            }
+            if !exists && table.len() >= MAX_ADVISORIES {
+                return Err(AdvisoryError::TooMany(MAX_ADVISORIES));
+            }
+            table.insert(id, Item::Table(spec_to_table(advisory.spec())));
+            Ok(advisory.clone())
+        })
     }
+
     /// Apply `name=value` settings to `id` (see `Advisory::with_settings`).
     pub fn set(&self, id: &str, assignments: &[String]) -> Result<Advisory, AdvisoryError> {
-        let _ = (id, assignments);
-        Err(AdvisoryError::Disabled)
+        self.edit(|doc| {
+            let table = table_mut(doc, &self.path)?;
+            let current = usable(id, table)?;
+            let changed = current.with_settings(assignments)?;
+            let item = table.get_mut(id).and_then(Item::as_table_like_mut).expect("usable() found it");
+            write_changes(item, current.spec(), changed.spec());
+            Ok(changed)
+        })
     }
+
     pub fn remove(&self, id: &str) -> Result<(), AdvisoryError> {
-        let _ = id;
-        Err(AdvisoryError::Disabled)
+        self.edit(|doc| {
+            let table = table_mut(doc, &self.path)?;
+            if table.remove(id).is_none() {
+                return Err(unknown(id, table));
+            }
+            Ok(())
+        })
     }
+
     /// One advisory, which must be usable.
     pub fn get(&self, id: &str) -> Result<Advisory, AdvisoryError> {
-        let _ = id;
-        Err(AdvisoryError::Disabled)
+        let set = self.load()?;
+        let ids = set.ids();
+        match set.entries.into_iter().find(|entry| entry.id() == id) {
+            Some(Entry::Ready(advisory)) => Ok(advisory),
+            Some(Entry::Broken { id, reason }) => Err(AdvisoryError::invalid(&format!("advisory {id}"), reason)),
+            None => Err(AdvisoryError::Unknown { id: id.to_string(), known: known_list(&ids) }),
+        }
     }
+}
+
+fn known_list(ids: &[String]) -> String {
+    if ids.is_empty() { "none".to_string() } else { ids.join(", ") }
+}
+
+fn unknown(id: &str, table: &Table) -> AdvisoryError {
+    let ids: Vec<String> = table.iter().map(|(key, _)| key.to_string()).collect();
+    AdvisoryError::Unknown { id: id.to_string(), known: known_list(&ids) }
+}
+
+fn table_mut<'a>(doc: &'a mut DocumentMut, path: &Path) -> Result<&'a mut Table, AdvisoryError> {
+    if !doc.contains_key(TABLE) {
+        let mut advisories = Table::new();
+        advisories.set_implicit(true);
+        doc.insert(TABLE, Item::Table(advisories));
+    }
+    doc[TABLE].as_table_mut().ok_or_else(|| AdvisoryError::File { path: path.display().to_string(), reason: format!("`{TABLE}` must be a table, with one [{TABLE}.<id>] table per advisory") })
+}
+
+/// The entry `id` as a checked advisory, or the reason it cannot be one.
+fn usable(id: &str, table: &Table) -> Result<Advisory, AdvisoryError> {
+    let item = table.get(id).ok_or_else(|| unknown(id, table))?;
+    match entry_of(id, item) {
+        Entry::Ready(advisory) => Ok(advisory),
+        Entry::Broken { id, reason } => Err(AdvisoryError::invalid(&format!("advisory {id}"), reason)),
+    }
+}
+
+fn entries_of(doc: &DocumentMut) -> Vec<Entry> {
+    match doc.get(TABLE).and_then(Item::as_table_like) {
+        Some(table) => table.iter().map(|(id, item)| entry_of(id, item)).collect(),
+        None => Vec::new(),
+    }
+}
+
+fn entry_of(id: &str, item: &Item) -> Entry {
+    let broken = |reason: String| Entry::Broken { id: id.to_string(), reason };
+    let spec: AdvisorySpec = match serde_json::from_value(item_to_json(item)) {
+        Ok(spec) => spec,
+        Err(error) => return broken(format!("not an advisory: {error}")),
+    };
+    match AdvisoryId::parse(id).and_then(|parsed| Advisory::new(parsed, spec)) {
+        Ok(advisory) => Entry::Ready(advisory),
+        Err(error) => broken(error.to_string()),
+    }
+}
+
+// ---- TOML <-> JSON --------------------------------------------------------
+
+fn item_to_json(item: &Item) -> Value {
+    match item {
+        Item::None => Value::Null,
+        Item::Value(value) => value_to_json(value),
+        Item::Table(table) => Value::Object(table.iter().map(|(key, item)| (key.to_string(), item_to_json(item))).collect()),
+        Item::ArrayOfTables(tables) => Value::Array(tables.iter().map(|table| Value::Object(table.iter().map(|(key, item)| (key.to_string(), item_to_json(item))).collect())).collect()),
+    }
+}
+
+fn value_to_json(value: &toml_edit::Value) -> Value {
+    use toml_edit::Value as Toml;
+    match value {
+        Toml::String(text) => Value::String(text.value().clone()),
+        Toml::Integer(number) => Value::from(*number.value()),
+        // NaN and infinity have no JSON form; a string makes the spec fail to
+        // parse with a type error instead of the number vanishing.
+        Toml::Float(number) => serde_json::Number::from_f64(*number.value()).map_or_else(|| Value::String(format!("non-finite number {}", number.value())), Value::Number),
+        Toml::Boolean(flag) => Value::Bool(*flag.value()),
+        Toml::Datetime(stamp) => Value::String(stamp.value().to_string()),
+        Toml::Array(items) => Value::Array(items.iter().map(value_to_json).collect()),
+        Toml::InlineTable(table) => Value::Object(table.iter().map(|(key, value)| (key.to_string(), value_to_json(value))).collect()),
+    }
+}
+
+fn json_to_value(value: &Value) -> Option<toml_edit::Value> {
+    Some(match value {
+        Value::Null => return None,
+        Value::Bool(flag) => (*flag).into(),
+        Value::Number(number) => match number.as_i64() {
+            Some(whole) => whole.into(),
+            None => number.as_f64()?.into(),
+        },
+        Value::String(text) => text.as_str().into(),
+        Value::Array(items) => items.iter().filter_map(json_to_value).collect::<toml_edit::Array>().into(),
+        Value::Object(map) => {
+            let mut table = toml_edit::InlineTable::new();
+            for (key, value) in map {
+                if let Some(value) = json_to_value(value) {
+                    table.insert(key, value);
+                }
+            }
+            table.into()
+        }
+    })
+}
+
+/// `10.0` is written `10`, `7.5` as `7.5`.
+fn number_value(number: f64) -> toml_edit::Value {
+    if number.fract() == 0.0 && number.abs() < 1e15 { (number as i64).into() } else { number.into() }
+}
+
+/// The canonical on-disk form of a spec: scalar fields, `probe` and `extract`
+/// as inline tables, `params` as its own table.
+fn spec_to_table(spec: &AdvisorySpec) -> Table {
+    let json = serde_json::to_value(spec).expect("a spec always serializes");
+    let mut table = Table::new();
+    for key in ["probe", "extract", "condition", "message_when_true", "message_when_false", "cache_s"] {
+        if let Some(value) = json.get(key).and_then(json_to_value) {
+            table.insert(key, Item::Value(value));
+        }
+    }
+    if !spec.params.is_empty() {
+        let mut params = Table::new();
+        for (name, number) in &spec.params {
+            params.insert(name, Item::Value(number_value(*number)));
+        }
+        table.insert("params", Item::Table(params));
+    }
+    table
+}
+
+/// Apply only what differs between `old` and `new` to the entry in place, so
+/// comments and layout the operator wrote survive.
+fn write_changes(entry: &mut dyn TableLike, old: &AdvisorySpec, new: &AdvisorySpec) {
+    for (key, before, after) in [
+        ("condition", &old.condition, &new.condition),
+        ("message_when_true", &old.message_when_true, &new.message_when_true),
+        ("message_when_false", &old.message_when_false, &new.message_when_false),
+    ] {
+        if before != after {
+            replace_value(entry, key, after.as_str().into());
+        }
+    }
+    if old.cache_s != new.cache_s {
+        replace_value(entry, "cache_s", (new.cache_s.unwrap_or(crate::advisory::DEFAULT_CACHE_S) as i64).into());
+    }
+    for (name, number) in &new.params {
+        if old.params.get(name) != Some(number)
+            && let Some(params) = entry.get_mut("params").and_then(Item::as_table_like_mut)
+        {
+            replace_value(params, name, number_value(*number));
+        }
+    }
+}
+
+/// Set `key`, keeping the comment and spacing around the value it replaces.
+fn replace_value(table: &mut dyn TableLike, key: &str, mut value: toml_edit::Value) {
+    // In place, so the key keeps the comment lines above it too.
+    if let Some(Item::Value(old)) = table.get_mut(key) {
+        *value.decor_mut() = old.decor().clone();
+        *old = value;
+        return;
+    }
+    table.insert(key, Item::Value(value));
 }
 
 #[cfg(test)]
@@ -288,7 +572,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(&dir);
         let params: serde_json::Map<String, serde_json::Value> = (0..8).map(|n| (format!("p{n}"), json!(0))).collect();
-        store.add("many", spec(json!({"params": params, "condition": "free < p0"})), false).unwrap();
+        store.add("many", spec(json!({"params": params, "condition": "free < p0", "message_when_true": "Low {free}", "message_when_false": "Plenty {free}"})), false).unwrap();
         std::thread::scope(|scope| {
             for n in 0..8 {
                 let store = store.clone();

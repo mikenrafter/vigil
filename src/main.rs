@@ -38,6 +38,17 @@ enum Command {
         #[arg(long)]
         orchestrator: bool,
     },
+    /// Print the current advice (operator rules for agents), for hooks and
+    /// scripts: one `id: message` line per advisory, or JSON with --json.
+    Advice {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Program advisories: rules that tell agents what to do (SPEC "Advisories").
+    Advisory {
+        #[command(subcommand)]
+        command: AdvisoryCommand,
+    },
     /// Block with no ceiling until the watch finishes; print ONE final
     /// envelope JSON (all events in it; no streaming, R8/V21).
     ///
@@ -49,6 +60,31 @@ enum Command {
         #[arg(long)]
         orchestrator: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdvisoryCommand {
+    /// List advisories (id, status, params, condition, cache time).
+    List,
+    /// One advisory: its spec and its current evaluation.
+    Show { id: String },
+    /// Add an advisory from one JSON object (argument, or stdin if absent).
+    Add {
+        id: String,
+        json: Option<String>,
+        /// Replace an existing advisory of that id.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Change settings: `NAME=VALUE` for a parameter (e.g. threshold=15), or
+    /// for cache_s, condition, message_when_true, message_when_false.
+    Set {
+        id: String,
+        #[arg(required = true, num_args = 1..)]
+        settings: Vec<String>,
+    },
+    /// Remove an advisory.
+    Rm { id: String },
 }
 
 fn main() {
@@ -199,6 +235,41 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             vigil.commit_delivery(delivery);
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(wait_exit_code(&envelope).unwrap_or(0))
+        }
+        Command::Advice { json } => {
+            let report = vigil.advice_report().await?;
+            if json {
+                print_json(&report)?;
+            } else {
+                for entry in report["advice"].as_array().into_iter().flatten() {
+                    println!("{}: {}", entry["id"].as_str().unwrap_or("?"), entry["message"].as_str().unwrap_or(""));
+                }
+            }
+            Ok(0)
+        }
+        Command::Advisory { command } => {
+            let shown = match command {
+                AdvisoryCommand::List => vigil.advisory_list()?,
+                AdvisoryCommand::Show { id } => vigil.advisory_show(&id).await?,
+                AdvisoryCommand::Add { id, json, replace } => {
+                    let raw = match json {
+                        Some(raw) => raw,
+                        None => {
+                            let mut raw = String::new();
+                            tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut raw).await?;
+                            raw
+                        }
+                    };
+                    let spec = serde_json::from_str(&raw).map_err(|error| anyhow::anyhow!("invalid advisory JSON: {error}"));
+                    // The id is checked before the body, so a bad id is named first.
+                    vigil::AdvisoryId::parse(&id)?;
+                    vigil.advisory_add(&id, spec?, replace)?
+                }
+                AdvisoryCommand::Set { id, settings } => vigil.advisory_set(&id, &settings)?,
+                AdvisoryCommand::Rm { id } => vigil.advisory_remove(&id)?,
+            };
+            print_json(&shown)?;
+            Ok(0)
         }
         Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil)).await.map(|()| 0),
     }

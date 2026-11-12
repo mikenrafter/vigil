@@ -19,6 +19,9 @@
 
 use std::collections::BTreeMap;
 
+use regex::Regex;
+use serde_json::Value;
+
 use serde::{Deserialize, Serialize};
 
 use crate::inputs::Reading;
@@ -70,7 +73,12 @@ pub struct AdvisoryId(String);
 
 impl AdvisoryId {
     pub fn parse(raw: &str) -> Result<AdvisoryId, AdvisoryError> {
-        Ok(AdvisoryId(raw.to_string()))
+        let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if (1..=64).contains(&raw.len()) && raw.chars().all(allowed) {
+            Ok(AdvisoryId(raw.to_string()))
+        } else {
+            Err(AdvisoryError::BadId(raw.to_string()))
+        }
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -127,17 +135,337 @@ pub struct Verdict {
     pub message: String,
 }
 
+/// Names a condition or message may use: parameters, the extracted number's
+/// name, and `value`.
+type Scope = BTreeMap<String, f64>;
+
+fn is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && text.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn known_names(scope: &Scope) -> String {
+    scope.keys().cloned().collect::<Vec<_>>().join(", ")
+}
+
+// ---- extraction -----------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum Extract {
+    Json { path: String, of: Option<String>, scale: f64 },
+    Pattern(Regex),
+}
+
+impl Extract {
+    fn compile(spec: &ExtractSpec) -> Result<Extract, AdvisoryError> {
+        let bad = |reason: &str| AdvisoryError::invalid("extract", reason);
+        match (&spec.json, &spec.regex) {
+            (Some(_), Some(_)) => Err(bad("give either json or regex, not both")),
+            (None, None) => Err(bad("give json (a dotted path) or regex")),
+            (Some(path), None) => {
+                for (label, text) in [("json", Some(path)), ("of", spec.of.as_ref())] {
+                    if let Some(text) = text
+                        && (text.is_empty() || text.split('.').any(str::is_empty))
+                    {
+                        return Err(bad(&format!("{label} must be a dotted path like a.b.0.c, got {text:?}")));
+                    }
+                }
+                let scale = spec.scale.unwrap_or(1.0);
+                if !scale.is_finite() {
+                    return Err(bad("scale must be a finite number"));
+                }
+                Ok(Extract::Json { path: path.clone(), of: spec.of.clone(), scale })
+            }
+            (None, Some(pattern)) => {
+                if spec.of.is_some() || spec.scale.is_some() {
+                    return Err(bad("of and scale go only with json"));
+                }
+                if pattern.len() > MAX_REGEX_BYTES {
+                    return Err(bad(&format!("regex is longer than {MAX_REGEX_BYTES} bytes")));
+                }
+                regex::RegexBuilder::new(pattern)
+                    .size_limit(1 << 20)
+                    .build()
+                    .map(Extract::Pattern)
+                    .map_err(|error| bad(&format!("regex does not compile: {error}")))
+            }
+        }
+    }
+
+    fn apply(&self, text: &str) -> Result<f64, String> {
+        let number = match self {
+            Extract::Json { path, of, scale } => {
+                let root: Value = serde_json::from_str(text).map_err(|error| format!("probe output is not JSON: {error}"))?;
+                let numerator = number_at(&root, path)?;
+                let ratio = match of {
+                    None => numerator,
+                    Some(of) => {
+                        let denominator = number_at(&root, of)?;
+                        if denominator == 0.0 {
+                            return Err(format!("{of} is 0, cannot divide {path} by it"));
+                        }
+                        numerator / denominator
+                    }
+                };
+                ratio * scale
+            }
+            Extract::Pattern(pattern) => {
+                let captures = pattern.captures(text).ok_or_else(|| format!("regex {} did not match the probe output", pattern.as_str()))?;
+                let matched = if captures.len() > 1 { captures.get(1) } else { captures.get(0) }
+                    .ok_or_else(|| format!("regex {}: group 1 took no part in the match", pattern.as_str()))?
+                    .as_str();
+                matched.trim().parse::<f64>().map_err(|_| format!("regex matched {matched:?}, which is not a number"))?
+            }
+        };
+        if number.is_finite() { Ok(number) } else { Err("the extracted value is not a finite number".to_string()) }
+    }
+}
+
+fn number_at(root: &Value, path: &str) -> Result<f64, String> {
+    let mut at = root;
+    for segment in path.split('.') {
+        let next = match at {
+            Value::Object(map) => map.get(segment),
+            Value::Array(items) => segment.parse::<usize>().ok().and_then(|index| items.get(index)),
+            _ => None,
+        };
+        at = next.ok_or_else(|| format!("{path} not found in the probe output"))?;
+    }
+    let number = match at {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    number.filter(|number| number.is_finite()).ok_or_else(|| {
+        let found = match at {
+            Value::Null => "null".to_string(),
+            Value::Bool(_) => "a boolean".to_string(),
+            Value::String(text) => format!("the text {text:?}"),
+            Value::Array(_) => "an array".to_string(),
+            Value::Object(_) => "an object".to_string(),
+            Value::Number(_) => "an unusable number".to_string(),
+        };
+        format!("{path} is not a number (found {found})")
+    })
+}
+
+// ---- condition ------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Operand {
+    Number(f64),
+    Name(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Comparison {
+    AtMost,
+    Less,
+    AtLeast,
+    Greater,
+    Equal,
+    NotEqual,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Condition {
+    left: Operand,
+    comparison: Comparison,
+    right: Operand,
+}
+
+impl Condition {
+    fn parse(text: &str, scope: &Scope) -> Result<Condition, AdvisoryError> {
+        let bad = |reason: String| AdvisoryError::invalid("condition", reason);
+        if text.len() > MAX_CONDITION_BYTES {
+            return Err(bad(format!("longer than {MAX_CONDITION_BYTES} bytes")));
+        }
+        let shape = || bad(format!("{text:?} is not `<name or number> <op> <name or number>`; ops: <= < >= > == !="));
+        let start = text.find(['<', '>', '=', '!']).ok_or_else(shape)?;
+        let rest = &text[start..];
+        let (comparison, length) = [("<=", Comparison::AtMost), (">=", Comparison::AtLeast), ("==", Comparison::Equal), ("!=", Comparison::NotEqual), ("<", Comparison::Less), (">", Comparison::Greater)]
+            .into_iter()
+            .find_map(|(symbol, comparison)| rest.starts_with(symbol).then_some((comparison, symbol.len())))
+            .ok_or_else(shape)?;
+        let operand = |raw: &str| -> Result<Operand, AdvisoryError> {
+            let raw = raw.trim();
+            if raw.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '-' | '+' | '.')) {
+                return raw.parse::<f64>().ok().filter(|n| n.is_finite()).map(Operand::Number).ok_or_else(shape);
+            }
+            if !is_identifier(raw) {
+                return Err(shape());
+            }
+            if !scope.contains_key(raw) {
+                return Err(bad(format!("unknown name {raw:?}; known names: {}", known_names(scope))));
+            }
+            Ok(Operand::Name(raw.to_string()))
+        };
+        let (left, right) = (operand(&text[..start])?, operand(&rest[length..])?);
+        if matches!((&left, &right), (Operand::Number(_), Operand::Number(_))) {
+            return Err(bad("compares two numbers; use a name on one side".to_string()));
+        }
+        Ok(Condition { left, comparison, right })
+    }
+
+    fn holds(&self, scope: &Scope) -> bool {
+        let resolve = |operand: &Operand| match operand {
+            Operand::Number(number) => *number,
+            Operand::Name(name) => scope[name],
+        };
+        let (left, right) = (resolve(&self.left), resolve(&self.right));
+        match self.comparison {
+            Comparison::AtMost => left <= right,
+            Comparison::Less => left < right,
+            Comparison::AtLeast => left >= right,
+            Comparison::Greater => left > right,
+            Comparison::Equal => left == right,
+            Comparison::NotEqual => left != right,
+        }
+    }
+}
+
+// ---- messages -------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Piece {
+    Text(String),
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Template(Vec<Piece>);
+
+impl Template {
+    fn parse(field: &str, text: &str, scope: &Scope) -> Result<Template, AdvisoryError> {
+        let bad = |reason: String| AdvisoryError::invalid(field, reason);
+        if text.is_empty() {
+            return Err(bad("is empty".to_string()));
+        }
+        if text.len() > MAX_MESSAGE_BYTES {
+            return Err(bad(format!("longer than {MAX_MESSAGE_BYTES} bytes")));
+        }
+        if text.chars().any(char::is_control) {
+            return Err(bad("must be one line of plain text".to_string()));
+        }
+        let (mut pieces, mut literal) = (Vec::new(), String::new());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    literal.push('{');
+                }
+                '}' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    literal.push('}');
+                }
+                '}' => return Err(bad("has a single `}`; write `}}` for a literal brace".to_string())),
+                '{' => {
+                    let mut name = String::new();
+                    let mut closed = false;
+                    for c in chars.by_ref() {
+                        if c == '}' {
+                            closed = true;
+                            break;
+                        }
+                        name.push(c);
+                    }
+                    if !closed {
+                        return Err(bad("has a `{` with no closing `}`; write `{{` for a literal brace".to_string()));
+                    }
+                    if !scope.contains_key(&name) {
+                        return Err(bad(format!("uses unknown name {{{name}}}; known names: {}", known_names(scope))));
+                    }
+                    if !literal.is_empty() {
+                        pieces.push(Piece::Text(std::mem::take(&mut literal)));
+                    }
+                    pieces.push(Piece::Name(name));
+                }
+                other => literal.push(other),
+            }
+        }
+        if !literal.is_empty() {
+            pieces.push(Piece::Text(literal));
+        }
+        Ok(Template(pieces))
+    }
+
+    fn render(&self, scope: &Scope) -> String {
+        self.0
+            .iter()
+            .map(|piece| match piece {
+                Piece::Text(text) => text.clone(),
+                Piece::Name(name) => format_number(scope[name]),
+            })
+            .collect()
+    }
+}
+
+// ---- the advisory ---------------------------------------------------------
+
 /// A checked advisory.
 #[derive(Debug, Clone)]
 pub struct Advisory {
     id: AdvisoryId,
     spec: AdvisorySpec,
+    name: String,
+    extract: Extract,
+    condition: Condition,
+    when_true: Template,
+    when_false: Template,
 }
 
 impl Advisory {
     /// Parse, don't validate: every check lives here.
     pub fn new(id: AdvisoryId, spec: AdvisorySpec) -> Result<Advisory, AdvisoryError> {
-        Ok(Advisory { id, spec })
+        // CLAIM(advisory-valid) ↳ every rule below
+        match &spec.probe {
+            Input::Cmd { .. } | Input::Url { .. } | Input::File { .. } => {}
+            other => {
+                return Err(AdvisoryError::invalid("probe", format!("{} cannot give text to read a number from; use cmd, url or file", other.label())));
+            }
+        }
+        crate::watch::validate_input(&spec.probe).map_err(|error| AdvisoryError::invalid("probe", error.to_string()))?;
+
+        let name = spec.extract.name.clone().unwrap_or_else(|| "value".to_string());
+        if !is_identifier(&name) {
+            return Err(AdvisoryError::invalid("extract.name", format!("{name:?} must be letters, digits and _ (not starting with a digit), at most 32")));
+        }
+        let extract = Extract::compile(&spec.extract)?;
+
+        if spec.params.len() > MAX_PARAMS {
+            return Err(AdvisoryError::invalid("params", format!("at most {MAX_PARAMS} parameters")));
+        }
+        for (param, value) in &spec.params {
+            let reason = if !is_identifier(param) {
+                Some("must be letters, digits and _ (not starting with a digit), at most 32")
+            } else if RESERVED_NAMES.contains(&param.as_str()) {
+                Some("is the name of a setting (cache_s, condition, message_when_true, message_when_false)")
+            } else if *param == name || param == "value" {
+                Some("is already the name of the extracted number")
+            } else if !value.is_finite() {
+                Some("must be a finite number")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(AdvisoryError::invalid("params", format!("{param:?} {reason}")));
+            }
+        }
+
+        if spec.cache_s.is_some_and(|seconds| seconds > MAX_CACHE_S) {
+            return Err(AdvisoryError::invalid("cache_s", format!("at most {MAX_CACHE_S} (one day); 0 means probe on every call")));
+        }
+
+        let mut scope: Scope = spec.params.clone();
+        scope.insert(name.clone(), 0.0);
+        scope.insert("value".to_string(), 0.0);
+        let condition = Condition::parse(&spec.condition, &scope)?;
+        let when_true = Template::parse("message_when_true", &spec.message_when_true, &scope)?;
+        let when_false = Template::parse("message_when_false", &spec.message_when_false, &scope)?;
+        Ok(Advisory { id, spec, name, extract, condition, when_true, when_false })
     }
     pub fn id(&self) -> &AdvisoryId {
         &self.id
@@ -146,7 +474,7 @@ impl Advisory {
         &self.spec
     }
     pub fn cache_s(&self) -> u64 {
-        0
+        self.spec.cache_s.unwrap_or(DEFAULT_CACHE_S)
     }
     pub fn probe(&self) -> &Input {
         &self.spec.probe
@@ -154,55 +482,121 @@ impl Advisory {
     /// Hash of what the cached probe result depends on: the probe and the
     /// extraction. Params, condition and messages are not part of it.
     pub fn fingerprint(&self) -> String {
-        String::new()
+        let basis = serde_json::json!({"probe": self.spec.probe, "extract": {"json": self.spec.extract.json, "of": self.spec.extract.of, "scale": self.spec.extract.scale, "regex": self.spec.extract.regex}});
+        crate::inputs::hash_hex(&basis.to_string())
     }
-    /// The extracted number name (`value` unless the spec names it).
-    pub fn value_name(&self) -> String {
-        String::new()
+    /// The extracted number's name (`value` unless the spec names it).
+    pub fn value_name(&self) -> &str {
+        &self.name
     }
     /// Take the number out of the probe's text; `Err` is the reason.
     pub fn extract_value(&self, probe_text: &str) -> Result<f64, String> {
-        let _ = probe_text;
-        Err("not implemented".to_string())
+        self.extract.apply(probe_text)
     }
     /// Evaluate the condition and render the message for `value`.
     pub fn judge(&self, value: f64) -> Verdict {
-        let _ = value;
-        Verdict { condition_true: false, message: String::new() }
+        let mut scope: Scope = self.spec.params.clone();
+        scope.insert(self.name.clone(), value);
+        scope.insert("value".to_string(), value);
+        let condition_true = self.condition.holds(&scope);
+        let template = if condition_true { &self.when_true } else { &self.when_false };
+        Verdict { condition_true, message: template.render(&scope) }
     }
     /// A copy with the settings applied (`name=value` strings: a parameter, or
     /// one of `RESERVED_NAMES`), validated as a whole; `self` is untouched.
     pub fn with_settings(&self, assignments: &[String]) -> Result<Advisory, AdvisoryError> {
-        let _ = assignments;
-        Ok(self.clone())
+        // CLAIM(advisory-set) ↳ all-or-nothing: the copy is built fully before it is returned
+        let mut spec = self.spec.clone();
+        for assignment in assignments {
+            let (name, value) = assignment
+                .split_once('=')
+                .map(|(name, value)| (name.trim(), value.trim()))
+                .filter(|(name, _)| !name.is_empty())
+                .ok_or_else(|| AdvisoryError::invalid("setting", format!("{assignment:?} is not name=value")))?;
+            match name {
+                "cache_s" => {
+                    spec.cache_s = Some(value.parse::<u64>().map_err(|_| AdvisoryError::invalid("cache_s", format!("{value:?} is not a whole number of seconds")))?);
+                }
+                "condition" => spec.condition = value.to_string(),
+                "message_when_true" => spec.message_when_true = value.to_string(),
+                "message_when_false" => spec.message_when_false = value.to_string(),
+                param => {
+                    if !spec.params.contains_key(param) {
+                        let known = spec.params.keys().cloned().collect::<Vec<_>>().join(", ");
+                        let known = if known.is_empty() { "none".to_string() } else { known };
+                        return Err(AdvisoryError::UnknownParam { id: self.id.to_string(), name: param.to_string(), known });
+                    }
+                    let number = value.parse::<f64>().ok().filter(|n| n.is_finite());
+                    let number = number.ok_or_else(|| AdvisoryError::invalid(&format!("params.{param}"), format!("{value:?} is not a number")))?;
+                    spec.params.insert(param.to_string(), number);
+                }
+            }
+        }
+        Advisory::new(self.id.clone(), spec)
     }
 }
 
 /// `7.3` -> `7.3`, `10.0` -> `10`, `4.04` -> `4`: one decimal, no trailing `.0`.
 pub fn format_number(number: f64) -> String {
-    format!("{number}")
+    let rounded = (number * 10.0).round() / 10.0;
+    if rounded == 0.0 {
+        "0".to_string()
+    } else if rounded == rounded.trunc() {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
+    }
 }
 
 /// Turn a reading of the probe into the text to extract from, or why the
 /// probe failed. A `cmd` must exit 0 and a `url` must answer 2xx; their
 /// header line (`exit=0`, `HTTP 200`) is removed.
 pub fn probe_body(probe: &Input, reading: &Reading) -> Result<String, String> {
-    let _ = probe;
-    Ok(reading.text.clone())
+    if reading.is_error {
+        return Err(reading.text.clone());
+    }
+    let shorten = |text: &str| -> String {
+        let text = text.trim();
+        let cut: String = text.chars().take(200).collect();
+        if cut.len() < text.len() { format!("{cut}...") } else { cut }
+    };
+    let (header, body) = reading.text.split_once('\n').unwrap_or((reading.text.as_str(), ""));
+    match probe {
+        Input::Cmd { .. } => match header.strip_prefix("exit=") {
+            Some("0") => Ok(body.to_string()),
+            Some(code) if body.trim().is_empty() => Err(format!("probe exited with {code}")),
+            Some(code) => Err(format!("probe exited with {code}: {}", shorten(body))),
+            None => Err(format!("probe gave an unreadable result: {}", shorten(&reading.text))),
+        },
+        Input::Url { .. } => match header.strip_prefix("HTTP ").and_then(|code| code.trim().parse::<u16>().ok()) {
+            Some(200..=299) => Ok(body.to_string()),
+            Some(code) => Err(format!("probe answered HTTP {code}: {}", shorten(body))),
+            None => Err(format!("probe gave an unreadable result: {}", shorten(&reading.text))),
+        },
+        Input::File { .. } => Ok(reading.text.clone()),
+        other => Err(format!("{} cannot be a probe", other.label())),
+    }
 }
 
 /// The advisory seeded into a fresh file (SPEC "Default advisory").
 pub fn default_boat_budget(home: Option<&str>) -> (AdvisoryId, AdvisorySpec) {
-    let _ = home;
-    (AdvisoryId("boat-budget".to_string()), AdvisorySpec {
-        probe: Input::Cmd { argv: vec![], timeout_s: None, cwd: None },
-        extract: ExtractSpec::default(),
-        params: BTreeMap::new(),
-        condition: String::new(),
-        message_when_true: String::new(),
-        message_when_false: String::new(),
-        cache_s: None,
-    })
+    let boat = home.filter(|home| !home.is_empty()).map_or_else(|| "boat".to_string(), |home| format!("{home}/.local/bin/boat"));
+    let spec = AdvisorySpec {
+        probe: Input::Cmd { argv: ["env", "BOAT_NO_UPDATE=1", boat.as_str(), "limits", "--json"].map(String::from).to_vec(), timeout_s: Some(15.0), cwd: None },
+        extract: ExtractSpec {
+            name: Some("pct".to_string()),
+            json: Some("planIncluded.vmHoursRemaining".to_string()),
+            of: Some("planIncluded.vmHours".to_string()),
+            scale: Some(100.0),
+            regex: None,
+        },
+        params: BTreeMap::from([("threshold".to_string(), 10.0)]),
+        condition: "pct <= threshold".to_string(),
+        message_when_true: "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): run heavy jobs (builds, test suites) through qex on this host instead of Boat.".to_string(),
+        message_when_false: "Boat has {pct}% of its hours left (above the {threshold}% threshold): prefer Boat for heavy work (builds, test runs) via edge.research/bin/boat-run; use qex locally only for one or two quick runs.".to_string(),
+        cache_s: Some(DEFAULT_CACHE_S),
+    };
+    (AdvisoryId("boat-budget".to_string()), spec)
 }
 
 #[cfg(test)]
@@ -422,7 +816,6 @@ mod tests {
         assert!(rejected(json!({"extract": {"regex": "("}})).contains("extract"), "regex must compile");
         assert!(rejected(json!({"extract": {"regex": "a".repeat(MAX_REGEX_BYTES + 1)}})).contains("extract"));
         assert!(rejected(json!({"extract": {"json": "a", "name": "1bad"}})).contains("extract.name"));
-        assert!(rejected(json!({"extract": {"json": "a", "scale": f64::MAX * 2.0}})).contains("extract"), "scale must be finite");
         assert!(rejected(json!({"cache_s": MAX_CACHE_S + 1})).contains("cache_s"));
         assert!(rejected(json!({"params": {"cache_s": 1}})).contains("params"), "reserved name");
         assert!(rejected(json!({"params": {"pct": 1}})).contains("params"), "same as the extract name");
@@ -430,6 +823,19 @@ mod tests {
         assert!(rejected(json!({"params": {"bad name": 1}})).contains("params"));
         let many: serde_json::Map<String, serde_json::Value> = (0..=MAX_PARAMS).map(|n| (format!("p{n}"), json!(n))).collect();
         assert!(rejected(json!({"params": many})).contains("params"));
+    }
+
+    #[test]
+    fn non_finite_numbers_are_refused_where_json_cannot_carry_them() {
+        // why: TOML can say `scale = inf` and `floor = nan`; JSON tests cannot,
+        //      so build the spec in Rust. Either would make every message "NaN".
+        // proves: CLAIM(advisory-valid)
+        let mut infinite_scale = spec(budget_json());
+        infinite_scale.extract.scale = Some(f64::INFINITY);
+        assert!(Advisory::new(id("x"), infinite_scale).unwrap_err().to_string().contains("extract"));
+        let mut nan_param = spec(budget_json());
+        nan_param.params.insert("threshold".to_string(), f64::NAN);
+        assert!(Advisory::new(id("x"), nan_param).unwrap_err().to_string().contains("params"));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 
 pub mod advisory;
 pub mod advisory_eval;
+pub mod advisory_ops;
 pub mod advisory_store;
 pub mod attention;
 pub mod cache;
