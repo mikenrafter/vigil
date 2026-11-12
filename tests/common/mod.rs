@@ -374,22 +374,61 @@ pub fn reserve_used_note() -> serde_json::Value {
     serde_json::json!({"ok": true, "used_reserve": true, "kind": "disk_full"})
 }
 
-/// A stand-in `qex` for hold tests (W36): `qex status ID --json --no-logs`
-/// answers `{"state": ...}` from `jobs/<ID>` (exit 127 and qex's own
-/// "there is no job" message when the file is absent) and `qex list ...`
-/// prints `list.json` (default `[]`). Every call's arguments are appended to
-/// `calls.log`. Put it first on a command's PATH with `path_with`.
+/// A stand-in `qex` for hold tests (W36) that answers the way the installed
+/// qex does (outputs captured 2026-11-12, `tests/fixtures/qex`):
+///
+/// - `qex status REF --json --no-logs` prints the full real status record with
+///   `id` and `state` replaced, for a job set with `set_job`; a name set with
+///   `set_name` answers for its job; a name set with `set_ambiguous` answers
+///   exit 127 and the real "names N jobs" text; a job set with `set_removed`
+///   answers exit 127 and the real "existed ... deleted its record" text;
+///   anything else is exit 127 and "there is no job or pipeline ...".
+/// - `qex list ARGS` prints what `set_list("ARGS", output)` stored for exactly
+///   those arguments; any other query is exit 2, so a hold that asks the wrong
+///   question fails instead of getting a convenient `[]`.
+///
+/// Every call's arguments are appended to `calls.log`. Put it first on a
+/// command's PATH with `path`.
 pub struct FakeQex {
     dir: PathBuf,
+}
+
+const STATUS_RECORD: &str = include_str!("../fixtures/qex/status_completed.json");
+const LIST_RECORD: &str = include_str!("../fixtures/qex/list_active_running.json");
+const REMOVED_TEXT: &str = include_str!("../fixtures/qex/status_removed_completed.err");
+const AMBIGUOUS_TEXT: &str = include_str!("../fixtures/qex/status_ambiguous.err");
+/// The id inside `status_completed.json` and `status_removed_completed.err`.
+const FIXTURE_ID: &str = "0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9";
+
+fn list_key(args: &str) -> String {
+    args.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect()
 }
 
 impl FakeQex {
     pub fn new(sandbox: &Sandbox) -> FakeQex {
         let dir = sandbox.dir.path().join("fake-qex");
-        std::fs::create_dir_all(dir.join("jobs")).unwrap();
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        for sub in ["jobs", "alias", "removed", "ambiguous", "list", "bin"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
         let script = format!(
-            "#!/bin/sh\necho \"$*\" >> '{d}/calls.log'\ncase \"$1\" in\n  status) f='{d}/jobs'/\"$2\"; if [ -f \"$f\" ]; then printf '{{\"id\": \"%s\", \"state\": \"%s\"}}\\n' \"$2\" \"$(cat \"$f\")\"; else echo \"qex: there is no job or pipeline with the id or the name \\`$2\\`\" >&2; exit 127; fi ;;\n  list) if [ -f '{d}/list.json' ]; then cat '{d}/list.json'; else echo '[]'; fi ;;\n  *) echo \"fake qex: unexpected $*\" >&2; exit 2 ;;\nesac\n",
+            r#"#!/bin/sh
+d='{d}'
+echo "$*" >> "$d/calls.log"
+case "$1" in
+  status)
+    ref="$2"
+    id="$ref"
+    if [ -f "$d/alias/$ref" ]; then id=$(cat "$d/alias/$ref"); fi
+    if [ -f "$d/jobs/$id" ]; then cat "$d/jobs/$id"
+    elif [ -f "$d/removed/$id" ]; then cat "$d/removed/$id" >&2; exit 127
+    elif [ -f "$d/ambiguous/$ref" ]; then cat "$d/ambiguous/$ref" >&2; exit 127
+    else echo "qex: there is no job or pipeline with the id or the name \`$ref\`" >&2; exit 127; fi ;;
+  list)
+    key=$(printf '%s' "$*" | tr -c 'A-Za-z0-9.-' '_')
+    if [ -f "$d/list/$key" ]; then cat "$d/list/$key"; else echo "fake qex: unexpected $*" >&2; exit 2; fi ;;
+  *) echo "fake qex: unexpected $*" >&2; exit 2 ;;
+esac
+"#,
             d = dir.display()
         );
         let bin = dir.join("bin/qex");
@@ -398,11 +437,48 @@ impl FakeQex {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         FakeQex { dir }
     }
+    /// Job `id` is in `state`: `qex status id` prints the real record shape.
     pub fn set_job(&self, id: &str, state: &str) {
-        std::fs::write(self.dir.join("jobs").join(id), state).unwrap();
+        let mut record: serde_json::Value = serde_json::from_str(STATUS_RECORD).unwrap();
+        record["id"] = id.into();
+        record["state"] = state.into();
+        std::fs::write(self.dir.join("jobs").join(id), serde_json::to_string_pretty(&record).unwrap() + "\n").unwrap();
+        let _ = std::fs::remove_file(self.dir.join("removed").join(id));
     }
-    pub fn set_list(&self, json: &serde_json::Value) {
-        std::fs::write(self.dir.join("list.json"), json.to_string()).unwrap();
+    /// `qex status NAME` (or a prefix) answers for job `id`.
+    pub fn set_name(&self, name: &str, id: &str) {
+        std::fs::write(self.dir.join("alias").join(name), id).unwrap();
+    }
+    /// `qex status NAME` is ambiguous between two jobs, in qex's own words.
+    pub fn set_ambiguous(&self, name: &str) {
+        let _ = std::fs::remove_file(self.dir.join("alias").join(name));
+        let text = AMBIGUOUS_TEXT.replace("vigil-fixture", name);
+        std::fs::write(self.dir.join("ambiguous").join(name), text).unwrap();
+    }
+    /// Job `id` finished and `qex clean` removed its record: `qex status id` now
+    /// says so, in qex's own words, and keeps the `completed` state.
+    pub fn set_removed(&self, id: &str) {
+        let _ = std::fs::remove_file(self.dir.join("jobs").join(id));
+        std::fs::write(self.dir.join("removed").join(id), REMOVED_TEXT.replace(FIXTURE_ID, id)).unwrap();
+    }
+    /// `qex list ARGS` (the arguments after `list`, joined by spaces) prints
+    /// `output` exactly.
+    pub fn set_list(&self, args: &str, output: &str) {
+        std::fs::write(self.dir.join("list").join(list_key(&format!("list {args}"))), output).unwrap();
+    }
+    /// `count` records shaped like `qex list --json` entries (the captured running
+    /// job re-keyed), as qex prints them, in state `state`, for `set_list`.
+    pub fn list_of(count: usize, state: &str) -> String {
+        let template = serde_json::from_str::<Vec<serde_json::Value>>(LIST_RECORD).unwrap().remove(0);
+        let jobs: Vec<_> = (0..count)
+            .map(|index| {
+                let mut job = template.clone();
+                job["id"] = format!("{index:08x}-6827-4b1d-ba7f-1abc7fc9c0f8").into();
+                job["state"] = state.into();
+                job
+            })
+            .collect();
+        serde_json::to_string_pretty(&jobs).unwrap() + "\n"
     }
     /// The arguments of every call so far, one string per call.
     pub fn calls(&self) -> Vec<String> {

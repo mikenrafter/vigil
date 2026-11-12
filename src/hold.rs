@@ -80,7 +80,9 @@ impl Work {
 
 /// qex states that mean the job is still going; every other state word ends it.
 const LIVE_STATES: [&str; 3] = ["queued", "starting", "running"];
-/// qex states that mean the job has stopped (`qex list --state` names them).
+/// The qex states that mean the job has stopped (`qex list --state` names them).
+/// Only these end a hold: a state not listed (a newer qex's) is NOT an end, and
+/// the live ones (queued, starting, running) are simply not listed.
 const ENDED_STATES: [&str; 8] = ["completed", "failed", "killed", "timeout", "expired", "oom", "cancelled", "skipped"];
 
 /// Has the work behind `input` ended, given what its last reading said (H2)?
@@ -119,7 +121,7 @@ fn json_in(output: &str, open: char, close: char) -> Option<serde_json::Value> {
 /// The reading of a `qex status ID --json --no-logs` run (`cmd_text` is the
 /// command reader's text, `exit=<code>\n<output>`, or its error text): the
 /// job's state name, `gone` when qex does not know the job, else `error: ...`.
-pub fn qex_status_reading(cmd_text: &str) -> String {
+pub fn qex_status_reading(_job: &str, cmd_text: &str) -> String {
     let Some((code, output)) = split_exit(cmd_text) else { return error_reading(cmd_text) };
     match code {
         "0" => match json_in(output, '{', '}').as_ref().and_then(|value| value.get("state")).and_then(serde_json::Value::as_str) {
@@ -129,6 +131,16 @@ pub fn qex_status_reading(cmd_text: &str) -> String {
         "127" if output.contains("there is no job") => "gone".to_string(),
         _ => error_reading(&format!("exit {code}: {output}")),
     }
+}
+
+/// RED STUB: resolve a name or prefix to a full job id.
+pub fn qex_resolution(job: &str, _cmd_text: &str) -> Result<String, CreateError> {
+    Ok(job.to_string())
+}
+
+/// RED STUB: the `qex list` arguments of an idle reading.
+pub fn idle_argv(dir: &std::path::Path) -> Vec<String> {
+    vec!["qex".to_string(), "list".into(), "--under".into(), dir.to_string_lossy().into_owned(), "--all".into(), "--json".into()]
 }
 
 /// The reading of a `qex list --under DIR --all --json` run: `idle`, or
@@ -176,8 +188,11 @@ pub struct HoldRequest {
 impl Vigil {
     /// Create a hold (H1-H5, H10).
     ///
-    /// Every spec is parsed before anything is read or written. A `qex` job
-    /// that qex does not know is refused (H3): a typo must not become a hold.
+    /// Every spec is parsed before anything is read or written. Each `qex` job
+    /// is resolved to its full job id, which is what the hold stores (H3): a
+    /// name reused later cannot make the hold read another job, a job qex does
+    /// not know is refused (a typo must not become a hold), and so is a name
+    /// that is ambiguous.
     pub async fn hold(&self, request: HoldRequest) -> Result<Created, VigilError> {
         let mut inputs = request.work.iter().map(|spec| Work::parse(spec).map(Work::into_input)).collect::<Result<Vec<_>, _>>()?;
         if request.until_idle {
@@ -273,9 +288,9 @@ mod tests {
         // proves: CLAIM(H2)
         for state in ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "expired", "oom", "cancelled", "skipped"] {
             let text = format!("exit=0\n{{\"id\": \"8c4e\", \"state\": \"{state}\", \"exit_code\": null}}\n");
-            assert_eq!(qex_status_reading(&text), state);
+            assert_eq!(qex_status_reading("8c4e", &text), state);
         }
-        assert_eq!(qex_status_reading("exit=0\nqex: a hint on stderr\n{\"state\": \"running\"}\n"), "running");
+        assert_eq!(qex_status_reading("8c4e", "exit=0\nqex: a hint on stderr\n{\"state\": \"running\"}\n"), "running");
     }
 
     #[test]
@@ -286,7 +301,7 @@ mod tests {
         //      reason must NEVER end it: the cost of an early release is the
         //      lost cache.
         // proves: CLAIM(H2), CLAIM(H3)
-        assert_eq!(qex_status_reading("exit=127\nqex: there is no job or pipeline with the id or the name `nosuchid`\n"), "gone");
+        assert_eq!(qex_status_reading("nosuchid", "exit=127\nqex: there is no job or pipeline with the id or the name `nosuchid`\n"), "gone");
         for text in [
             "cannot run qex: No such file or directory (os error 2)",
             "timeout after 10s",
@@ -296,7 +311,7 @@ mod tests {
             "exit=0\n{\"no_state\": 1}",
             "exit=0\n",
         ] {
-            let reading = qex_status_reading(text);
+            let reading = qex_status_reading("x", text);
             assert!(reading.starts_with("error: "), "{text:?} -> {reading:?}");
             assert!(!ended(&Input::Qex { job: "x".into() }, &reading), "{text:?} must not end a hold");
             assert!(reading.len() <= 200, "bounded: {reading:?}");
@@ -324,6 +339,178 @@ mod tests {
             let reading = qex_idle_reading(text);
             assert!(reading.starts_with("error: "), "{text:?} -> {reading:?}");
             assert!(!ended(&Input::QexIdle { dir: "/w".into() }, &reading), "an unreadable queue is not an idle one");
+        }
+    }
+
+    // ---- real qex output (captured 2026-11-12 from the installed qex, a fork
+    //      of 0.33; files under tests/fixtures/qex) ----
+
+    const COMPLETED_ID: &str = "0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9";
+    const STATUS_COMPLETED: &str = include_str!("../tests/fixtures/qex/status_completed.json");
+    const STATUS_REMOVED: &str = include_str!("../tests/fixtures/qex/status_removed_completed.err");
+    const STATUS_UNKNOWN_ID: &str = include_str!("../tests/fixtures/qex/status_unknown_id.err");
+    const STATUS_UNKNOWN_NAME: &str = include_str!("../tests/fixtures/qex/status_unknown_name.err");
+    const STATUS_AMBIGUOUS: &str = include_str!("../tests/fixtures/qex/status_ambiguous.err");
+    const LIST_RUNNING: &str = include_str!("../tests/fixtures/qex/list_active_running.json");
+    const LIST_EMPTY: &str = include_str!("../tests/fixtures/qex/list_active_empty.json");
+    const LIST_UNDER_MISSING: &str = include_str!("../tests/fixtures/qex/list_under_missing.err");
+
+    /// What the command reader hands over: `exit=<code>\n<stdout then stderr>`.
+    fn ran(code: i32, stdout: &str, stderr: &str) -> String {
+        format!("exit={code}\n{stdout}{stderr}")
+    }
+
+    #[test]
+    fn a_removed_record_is_an_end_in_every_form_qex_words_it_and_never_for_another_job() {
+        // why: S2. `qex clean` (or the history prune) before the next tick must
+        //      release the hold, not strand it: qex still ACCEPTS the id but
+        //      answers exit 127 with "the job ID (NAME) existed ...". The first
+        //      case is a real capture; the other three are the other branches
+        //      of qex's `describe_missing` (qex/src/history.rs), worded as in
+        //      that source (derived, not captured: they need a cancelled job
+        //      and a hand-damaged state directory). A record removed for ANOTHER
+        //      job id is not this job's end; an exit other than 127 is not either.
+        // proves: CLAIM(H2)
+        let removed = ran(127, "", STATUS_REMOVED);
+        assert!(STATUS_REMOVED.contains("existed and its state was `completed`"), "fixture is the real message");
+        assert_eq!(qex_status_reading(COMPLETED_ID, &removed), "gone");
+        let derived = [
+            format!("qex: the job {COMPLETED_ID} (nightly) existed and its state was `cancelled`. Something deleted its record 3m ago, with `qex clean` or by a deletion of the state directory. The job NEVER RAN. Submit it again if you still want the work.\n"),
+            format!("qex: the job {COMPLETED_ID} (nightly) existed. Something deleted its record 3m ago. qex does not know how that job ended.\n"),
+            format!("qex: the job {COMPLETED_ID} (nightly) existed, and qex accepted it 3m ago, but its record is gone and qex did not delete it. Something removed the state directory. The job may have run.\n"),
+        ];
+        for text in derived {
+            assert_eq!(qex_status_reading(COMPLETED_ID, &ran(127, "", &text)), "gone", "{text}");
+        }
+        let other = "07193384-6827-4b1d-ba7f-1abc7fc9c0f8";
+        let reading = qex_status_reading(other, &removed);
+        assert!(reading.starts_with("error: "), "another job's removal is not this job's end: {reading}");
+        assert!(qex_status_reading(COMPLETED_ID, &ran(1, "", STATUS_REMOVED)).starts_with("error: "), "only exit 127 is a missing job");
+    }
+
+    #[test]
+    fn unknown_jobs_are_gone_and_an_ambiguous_name_is_an_error_never_an_end() {
+        // why: S2. Real captures: an unknown full id and an unknown name are
+        //      `gone` (exit 127), but an AMBIGUOUS name also exits 127 and
+        //      must not end a hold: it says the job exists. The ambiguity text
+        //      lists job names after two spaces, so a job named "there is no
+        //      job" must not read as qex's own sentence either.
+        // proves: CLAIM(H2)
+        assert_eq!(qex_status_reading("00000000-0000-0000-0000-000000000000", &ran(127, "", STATUS_UNKNOWN_ID)), "gone");
+        assert_eq!(qex_status_reading("nosuchname-zzz", &ran(127, "", STATUS_UNKNOWN_NAME)), "gone");
+        assert!(STATUS_AMBIGUOUS.contains("names 2 jobs"), "fixture is the real message");
+        let reading = qex_status_reading("vigil-fixture", &ran(127, "", STATUS_AMBIGUOUS));
+        assert!(reading.starts_with("error: ") && reading.contains("names 2 jobs"), "{reading}");
+        let tricky = "qex: `x` names 2 jobs. Give the id of the job that you want.\n  07193384-6827-4b1d-ba7f-1abc7fc9c0f8 there is no job\n";
+        assert!(qex_status_reading("x", &ran(127, "", tricky)).starts_with("error: "));
+    }
+
+    #[test]
+    fn a_real_status_record_reads_as_its_state() {
+        // why: H2 with the whole real record (all 50 keys, pretty-printed), not
+        //      a one-key object.
+        // proves: CLAIM(H2)
+        assert_eq!(qex_status_reading(COMPLETED_ID, &ran(0, STATUS_COMPLETED, "")), "completed");
+    }
+
+    /// `n` records shaped like a real `qex list --json` entry (the captured
+    /// running job, re-keyed), pretty-printed as qex prints them.
+    fn active_list(n: usize) -> String {
+        let template: serde_json::Value = serde_json::from_str::<Vec<serde_json::Value>>(LIST_RUNNING).unwrap().remove(0);
+        let jobs: Vec<_> = (0..n)
+            .map(|index| {
+                let mut job = template.clone();
+                job["id"] = json!(format!("{index:08x}-6827-4b1d-ba7f-1abc7fc9c0f8"));
+                job["sequence"] = json!(1000 + index);
+                job
+            })
+            .collect();
+        serde_json::to_string_pretty(&jobs).unwrap() + "\n"
+    }
+
+    #[test]
+    fn idle_asks_qex_for_active_jobs_under_the_directory_only() {
+        // why: S1. The query must be bounded by what is wanted: active jobs
+        //      (`--state active` is queued, starting and running; the
+        //      installed qex implements it as "not terminal"), scoped with
+        //      `--under`. Without it qex returns every terminal job as well:
+        //      2.5 MB for 991 jobs on this host, far over the 64 KiB capture.
+        // proves: CLAIM(H10)
+        let argv = idle_argv(std::path::Path::new("/work/repo"));
+        assert_eq!(argv, ["qex", "list", "--under", "/work/repo", "--state", "active", "--json"]);
+    }
+
+    #[test]
+    fn an_empty_and_a_real_running_list_read_as_idle_and_busy() {
+        // why: H10 with real captures: `[]` and one real running record.
+        // proves: CLAIM(H10)
+        assert_eq!(qex_idle_reading(&ran(0, LIST_EMPTY, "")), "idle");
+        assert_eq!(qex_idle_reading(&ran(0, LIST_RUNNING, "")), "busy: 1 active (54f37003)");
+    }
+
+    #[test]
+    fn a_busy_list_longer_than_the_capture_still_reads_busy_not_as_an_error() {
+        // why: S1. 40 real-shaped records are over 80 KB; the command reader
+        //      keeps 64 KiB and appends its marker, so the JSON is cut in the
+        //      middle of a record. The queue is plainly busy, and an "error"
+        //      here would hold a finished session for seven days or release
+        //      nothing. The reading names a lower bound on the count.
+        // proves: CLAIM(H10)
+        let list = active_list(40);
+        assert!(list.len() > crate::inputs::MAX_CAPTURE_BYTES, "the list must exceed the capture: {} bytes", list.len());
+        let kept = &list[..crate::inputs::MAX_CAPTURE_BYTES];
+        let text = format!("exit=0\n{kept}\n{}", crate::inputs::TRUNCATED_MARKER);
+        let reading = qex_idle_reading(&text);
+        assert!(reading.starts_with("busy: ") && !reading.contains("error"), "{reading}");
+        assert!(reading.contains("00000000"), "{reading}");
+        // A truncated capture that holds no record at all is unreadable, not idle.
+        assert!(qex_idle_reading("exit=0\n[\n  {\n    \"na").starts_with("error: "));
+    }
+
+    #[test]
+    fn a_missing_directory_and_unknown_states_do_not_release_an_idle_hold() {
+        // why: S1 and the hardening note. A directory that no longer exists
+        //      makes `qex list --under` exit 1 (real capture): an error, not
+        //      idle. Whatever qex returns for an active query counts as active,
+        //      except a record that says it is terminal.
+        // proves: CLAIM(H10)
+        let reading = qex_idle_reading(&ran(1, "", LIST_UNDER_MISSING));
+        assert!(reading.starts_with("error: ") && reading.contains("does not exist"), "{reading}");
+        let future = format!("exit=0\n{}", json!([{"id": "abcdef01-0000", "state": "paused"}, {"id": "abcdef02-0000"}]));
+        assert_eq!(qex_idle_reading(&future), "busy: 2 active (abcdef01, abcdef02)");
+        let mixed = format!("exit=0\n{}", json!([{"id": "abcdef01-0000", "state": "completed"}]));
+        assert_eq!(qex_idle_reading(&mixed), "idle");
+    }
+
+    #[test]
+    fn a_name_or_prefix_resolves_to_the_full_job_id_and_everything_else_is_refused_by_cause() {
+        // why: S3. The hold stores the full id qex gives back. Real captures:
+        //      a unique name or prefix answers with the record (its "id");
+        //      an unknown name or id is not found; an ambiguous name is refused
+        //      naming the cause; a removed record of a FULL id is accepted (the
+        //      id is a real job that ended, so the first tick releases); a qex
+        //      that cannot answer refuses a name (no identity to store) but not
+        //      a full id (it already is one).
+        // proves: CLAIM(H3)
+        let found = ran(0, STATUS_COMPLETED, "");
+        for given in ["vigil-fixture", "0d31c8ac", COMPLETED_ID] {
+            assert_eq!(qex_resolution(given, &found).unwrap(), COMPLETED_ID, "{given}");
+        }
+        assert_eq!(
+            qex_resolution("nosuchname-zzz", &ran(127, "", STATUS_UNKNOWN_NAME)).unwrap_err(),
+            CreateError::QexJobNotFound("nosuchname-zzz".into())
+        );
+        assert_eq!(
+            qex_resolution("00000000-0000-0000-0000-000000000000", &ran(127, "", STATUS_UNKNOWN_ID)).unwrap_err(),
+            CreateError::QexJobNotFound("00000000-0000-0000-0000-000000000000".into())
+        );
+        let ambiguous = qex_resolution("vigil-fixture", &ran(127, "", STATUS_AMBIGUOUS)).unwrap_err();
+        assert!(matches!(&ambiguous, CreateError::QexJobAmbiguous { job, detail } if job == "vigil-fixture" && detail.contains("names 2 jobs")), "{ambiguous:?}");
+        assert_eq!(qex_resolution(COMPLETED_ID, &ran(127, "", STATUS_REMOVED)).unwrap(), COMPLETED_ID);
+        for down in ["timeout after 10s", "cannot run qex: No such file or directory (os error 2)", "exit=1\nqex: the queue is locked\n", "exit=0\nnot json", "exit=0\n{\"state\": \"running\"}\n"] {
+            let refused = qex_resolution("vigil-fixture", down).unwrap_err();
+            assert!(matches!(refused, CreateError::QexJobUnresolved { .. }), "{down}: {refused:?}");
+            assert_eq!(qex_resolution(COMPLETED_ID, down).unwrap(), COMPLETED_ID, "a full id needs no lookup: {down}");
         }
     }
 

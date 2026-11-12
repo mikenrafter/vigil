@@ -197,6 +197,7 @@ struct ReaderScript {
 #[derive(Default)]
 struct ReaderState {
     scripts: std::collections::HashMap<String, ReaderScript>,
+    resolutions: std::collections::HashMap<String, Result<String, crate::error::CreateError>>,
     reads: Vec<ReadRecord>,
 }
 
@@ -230,6 +231,11 @@ impl ScriptedReader {
     /// Reads of `label` wait for this gate before anything else.
     pub fn set_gate(&self, label: &str, gate: Option<Gate>) {
         self.state.lock().unwrap().scripts.entry(label.to_string()).or_default().gate = gate;
+    }
+    /// What `qex` says a job name or id prefix is when a hold is created (W36,
+    /// H3): the full job id, or the refusal.
+    pub fn set_qex_resolution(&self, job: &str, resolution: Result<String, crate::error::CreateError>) {
+        self.state.lock().unwrap().resolutions.insert(job.to_string(), resolution);
     }
     /// Every scripted read so far, in start order.
     pub fn reads(&self) -> Vec<ReadRecord> {
@@ -265,6 +271,26 @@ fn script_key(input: &Input) -> Option<String> {
 }
 
 impl InputReader for ScriptedReader {
+    /// A job with a `set_qex_resolution` answers with it. A job whose status is
+    /// scripted (`set_text("qex:JOB", ...)`) is already an id (or `gone`, which
+    /// qex does not know); anything else asks the real `qex`.
+    fn resolve_qex<'a>(&'a self, job: &'a str) -> BoxFuture<'a, Result<String, crate::error::CreateError>> {
+        Box::pin(async move {
+            {
+                let state = self.state.lock().unwrap();
+                if let Some(resolution) = state.resolutions.get(job) {
+                    return resolution.clone();
+                }
+                if let Some(script) = state.scripts.get(&format!("qex:{job}")) {
+                    return match script.text.as_deref() {
+                        Some("gone") => Err(crate::error::CreateError::QexJobNotFound(job.to_string())),
+                        _ => Ok(job.to_string()),
+                    };
+                }
+            }
+            crate::inputs::resolve_qex_job(job).await
+        })
+    }
     fn read<'a>(&'a self, input: &'a Input, previous: &'a InputState) -> BoxFuture<'a, Reading> {
         Box::pin(async move {
             let Some(label) = script_key(input) else {

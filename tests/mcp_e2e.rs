@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
+
+/// A real qex job id (tests/fixtures/qex) for the hold tests.
+const J1: &str = "0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9";
 use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
     model::{CallToolRequestParams, CallToolResult, ProgressNotificationParam},
@@ -763,17 +766,17 @@ async fn the_hold_tool_holds_on_qex_work_and_a_keepalive_releases_it_with_the_re
     // proves: CLAIM(H1), CLAIM(H6), CLAIM(H11), CLAIM(H2), CLAIM(H3)
     let sandbox = Sandbox::new();
     let qex = FakeQex::new(&sandbox);
-    qex.set_job("j1", "completed");
+    qex.set_job(J1, "completed");
     let client = connect_with_env(&sandbox, &[("PATH", std::ffi::OsStr::new(&qex.path()))]).await;
     let peer = client.peer();
 
-    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": ["qex:j1"]})).await;
+    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": [format!("qex:{J1}")]})).await;
     assert_ne!(created.is_error, Some(true), "{created:?}");
     let created = text_json(&created);
     assert_eq!((created["watch_id"].as_str(), created["status"].as_str()), (Some("h"), Some("pending")));
     let released = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h"})).await);
     assert_eq!((released["status"].as_str(), released["next"].as_str()), (Some("fired"), Some("act on events")), "{released}");
-    assert_eq!(released["events"][0]["summary"], "hold released: qex:j1 completed");
+    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{J1} completed"));
 
     let bare = call(peer, "hold", serde_json::json!({"id": "bare"})).await;
     assert_ne!(bare.is_error, Some(true), "{bare:?}");

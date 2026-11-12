@@ -1685,6 +1685,10 @@ fn a_failed_stdout_write_leaves_the_event_uncommitted_and_the_next_call_replays_
 
 // ---- holds (SPEC "Holds", H1-H12) ------------------------------------------
 
+/// A qex job id (the real one in `tests/fixtures/qex`) and the `--for` spec for it.
+const J1: &str = "0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9";
+const J1_SPEC: &str = "qex:0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9";
+
 /// `vigil <args>` with a fake `qex` first on PATH, finishing inside 10 s.
 fn run_with_qex(sandbox: &Sandbox, qex: &FakeQex, args: &[&str]) -> std::process::Output {
     let mut command = sandbox.command();
@@ -1706,8 +1710,8 @@ fn hold_on_a_finished_qex_job_releases_at_the_first_keepalive_and_says_why() {
     // proves: CLAIM(H1), CLAIM(H5), CLAIM(H6), CLAIM(H11)
     let sandbox = Sandbox::new();
     let qex = FakeQex::new(&sandbox);
-    qex.set_job("j1", "completed");
-    let created = run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", "qex:j1"]);
+    qex.set_job(J1, "completed");
+    let created = run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", J1_SPEC]);
     assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
     let created = stdout_json(&created);
     assert_eq!((created["watch_id"].as_str(), created["status"].as_str()), (Some("h"), Some("pending")));
@@ -1718,9 +1722,9 @@ fn hold_on_a_finished_qex_job_releases_at_the_first_keepalive_and_says_why() {
     let envelope = stdout_json(&envelope);
     assert_eq!((envelope["status"].as_str(), envelope["next"].as_str()), (Some("fired"), Some("act on events")), "{envelope}");
     let event = &envelope["events"][0];
-    assert_eq!((event["input"].as_str(), event["summary"].as_str()), (Some("hold"), Some("hold released: qex:j1 completed")), "{envelope}");
+    assert_eq!((event["input"].as_str(), event["summary"].as_str()), (Some("hold"), Some(format!("hold released: qex:{J1} completed").as_str())), "{envelope}");
     assert!(event.get("kind").is_none());
-    assert!(qex.calls().contains(&"status j1 --json --no-logs".to_string()), "{:?}", qex.calls());
+    assert!(qex.calls().contains(&format!("status {J1} --json --no-logs")), "{:?}", qex.calls());
 }
 
 #[test]
@@ -1730,11 +1734,11 @@ fn wait_on_a_hold_exits_0_when_its_work_has_ended() {
     // proves: CLAIM(H6)
     let sandbox = Sandbox::new();
     let qex = FakeQex::new(&sandbox);
-    qex.set_job("j1", "failed");
-    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "w", "--for", "qex:j1"]).status.success());
+    qex.set_job(J1, "failed");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "w", "--for", J1_SPEC]).status.success());
     let output = run_with_qex(&sandbox, &qex, &["wait", "w"]);
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(stdout_json(&output)["events"][0]["summary"], "hold released: qex:j1 failed");
+    assert_eq!(stdout_json(&output)["events"][0]["summary"], format!("hold released: qex:{J1} failed"));
 }
 
 #[test]
@@ -1746,8 +1750,8 @@ fn a_hold_on_a_live_job_is_pending_with_call_keepalive_again_until_cancelled() {
     // proves: CLAIM(H7), CLAIM(H1)
     let sandbox = Sandbox::new();
     let qex = FakeQex::new(&sandbox);
-    qex.set_job("j1", "running");
-    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", "qex:j1", "--for", "pid:1", "--for", "until:2099-01-01T00:00:00Z"]).status.success());
+    qex.set_job(J1, "running");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", J1_SPEC, "--for", "pid:1", "--for", "until:2099-01-01T00:00:00Z"]).status.success());
     let status = stdout_json(&run_with_qex(&sandbox, &qex, &["status", "h"]));
     assert_eq!((status["status"].as_str(), status["next"].as_str()), (Some("pending"), Some("call keepalive again")), "{status}");
     let file = sandbox.watch_file("h").unwrap();
@@ -1755,7 +1759,7 @@ fn a_hold_on_a_live_job_is_pending_with_call_keepalive_again_until_cancelled() {
     assert_eq!(file["orchestrator"], true);
     assert_eq!(
         file["inputs"],
-        serde_json::json!([{"kind": "qex", "job": "j1"}, {"kind": "process", "pid": 1, "want": "exited"}, {"kind": "until", "at": "2099-01-01T00:00:00Z"}])
+        serde_json::json!([{"kind": "qex", "job": J1}, {"kind": "process", "pid": 1, "want": "exited"}, {"kind": "until", "at": "2099-01-01T00:00:00Z"}])
     );
     assert_eq!(stdout_json(&run_with_qex(&sandbox, &qex, &["cancel", "h"]))["status"], "cancelled");
 }
@@ -1781,7 +1785,7 @@ fn a_hold_on_an_unknown_qex_job_or_a_bad_spec_exits_1_and_writes_nothing() {
 fn a_bare_hold_and_until_idle_are_holds_on_nothing_and_on_the_cwd() {
     // why: H5/H10/H11. `vigil hold` with no work is the bare hold: no inputs,
     //      pending. `--until-idle` holds on the creating cwd through
-    //      `qex list --under <cwd> --all --json`: with an empty queue it is
+    //      `qex list --under <cwd> --state active --json`: with an empty queue it is
     //      idle at once and releases with the directory in the reason.
     // proves: CLAIM(H5), CLAIM(H10), CLAIM(H11)
     let sandbox = Sandbox::new();
@@ -1791,13 +1795,14 @@ fn a_bare_hold_and_until_idle_are_holds_on_nothing_and_on_the_cwd() {
     assert_eq!((bare["fire"].as_str(), bare["inputs"].as_array().map(Vec::len)), (Some("hold"), Some(0)));
     assert_eq!(stdout_json(&run_with_qex(&sandbox, &qex, &["status", "bare"]))["status"], "pending");
 
+    qex.set_list(&format!("--under {} --state active --json", sandbox.cwd().display()), "[]\n");
     assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "idle", "--until-idle"]).status.success());
     let cwd = sandbox.cwd();
     assert_eq!(sandbox.watch_file("idle").unwrap()["inputs"], serde_json::json!([{"kind": "qex_idle", "dir": cwd}]));
     let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "idle"]));
     assert_eq!(envelope["status"], "fired", "{envelope}");
     assert_eq!(envelope["events"][0]["summary"], format!("hold released: idle:{} idle", cwd.display()));
-    assert!(qex.calls().contains(&format!("list --under {} --all --json", cwd.display())), "{:?}", qex.calls());
+    assert!(qex.calls().contains(&format!("list --under {} --state active --json", cwd.display())), "{:?}", qex.calls());
 }
 
 #[test]
@@ -1809,7 +1814,7 @@ fn a_hold_defaults_to_the_orchestrator_window_and_hold_orchestrator_false_turns_
     // proves: CLAIM(H9)
     let (sandbox, fake_uw) = auto_sandbox(true);
     let qex = FakeQex::new(&sandbox);
-    qex.set_job("j1", "completed");
+    qex.set_job(J1, "completed");
     let keepalive = |id: &str| {
         let mut command = sandbox.command();
         command.args(["keepalive", id]).env("PATH", qex.path()).env("VIGIL_UW_COMMAND", &fake_uw).env("CLAUDE_CODE_SESSION_ID", SESSION);
@@ -1817,8 +1822,8 @@ fn a_hold_defaults_to_the_orchestrator_window_and_hold_orchestrator_false_turns_
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         stdout_json(&output)
     };
-    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "main", "--for", "qex:j1"]).status.success());
-    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "sub", "--for", "qex:j1", "--orchestrator", "false"]).status.success());
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "main", "--for", J1_SPEC]).status.success());
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "sub", "--for", J1_SPEC, "--orchestrator", "false"]).status.success());
     let main = keepalive("main");
     assert_eq!((main["max_s"].as_u64(), main["cache"]["ttl"].as_str()), (Some(3300), Some("1h")), "{main}");
     assert_eq!(keepalive("sub")["max_s"], 270);
@@ -1846,4 +1851,86 @@ fn the_cli_help_documents_hold_and_the_orchestrator_flag() {
             assert!(text.contains(needle), "{args:?} must mention {needle:?}:\n{text}");
         }
     }
+}
+
+#[test]
+fn an_idle_hold_reads_only_active_jobs_so_a_long_history_cannot_blind_it() {
+    // why: S1. On this host `qex list --under /home/user --all --json` is 2.5 MB
+    //      of terminal jobs, over the 64 KiB command capture, and the old query
+    //      made an idle queue read "error: qex answered no job list" for ever.
+    //      The fake answers the history query with 200 real-shaped records
+    //      (>400 KB) and the active query with `[]`: the hold releases on its
+    //      first tick. Control: a busy queue of 40 real-shaped records, itself
+    //      over the capture, keeps the hold pending.
+    // proves: CLAIM(H10)
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    let cwd = sandbox.cwd();
+    let history = FakeQex::list_of(200, "completed");
+    assert!(history.len() > 400_000, "the history must dwarf the capture: {}", history.len());
+    qex.set_list(&format!("--under {} --all --json", cwd.display()), &history);
+    qex.set_list(&format!("--under {} --state active --json", cwd.display()), "[]\n");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "idle", "--until-idle"]).status.success());
+    let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "idle", "--max-s", "30"]));
+    assert_eq!(released["status"], "fired", "an idle queue releases despite its history: {released}");
+
+    let busy = FakeQex::list_of(40, "running");
+    assert!(busy.len() > 64 * 1024);
+    qex.set_list(&format!("--under {} --state active --json", cwd.display()), &busy);
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "busy", "--until-idle"]).status.success());
+    let held = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "busy", "--max-s", "2"]));
+    assert_eq!((held["status"].as_str(), held["events"].as_array().map(Vec::len)), (Some("pending"), Some(0)), "{held}");
+    // (That the truncated list reads `busy: N+`, not `error:`, is pinned on the reading itself in
+    // `hold::tests`: both are `pending` here.)
+    assert!(qex.calls().iter().all(|call| !call.contains("--all")), "the history is never asked for: {:?}", qex.calls());
+}
+
+#[test]
+fn a_hold_on_a_job_whose_record_is_cleaned_before_the_next_tick_releases() {
+    // why: S2. The job is running when the hold is made; it finishes and
+    //      `qex clean` deletes it. qex still accepts the id but answers exit
+    //      127 "the job ID (NAME) existed and its state was `completed`.
+    //      Something deleted its record" (real text). The hold releases,
+    //      saying `gone`.
+    // proves: CLAIM(H2)
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", J1_SPEC]).status.success());
+    qex.set_removed(J1);
+    let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30"]));
+    assert_eq!((released["status"].as_str(), released["next"].as_str()), (Some("fired"), Some("act on events")), "{released}");
+    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{J1} gone"));
+}
+
+#[test]
+fn a_hold_made_on_a_name_stores_the_job_id_and_survives_the_name_being_reused() {
+    // why: S3. `--for qex:nightly` resolves to the job id when the hold is
+    //      made and stores THAT. A second job then takes the name, so qex
+    //      answers "`nightly` names 2 jobs" (real text, exit 127) to a status
+    //      by name; the hold must not ask by name again. When the first job
+    //      completes it releases, naming the id; the call log shows no status
+    //      for the name after creation.
+    // proves: CLAIM(H3)
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    qex.set_name("nightly", J1);
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", "qex:nightly"]).status.success());
+    assert_eq!(sandbox.watch_file("h").unwrap()["inputs"], serde_json::json!([{"kind": "qex", "job": J1}]));
+
+    qex.set_ambiguous("nightly");
+    qex.set_job(J1, "completed");
+    let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30"]));
+    assert_eq!(released["status"], "fired", "{released}");
+    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{J1} completed"));
+    let by_name = qex.calls().iter().filter(|call| call.starts_with("status nightly")).count();
+    assert_eq!(by_name, 1, "only the creation asked by name: {:?}", qex.calls());
+
+    // A name that is ambiguous at creation is refused, naming the cause.
+    let refused = run_with_qex(&sandbox, &qex, &["hold", "--id", "again", "--for", "qex:nightly"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("nightly") && stderr.contains("ambiguous") && stderr.contains("names 2 jobs"), "{stderr}");
+    assert!(sandbox.watch_file("again").is_none());
 }

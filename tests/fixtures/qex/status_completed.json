@@ -1,0 +1,86 @@
+{
+  "after": [],
+  "assigned": {},
+  "attempts": 1,
+  "blocked_reason": null,
+  "blocked_since": null,
+  "boot_id": "e69429ca-c44b-44c0-baa9-e444fe54bb04",
+  "caused_by": null,
+  "claim_source": "explicit",
+  "claims": {},
+  "command": [
+    "true"
+  ],
+  "cpu": 1,
+  "cpu_source": "explicit",
+  "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+  "dedupe_key": null,
+  "disk": null,
+  "disk_path": null,
+  "error": null,
+  "exit_code": 0,
+  "finished_at": 1794489833,
+  "forced": false,
+  "forced_reason": null,
+  "group": null,
+  "group_name": null,
+  "id": "0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9",
+  "last_pid": 3080091,
+  "locks": [],
+  "logs_dropped": null,
+  "mem": 16777216,
+  "mem_source": "explicit",
+  "name": "vigil-fixture",
+  "needs": [],
+  "passed_by": 0,
+  "pid": null,
+  "pid_start_token": null,
+  "queue_pause_secs": 0,
+  "retries_left": 0,
+  "sequence": 1022,
+  "signal": null,
+  "started_at": 1794489833,
+  "state": "completed",
+  "submitted_at": 1794489833,
+  "submitter": [
+    {
+      "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+      "name": "bash",
+      "pid": 3080082,
+      "ppid": 3075642,
+      "start": 116142752,
+      "terminal": false
+    },
+    {
+      "cwd": "/home/user/Documents/repos/host-config",
+      "name": ".claude-wrapped",
+      "pid": 3075642,
+      "ppid": 2766008,
+      "start": 116129534,
+      "terminal": false
+    },
+    {
+      "cwd": "/home/user",
+      "name": "node-MainThread",
+      "pid": 2766008,
+      "ppid": 1,
+      "start": 97909919,
+      "terminal": false
+    },
+    {
+      "cwd": null,
+      "name": "systemd",
+      "pid": 1,
+      "ppid": 0,
+      "start": 0,
+      "terminal": false
+    }
+  ],
+  "supervisor_pid": 3080088,
+  "supervisor_start_token": 116142756,
+  "tags": [],
+  "usage": {
+    "cpu_secs": 0.000564,
+    "max_rss": 3260416
+  }
+}

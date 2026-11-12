@@ -76,6 +76,12 @@ pub enum CreateError {
     /// W36 (H3): a hold on a qex job qex does not know is a typo, not a hold.
     #[error("qex job {0:?} not found")]
     QexJobNotFound(String),
+    /// W36 (H3): a name or id prefix that names several qex jobs cannot be held on.
+    #[error("qex job {job:?} is ambiguous: {detail}; hold on the full job id")]
+    QexJobAmbiguous { job: String, detail: String },
+    /// W36 (H3): qex did not say which job a name or id prefix is.
+    #[error("cannot resolve qex job {job:?} to a job id: {reason}")]
+    QexJobUnresolved { job: String, reason: String },
     #[error(transparent)]
     Store(#[from] StoreError),
 }

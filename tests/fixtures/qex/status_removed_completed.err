@@ -1,0 +1,1 @@
+qex: the job 0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9 (vigil-fixture) existed and its state was `completed`. Something deleted its record 0s ago, with `qex clean` or by a deletion of the state directory. The work of that job HAPPENED. Do not submit it again unless you want to repeat the work.

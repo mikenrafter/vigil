@@ -106,11 +106,11 @@ pub async fn read_input(input: &Input, previous: &InputState) -> Reading {
         // system and the system clock; tests script these through `ScriptedReader`.
         Input::Qex { job } => {
             let argv = ["qex", "status", job, "--json", "--no-logs"].map(String::from);
-            let text = crate::hold::qex_status_reading(&observe_cmd(&argv, None, None).await.text);
+            let text = crate::hold::qex_status_reading(job, &observe_cmd(&argv, None, None).await.text);
             settle(label, previous, work_observed(input, text), None)
         }
         Input::QexIdle { dir } => {
-            let argv = vec!["qex".to_string(), "list".into(), "--under".into(), dir.to_string_lossy().into_owned(), "--all".into(), "--json".into()];
+            let argv = crate::hold::idle_argv(dir);
             let text = crate::hold::qex_idle_reading(&observe_cmd(&argv, None, None).await.text);
             settle(label, previous, work_observed(input, text), None)
         }
@@ -514,6 +514,16 @@ fn observe_process(pid: u32, want: Option<ProcessWant>, previous: &InputState) -
 /// the call budget (V2): a reader that overruns must be cut off.
 pub trait InputReader: Send + Sync {
     fn read<'a>(&'a self, input: &'a Input, previous: &'a InputState) -> crate::judge::BoxFuture<'a, Reading>;
+    /// W36 (H3): the full job id behind a qex job name, id prefix or id.
+    fn resolve_qex<'a>(&'a self, job: &'a str) -> crate::judge::BoxFuture<'a, Result<String, crate::error::CreateError>> {
+        Box::pin(resolve_qex_job(job))
+    }
+}
+
+/// W36 (H3): ask `qex status JOB --json --no-logs` which job `job` is.
+pub async fn resolve_qex_job(job: &str) -> Result<String, crate::error::CreateError> {
+    let argv = ["qex", "status", job, "--json", "--no-logs"].map(String::from);
+    crate::hold::qex_resolution(job, &observe_cmd(&argv, None, None).await.text)
 }
 
 /// Production reader: `read_input`.

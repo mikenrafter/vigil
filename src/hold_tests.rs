@@ -474,3 +474,50 @@ fn watch_files_written_before_holds_still_load_unchanged() {
     let hold = serde_json::to_value(crate::watch::WatchSpec::parse(hold_request("h", vec![])).unwrap()).unwrap();
     assert_eq!(hold["fire"], "hold");
 }
+
+const JOB_ID: &str = "0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9";
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_made_on_a_name_follows_the_job_it_resolved_to_even_after_the_name_is_reused() {
+    // why: S3. `qex:build` named one job when the hold was made. A later job
+    //      reuses the name, and qex then answers "names 2 jobs" for it (real
+    //      capture in hold::tests). The stored input is the FULL id, so the
+    //      hold neither reads the name again nor goes ambiguous: it follows
+    //      the first job to its end. The name's own script reads as an error to
+    //      prove it is never asked.
+    // proves: CLAIM(H3)
+    let env = rig();
+    env.reader.set_qex_resolution("build", Ok(JOB_ID.to_string()));
+    env.reader.set_text(&format!("qex:{JOB_ID}"), "running");
+    env.reader.set_text("qex:build", "error: `build` names 2 jobs");
+    env.vigil.hold(request_for(&["qex:build"])).await.unwrap();
+    assert_eq!(watch_file(&env.vigil, "h").spec.inputs, vec![qex(JOB_ID)], "the full id is what is stored");
+
+    let quiet = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(quiet["status"], "pending", "{quiet}");
+    env.reader.set_text(&format!("qex:{JOB_ID}"), "completed");
+    let released = call(&env.vigil, "h", Some(60)).await;
+    assert_eq!(released["status"], "fired", "{released}");
+    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{JOB_ID} completed"));
+    assert_eq!(env.reader.started_count("qex:build"), 0, "the name is never read after creation");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_on_an_ambiguous_or_unresolvable_name_is_refused_with_the_cause_and_leaves_nothing() {
+    // why: S3/H3. A name that already names two jobs has no identity to store,
+    //      and a qex that cannot answer cannot tell which job a name is. Both
+    //      refuse, each naming its cause, and write nothing (the id stays
+    //      usable). Control: a full id is accepted.
+    // proves: CLAIM(H3)
+    use crate::error::CreateError;
+    let env = rig();
+    env.reader.set_qex_resolution("dup", Err(CreateError::QexJobAmbiguous { job: "dup".into(), detail: "`dup` names 2 jobs".into() }));
+    env.reader.set_qex_resolution("mute", Err(CreateError::QexJobUnresolved { job: "mute".into(), reason: "timeout after 10s".into() }));
+    env.reader.set_text(&format!("qex:{JOB_ID}"), "running");
+    let ambiguous = env.vigil.hold(request_for(&["qex:dup"])).await.unwrap_err().to_string();
+    assert!(ambiguous.contains("dup") && ambiguous.contains("ambiguous") && ambiguous.contains("full job id"), "{ambiguous}");
+    let unresolved = env.vigil.hold(request_for(&["qex:mute"])).await.unwrap_err().to_string();
+    assert!(unresolved.contains("mute") && unresolved.contains("timeout"), "{unresolved}");
+    assert!(!env.vigil.store().watch_path(&WatchId::parse("h").unwrap()).exists());
+    env.vigil.hold(request_for(&[&format!("qex:{JOB_ID}")])).await.unwrap();
+}

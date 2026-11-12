@@ -1,0 +1,89 @@
+[
+  {
+    "id": "54f37003-8ec5-42e2-9edb-da031d8f165a",
+    "name": "vigil-queued",
+    "command": [
+      "sleep",
+      "5"
+    ],
+    "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+    "state": "starting",
+    "pid": null,
+    "pid_start_token": null,
+    "last_pid": null,
+    "supervisor_pid": null,
+    "submitter": [
+      {
+        "pid": 3080082,
+        "ppid": 3075642,
+        "start": 116142752,
+        "name": "bash",
+        "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+        "terminal": false
+      },
+      {
+        "pid": 3075642,
+        "ppid": 2766008,
+        "start": 116129534,
+        "name": ".claude-wrapped",
+        "cwd": "/home/user/Documents/repos/host-config",
+        "terminal": false
+      },
+      {
+        "pid": 2766008,
+        "ppid": 1,
+        "start": 97909919,
+        "name": "node-MainThread",
+        "cwd": "/home/user",
+        "terminal": false
+      },
+      {
+        "pid": 1,
+        "ppid": 0,
+        "start": 0,
+        "name": "systemd",
+        "cwd": null,
+        "terminal": false
+      }
+    ],
+    "boot_id": "e69429ca-c44b-44c0-baa9-e444fe54bb04",
+    "supervisor_start_token": null,
+    "exit_code": null,
+    "signal": null,
+    "submitted_at": 1794489833,
+    "sequence": 1024,
+    "started_at": 1794489833,
+    "finished_at": null,
+    "cpu": 1,
+    "mem": 16777216,
+    "disk": null,
+    "disk_path": null,
+    "claim_source": "explicit",
+    "cpu_source": "explicit",
+    "mem_source": "explicit",
+    "group": null,
+    "group_name": null,
+    "usage": {
+      "max_rss": 0,
+      "cpu_secs": 0.0
+    },
+    "forced": false,
+    "forced_reason": null,
+    "queue_pause_secs": 0,
+    "blocked_reason": null,
+    "blocked_since": null,
+    "passed_by": 0,
+    "error": null,
+    "needs": [],
+    "after": [],
+    "locks": [],
+    "dedupe_key": null,
+    "claims": {},
+    "assigned": {},
+    "attempts": 0,
+    "retries_left": 0,
+    "caused_by": null,
+    "logs_dropped": null,
+    "tags": []
+  }
+]
