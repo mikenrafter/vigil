@@ -70,7 +70,7 @@ mcp` (new session, harness restart) picks up where the file says.
 
 - `vigil mcp`: stdio MCP server. Runs ticks only inside a `keepalive` call,
   in-process.
-- `vigil` CLI subcommands (`create`, `status`, `list`, `cancel`, `keepalive`,
+- `vigil` CLI subcommands (`create`, `hold`, `status`, `list`, `cancel`, `keepalive`,
   `wait`, `advice`, `advisory`) run the same code against the same files. Programmatic monitors, with no
   agent involved, use these; `vigil keepalive` blocks in the shell the same
   way.
@@ -198,6 +198,12 @@ Blocks until any covered watch fires, expires or needs attention, or the
 window (270 s by default, see below) elapses. Ticks run in this call, each when the watch's
 `last_tick_at + interval_s` comes due, so the cadence holds across calls and
 an immediate re-call does not cause an extra tick.
+
+### `hold`
+
+Creates a hold (a watch on the work itself): see "Holds". Arguments `{id?, for?,
+until_idle?, deadline_s?, expect_s?, orchestrator?}`; returns what `watch_create`
+returns. Then `keepalive`.
 
 ### `watch_status`, `watch_list`, `watch_cancel`
 
@@ -814,8 +820,8 @@ watches (`judge`, `change`, `condition`) read and behave exactly as before
   `error: <why>` and is **not ended**: a hold errs towards staying live, because
   the cost of an early release is the lost cache. The one exception is qex's own
   "there is no job" answer, which is `gone` and ended (qex prunes old jobs), so
-  a hold does not outlive its job's record. At creation `gone` is refused
-  (`qex job X not found`), so a typo is an error at once, not a hold that lives
+  a hold does not outlive its job's record. `vigil hold` and the `hold` tool refuse `gone` at creation
+  (`qex job X not found`; `watch_create` does not check), so a typo is an error at once, not a hold that lives
   7 days (CLAIM(H3)).
 - qex states: ended = `completed failed killed timeout expired oom cancelled
   skipped`; live = `queued starting running`. A job that fails and is queued for
