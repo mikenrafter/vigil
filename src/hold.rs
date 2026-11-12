@@ -78,8 +78,6 @@ impl Work {
     }
 }
 
-/// qex states that mean the job is still going; every other state word ends it.
-const LIVE_STATES: [&str; 3] = ["queued", "starting", "running"];
 /// The qex states that mean the job has stopped (`qex list --state` names them).
 /// Only these end a hold: a state not listed (a newer qex's) is NOT an end, and
 /// the live ones (queued, starting, running) are simply not listed.
@@ -138,32 +136,51 @@ pub fn qex_resolution(job: &str, _cmd_text: &str) -> Result<String, CreateError>
     Ok(job.to_string())
 }
 
-/// RED STUB: the `qex list` arguments of an idle reading.
+/// The `qex list` arguments of an idle reading (H10): the jobs at or under
+/// `dir` that have not ended (`active` is queued, starting and running), never
+/// the history. Qex keeps terminal jobs for a day or more, and listing them is
+/// megabytes against the 64 KiB command capture.
 pub fn idle_argv(dir: &std::path::Path) -> Vec<String> {
-    vec!["qex".to_string(), "list".into(), "--under".into(), dir.to_string_lossy().into_owned(), "--all".into(), "--json".into()]
+    ["qex", "list", "--under"].into_iter().map(String::from).chain([dir.to_string_lossy().into_owned()]).chain(["--state", "active", "--json"].map(String::from)).collect()
 }
 
-/// The reading of a `qex list --under DIR --all --json` run: `idle`, or
-/// `busy: N active (ID, ...)`, or `error: ...`.
+/// The reading of an `idle_argv` run: `idle`, or `busy: N active (ID, ...)`, or
+/// `error: ...`. Every job qex returns for the query is active unless its
+/// record says it ended, so a state a newer qex adds counts as active. A list
+/// the command capture cut short is still plainly busy: it is read for the job
+/// ids it holds, and the count is then a lower bound (`N+`).
 pub fn qex_idle_reading(cmd_text: &str) -> String {
     let Some((code, output)) = split_exit(cmd_text) else { return error_reading(cmd_text) };
     if code != "0" {
         return error_reading(&format!("exit {code}: {output}"));
     }
-    let Some(serde_json::Value::Array(jobs)) = json_in(output, '[', ']') else { return error_reading("qex answered no job list") };
-    let active: Vec<&str> = jobs
-        .iter()
-        .filter(|job| job.get("state").and_then(serde_json::Value::as_str).is_some_and(|state| LIVE_STATES.contains(&state)))
-        .map(|job| job.get("id").and_then(serde_json::Value::as_str).unwrap_or("?"))
-        .collect();
-    if active.is_empty() {
+    let (ids, more): (Vec<String>, bool) = match json_in(output, '[', ']') {
+        Some(serde_json::Value::Array(jobs)) => (
+            jobs.iter()
+                .filter(|job| !job.get("state").and_then(serde_json::Value::as_str).is_some_and(|state| ENDED_STATES.contains(&state)))
+                .map(|job| job.get("id").and_then(serde_json::Value::as_str).unwrap_or("?").to_string())
+                .collect(),
+            false,
+        ),
+        _ if output.contains(crate::inputs::TRUNCATED_MARKER) => {
+            // The cut JSON is qex's pretty-printed array: a job's own `id` is the
+            // only key at four spaces of indent (nested records sit deeper).
+            let ids = output.lines().filter_map(|line| line.strip_prefix("    \"id\": \"")?.split('"').next().map(str::to_string)).collect::<Vec<_>>();
+            if ids.is_empty() {
+                return error_reading("qex answered no job list");
+            }
+            (ids, true)
+        }
+        _ => return error_reading("qex answered no job list"),
+    };
+    if ids.is_empty() {
         return "idle".to_string();
     }
-    let mut ids: Vec<String> = active.iter().take(3).map(|id| id.chars().take(8).collect()).collect();
-    if active.len() > 3 {
-        ids.push("...".to_string());
+    let mut shown: Vec<String> = ids.iter().take(3).map(|id| id.chars().take(8).collect()).collect();
+    if ids.len() > 3 {
+        shown.push("...".to_string());
     }
-    format!("busy: {} active ({})", active.len(), ids.join(", "))
+    format!("busy: {}{} active ({})", ids.len(), if more { "+" } else { "" }, shown.join(", "))
 }
 
 /// `vigil hold` / the `hold` tool (H11).
