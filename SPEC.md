@@ -807,7 +807,7 @@ watches (`judge`, `change`, `condition`) read and behave exactly as before
 | `qex:<job-id>` | `{"kind":"qex","job":ID}` | `qex status ID --json --no-logs` shows a state other than `queued`, `starting`, `running`; or qex no longer knows the job (`gone`) | the state name, `gone`, or `error: ...` |
 | `pid:<pid>` | `{"kind":"process","pid":N,"want":"exited"}` | the pid is gone, a zombie, or reused (V17) | `running` / `exited` |
 | `file:<path>` | `{"kind":"path_exists","path":P}` | the path exists (a done-marker another program writes) | `missing` / `present` |
-| `until:<RFC3339>` | `{"kind":"until","at":T}` | the wall clock is at or past `T` | `before T` / `reached T` |
+| `until:<RFC3339>` | `{"kind":"until","at":T}` | the wall clock is at or past `T` | `waiting` / `reached` |
 | `idle:<dir>` | `{"kind":"qex_idle","dir":D}` | no qex job under `D` is `queued`, `starting` or `running` | `idle` / `busy: N active` |
 
 - A read that fails (qex missing, a timeout, unparsable output) reads
@@ -846,7 +846,7 @@ cancelled or the 7 days are up.
 
 **Release (H6).** When all work has ended the hold fires once with one event:
 `input: "hold"`, `summary: "hold released: <why>"` where `<why>` lists each
-input and what it read (`qex:ab12 completed; process:4242 exited`), cut to 200
+input and what it read (`qex:ab12 completed; process:4242 exited`; each input's label, then its reading), cut to 200
 bytes. `next` is `"act on events"`; `vigil wait` exits 0. While any work is live
 the envelope is `pending` with `next: "call keepalive again"` and no events
 (CLAIM(H7)). A hold that expires or is cancelled gives the ordinary terminal
@@ -871,8 +871,7 @@ submitting process tree (qex records `submitter` pids), which would follow a
 session into its worktrees; the data is there, the rule is not decided.
 
 **CLI (H11).** `vigil hold [--id ID] [--for SPEC]... [--until-idle]
-[--deadline-s N] [--expect-s N] [--orchestrator BOOL]`. `--for` repeats and also
-takes a comma-free single spec per use. Prints the created watch like `vigil
+[--deadline-s N] [--expect-s N] [--orchestrator BOOL]`. `--for` repeats, one spec per use. Prints the created watch like `vigil
 create` (`watch_id`, `status`, `created_at`, `deadline_at`); then `keepalive
 <id>` / `wait <id>` as for any watch. `--orchestrator` on `keepalive` and
 `wait` is the existing flag (AI1'): main session only, selects the 55 minute

@@ -286,6 +286,24 @@ pub(crate) fn validate_input(input: &Input) -> Result<(), CreateError> {
     Ok(())
 }
 
+/// H4: a hold waits on work and takes no stall limit.
+fn validate_hold(request: &CreateRequest) -> Result<(), CreateError> {
+    if request.stall_s.is_some() {
+        return Err(CreateError::HoldRejects("stall_s"));
+    }
+    for input in &request.inputs {
+        let is_work = match input {
+            Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } => true,
+            Input::Process { want, .. } => *want == Some(ProcessWant::Exited),
+            Input::File { .. } | Input::Glob { .. } | Input::Cmd { .. } | Input::Url { .. } | Input::Port { .. } => false,
+        };
+        if !is_work {
+            return Err(CreateError::NotWork(input.label()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_judge(questions: &Map<String, Value>, rule: &JudgeRule) -> Result<(), CreateError> {
     if questions.is_empty() {
         return Err(CreateError::EmptyQuestions);
@@ -352,7 +370,8 @@ impl WatchSpec {
         if request.prompt.len() > MAX_PROMPT_BYTES {
             return Err(CreateError::PromptTooLong(request.prompt.len()));
         }
-        let deadline_s = request.deadline_s.unwrap_or(DEFAULT_DEADLINE_S);
+        // H5: a hold lives as long as any watch can unless told less.
+        let deadline_s = request.deadline_s.unwrap_or(if request.fire == FireKind::Hold { MAX_DEADLINE_S } else { DEFAULT_DEADLINE_S });
         if !(MIN_DEADLINE_S..=MAX_DEADLINE_S).contains(&deadline_s) {
             return Err(CreateError::DeadlineOutOfRange(deadline_s));
         }
@@ -368,6 +387,9 @@ impl WatchSpec {
         let interval_s = request.interval_s.unwrap_or(DEFAULT_INTERVAL_S).clamp(MIN_INTERVAL_S, MAX_INTERVAL_S);
         for input in &request.inputs {
             validate_input(input)?;
+        }
+        if request.fire == FireKind::Hold {
+            validate_hold(&request)?;
         }
         let fire = match request.fire {
             FireKind::Judge => {
@@ -402,7 +424,8 @@ impl WatchSpec {
             fire,
             expect_s: request.expect_s,
             stall_s: request.stall_s,
-            orchestrator: request.orchestrator.unwrap_or(false),
+            // H9: holds are for main sessions.
+            orchestrator: request.orchestrator.unwrap_or(request.fire == FireKind::Hold),
         })
     }
 

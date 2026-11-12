@@ -163,7 +163,7 @@ impl Vigil {
         let fired_events = match &watch.spec.fire {
             FireRule::Change => change_events(&watch, tick, &readings),
             FireRule::Condition => condition_events(&mut watch, tick, &readings),
-            FireRule::Hold => Vec::new(),
+            FireRule::Hold => hold_events(&mut watch, tick, &readings),
             FireRule::Judge { .. } => {
                 if changed.is_empty() && watch.pending_change.is_none() {
                     Vec::new()
@@ -421,6 +421,28 @@ fn condition_events(watch: &mut WatchFile, tick: u64, readings: &[Reading]) -> V
         watch_id: watch.spec.id.to_string(),
         input: labels,
         summary: cap_bytes(&format!("condition met: {summary}"), MAX_SUMMARY_BYTES),
+        judge: None,
+        redelivered: false,
+        detail: None,
+    }]
+}
+
+/// fire = hold (H6): fires once every work input has ended; a hold with no
+/// work never fires (H5). One event, `input: "hold"`, whose summary is the
+/// reason: each input's label and what it read.
+fn hold_events(watch: &mut WatchFile, tick: u64, readings: &[Reading]) -> Vec<Event> {
+    if readings.is_empty() || !readings.iter().all(|reading| reading.want_met == Some(true)) {
+        return Vec::new();
+    }
+    let met: Vec<ChangedInput> = readings.iter().map(|reading| ChangedInput { label: reading.label.clone(), text: reading.text.clone() }).collect();
+    watch.last_digest = digest_of(&met);
+    let why = met.iter().map(|input| format!("{} {}", input.label, input.text)).collect::<Vec<_>>().join("; ");
+    vec![Event {
+        event_id: Event::make_id(watch.spec.id.as_str(), tick, 0),
+        tick,
+        watch_id: watch.spec.id.to_string(),
+        input: "hold".to_string(),
+        summary: cap_bytes(&format!("hold released: {why}"), MAX_SUMMARY_BYTES),
         judge: None,
         redelivered: false,
         detail: None,

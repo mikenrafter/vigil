@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::Timestamp;
 use crate::engine::{Created, Vigil};
 use crate::error::{CreateError, VigilError};
-use crate::watch::{CreateRequest, FireKind, Input, ProcessWant, MAX_DEADLINE_S};
+use crate::watch::{CreateRequest, FireKind, Input, InputState, ProcessWant, MAX_DEADLINE_S};
 
 /// H5: a hold lives this long unless asked for less (the longest any watch lives).
 pub const HOLD_DEADLINE_S: u64 = MAX_DEADLINE_S;
@@ -32,11 +32,39 @@ pub enum Work {
     Idle(PathBuf),
 }
 
+const USAGE: &str = "expected qex:ID, pid:N, file:PATH, until:RFC3339 or idle:DIR";
+
+/// A qex job id, id prefix or name: what is safe to hand to `qex status` as a
+/// single argument that can never read as an option.
+fn valid_job(job: &str) -> bool {
+    (1..=128).contains(&job.len())
+        && !job.starts_with('-')
+        && job.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 impl Work {
     /// Parse `qex:<job>`, `pid:<pid>`, `file:<path>`, `until:<RFC3339>` or
     /// `idle:<dir>` (H2).
     pub fn parse(spec: &str) -> Result<Work, CreateError> {
-        Err(CreateError::InvalidWork { spec: spec.to_string(), reason: "not implemented".to_string() })
+        let bad = |reason: &str| CreateError::InvalidWork { spec: spec.to_string(), reason: reason.to_string() };
+        let (kind, value) = spec.split_once(':').ok_or_else(|| bad(USAGE))?;
+        match kind {
+            "qex" if value.is_empty() => Err(bad("empty job id")),
+            "qex" if !valid_job(value) => Err(bad("job id must be 1-128 letters, digits, '.', '_' or '-', and not start with '-'")),
+            "qex" => Ok(Work::Qex(value.to_string())),
+            "pid" => match value.parse::<u32>() {
+                Ok(pid) if pid > 0 => Ok(Work::Pid(pid)),
+                _ => Err(bad("pid must be a positive integer")),
+            },
+            "file" if value.is_empty() => Err(bad("empty path")),
+            "file" => Ok(Work::Exists(PathBuf::from(value))),
+            "until" => chrono::DateTime::parse_from_rfc3339(value)
+                .map(|at| Work::Until(Timestamp(at.with_timezone(&chrono::Utc))))
+                .map_err(|_| bad("time must be RFC 3339, e.g. 2026-11-12T20:00:00Z")),
+            "idle" if value.is_empty() => Err(bad("empty directory")),
+            "idle" => Ok(Work::Idle(PathBuf::from(value))),
+            _ => Err(bad(USAGE)),
+        }
     }
 
     pub fn into_input(self) -> Input {
@@ -50,22 +78,80 @@ impl Work {
     }
 }
 
+/// qex states that mean the job is still going; every other state word ends it.
+const LIVE_STATES: [&str; 3] = ["queued", "starting", "running"];
+/// qex states that mean the job has stopped (`qex list --state` names them).
+const ENDED_STATES: [&str; 8] = ["completed", "failed", "killed", "timeout", "expired", "oom", "cancelled", "skipped"];
+
 /// Has the work behind `input` ended, given what its last reading said (H2)?
+/// An unknown qex state is NOT an end: a newer qex must not release holds early.
 pub fn ended(input: &Input, text: &str) -> bool {
-    false
+    match input {
+        Input::Qex { .. } => text == "gone" || ENDED_STATES.contains(&text),
+        Input::QexIdle { .. } => text == "idle",
+        Input::PathExists { .. } => text == "present",
+        Input::Until { .. } => text == "reached",
+        Input::Process { .. } => text == "exited",
+        _ => false,
+    }
+}
+
+/// `error: <first line>`, bounded.
+fn error_reading(text: &str) -> String {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("no output");
+    format!("error: {}", crate::tick::cap_bytes(line, 160))
+}
+
+/// Split the command reader's `exit=<code>\n<output>` into code and output;
+/// `None` for its own error texts (spawn failure, timeout).
+fn split_exit(cmd_text: &str) -> Option<(&str, &str)> {
+    let rest = cmd_text.strip_prefix("exit=")?;
+    Some(rest.split_once('\n').unwrap_or((rest, "")))
+}
+
+/// The JSON value in `output` between the first `open` and the last `close`
+/// (stderr hints may surround it).
+fn json_in(output: &str, open: char, close: char) -> Option<serde_json::Value> {
+    let (from, to) = (output.find(open)?, output.rfind(close)?);
+    serde_json::from_str(output.get(from..=to)?).ok()
 }
 
 /// The reading of a `qex status ID --json --no-logs` run (`cmd_text` is the
 /// command reader's text, `exit=<code>\n<output>`, or its error text): the
 /// job's state name, `gone` when qex does not know the job, else `error: ...`.
 pub fn qex_status_reading(cmd_text: &str) -> String {
-    "error: not implemented".to_string()
+    let Some((code, output)) = split_exit(cmd_text) else { return error_reading(cmd_text) };
+    match code {
+        "0" => match json_in(output, '{', '}').as_ref().and_then(|value| value.get("state")).and_then(serde_json::Value::as_str) {
+            Some(state) if (1..=32).contains(&state.len()) && state.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_') => state.to_string(),
+            _ => error_reading("qex answered no state"),
+        },
+        "127" if output.contains("there is no job") => "gone".to_string(),
+        _ => error_reading(&format!("exit {code}: {output}")),
+    }
 }
 
 /// The reading of a `qex list --under DIR --all --json` run: `idle`, or
 /// `busy: N active (ID, ...)`, or `error: ...`.
 pub fn qex_idle_reading(cmd_text: &str) -> String {
-    "error: not implemented".to_string()
+    let Some((code, output)) = split_exit(cmd_text) else { return error_reading(cmd_text) };
+    if code != "0" {
+        return error_reading(&format!("exit {code}: {output}"));
+    }
+    let Some(serde_json::Value::Array(jobs)) = json_in(output, '[', ']') else { return error_reading("qex answered no job list") };
+    let active: Vec<&str> = jobs
+        .iter()
+        .filter(|job| job.get("state").and_then(serde_json::Value::as_str).is_some_and(|state| LIVE_STATES.contains(&state)))
+        .map(|job| job.get("id").and_then(serde_json::Value::as_str).unwrap_or("?"))
+        .collect();
+    if active.is_empty() {
+        return "idle".to_string();
+    }
+    let mut ids: Vec<String> = active.iter().take(3).map(|id| id.chars().take(8).collect()).collect();
+    if active.len() > 3 {
+        ids.push("...".to_string());
+    }
+    format!("busy: {} active ({})", active.len(), ids.join(", "))
 }
 
 /// `vigil hold` / the `hold` tool (H11).
@@ -89,8 +175,35 @@ pub struct HoldRequest {
 
 impl Vigil {
     /// Create a hold (H1-H5, H10).
+    ///
+    /// Every spec is parsed before anything is read or written. A `qex` job
+    /// that qex does not know is refused (H3): a typo must not become a hold.
     pub async fn hold(&self, request: HoldRequest) -> Result<Created, VigilError> {
-        Err(CreateError::HoldRejects("hold (not implemented)").into())
+        let mut inputs = request.work.iter().map(|spec| Work::parse(spec).map(Work::into_input)).collect::<Result<Vec<_>, _>>()?;
+        if request.until_idle {
+            inputs.push(Work::Idle(self.cwd.clone()).into_input());
+        }
+        for input in &inputs {
+            if let Input::Qex { job } = input
+                && self.reader.read(input, &InputState::default()).await.text == "gone"
+            {
+                return Err(CreateError::QexJobNotFound(job.clone()).into());
+            }
+        }
+        self.create(CreateRequest {
+            id: request.id,
+            prompt: String::new(),
+            inputs,
+            interval_s: Some(HOLD_INTERVAL_S),
+            deadline_s: request.deadline_s,
+            fire: FireKind::Hold,
+            judge_questions: None,
+            judge_rule: None,
+            expect_s: request.expect_s,
+            stall_s: None,
+            orchestrator: request.orchestrator,
+        })
+        .await
     }
 }
 

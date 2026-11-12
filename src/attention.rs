@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Timestamp;
-use crate::watch::{Event, EventDetail, Input, WatchFile, WatchStatus, MAX_SUMMARY_BYTES};
+use crate::watch::{Event, EventDetail, FireRule, Input, WatchFile, WatchStatus, MAX_SUMMARY_BYTES};
 
 /// AI5: "1.5x or 9 minutes over, whichever comes first" (build-loop budget rule).
 pub const OVERDUE_EXTRA_CAP_S: u64 = 540;
@@ -79,7 +79,8 @@ pub fn due_reasons(watch: &WatchFile, now: Timestamp, long_window: bool) -> Vec<
         // A15: "neither field set" is literal; `expect_s` alone turns the default off.
         let rule = match (watch.spec.stall_s, watch.spec.expect_s) {
             (Some(stall_s), _) => Some((stall_s, activity.last_change_at)),
-            (None, None) if long_window => Some((DEFAULT_STALL_S, activity.last_output_change_at)),
+            // H8: a hold waits by definition; the default stall never applies to it.
+            (None, None) if long_window && !matches!(watch.spec.fire, FireRule::Hold) => Some((DEFAULT_STALL_S, activity.last_output_change_at)),
             (None, _) => None,
         };
         if let Some((stall_s, since)) = rule

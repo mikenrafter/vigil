@@ -38,6 +38,32 @@ enum Command {
         #[arg(long)]
         orchestrator: bool,
     },
+    /// Hold the session: a watch on the work itself, live until all of it has
+    /// ended, then released. Work specs (`--for`, repeatable): `qex:JOB`,
+    /// `pid:N`, `file:PATH` (ends when it exists), `until:RFC3339`,
+    /// `idle:DIR` (no qex job at or under DIR is running). With no work it is a
+    /// bare hold, live until cancelled (7 days at most). Then `keepalive ID`
+    /// (main session: add --orchestrator, a hold stores it by default) or
+    /// `wait ID`. A T3 task cannot be sensed here: hold on a pid or a marker file.
+    Hold {
+        #[arg(long)]
+        id: Option<String>,
+        /// A unit of work to wait on (repeatable).
+        #[arg(long = "for", value_name = "SPEC")]
+        work: Vec<String>,
+        /// Also wait for every qex job at or under the current directory.
+        #[arg(long)]
+        until_idle: bool,
+        /// Seconds until the hold expires, 1..=604800 (default 604800).
+        #[arg(long)]
+        deadline_s: Option<u64>,
+        /// Seconds the work should take; one `overdue` attention event after 1.5x.
+        #[arg(long)]
+        expect_s: Option<u64>,
+        /// Store whether keepalive calls are the main session's (default true).
+        #[arg(long, value_name = "BOOL")]
+        orchestrator: Option<bool>,
+    },
     /// Print the current advice (operator rules for agents), for hooks and
     /// scripts: one `id: message` line per advisory, or JSON with --json.
     Advice {
@@ -206,6 +232,10 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             };
             let request: CreateRequest = serde_json::from_str(&raw).map_err(|error| anyhow::anyhow!("invalid watch JSON: {error}"))?;
             print_json(&vigil.create(request).await?)?;
+            Ok(0)
+        }
+        Command::Hold { id, work, until_idle, deadline_s, expect_s, orchestrator } => {
+            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator }).await?)?;
             Ok(0)
         }
         Command::Status { id } => print_json(&vigil.status(&WatchId::parse(&id)?).await?).map(|()| 0),

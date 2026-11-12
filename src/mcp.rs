@@ -88,6 +88,28 @@ pub struct CreateArgs {
     pub judge_rule: Option<Value>,
 }
 
+/// `hold` arguments (SPEC "Holds", H11).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HoldArgs {
+    /// Optional stable id, `[A-Za-z0-9_-]{1,64}`; generated when absent.
+    pub id: Option<String>,
+    /// Work to wait on: `qex:JOB`, `pid:N`, `file:PATH` (ends when it exists),
+    /// `until:RFC3339`, `idle:DIR` (no qex job at or under DIR is running).
+    /// Omit for a bare hold that lives until cancelled.
+    #[serde(default, rename = "for")]
+    #[schemars(rename = "for")]
+    pub work: Vec<String>,
+    /// Also wait for every qex job at or under the server's working directory.
+    #[serde(default)]
+    pub until_idle: bool,
+    /// Seconds until the hold expires, 1..=604800 (default 604800).
+    pub deadline_s: Option<u64>,
+    /// Seconds the work should take; one `overdue` attention event after 1.5x.
+    pub expect_s: Option<u64>,
+    /// Whether keepalive calls for this hold are the main session's (default true).
+    pub orchestrator: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KeepaliveArgs {
     /// Watch to cover; without it, the watches this server created.
@@ -291,6 +313,23 @@ impl VigilServer {
                 created = self.vigil.create(request) => reply(created),
             },
             Err(message) => text_result(true, message),
+        })
+    }
+
+    #[tool(description = "Hold the session in cache by watching the work itself: qex jobs, pids, marker files, times, or a qex queue (for: [\"qex:ID\", \"pid:N\", \"file:PATH\", \"until:RFC3339\", \"idle:DIR\"]). Live until all of it has ended, then keepalive returns \"hold released: why\". With no work it lives until cancelled. Then call keepalive.")]
+    async fn hold(&self, Parameters(args): Parameters<HoldArgs>, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
+        let request = crate::hold::HoldRequest {
+            id: args.id,
+            work: args.work,
+            until_idle: args.until_idle,
+            deadline_s: args.deadline_s,
+            expect_s: args.expect_s,
+            orchestrator: args.orchestrator,
+        };
+        Ok(tokio::select! {
+            biased;
+            () = ctx.ct.cancelled() => cancelled_result(),
+            created = self.vigil.hold(request) => reply(created),
         })
     }
 

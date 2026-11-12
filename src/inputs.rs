@@ -102,10 +102,34 @@ pub async fn read_input(input: &Input, previous: &InputState) -> Reading {
             let (observed, proc_start) = observe_process(*pid, *want, previous);
             settle(label, previous, observed, Some(proc_start))
         }
-        Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } => {
-            settle(label, previous, Observed { text: "error: not implemented".to_string(), is_error: true, want_met: None }, None)
+        // W36 (H2). The production reader is the edge: it asks `qex`, the file
+        // system and the system clock; tests script these through `ScriptedReader`.
+        Input::Qex { job } => {
+            let argv = ["qex", "status", job, "--json", "--no-logs"].map(String::from);
+            let text = crate::hold::qex_status_reading(&observe_cmd(&argv, None, None).await.text);
+            settle(label, previous, work_observed(input, text), None)
+        }
+        Input::QexIdle { dir } => {
+            let argv = vec!["qex".to_string(), "list".into(), "--under".into(), dir.to_string_lossy().into_owned(), "--all".into(), "--json".into()];
+            let text = crate::hold::qex_idle_reading(&observe_cmd(&argv, None, None).await.text);
+            settle(label, previous, work_observed(input, text), None)
+        }
+        Input::PathExists { path } => {
+            let text = if path.exists() { "present" } else { "missing" };
+            settle(label, previous, work_observed(input, text.to_string()), None)
+        }
+        Input::Until { at } => {
+            let text = if crate::clock::Timestamp(chrono::Utc::now()) >= *at { "reached" } else { "waiting" };
+            settle(label, previous, work_observed(input, text.to_string()), None)
         }
     }
+}
+
+/// A hold work input's observation: its reading text, and whether the work
+/// behind it has ended (`hold::ended`, the one rule). `error: ...` is a read
+/// error, never an end.
+fn work_observed(input: &Input, text: String) -> Observed {
+    Observed { is_error: text.starts_with("error:"), want_met: Some(crate::hold::ended(input, &text)), text }
 }
 
 /// What one non-file read saw, before change detection.
