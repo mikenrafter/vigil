@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::Timestamp;
 use crate::engine::{Created, Vigil};
 use crate::error::{CreateError, VigilError};
-use crate::watch::{CreateRequest, FireKind, Input, InputState, ProcessWant, MAX_DEADLINE_S};
+use crate::watch::{CreateRequest, FireKind, Input, ProcessWant, MAX_DEADLINE_S};
 
 /// H5: a hold lives this long unless asked for less (the longest any watch lives).
 pub const HOLD_DEADLINE_S: u64 = MAX_DEADLINE_S;
@@ -163,9 +163,25 @@ pub fn qex_status_reading(job: &str, cmd_text: &str) -> String {
     }
 }
 
-/// RED STUB: resolve a name or prefix to a full job id.
-pub fn qex_resolution(job: &str, _cmd_text: &str) -> Result<String, CreateError> {
-    Ok(job.to_string())
+/// H3: which job a `qex:JOB` spec is, from the text of `qex status JOB --json
+/// --no-logs`. A name or id prefix resolves to the full id in the record; an
+/// unknown job, an ambiguous name, or a qex that cannot answer is refused with
+/// its cause. A full id qex accepted but whose record was removed is a real job
+/// that ended (the first tick releases the hold). A full id needs no lookup,
+/// so a qex that cannot answer does not refuse it.
+pub fn qex_resolution(job: &str, cmd_text: &str) -> Result<String, CreateError> {
+    let unknown = |reason: String| if is_job_id(job) { Ok(job.to_string()) } else { Err(CreateError::QexJobUnresolved { job: job.to_string(), reason }) };
+    let Some((code, output)) = split_exit(cmd_text) else { return unknown(error_reading(cmd_text)) };
+    match code {
+        "0" => match json_in(output, '{', '}').as_ref().and_then(|value| value.get("id")).and_then(serde_json::Value::as_str) {
+            Some(id) if valid_job(id) => Ok(id.to_string()),
+            _ => unknown("qex answered no job id".to_string()),
+        },
+        "127" if says_no_such_job(output) => Err(CreateError::QexJobNotFound(job.to_string())),
+        "127" if says_record_removed(output, job) => Ok(job.to_string()),
+        "127" if ambiguity(output).is_some() => Err(CreateError::QexJobAmbiguous { job: job.to_string(), detail: crate::tick::cap_bytes(ambiguity(output).unwrap_or_default(), 160) }),
+        _ => unknown(error_reading(&format!("exit {code}: {output}"))),
+    }
 }
 
 /// The `qex list` arguments of an idle reading (H10): the jobs at or under
@@ -247,11 +263,9 @@ impl Vigil {
         if request.until_idle {
             inputs.push(Work::Idle(self.cwd.clone()).into_input());
         }
-        for input in &inputs {
-            if let Input::Qex { job } = input
-                && self.reader.read(input, &InputState::default()).await.text == "gone"
-            {
-                return Err(CreateError::QexJobNotFound(job.clone()).into());
+        for input in &mut inputs {
+            if let Input::Qex { job } = input {
+                *job = self.reader.resolve_qex(job).await?;
             }
         }
         self.create(CreateRequest {
