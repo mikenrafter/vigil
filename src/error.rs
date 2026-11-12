@@ -63,6 +63,19 @@ pub enum CreateError {
     /// values near `u64::MAX` overflow the time arithmetic.
     #[error("{field} must be at most {max} seconds (the longest a watch can run), got {value}")]
     AboveLongestWatch { field: &'static str, max: u64, value: u64 },
+    /// W36 (H2): a `--for` / `for` spec that is not `qex:`, `pid:`, `file:`,
+    /// `until:` or `idle:`, or whose value is not valid.
+    #[error("invalid work {spec:?}: {reason}")]
+    InvalidWork { spec: String, reason: String },
+    /// W36 (H4): `fire = hold` waits on work, not on files, commands or URLs.
+    #[error("a hold waits on work (qex, process with want exited, path_exists, until, qex_idle), not on {0}; use fire = condition for that")]
+    NotWork(String),
+    /// W36 (H4): a field a hold does not take.
+    #[error("{0} is not allowed with fire = hold")]
+    HoldRejects(&'static str),
+    /// W36 (H3): a hold on a qex job qex does not know is a typo, not a hold.
+    #[error("qex job {0:?} not found")]
+    QexJobNotFound(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }

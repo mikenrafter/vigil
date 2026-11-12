@@ -205,8 +205,10 @@ struct ReaderState {
 /// its (tokio, so possibly virtual) duration, then report its text; the
 /// reading is `changed` when the text differs from the previous reading's
 /// stored text (the first read of an input is a baseline, never a change).
-/// Only `cmd` inputs can be scripted, keyed `cmd:<argv joined by spaces>`;
-/// every other input (and every unscripted `cmd`) goes to the real
+/// `cmd` inputs are keyed `cmd:<argv joined by spaces>`; the hold work inputs
+/// (`qex`, `qex_idle`, `path_exists`, `until`, W36) by their label, and their
+/// reading is `want_met` by the same rule production uses (`hold::ended`).
+/// Every other input (and every unscripted one) goes to the real
 /// `read_input`, so file inputs still behave like files.
 pub struct ScriptedReader {
     state: Mutex<ReaderState>,
@@ -257,6 +259,7 @@ impl ScriptedReader {
 fn script_key(input: &Input) -> Option<String> {
     match input {
         Input::Cmd { argv, .. } => Some(format!("cmd:{}", argv.join(" "))),
+        Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } => Some(input.label()),
         _ => None,
     }
 }
@@ -294,7 +297,9 @@ impl InputReader for ScriptedReader {
             let mut state = InputState::default();
             state.hash = Some(text.clone());
             self.state.lock().unwrap().reads[index].finished = Some(tokio::time::Instant::now());
-            Reading { label, text, changed, is_error: false, want_met: None, state }
+            let want_met = Some(crate::hold::ended(input, &text));
+            let is_error = text.starts_with("error:");
+            Reading { label, text, changed, is_error, want_met, state }
         })
     }
 }

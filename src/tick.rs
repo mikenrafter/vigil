@@ -163,6 +163,7 @@ impl Vigil {
         let fired_events = match &watch.spec.fire {
             FireRule::Change => change_events(&watch, tick, &readings),
             FireRule::Condition => condition_events(&mut watch, tick, &readings),
+            FireRule::Hold => Vec::new(),
             FireRule::Judge { .. } => {
                 if changed.is_empty() && watch.pending_change.is_none() {
                     Vec::new()

@@ -102,6 +102,9 @@ pub async fn read_input(input: &Input, previous: &InputState) -> Reading {
             let (observed, proc_start) = observe_process(*pid, *want, previous);
             settle(label, previous, observed, Some(proc_start))
         }
+        Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } => {
+            settle(label, previous, Observed { text: "error: not implemented".to_string(), is_error: true, want_met: None }, None)
+        }
     }
 }
 

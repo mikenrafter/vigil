@@ -81,8 +81,8 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     let tools = client.list_all_tools().await.unwrap();
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    // The five watch tools of the SPEC plus the six advisory tools (SPEC "Advisories").
-    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
+    // The five watch tools of the SPEC, `hold` (SPEC "Holds") and the six advisory tools (SPEC "Advisories").
+    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "hold", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
     for tool in &tools {
         assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()), "{} has no description", tool.name);
     }
@@ -727,5 +727,66 @@ async fn an_mcp_server_started_by_codex_never_exceeds_270_s() {
     assert_eq!(cache_without_credit_check(&derived), serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}));
     let clamped = fired_keepalive(&client, &sandbox, "b", serde_json::json!({}), serde_json::json!({"watch_id": "b", "orchestrator": true, "max_s": 9999})).await;
     assert_eq!(clamped["max_s"], 270);
+    client.cancel().await.unwrap();
+}
+
+// ---- holds (SPEC "Holds", H1-H12) ------------------------------------------
+
+#[tokio::test]
+async fn hold_is_a_listed_tool_with_for_until_idle_and_deadline_in_its_schema() {
+    // why: H11: the `hold` tool takes the same specs as `vigil hold`. `for` is
+    //      an array of strings (clients that send a string fail, see
+    //      CLAIM(create-schema-objects)), plus until_idle, deadline_s,
+    //      expect_s, orchestrator and id.
+    // proves: CLAIM(H11)
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let hold = tools.iter().find(|t| t.name == "hold").expect("the hold tool is listed");
+    assert!(hold.description.as_deref().is_some_and(|d| d.contains("hold")));
+    let schema = serde_json::Value::Object((*hold.input_schema).clone());
+    let properties = &schema["properties"];
+    for field in ["id", "for", "until_idle", "deadline_s", "expect_s", "orchestrator"] {
+        assert!(properties.get(field).is_some(), "{field} missing: {schema}");
+    }
+    assert_eq!(properties["for"]["items"]["type"], "string", "{schema}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_hold_tool_holds_on_qex_work_and_a_keepalive_releases_it_with_the_reason() {
+    // why: H1, H6, H11 over the wire. The server's PATH has the fake qex. One
+    //      job already completed -> `keepalive` on the hold fires at once with
+    //      "hold released: ...". A bare hold (no arguments) is accepted and
+    //      pending. A bad spec and an unknown job are tool errors (isError)
+    //      naming the problem, and write no watch.
+    // proves: CLAIM(H1), CLAIM(H6), CLAIM(H11), CLAIM(H2), CLAIM(H3)
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job("j1", "completed");
+    let client = connect_with_env(&sandbox, &[("PATH", std::ffi::OsStr::new(&qex.path()))]).await;
+    let peer = client.peer();
+
+    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": ["qex:j1"]})).await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    let created = text_json(&created);
+    assert_eq!((created["watch_id"].as_str(), created["status"].as_str()), (Some("h"), Some("pending")));
+    let released = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h"})).await);
+    assert_eq!((released["status"].as_str(), released["next"].as_str()), (Some("fired"), Some("act on events")), "{released}");
+    assert_eq!(released["events"][0]["summary"], "hold released: qex:j1 completed");
+
+    let bare = call(peer, "hold", serde_json::json!({"id": "bare"})).await;
+    assert_ne!(bare.is_error, Some(true), "{bare:?}");
+    let status = text_json(&call(peer, "watch_status", serde_json::json!({"watch_id": "bare"})).await);
+    assert_eq!((status["status"].as_str(), status["next"].as_str()), (Some("pending"), Some("call keepalive again")), "{status}");
+    assert_eq!(sandbox.watch_file("bare").unwrap()["orchestrator"], true);
+
+    let bad = call(peer, "hold", serde_json::json!({"id": "bad", "for": ["nonsense"]})).await;
+    assert_eq!(bad.is_error, Some(true));
+    assert!(bad.content[0].as_text().unwrap().text.contains("nonsense"));
+    let typo = call(peer, "hold", serde_json::json!({"id": "typo", "for": ["qex:typo"]})).await;
+    assert_eq!(typo.is_error, Some(true));
+    assert!(typo.content[0].as_text().unwrap().text.contains("not found"));
+    assert!(sandbox.watch_file("bad").is_none() && sandbox.watch_file("typo").is_none());
     client.cancel().await.unwrap();
 }

@@ -151,6 +151,16 @@ pub enum Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         want: Option<ProcessWant>,
     },
+    /// W36 (H2): a qex job. Ended when its state is not queued, starting or
+    /// running. Carries an implicit want, so `fire = condition` takes it too.
+    Qex { job: String },
+    /// W36 (H2/H10): ended when no qex job at or under `dir` is queued,
+    /// starting or running.
+    QexIdle { dir: PathBuf },
+    /// W36 (H2): ended when `path` exists (a done-marker another program writes).
+    PathExists { path: PathBuf },
+    /// W36 (H2): ended when the wall clock is at or past `at`.
+    Until { at: Timestamp },
 }
 
 impl Input {
@@ -165,6 +175,10 @@ impl Input {
             Input::Url { url } => format!("url:{url}"),
             Input::Port { host, port, .. } => format!("port:{host}:{port}"),
             Input::Process { pid, .. } => format!("process:{pid}"),
+            Input::Qex { job } => format!("qex:{job}"),
+            Input::QexIdle { dir } => format!("idle:{}", dir.display()),
+            Input::PathExists { path } => format!("exists:{}", path.display()),
+            Input::Until { at } => format!("until:{}", serde_json::to_string(at).unwrap_or_default().trim_matches('"')),
         }
     }
     /// Does this input carry a `want` (used by fire = condition)?
@@ -172,6 +186,7 @@ impl Input {
         match self {
             Input::Port { want, .. } => want.is_some(),
             Input::Process { want, .. } => want.is_some(),
+            Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } => true,
             _ => false,
         }
     }
@@ -183,8 +198,8 @@ impl Input {
         let default = std::time::Duration::from_secs_f64(DEFAULT_TIMEOUT_S);
         match self {
             Input::Cmd { timeout_s, .. } => timeout_s.map_or(default, std::time::Duration::from_secs_f64),
-            Input::Url { .. } | Input::Port { .. } => default,
-            Input::File { .. } | Input::Glob { .. } | Input::Process { .. } => std::time::Duration::ZERO,
+            Input::Url { .. } | Input::Port { .. } | Input::Qex { .. } | Input::QexIdle { .. } => default,
+            Input::File { .. } | Input::Glob { .. } | Input::Process { .. } | Input::PathExists { .. } | Input::Until { .. } => std::time::Duration::ZERO,
         }
     }
 }
@@ -195,6 +210,8 @@ pub enum FireKind {
     Judge,
     Change,
     Condition,
+    /// W36 (H1): fire when every work input has ended.
+    Hold,
 }
 
 /// Judge questions in Laya's own schema, passed through unchanged.
@@ -241,6 +258,8 @@ pub enum FireRule {
     },
     Change,
     Condition,
+    /// W36 (H1): inputs are work; fires when all of it has ended.
+    Hold,
 }
 
 pub(crate) fn validate_input(input: &Input) -> Result<(), CreateError> {
@@ -262,6 +281,7 @@ pub(crate) fn validate_input(input: &Input) -> Result<(), CreateError> {
             }
         }
         Input::File { .. } | Input::Glob { .. } | Input::Port { .. } | Input::Process { .. } => {}
+        Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } => {}
     }
     Ok(())
 }
@@ -357,11 +377,13 @@ impl WatchSpec {
                 validate_judge(&questions, &rule)?;
                 FireRule::Judge { judge_questions: JudgeQuestions(questions), judge_rule: rule }
             }
-            FireKind::Change | FireKind::Condition => {
+            FireKind::Change | FireKind::Condition | FireKind::Hold => {
                 if request.judge_questions.is_some() || request.judge_rule.is_some() {
                     return Err(CreateError::UnexpectedJudgeFields);
                 }
-                if request.fire == FireKind::Change {
+                if request.fire == FireKind::Hold {
+                    FireRule::Hold
+                } else if request.fire == FireKind::Change {
                     FireRule::Change
                 } else {
                     if !request.inputs.iter().any(Input::has_want) {
@@ -401,7 +423,9 @@ impl WatchSpec {
                         None => cwd.to_path_buf(),
                     });
                 }
-                Input::Url { .. } | Input::Port { .. } | Input::Process { .. } => {}
+                Input::PathExists { path } => *path = cwd.join(&*path),
+                Input::QexIdle { dir } => *dir = cwd.join(&*dir),
+                Input::Url { .. } | Input::Port { .. } | Input::Process { .. } | Input::Qex { .. } | Input::Until { .. } => {}
             }
         }
         self

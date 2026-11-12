@@ -373,3 +373,43 @@ pub fn assert_failed_persist(envelope: &serde_json::Value, kind: &str, os_text: 
 pub fn reserve_used_note() -> serde_json::Value {
     serde_json::json!({"ok": true, "used_reserve": true, "kind": "disk_full"})
 }
+
+/// A stand-in `qex` for hold tests (W36): `qex status ID --json --no-logs`
+/// answers `{"state": ...}` from `jobs/<ID>` (exit 127 and qex's own
+/// "there is no job" message when the file is absent) and `qex list ...`
+/// prints `list.json` (default `[]`). Every call's arguments are appended to
+/// `calls.log`. Put it first on a command's PATH with `path_with`.
+pub struct FakeQex {
+    dir: PathBuf,
+}
+
+impl FakeQex {
+    pub fn new(sandbox: &Sandbox) -> FakeQex {
+        let dir = sandbox.dir.path().join("fake-qex");
+        std::fs::create_dir_all(dir.join("jobs")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{d}/calls.log'\ncase \"$1\" in\n  status) f='{d}/jobs'/\"$2\"; if [ -f \"$f\" ]; then printf '{{\"id\": \"%s\", \"state\": \"%s\"}}\\n' \"$2\" \"$(cat \"$f\")\"; else echo \"qex: there is no job or pipeline with the id or the name \\`$2\\`\" >&2; exit 127; fi ;;\n  list) if [ -f '{d}/list.json' ]; then cat '{d}/list.json'; else echo '[]'; fi ;;\n  *) echo \"fake qex: unexpected $*\" >&2; exit 2 ;;\nesac\n",
+            d = dir.display()
+        );
+        let bin = dir.join("bin/qex");
+        std::fs::write(&bin, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        FakeQex { dir }
+    }
+    pub fn set_job(&self, id: &str, state: &str) {
+        std::fs::write(self.dir.join("jobs").join(id), state).unwrap();
+    }
+    pub fn set_list(&self, json: &serde_json::Value) {
+        std::fs::write(self.dir.join("list.json"), json.to_string()).unwrap();
+    }
+    /// The arguments of every call so far, one string per call.
+    pub fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("calls.log")).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+    /// The PATH value that finds this `qex` first.
+    pub fn path(&self) -> String {
+        format!("{}:{}", self.dir.join("bin").display(), std::env::var("PATH").unwrap_or_default())
+    }
+}

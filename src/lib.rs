@@ -22,6 +22,7 @@ pub mod engine;
 pub mod envelope;
 pub mod error;
 pub mod fault;
+pub mod hold;
 pub mod inputs;
 pub mod judge;
 pub mod meter;
@@ -42,6 +43,7 @@ pub use engine::Vigil;
 pub use envelope::{Envelope, Next, OtherWatch, PersistFailure, PersistNote, SecondaryFailure};
 pub use error::{CreateError, FailureKind, StoreError, VigilError};
 pub use fault::{Attempt, FaultPlan, FaultRule, Stage, WriteKind};
+pub use hold::{HoldRequest, Work};
 pub use judge::{Answer, Answers, Judge, JudgeError, JudgeRequest, JudgeRule, RuleTest};
 pub use keepalive::{KeepaliveRequest, ProgressSink};
 pub use store::{Store, StoreLock, WatchLock, WriteOutcome};
@@ -57,3 +59,5 @@ mod advisory_tests;
 mod auto_interval_tests;
 #[cfg(test)]
 mod disk_full_tests;
+#[cfg(test)]
+mod hold_tests;
