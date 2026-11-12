@@ -45,6 +45,13 @@ pub struct Config {
     pub credit_check_every: Duration,
     /// AI8: how long the hook may run (default 10 s).
     pub credit_hook_timeout: Duration,
+    /// Advisories file: `VIGIL_ADVISORIES_FILE` (`off` turns advisories off),
+    /// else `$XDG_CONFIG_HOME/vigil/advisories.toml`, else
+    /// `$HOME/.config/vigil/advisories.toml`; `None` when off or no place can be
+    /// formed. No file means no advisories and no `advice` key anywhere.
+    pub advisories_file: Option<PathBuf>,
+    /// `$HOME`, for the default advisory's absolute `boat` path.
+    pub home: Option<String>,
 }
 
 impl Config {
@@ -75,6 +82,8 @@ impl Config {
             on_credit_change: non_empty("VIGIL_ON_CREDIT_CHANGE"),
             credit_check_every: DEFAULT_CREDIT_CHECK_EVERY,
             credit_hook_timeout: DEFAULT_CREDIT_HOOK_TIMEOUT,
+            advisories_file: None,
+            home: None,
         }
     }
 }
@@ -206,6 +215,28 @@ mod tests {
         let blank = Config::from_lookup(lookup(&[("VIGIL_UW_COMMAND", ""), ("VIGIL_ON_CREDIT_CHANGE", "")]));
         assert_eq!(blank.uw_command, PathBuf::from("uw"));
         assert_eq!(blank.on_credit_change, None);
+    }
+
+    #[test]
+    fn the_advisories_file_follows_vigil_then_xdg_config_then_home_and_can_be_turned_off() {
+        // why: owner: "~/.config/vigil/advisories.toml (or the repo's existing
+        //      convention)". Order: VIGIL_ADVISORIES_FILE, then
+        //      $XDG_CONFIG_HOME/vigil/advisories.toml, then
+        //      $HOME/.config/vigil/advisories.toml. Empty counts as unset (like
+        //      the other variables here). `off` disables advisories (the test
+        //      sandboxes use it so nothing is written into their HOME or
+        //      XDG_CONFIG_HOME). Nowhere to look: disabled.
+        // proves: CLAIM(advisory-file)
+        let file = |pairs: &[(&str, &str)]| Config::from_lookup(lookup(pairs)).advisories_file;
+        assert_eq!(file(&[("HOME", "/home/u")]), Some(PathBuf::from("/home/u/.config/vigil/advisories.toml")));
+        assert_eq!(file(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", "/cfg")]), Some(PathBuf::from("/cfg/vigil/advisories.toml")));
+        assert_eq!(file(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", "/cfg"), ("VIGIL_ADVISORIES_FILE", "/x/a.toml")]), Some(PathBuf::from("/x/a.toml")));
+        assert_eq!(file(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", ""), ("VIGIL_ADVISORIES_FILE", "")]), Some(PathBuf::from("/home/u/.config/vigil/advisories.toml")));
+        assert_eq!(file(&[("HOME", "/home/u"), ("VIGIL_ADVISORIES_FILE", "off")]), None);
+        assert_eq!(file(&[]), None);
+        assert_eq!(file(&[("HOME", "")]), None);
+        assert_eq!(Config::from_lookup(lookup(&[("HOME", "/home/u")])).home.as_deref(), Some("/home/u"));
+        assert_eq!(Config::from_lookup(lookup(&[("HOME", "")])).home, None);
     }
 
     #[test]

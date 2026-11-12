@@ -202,6 +202,11 @@ pub struct Envelope {
     /// AI4: how long this call waited and how long the watch has lived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock: Option<ClockNote>,
+    /// Advisories (SPEC "Advisories"): what the operator's rules say to do
+    /// now. Only on blocking returns, and only when advisories are on; an empty
+    /// list means "on, nothing configured".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice: Option<Vec<crate::advisory_eval::Advice>>,
 }
 
 /// The envelope's `clock` (AI4). `since_last_call_s` is always present on the
@@ -307,6 +312,7 @@ mod tests {
             persist_failures: vec![],
             cache: None,
             clock: None,
+            advice: None,
         }
     }
 

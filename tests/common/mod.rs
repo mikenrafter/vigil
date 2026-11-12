@@ -59,6 +59,10 @@ impl Sandbox {
             .env("HOME", self.home())
             .env("XDG_STATE_HOME", self.state_home())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            // Advisories are off in every suite that is not about them, so no
+            // probe runs and nothing is written into HOME or XDG_CONFIG_HOME
+            // (the confinement tests compare those byte for byte).
+            .env("VIGIL_ADVISORIES_FILE", "off")
             .env("VIGIL_JUDGE_URL", "http://127.0.0.1:9");
     }
     pub fn run(&self, args: &[&str]) -> Output {
@@ -208,6 +212,10 @@ impl Sandbox {
             .env("HOME", self.home())
             .env("XDG_STATE_HOME", self.state_home())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            // Advisories are off in every suite that is not about them, so no
+            // probe runs and nothing is written into HOME or XDG_CONFIG_HOME
+            // (the confinement tests compare those byte for byte).
+            .env("VIGIL_ADVISORIES_FILE", "off")
             .env("VIGIL_JUDGE_URL", "http://127.0.0.1:9");
         command
     }

@@ -989,6 +989,7 @@ mod tests {
             persist_failures: vec![],
             cache: None,
             clock: None,
+            advice: None,
         }
     }
 

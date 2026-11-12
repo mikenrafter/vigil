@@ -243,7 +243,7 @@ pub enum FireRule {
     Condition,
 }
 
-fn validate_input(input: &Input) -> Result<(), CreateError> {
+pub(crate) fn validate_input(input: &Input) -> Result<(), CreateError> {
     match input {
         Input::Cmd { argv, timeout_s, .. } => {
             if argv.is_empty() {

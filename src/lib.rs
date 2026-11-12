@@ -4,10 +4,14 @@
 //! Module map: `watch`/`store`/`tick` (watches and their files), `keepalive`
 //! (the blocking call), `cache` (call window from the prompt-cache TTL),
 //! `attention` (early wake rules), `credit` + `monitor` (the orchestrator's
-//! credit check and hook), `envelope` (what the agent reads), `mcp` (the
+//! credit check and hook), `advisory`/`advisory_store`/`advisory_eval` (rules
+//! that tell agents what to do, on every envelope), `envelope` (what the agent reads), `mcp` (the
 //! server front), `fault`/`meter`/`testing` (test seams).
 #![allow(dead_code, unused_variables)] // fixtures in testing.rs and some seams are used only by tests
 
+pub mod advisory;
+pub mod advisory_eval;
+pub mod advisory_store;
 pub mod attention;
 pub mod cache;
 pub mod clock;
@@ -29,6 +33,8 @@ pub mod testing;
 pub mod tick;
 pub mod watch;
 
+pub use advisory::{Advisory, AdvisoryError, AdvisoryId, AdvisorySpec};
+pub use advisory_eval::{Advice, AdviceKind};
 pub use clock::{Clock, SystemClock, Timestamp};
 pub use config::Config;
 pub use engine::Vigil;
@@ -44,6 +50,8 @@ pub use watch::{
     WatchStatus,
 };
 
+#[cfg(test)]
+mod advisory_tests;
 #[cfg(test)]
 mod auto_interval_tests;
 #[cfg(test)]

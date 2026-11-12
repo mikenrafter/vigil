@@ -40,6 +40,8 @@ pub fn default_config() -> Config {
         on_credit_change: None,
         credit_check_every: Duration::from_secs(240),
         credit_hook_timeout: Duration::from_secs(10),
+        advisories_file: None,
+        home: None,
     }
 }
 

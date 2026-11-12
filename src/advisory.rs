@@ -1,0 +1,590 @@
+//! Advisories: rules the operator programs at runtime that tell agents what to
+//! do, delivered on every blocking return and by `vigil advice` (SPEC
+//! "Advisories"). This module is the pure model: ids, specs, the condition
+//! and message languages, number extraction and the validated `Advisory`. The
+//! file (`advisory_store.rs`) and the evaluation with its cache
+//! (`advisory_eval.rs`) sit on top.
+//!
+//! Reason it exists: an agent cannot see Boat's remaining hours or the host's
+//! memory; an operator can write down what to do about them once, and every
+//! agent reads it where it already looks (the keepalive envelope).
+//!
+//! Invariants (CLAIM(advisory-valid)): an `Advisory` that exists has a probe
+//! that can yield text, an extraction that compiles, a condition and two
+//! messages whose names are all known, and bounded sizes. Everything an
+//! untrusted caller can send goes through `Advisory::new`.
+//!
+//! Mating parts: `AdvisorySpec` is the wire/TOML form; `Advisory::spec()` is
+//! its canonical copy (parity: `advisory_store` round trip).
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::inputs::Reading;
+use crate::watch::Input;
+
+pub const MAX_ADVISORIES: usize = 32;
+pub const MAX_PARAMS: usize = 16;
+pub const MAX_MESSAGE_BYTES: usize = 512;
+pub const MAX_CONDITION_BYTES: usize = 128;
+pub const MAX_REGEX_BYTES: usize = 256;
+pub const DEFAULT_CACHE_S: u64 = 600;
+pub const MAX_CACHE_S: u64 = 86_400;
+/// A failed probe is remembered this long at most, so a dead probe is not
+/// retried (and waited for) on every call, yet the failure is re-checked soon.
+pub const FAILURE_CACHE_S: u64 = 30;
+/// Setting names that `advisory set` treats as fields, so a parameter cannot
+/// be called any of them.
+pub const RESERVED_NAMES: [&str; 4] = ["cache_s", "condition", "message_when_true", "message_when_false"];
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AdvisoryError {
+    #[error("advisories are turned off (VIGIL_ADVISORIES_FILE=off)")]
+    Disabled,
+    #[error("bad advisory id {0:?}: use 1 to 64 characters from A-Z a-z 0-9 _ -")]
+    BadId(String),
+    #[error("no advisory named {id:?}; known: {known}")]
+    Unknown { id: String, known: String },
+    #[error("advisory {0:?} already exists; change it with `advisory set`, or add it again with replace")]
+    Exists(String),
+    #[error("invalid {field}: {reason}")]
+    Invalid { field: String, reason: String },
+    #[error("advisory {id:?} has no parameter {name:?}; its parameters: {known}")]
+    UnknownParam { id: String, name: String, known: String },
+    #[error("too many advisories (at most {0})")]
+    TooMany(usize),
+    #[error("advisories file {path}: {reason}")]
+    File { path: String, reason: String },
+}
+
+impl AdvisoryError {
+    pub fn invalid(field: &str, reason: impl Into<String>) -> AdvisoryError {
+        AdvisoryError::Invalid { field: field.to_string(), reason: reason.into() }
+    }
+}
+
+/// `[A-Za-z0-9_-]{1,64}`, parsed once at the edge.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AdvisoryId(String);
+
+impl AdvisoryId {
+    pub fn parse(raw: &str) -> Result<AdvisoryId, AdvisoryError> {
+        Ok(AdvisoryId(raw.to_string()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AdvisoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How the number is taken out of the probe's text. Exactly one of `json` or
+/// `regex`; `of` and `scale` go only with `json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractSpec {
+    /// Name the number goes by in the condition and the messages (default `value`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Dotted path into the probe's JSON, e.g. `planIncluded.vmHoursRemaining`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<String>,
+    /// With `json`: a second path; the result is `json / of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub of: Option<String>,
+    /// With `json`: multiplier applied last (100 turns a ratio into a percent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    /// A regular expression; the number is its first group, else the whole match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+}
+
+/// The advisory as written in the file and sent over MCP and the CLI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisorySpec {
+    pub probe: Input,
+    pub extract: ExtractSpec,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, f64>,
+    pub condition: String,
+    pub message_when_true: String,
+    pub message_when_false: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_s: Option<u64>,
+}
+
+/// The two possible meanings of a probed value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verdict {
+    pub condition_true: bool,
+    pub message: String,
+}
+
+/// A checked advisory.
+#[derive(Debug, Clone)]
+pub struct Advisory {
+    id: AdvisoryId,
+    spec: AdvisorySpec,
+}
+
+impl Advisory {
+    /// Parse, don't validate: every check lives here.
+    pub fn new(id: AdvisoryId, spec: AdvisorySpec) -> Result<Advisory, AdvisoryError> {
+        Ok(Advisory { id, spec })
+    }
+    pub fn id(&self) -> &AdvisoryId {
+        &self.id
+    }
+    pub fn spec(&self) -> &AdvisorySpec {
+        &self.spec
+    }
+    pub fn cache_s(&self) -> u64 {
+        0
+    }
+    pub fn probe(&self) -> &Input {
+        &self.spec.probe
+    }
+    /// Hash of what the cached probe result depends on: the probe and the
+    /// extraction. Params, condition and messages are not part of it.
+    pub fn fingerprint(&self) -> String {
+        String::new()
+    }
+    /// The extracted number name (`value` unless the spec names it).
+    pub fn value_name(&self) -> String {
+        String::new()
+    }
+    /// Take the number out of the probe's text; `Err` is the reason.
+    pub fn extract_value(&self, probe_text: &str) -> Result<f64, String> {
+        let _ = probe_text;
+        Err("not implemented".to_string())
+    }
+    /// Evaluate the condition and render the message for `value`.
+    pub fn judge(&self, value: f64) -> Verdict {
+        let _ = value;
+        Verdict { condition_true: false, message: String::new() }
+    }
+    /// A copy with the settings applied (`name=value` strings: a parameter, or
+    /// one of `RESERVED_NAMES`), validated as a whole; `self` is untouched.
+    pub fn with_settings(&self, assignments: &[String]) -> Result<Advisory, AdvisoryError> {
+        let _ = assignments;
+        Ok(self.clone())
+    }
+}
+
+/// `7.3` -> `7.3`, `10.0` -> `10`, `4.04` -> `4`: one decimal, no trailing `.0`.
+pub fn format_number(number: f64) -> String {
+    format!("{number}")
+}
+
+/// Turn a reading of the probe into the text to extract from, or why the
+/// probe failed. A `cmd` must exit 0 and a `url` must answer 2xx; their
+/// header line (`exit=0`, `HTTP 200`) is removed.
+pub fn probe_body(probe: &Input, reading: &Reading) -> Result<String, String> {
+    let _ = probe;
+    Ok(reading.text.clone())
+}
+
+/// The advisory seeded into a fresh file (SPEC "Default advisory").
+pub fn default_boat_budget(home: Option<&str>) -> (AdvisoryId, AdvisorySpec) {
+    let _ = home;
+    (AdvisoryId("boat-budget".to_string()), AdvisorySpec {
+        probe: Input::Cmd { argv: vec![], timeout_s: None, cwd: None },
+        extract: ExtractSpec::default(),
+        params: BTreeMap::new(),
+        condition: String::new(),
+        message_when_true: String::new(),
+        message_when_false: String::new(),
+        cache_s: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn spec(value: serde_json::Value) -> AdvisorySpec {
+        serde_json::from_value(value).expect("test spec parses")
+    }
+
+    fn id(raw: &str) -> AdvisoryId {
+        AdvisoryId::parse(raw).unwrap()
+    }
+
+    /// A small advisory: `echo` probe, percent of two JSON numbers.
+    fn budget_json() -> serde_json::Value {
+        json!({
+            "probe": {"kind": "cmd", "argv": ["probe-cmd"]},
+            "extract": {"name": "pct", "json": "plan.left", "of": "plan.total", "scale": 100},
+            "params": {"threshold": 10},
+            "condition": "pct <= threshold",
+            "message_when_true": "Low at {pct}% (<= {threshold}%)",
+            "message_when_false": "Fine at {pct}% (> {threshold}%)"
+        })
+    }
+
+    fn budget() -> Advisory {
+        Advisory::new(id("budget"), spec(budget_json())).unwrap()
+    }
+
+    fn rejected(mut changes: serde_json::Value) -> String {
+        let mut base = budget_json();
+        for (key, value) in changes.as_object_mut().unwrap().iter() {
+            base[key] = value.clone();
+        }
+        Advisory::new(id("x"), spec(base)).expect_err("must be rejected").to_string()
+    }
+
+    #[test]
+    fn ids_follow_the_watch_id_alphabet_and_length() {
+        // why: the id names a file key and appears in CLI arguments and
+        //      messages; it must stay in [A-Za-z0-9_-]{1,64} like a watch id.
+        //      Boundaries: 64 ok, 65 not, empty not, path-like and spaced not.
+        // proves: CLAIM(advisory-valid)
+        assert!(AdvisoryId::parse("boat-budget").is_ok());
+        assert!(AdvisoryId::parse("A_9-z").is_ok());
+        assert!(AdvisoryId::parse(&"a".repeat(64)).is_ok());
+        for bad in ["", &"a".repeat(65), "a b", "a/b", "..", "a.b", "é", "a\n"] {
+            assert_eq!(AdvisoryId::parse(bad), Err(AdvisoryError::BadId(bad.to_string())), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn numbers_print_with_at_most_one_decimal_and_no_trailing_zero() {
+        // why: messages are read by agents; "10.0%" and "86.21999%" are noise.
+        //      Hand cases: 10 -> "10", 7.3 -> "7.3", 4.04 -> "4" (rounds to
+        //      4.0, trailing .0 dropped), 86.26 -> "86.3", 0 -> "0",
+        //      -0.04 -> "0" (not "-0"), 1234.5 -> "1234.5".
+        // proves: CLAIM(advisory-message)
+        for (number, text) in [(10.0, "10"), (7.3, "7.3"), (4.04, "4"), (86.26, "86.3"), (0.0, "0"), (-0.04, "0"), (1234.5, "1234.5"), (-2.5, "-2.5")] {
+            assert_eq!(format_number(number), text, "{number}");
+        }
+    }
+
+    #[test]
+    fn extraction_by_json_path_takes_a_ratio_scaled_to_a_percent() {
+        // why: the default advisory needs remaining / total * 100. 50 of 200
+        //      is 25 by hand. A plain path returns the number as is; array
+        //      indices and numeric strings work, so other CLIs' output fits.
+        // proves: CLAIM(advisory-extract)
+        let advisory = budget();
+        assert_eq!(advisory.extract_value(r#"{"plan":{"left":50,"total":200}}"#), Ok(25.0));
+        assert_eq!(advisory.extract_value(r#"{"plan":{"left":0,"total":200}}"#), Ok(0.0));
+        let plain = Advisory::new(id("p"), spec(json!({
+            "probe": {"kind": "cmd", "argv": ["x"]}, "extract": {"json": "a.1.b"},
+            "condition": "value > 1", "message_when_true": "t", "message_when_false": "f"
+        }))).unwrap();
+        assert_eq!(plain.extract_value(r#"{"a":[{"b":1},{"b":12.5}]}"#), Ok(12.5));
+        assert_eq!(plain.extract_value(r#"{"a":[{"b":1},{"b":"7.5"}]}"#), Ok(7.5), "a numeric string is a number");
+    }
+
+    #[test]
+    fn extraction_failures_say_what_is_wrong() {
+        // why: "never silence": every way the probe text can fail to hold a
+        //      number must produce a specific reason that ends up in the
+        //      "advisory <id> unavailable: <reason>" entry.
+        // proves: CLAIM(advisory-extract)
+        let advisory = budget();
+        let cases = [
+            (r#"{"plan":{"total":200}}"#, "plan.left"),           // path missing
+            (r#"{"plan":{"left":"lots","total":200}}"#, "not a number"),
+            (r#"{"plan":{"left":5,"total":0}}"#, "plan.total is 0"), // zero denominator
+            ("not json at all", "not JSON"),
+            ("", "not JSON"),
+            (r#"{"plan":{"left":null,"total":1}}"#, "not a number"),
+        ];
+        for (text, needle) in cases {
+            let error = advisory.extract_value(text).expect_err(text);
+            assert!(error.contains(needle), "{text:?} -> {error:?} should mention {needle:?}");
+        }
+    }
+
+    #[test]
+    fn extraction_by_regex_uses_group_one_else_the_whole_match() {
+        // why: probes that print text (not JSON) need a regex. Group 1 wins so
+        //      surrounding words are not part of the number.
+        // proves: CLAIM(advisory-extract)
+        let with_group = Advisory::new(id("r"), spec(json!({
+            "probe": {"kind": "cmd", "argv": ["x"]}, "extract": {"name": "left", "regex": "(\\d+(?:\\.\\d+)?)% left"},
+            "condition": "left < 5", "message_when_true": "t {left}", "message_when_false": "f {left}"
+        }))).unwrap();
+        assert_eq!(with_group.extract_value("Boat: 42.5% left of plan"), Ok(42.5));
+        assert!(with_group.extract_value("nothing here").unwrap_err().contains("did not match"));
+        let bare = Advisory::new(id("r"), spec(json!({
+            "probe": {"kind": "cmd", "argv": ["x"]}, "extract": {"regex": "\\d+"},
+            "condition": "value < 5", "message_when_true": "t", "message_when_false": "f"
+        }))).unwrap();
+        assert_eq!(bare.extract_value("abc 17 def"), Ok(17.0));
+    }
+
+    #[test]
+    fn conditions_compare_with_every_operator_and_boundary() {
+        // why: the Boat rule is "<= threshold": 10 must be TRUE (at or below).
+        //      All six operators, each at below / equal / above the threshold
+        //      (values 9, 10, 11), derived by hand from the operator meaning.
+        // proves: CLAIM(advisory-condition)
+        let table: [(&str, [bool; 3]); 6] = [
+            ("<=", [true, true, false]),
+            ("<", [true, false, false]),
+            (">=", [false, true, true]),
+            (">", [false, false, true]),
+            ("==", [false, true, false]),
+            ("!=", [true, false, true]),
+        ];
+        for (op, expected) in table {
+            for (value, want) in [9.0, 10.0, 11.0].into_iter().zip(expected) {
+                let mut base = budget_json();
+                base["condition"] = json!(format!("pct {op} threshold"));
+                let advisory = Advisory::new(id("c"), spec(base)).unwrap();
+                assert_eq!(advisory.judge(value).condition_true, want, "{value} {op} 10");
+            }
+        }
+    }
+
+    #[test]
+    fn conditions_accept_number_literals_the_alias_and_no_spaces() {
+        // why: operators typed fast: `pct<=5`, `value>threshold`, `3 < pct`.
+        // proves: CLAIM(advisory-condition)
+        for (condition, value, want) in [("pct<=5", 5.0, true), ("pct<=5", 5.1, false), ("value>threshold", 11.0, true), ("3 < pct", 2.0, false), ("3 < pct", 4.0, true)] {
+            let mut base = budget_json();
+            base["condition"] = json!(condition);
+            let advisory = Advisory::new(id("c"), spec(base)).unwrap();
+            assert_eq!(advisory.judge(value).condition_true, want, "{condition} at {value}");
+        }
+    }
+
+    #[test]
+    fn bad_conditions_are_errors_that_name_the_problem() {
+        // why: the model is an untrusted caller; a typo must be refused with a
+        //      message that says which name is unknown or what shape is wrong,
+        //      not silently evaluate to false.
+        // proves: CLAIM(advisory-condition)
+        let unknown = rejected(json!({"condition": "pct <= treshold"}));
+        assert!(unknown.contains("treshold") && unknown.contains("threshold"), "names the typo and the known names: {unknown}");
+        for bad in ["", "pct", "pct <=", "<= 5", "pct <= threshold <= 3", "pct = 5", "pct <=> 5", "pct and threshold", "5 < 6"] {
+            let error = rejected(json!({"condition": bad}));
+            assert!(error.contains("condition"), "{bad:?} -> {error}");
+        }
+        assert!(rejected(json!({"condition": "x".repeat(MAX_CONDITION_BYTES + 1)})).contains("condition"));
+    }
+
+    #[test]
+    fn messages_fill_the_value_the_alias_and_every_param() {
+        // why: the owner's example: "Boat at {pct}% (<= {threshold}%): ...".
+        //      pct 7.3 and threshold 10 render by hand as below; `{value}` is
+        //      an alias of the named number; `{{`/`}}` print braces.
+        // proves: CLAIM(advisory-message)
+        let advisory = budget();
+        assert_eq!(advisory.judge(7.3), Verdict { condition_true: true, message: "Low at 7.3% (<= 10%)".to_string() });
+        assert_eq!(advisory.judge(86.26), Verdict { condition_true: false, message: "Fine at 86.3% (> 10%)".to_string() });
+        let mut base = budget_json();
+        base["message_when_true"] = json!("v={value} p={pct} {{literal}}");
+        let advisory = Advisory::new(id("m"), spec(base)).unwrap();
+        assert_eq!(advisory.judge(1.0).message, "v=1 p=1 {literal}");
+    }
+
+    #[test]
+    fn bad_templates_are_errors() {
+        // why: an unknown placeholder would print "{treshold}" to every agent
+        //      forever; refuse it when it is written. Unbalanced braces too.
+        // proves: CLAIM(advisory-message)
+        for field in ["message_when_true", "message_when_false"] {
+            for bad in ["at {nope}%", "open {pct", "close pct}", "empty {}", ""] {
+                let error = rejected(json!({ field: bad }));
+                assert!(error.contains(field), "{field} {bad:?} -> {error}");
+            }
+            assert!(rejected(json!({ field: "x".repeat(MAX_MESSAGE_BYTES + 1) })).contains(field));
+        }
+    }
+
+    #[test]
+    fn a_spec_is_checked_as_a_whole() {
+        // why: CLAIM(advisory-valid): each rejected input below is one the
+        //      model could send; each must fail with the field named.
+        // proves: CLAIM(advisory-valid)
+        assert!(rejected(json!({"probe": {"kind": "port", "host": "h", "port": 1}})).contains("probe"));
+        assert!(rejected(json!({"probe": {"kind": "process", "pid": 1}})).contains("probe"));
+        assert!(rejected(json!({"probe": {"kind": "glob", "pattern": "*"}})).contains("probe"));
+        assert!(rejected(json!({"probe": {"kind": "cmd", "argv": []}})).contains("probe"));
+        assert!(rejected(json!({"probe": {"kind": "cmd", "argv": ["x"], "timeout_s": 25}})).contains("probe"));
+        assert!(rejected(json!({"probe": {"kind": "url", "url": "https://x"}})).contains("probe"));
+        assert!(rejected(json!({"extract": {"json": "a", "regex": "b"}})).contains("extract"), "json and regex together");
+        assert!(rejected(json!({"extract": {}})).contains("extract"), "neither");
+        assert!(rejected(json!({"extract": {"regex": "a", "of": "b"}})).contains("extract"), "of needs json");
+        assert!(rejected(json!({"extract": {"regex": "a", "scale": 2}})).contains("extract"), "scale needs json");
+        assert!(rejected(json!({"extract": {"regex": "("}})).contains("extract"), "regex must compile");
+        assert!(rejected(json!({"extract": {"regex": "a".repeat(MAX_REGEX_BYTES + 1)}})).contains("extract"));
+        assert!(rejected(json!({"extract": {"json": "a", "name": "1bad"}})).contains("extract.name"));
+        assert!(rejected(json!({"extract": {"json": "a", "scale": f64::MAX * 2.0}})).contains("extract"), "scale must be finite");
+        assert!(rejected(json!({"cache_s": MAX_CACHE_S + 1})).contains("cache_s"));
+        assert!(rejected(json!({"params": {"cache_s": 1}})).contains("params"), "reserved name");
+        assert!(rejected(json!({"params": {"pct": 1}})).contains("params"), "same as the extract name");
+        assert!(rejected(json!({"params": {"value": 1}})).contains("params"), "the alias");
+        assert!(rejected(json!({"params": {"bad name": 1}})).contains("params"));
+        let many: serde_json::Map<String, serde_json::Value> = (0..=MAX_PARAMS).map(|n| (format!("p{n}"), json!(n))).collect();
+        assert!(rejected(json!({"params": many})).contains("params"));
+    }
+
+    #[test]
+    fn unknown_fields_and_missing_fields_do_not_parse() {
+        // why: `{"treshold": 15}` or `cache: 5` must fail loudly instead of
+        //      being ignored (deny_unknown_fields), and a spec without a
+        //      condition is not a spec.
+        // proves: CLAIM(advisory-valid)
+        let mut typo = budget_json();
+        typo["cach_s"] = json!(5);
+        assert!(serde_json::from_value::<AdvisorySpec>(typo).unwrap_err().to_string().contains("cach_s"));
+        let mut missing = budget_json();
+        missing.as_object_mut().unwrap().remove("condition");
+        assert!(serde_json::from_value::<AdvisorySpec>(missing).unwrap_err().to_string().contains("condition"));
+    }
+
+    #[test]
+    fn cache_s_defaults_to_600_and_accepts_zero_to_a_day() {
+        // why: SPEC: cache_s default 600; 0 means "probe every call"; a day
+        //      is the ceiling.
+        // proves: CLAIM(advisory-cache)
+        assert_eq!(budget().cache_s(), 600);
+        for seconds in [0, 1, MAX_CACHE_S] {
+            let mut base = budget_json();
+            base["cache_s"] = json!(seconds);
+            assert_eq!(Advisory::new(id("c"), spec(base)).unwrap().cache_s(), seconds);
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_follows_the_probe_and_extraction_but_not_params_or_messages() {
+        // why: CLAIM(advisory-immediate): changing the threshold or a message
+        //      must not throw the probe result away (no new probe), but
+        //      changing what is probed or extracted must (a cached value of
+        //      the old probe would be presented as the new one's).
+        // proves: CLAIM(advisory-immediate), CLAIM(advisory-cache)
+        let base = budget();
+        let print = base.fingerprint();
+        assert!(!print.is_empty());
+        let derive = |key: &str, value: serde_json::Value| {
+            let mut changed = budget_json();
+            changed[key] = value;
+            Advisory::new(id("budget"), spec(changed)).unwrap().fingerprint()
+        };
+        assert_eq!(derive("params", json!({"threshold": 99})), print);
+        assert_eq!(derive("condition", json!("pct < threshold")), print);
+        assert_eq!(derive("message_when_true", json!("other {pct}")), print);
+        assert_eq!(derive("cache_s", json!(5)), print);
+        assert_ne!(derive("probe", json!({"kind": "cmd", "argv": ["other"]})), print);
+        assert_ne!(derive("extract", json!({"name": "pct", "json": "plan.left", "of": "plan.total", "scale": 50})), print);
+    }
+
+    #[test]
+    fn settings_change_params_and_fields_atomically() {
+        // why: `advisory set boat-budget threshold=15` is the runtime knob.
+        //      The result is a new advisory (the old one is untouched); an
+        //      unknown name or a bad value refuses the WHOLE set; a field that
+        //      breaks the whole (condition naming a missing param) is refused.
+        // proves: CLAIM(advisory-set)
+        let base = budget();
+        let changed = base.with_settings(&["threshold=15".to_string()]).unwrap();
+        assert_eq!(changed.spec().params["threshold"], 15.0);
+        assert_eq!(base.spec().params["threshold"], 10.0, "the original is untouched");
+        assert!(changed.judge(12.0).condition_true, "12 <= 15 now");
+        assert!(!base.judge(12.0).condition_true);
+
+        let fields = base.with_settings(&["cache_s=60".into(), "condition=pct < threshold".into(), "message_when_true=Low {pct}".into(), "threshold=7.5".into()]).unwrap();
+        assert_eq!(fields.cache_s(), 60);
+        assert_eq!(fields.spec().condition, "pct < threshold");
+        assert_eq!(fields.spec().params["threshold"], 7.5);
+        assert_eq!(fields.judge(1.0).message, "Low 1");
+
+        let unknown = base.with_settings(&["threshold=15".into(), "treshold=3".into()]).unwrap_err();
+        assert!(matches!(&unknown, AdvisoryError::UnknownParam { name, known, .. } if name == "treshold" && known.contains("threshold")), "{unknown}");
+        for bad in ["threshold", "threshold=", "threshold=abc", "threshold=NaN", "threshold=inf", "=5", "cache_s=-1", "cache_s=1.5", "cache_s=999999"] {
+            let error = base.with_settings(&[bad.to_string()]).expect_err(bad);
+            assert!(!error.to_string().is_empty(), "{bad}");
+        }
+        assert!(base.with_settings(&["condition=pct <= gone".into()]).unwrap_err().to_string().contains("gone"));
+    }
+
+    #[test]
+    fn a_cmd_probe_must_exit_zero_and_a_url_probe_must_answer_2xx() {
+        // why: R3 reading formats: cmd is `exit=<code>\n<output>`, url is
+        //      `HTTP <status>\n<body>`. A failed probe must be a reason, never
+        //      a value parsed out of an error page.
+        // proves: CLAIM(advisory-unavailable)
+        let reading = |text: &str, is_error: bool| Reading { label: "l".into(), text: text.into(), changed: false, is_error, want_met: None, state: Default::default() };
+        let cmd = Input::Cmd { argv: vec!["x".into()], timeout_s: None, cwd: None };
+        assert_eq!(probe_body(&cmd, &reading("exit=0\n{\"a\":1}", false)), Ok("{\"a\":1}".to_string()));
+        assert_eq!(probe_body(&cmd, &reading("exit=0\n", false)), Ok(String::new()));
+        let failed = probe_body(&cmd, &reading("exit=3\nboom: no network", false)).unwrap_err();
+        assert!(failed.contains("exited with 3") && failed.contains("boom: no network"), "{failed}");
+        assert!(probe_body(&cmd, &reading("exit=signal-9\n", false)).unwrap_err().contains("signal-9"));
+        assert_eq!(probe_body(&cmd, &reading("cannot run x: No such file", true)).unwrap_err(), "cannot run x: No such file");
+        assert_eq!(probe_body(&cmd, &reading("timeout after 10s", true)).unwrap_err(), "timeout after 10s");
+        let url = Input::Url { url: "http://h/".into() };
+        assert_eq!(probe_body(&url, &reading("HTTP 200\n{\"a\":1}", false)), Ok("{\"a\":1}".to_string()));
+        assert!(probe_body(&url, &reading("HTTP 503\nbusy", false)).unwrap_err().contains("503"));
+        let file = Input::File { path: "/x".into(), tail_bytes: None };
+        assert_eq!(probe_body(&file, &reading("12.5\n", false)), Ok("12.5\n".to_string()));
+    }
+
+    /// A trimmed copy of a real `boat limits --json` (captured 2026-11-12) with
+    /// the two fields the default advisory reads.
+    fn boat_sample(remaining: f64) -> String {
+        format!(r#"{{"accessTier":"standard","planIncluded":{{"periodEnd":"2026-12-11T05:35:10.000Z","vmHours":555.56,"vmHoursRemaining":{remaining}}},"starts":{{"day":{{"limit":200}}}}}}"#)
+    }
+
+    #[test]
+    fn the_default_boat_budget_advisory_follows_the_owner_rule() {
+        // why: owner request 2026-11-12: "prefer Boat; when Boat's remaining
+        //      hours are at or below 10%, use qex locally". Total 555.56 h:
+        //      10% is 55.556 h. 55.556 -> exactly 10 -> TRUE (at or below);
+        //      55.5 -> 9.99 -> TRUE; 56 -> 10.08 -> FALSE; 479.01 (the live
+        //      sample) -> 86.22 -> FALSE; 0 -> TRUE.
+        // proves: CLAIM(advisory-boat-budget)
+        let (name, default) = default_boat_budget(Some("/home/u"));
+        assert_eq!(name.as_str(), "boat-budget");
+        let advisory = Advisory::new(name, default.clone()).unwrap();
+        assert_eq!(advisory.spec().params["threshold"], 10.0);
+        assert_eq!(advisory.cache_s(), 600);
+        let Input::Cmd { argv, .. } = advisory.probe() else { panic!("the probe is a cmd") };
+        assert!(argv.windows(2).any(|pair| pair == ["limits", "--json"]) && argv.iter().any(|a| a.ends_with("boat")), "{argv:?}");
+        let judge = |remaining: f64| {
+            let value = advisory.extract_value(&boat_sample(remaining)).expect("the sample has the fields");
+            (value, advisory.judge(value))
+        };
+        let (value, verdict) = judge(55.556);
+        assert!((value - 10.0).abs() < 1e-9, "{value}");
+        assert!(verdict.condition_true, "10% is at the threshold");
+        assert!(judge(55.5).1.condition_true);
+        assert!(!judge(56.0).1.condition_true);
+        let (value, verdict) = judge(479.01);
+        assert!((value - 86.2).abs() < 0.05, "479.01 / 555.56 = 0.8622 {value}");
+        assert!(!verdict.condition_true);
+        assert!(verdict.message.contains("86.2") && verdict.message.contains("boat-run"), "prefer Boat via boat-run: {}", verdict.message);
+        let (_, low) = judge(0.0);
+        assert!(low.condition_true);
+        assert!(low.message.contains("qex") && low.message.contains('0') && low.message.contains("10"), "use qex locally: {}", low.message);
+    }
+
+    #[test]
+    fn the_default_probe_is_found_under_home_when_boat_lives_there() {
+        // why: hooks and MCP servers may start with a PATH lacking
+        //      ~/.local/bin (where `boat` lives on this host). The seed uses
+        //      `env BOAT_NO_UPDATE=1 boat ...` (as boat-run does, so the CLI
+        //      does not self-update during a probe) and an absolute boat path
+        //      when HOME is known.
+        // proves: CLAIM(advisory-boat-budget)
+        let argv = |home: Option<&str>| match default_boat_budget(home).1.probe {
+            Input::Cmd { argv, .. } => argv,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(argv(Some("/home/u")), ["env", "BOAT_NO_UPDATE=1", "/home/u/.local/bin/boat", "limits", "--json"]);
+        assert_eq!(argv(None), ["env", "BOAT_NO_UPDATE=1", "boat", "limits", "--json"]);
+    }
+}

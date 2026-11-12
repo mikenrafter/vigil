@@ -193,6 +193,23 @@ impl Vigil {
         &self.config
     }
 
+    /// The advisories file, or `Disabled` when advisories are off.
+    pub fn advisory_store(&self) -> Result<crate::advisory_store::AdvisoryStore, crate::advisory::AdvisoryError> {
+        Err(crate::advisory::AdvisoryError::Disabled)
+    }
+
+    /// Where probe results are cached: `<state root>/advisory-cache`.
+    pub fn advisory_cache_dir(&self) -> PathBuf {
+        self.store.root().join("advisory-cache")
+    }
+
+    /// The current advice, evaluated now (within each advisory's cache time).
+    /// `Err(Disabled)` when advisories are off; a file that cannot be read is
+    /// an error here (the CLI reports it).
+    pub async fn advice(&self) -> Result<Vec<crate::advisory_eval::Advice>, crate::advisory::AdvisoryError> {
+        Err(crate::advisory::AdvisoryError::Disabled)
+    }
+
     /// `watch_create`. Validates (V12, V19), resolves relative inputs against
     /// the cwd (V11), (for fire = judge) checks the judge is reachable, and
     /// (X3) takes the watch's lock, then the GLOBAL lock only long enough to
@@ -536,6 +553,7 @@ impl Vigil {
             persist_failures: Vec::new(),
             cache: None,
             clock: None,
+            advice: None,
         }
     }
 }
