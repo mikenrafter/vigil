@@ -116,17 +116,49 @@ fn json_in(output: &str, open: char, close: char) -> Option<serde_json::Value> {
     serde_json::from_str(output.get(from..=to)?).ok()
 }
 
-/// The reading of a `qex status ID --json --no-logs` run (`cmd_text` is the
+/// The lines of qex's output with its `qex: ` prefix and indentation removed.
+fn sentences(output: &str) -> impl Iterator<Item = &str> {
+    output.lines().filter(|line| !line.starts_with(' ')).map(|line| line.trim().strip_prefix("qex: ").unwrap_or(line.trim()))
+}
+
+/// qex's own "there is no job ..." sentence: no record, no history of it.
+/// (Matched at the start of a sentence: an ambiguity listing indents the job
+/// names it prints, so a job NAMED like this sentence is not mistaken for it.)
+fn says_no_such_job(output: &str) -> bool {
+    sentences(output).any(|sentence| sentence.starts_with("there is no job"))
+}
+
+/// qex's removed-record sentence for exactly this job id (`describe_missing`
+/// in qex/src/history.rs): "the job ID (NAME) existed ...". qex still accepted
+/// the id, and the record was deleted by `qex clean` or the history prune.
+fn says_record_removed(output: &str, job: &str) -> bool {
+    let lead = format!("the job {job} (");
+    sentences(output).any(|sentence| sentence.starts_with(&lead) && sentence.contains(") existed"))
+}
+
+/// qex's ambiguity sentence ("`NAME` names N jobs. Give the id ..."), if any.
+fn ambiguity(output: &str) -> Option<&str> {
+    sentences(output).find(|sentence| sentence.starts_with('`') && sentence.contains("` names ") && sentence.contains(" jobs"))
+}
+
+/// A canonical qex job id (a UUID), as opposed to a name or an id prefix.
+fn is_job_id(job: &str) -> bool {
+    job.len() == 36 && job.bytes().enumerate().all(|(at, byte)| if matches!(at, 8 | 13 | 18 | 23) { byte == b'-' } else { byte.is_ascii_hexdigit() })
+}
+
+/// The reading of a `qex status JOB --json --no-logs` run (`cmd_text` is the
 /// command reader's text, `exit=<code>\n<output>`, or its error text): the
-/// job's state name, `gone` when qex does not know the job, else `error: ...`.
-pub fn qex_status_reading(_job: &str, cmd_text: &str) -> String {
+/// job's state name; `gone` when qex has no such job or says it deleted this
+/// job's record (both end the work); else `error: ...`. An ambiguous name also
+/// exits 127 and is an error: the job exists.
+pub fn qex_status_reading(job: &str, cmd_text: &str) -> String {
     let Some((code, output)) = split_exit(cmd_text) else { return error_reading(cmd_text) };
     match code {
         "0" => match json_in(output, '{', '}').as_ref().and_then(|value| value.get("state")).and_then(serde_json::Value::as_str) {
             Some(state) if (1..=32).contains(&state.len()) && state.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_') => state.to_string(),
             _ => error_reading("qex answered no state"),
         },
-        "127" if output.contains("there is no job") => "gone".to_string(),
+        "127" if says_no_such_job(output) || says_record_removed(output, job) => "gone".to_string(),
         _ => error_reading(&format!("exit {code}: {output}")),
     }
 }
