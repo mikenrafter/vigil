@@ -1306,11 +1306,11 @@ fn cache_without_credit_check(envelope: &serde_json::Value) -> serde_json::Value
 }
 
 #[test]
-fn the_cli_orchestrator_flag_on_a_one_hour_cache_chooses_a_3300_s_window() {
+fn the_cli_orchestrator_flag_on_a_one_hour_cache_chooses_a_3000_s_window() {
     // why: AI1' + AI3 through the real binary: CLAUDE_CODE_SESSION_ID is read
     //      from the environment at the edge, the transcript from the sandbox
     //      HOME (~/.claude/projects/p/sess-1.jsonl, newest write 1h), and the
-    //      window reported on the envelope is 3300 s with its reason. The
+    //      window reported on the envelope is 3000 s with its reason. The
     //      watch fires at once, so the call returns immediately; AI4's clock
     //      block is there too (first call: since_last_call_s null).
     // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(AI4)
@@ -1318,10 +1318,10 @@ fn the_cli_orchestrator_flag_on_a_one_hour_cache_chooses_a_3300_s_window() {
     assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
     let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &["--orchestrator"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
     assert_eq!(envelope["status"], "fired");
-    assert_eq!(envelope["max_s"], 3300);
+    assert_eq!(envelope["max_s"], 3000);
     assert_eq!(envelope["cache"]["ttl"], "1h");
     assert_eq!(envelope["cache"]["source"], "claude-transcript");
-    assert_eq!(envelope["cache"]["interval_s"], 3300);
+    assert_eq!(envelope["cache"]["interval_s"], 3000);
     let clock = envelope["clock"].as_object().expect("clock object");
     let mut names: Vec<&str> = clock.keys().map(String::as_str).collect();
     names.sort_unstable();
@@ -1364,7 +1364,7 @@ fn a_watch_created_with_orchestrator_true_gets_the_long_window_without_the_flag(
     let created = create_with(&sandbox, "w", serde_json::json!({"orchestrator": true, "expect_s": 600, "stall_s": 120}));
     assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
     let envelope = fire_and_keepalive(&sandbox, &fake_uw, "w", &[], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
-    assert_eq!(envelope["max_s"], 3300);
+    assert_eq!(envelope["max_s"], 3000);
     assert_eq!(envelope["cache"]["source"], "claude-transcript");
 }
 
@@ -1422,7 +1422,7 @@ fn creating_a_watch_with_a_zero_expect_s_fails() {
 fn cli_wait_orchestrator_reports_the_ttl_window_and_checks_credits() {
     // why: S1/S3. A quiet watch expires after 8s, allowing its credit probe
     //      to run before expiry. The final envelope must retain both the
-    //      3300s selected TTL window and the real probe result. The deadline
+    //      3000s selected TTL window and the real probe result. The deadline
     //      leaves the probe its full 5s budget plus margin.
     // proves: CLAIM(S1), CLAIM(S3)
     let (sandbox, fake_uw) = auto_sandbox(true);
@@ -1436,7 +1436,7 @@ fn cli_wait_orchestrator_reports_the_ttl_window_and_checks_credits() {
     let answer = stdout_json(&output);
     assert_eq!(answer["cache"]["ttl"], "1h");
     assert_eq!(answer["cache"]["credit_check"]["on_credits"], false);
-    assert_eq!(answer["cache"]["interval_s"], 3300);
+    assert_eq!(answer["cache"]["interval_s"], 3000);
     assert!(answer["clock"]["waited_s"].is_u64());
 }
 
@@ -1492,12 +1492,12 @@ fn cli_wait_orchestrator_credit_change_exits_5_and_reaches_the_agent() {
 fn cli_both_agent_signals_cap_both_nesting_directions_at_270() {
     // why: S4. Inherited CODEX_HOME from a Codex parent and inherited Claude
     //      session id in AGENT=codex are ambiguous. Claude-only control proves
-    //      the real transcript is otherwise sufficient for 3300.
+    //      the real transcript is otherwise sufficient for 3000.
     // proves: CLAIM(S4)
     let (sandbox, fake_uw) = auto_sandbox(true);
     assert!(create_with(&sandbox, "control", serde_json::json!({})).status.success());
     let control = fire_and_keepalive(&sandbox, &fake_uw, "control", &["--orchestrator"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
-    assert_eq!(control["cache"]["interval_s"], 3300);
+    assert_eq!(control["cache"]["interval_s"], 3000);
     for (id, signal, value) in [("claude-in-codex", "CODEX_HOME", "/inherited"), ("codex-in-claude", "AGENT", "codex")] {
         assert!(create_with(&sandbox, id, serde_json::json!({})).status.success());
         let answer = fire_and_keepalive(&sandbox, &fake_uw, id, &["--orchestrator"], &[("CLAUDE_CODE_SESSION_ID", SESSION), (signal, value)]);
@@ -1808,7 +1808,7 @@ fn a_bare_hold_and_until_idle_are_holds_on_nothing_and_on_the_cwd() {
 #[test]
 fn a_hold_defaults_to_the_orchestrator_window_and_hold_orchestrator_false_turns_it_off() {
     // why: H9 through the real binary: with a 1 h cache transcript, `keepalive`
-    //      with NO --orchestrator on a hold chooses 3300 s because the hold
+    //      with NO --orchestrator on a hold chooses 3000 s because the hold
     //      stores orchestrator = true (a plain watch would be 270 s); a hold
     //      made with `--orchestrator false` is 270 s.
     // proves: CLAIM(H9)
@@ -1825,7 +1825,7 @@ fn a_hold_defaults_to_the_orchestrator_window_and_hold_orchestrator_false_turns_
     assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "main", "--for", J1_SPEC]).status.success());
     assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "sub", "--for", J1_SPEC, "--orchestrator", "false"]).status.success());
     let main = keepalive("main");
-    assert_eq!((main["max_s"].as_u64(), main["cache"]["ttl"].as_str()), (Some(3300), Some("1h")), "{main}");
+    assert_eq!((main["max_s"].as_u64(), main["cache"]["ttl"].as_str()), (Some(3000), Some("1h")), "{main}");
     assert_eq!(keepalive("sub")["max_s"], 270);
 }
 

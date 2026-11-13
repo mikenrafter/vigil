@@ -1096,12 +1096,12 @@ mod tests {
     async fn max_s_below_the_floor_and_above_the_ceiling_are_clamped_and_reported() {
         // why: SPEC: max_s 5 -> 30, absent -> 270, "the envelope reports the
         //      value used" (V26 `max_s`), and the call really blocks that long
-        //      (virtual time). 9999 -> 3300 since auto-interval A2: the ceiling
-        //      of an explicit window is the largest vigil ever picks (3300), 270
+        //      (virtual time). 9999 -> 3000 since auto-interval A2: the ceiling
+        //      of an explicit window is the largest vigil ever picks (3000), 270
         //      only for Codex or an ambiguous caller (pinned in cache.rs and the
         //      Codex e2e tests); this engine has no agent signal at all.
         // proves: CLAIM(max-s-clamp)
-        for (requested, used) in [(Some(5), 30), (Some(9999), 3300), (None, 270)] {
+        for (requested, used) in [(Some(5), 30), (Some(9999), 3000), (None, 270)] {
             let env = paused_env();
             let vigil = process(&env);
             let (id, _) = quiet_watch(&env, &vigil, "w", 20, 7200).await;

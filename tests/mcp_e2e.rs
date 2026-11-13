@@ -685,7 +685,7 @@ async fn the_mcp_schemas_declare_the_new_fields() {
 #[tokio::test]
 async fn an_mcp_orchestrator_call_gets_the_one_hour_window_and_a_plain_call_does_not() {
     // why: AI1' + AI3 over real stdio MCP, server started with
-    //      CLAUDE_CODE_SESSION_ID=sess-1. `orchestrator: true` -> 3300 s,
+    //      CLAUDE_CODE_SESSION_ID=sess-1. `orchestrator: true` -> 3000 s,
     //      1h / claude-transcript; the same server, same transcript, no flag
     //      (a second watch) -> 270 s, unknown / default. Also the clock block
     //      is present on the wire.
@@ -693,8 +693,8 @@ async fn an_mcp_orchestrator_call_gets_the_one_hour_window_and_a_plain_call_does
     let (sandbox, fake_uw) = transcript_sandbox();
     let client = connect_with_env(&sandbox, &[("CLAUDE_CODE_SESSION_ID", "sess-1".as_ref()), ("VIGIL_UW_COMMAND", fake_uw.as_os_str())]).await;
     let long = fired_keepalive(&client, &sandbox, "a", serde_json::json!({}), serde_json::json!({"watch_id": "a", "orchestrator": true})).await;
-    assert_eq!(long["max_s"], 3300);
-    assert_eq!(cache_without_credit_check(&long), serde_json::json!({"ttl": "1h", "source": "claude-transcript", "interval_s": 3300}));
+    assert_eq!(long["max_s"], 3000);
+    assert_eq!(cache_without_credit_check(&long), serde_json::json!({"ttl": "1h", "source": "claude-transcript", "interval_s": 3000}));
     assert!(long["clock"]["summary"].as_str().is_some_and(|line| !line.is_empty() && !line.contains('\n')), "{long}");
     let plain = fired_keepalive(&client, &sandbox, "b", serde_json::json!({}), serde_json::json!({"watch_id": "b"})).await;
     assert_eq!(plain["max_s"], 270);
@@ -705,13 +705,13 @@ async fn an_mcp_orchestrator_call_gets_the_one_hour_window_and_a_plain_call_does
 #[tokio::test]
 async fn a_stored_orchestrator_flag_and_an_explicit_max_s_over_mcp() {
     // why: AI1': `orchestrator: true` stored by watch_create is honoured by a
-    //      bare keepalive (3300 s); an explicit max_s wins over it (max_s 45
+    //      bare keepalive (3000 s); an explicit max_s wins over it (max_s 45
     //      -> 45 s, source explicit).
     // proves: CLAIM(AI1'), CLAIM(AI3)
     let (sandbox, fake_uw) = transcript_sandbox();
     let client = connect_with_env(&sandbox, &[("CLAUDE_CODE_SESSION_ID", "sess-1".as_ref()), ("VIGIL_UW_COMMAND", fake_uw.as_os_str())]).await;
     let stored = fired_keepalive(&client, &sandbox, "a", serde_json::json!({"orchestrator": true, "expect_s": 600}), serde_json::json!({"watch_id": "a"})).await;
-    assert_eq!(stored["cache"]["interval_s"], 3300);
+    assert_eq!(stored["cache"]["interval_s"], 3000);
     let explicit = fired_keepalive(&client, &sandbox, "b", serde_json::json!({"orchestrator": true}), serde_json::json!({"watch_id": "b", "max_s": 45})).await;
     assert_eq!(explicit["cache"], serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 45}));
     client.cancel().await.unwrap();

@@ -117,9 +117,10 @@ The agent stays "in cache" only if the gap between its requests is under the
 prompt-cache TTL, so every `keepalive` call has a fixed window:
 
 - The window is chosen by vigil, not by the agent: **270 s** by default, and
-  up to **3300 s** for the orchestrator on a 1-hour prompt cache (see
+  up to **3000 s** (50 minutes; owner 2026-11-13: at most 50 minutes, was 3300 s)
+  for the orchestrator on a 1-hour prompt cache (see
   "Cache-aware window, time and early attention"). An explicit `max_s` still
-  wins, clamped to 30..=3300 (30..=270 for Codex and for an ambiguous
+  wins, clamped to 30..=3000 (30..=270 for Codex and for an ambiguous
   caller). Values outside the range are clamped, not rejected, and the
   envelope reports the value used (`max_s`, `waited_s`).
 - A deadline of any length (hours, days) needs no special path. Each call
@@ -492,9 +493,9 @@ server that returns canned answers.
    timeout, three strikes). Tests: each failure path, including that a
    change is never dropped.
 3. **MCP front and `keepalive`.** stdio server, the five tools, envelope,
-   `instructions`, `max_s` clamp to 30-3300 (originally 30-270), progress notifications. Tests: an MCP client
+   `instructions`, `max_s` clamp to 30-3000 (originally 30-270; 30-3300 until 2026-11-13), progress notifications. Tests: an MCP client
    in the test drives create, then repeated keepalive; blocked call returns
-   early on fire; `max_s` of 5 and 9999 are clamped to 30 and 3300 (270 for Codex; originally 270, see "Cache-aware window"); a deadline hours away returns `pending` at 270 s (the default window); pending returns carry `tick` and `now`; quiet envelope is
+   early on fire; `max_s` of 5 and 9999 are clamped to 30 and 3000 (270 for Codex; originally 270, see "Cache-aware window"); a deadline hours away returns `pending` at 270 s (the default window); pending returns carry `tick` and `now`; quiet envelope is
    small.
 4. **Nix packaging and skill.** Scout module, flakelet, agent skill, MCP
    wiring. Verify per `AGENTS.md`: the affected output evaluates, then
@@ -688,12 +689,12 @@ Full claims and decisions: `specs/auto-interval.md` (AI1-AI8, S1-S10, N1-N4).
 This section is the behaviour as built.
 
 **Why.** An agent should not pick a tick length. A Claude main session with a
-1-hour prompt cache needs a call only every ~55 minutes; a 270 s tick costs
+1-hour prompt cache needs a call only every ~50 minutes (owner 2026-11-13: at most 50 minutes; was 55); a 270 s tick costs
 about 11 times as many model calls. A long wait hides time, so a long window
 needs a clock in the envelope and an early wake when a job looks stuck.
 
 **Window (AI1', AI3, S4).** Per call, in this order:
-1. An explicit `max_s` / `--max-s` wins, clamped to 30..=3300, or 30..=270
+1. An explicit `max_s` / `--max-s` wins, clamped to 30..=3000, or 30..=270
    when the caller is Codex or ambiguous. `cache` is `unknown` / `explicit`.
 2. A caller that is not the orchestrator gets 270 s (`unknown` / `default`).
    Subagents therefore need no special instruction.
@@ -704,7 +705,7 @@ needs a clock in the envelope and an early wake when a job looks stuck.
    `~/.claude/projects/*/<id>.jsonl`, or `VIGIL_CLAUDE_PROJECTS_DIR`, or
    `$CLAUDE_CONFIG_DIR/projects`): the newest main-session assistant record
    with a nonzero `usage.cache_creation` write; `ephemeral_1h_input_tokens > 0`
-   gives 1 h and 3300 s, else a 5m write gives 5m and 270 s; nothing usable
+   gives 1 h and 3000 s (600 s margin; was 3300 s with a 300 s margin until 2026-11-13), else a 5m write gives 5m and 270 s; nothing usable
    gives `unknown` and 270 s. Codex (`AGENT=codex` or any `CODEX_*` variable)
    is `5m` / `codex-default` / 270 s. Claude and Codex signals together are
    ambiguous (a Claude started from a Codex shell or the reverse): 270 s,
@@ -876,7 +877,7 @@ the envelope is `pending` with `next: "call keepalive again"` and no events
 envelope, with no release event.
 
 **Orchestrator window (H9).** A hold defaults to `orchestrator: true`: holds are
-for main sessions, so keepalive over a hold uses the 55 minute window on a 1 hour
+for main sessions, so keepalive over a hold uses the 50 minute window on a 1 hour
 prompt cache (and the credit checks). `"orchestrator": false` at creation, or
 `orchestrator: false` on the call, overrides. A subagent must pass its own
 `watch_id` to `keepalive`: a no-id call covers every watch this process
@@ -901,7 +902,7 @@ scoping by the submitting process tree (qex records `submitter` pids).
 [--deadline-s N] [--expect-s N] [--orchestrator BOOL]`. `--for` repeats, one spec per use. Prints the created watch like `vigil
 create` (`watch_id`, `status`, `created_at`, `deadline_at`); then `keepalive
 <id>` / `wait <id>` as for any watch. `--orchestrator` on `keepalive` and
-`wait` is the existing flag (AI1'): main session only, selects the 55 minute
+`wait` is the existing flag (AI1'): main session only, selects the 50 minute
 window on a 1 hour cache. MCP: tool `hold {id?, for?: [spec], until_idle?,
 deadline_s?, expect_s?, orchestrator?}`, same errors as `watch_create`.
 `vigil hold` with neither `--for` nor `--until-idle` is the bare hold (H5).

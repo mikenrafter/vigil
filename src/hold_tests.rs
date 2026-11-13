@@ -249,9 +249,9 @@ fn claude_vigil(env: &Env, projects: &std::path::Path) -> Vigil {
 #[tokio::test(start_paused = true)]
 async fn a_hold_call_with_no_flag_gets_the_orchestrator_window_on_a_one_hour_cache() {
     // why: H9 + the owner's rule: the main session holds with vigil and the
-    //      55 minute window is what makes that cheap. A no-id keepalive with
+    //      50 minute window is what makes that cheap. A no-id keepalive with
     //      neither `orchestrator` nor `max_s` covers the hold, which stores
-    //      orchestrator = true, so on a 1 h transcript the call blocks 3300 s.
+    //      orchestrator = true, so on a 1 h transcript the call blocks 3000 s.
     //      Control: the same call over a plain watch is 270 s.
     // proves: CLAIM(H9)
     let env = rig();
@@ -261,8 +261,8 @@ async fn a_hold_call_with_no_flag_gets_the_orchestrator_window_on_a_one_hour_cac
     env.reader.set_text("qex:a", "running");
     vigil.create(hold_request("h", vec![qex("a")])).await.unwrap();
     let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: None, max_s: None, orchestrator: None }).await.unwrap()).unwrap();
-    assert_eq!((envelope["status"].as_str(), envelope["max_s"].as_u64()), (Some("pending"), Some(3300)), "{envelope}");
-    assert_eq!((envelope["cache"]["ttl"].as_str(), envelope["cache"]["interval_s"].as_u64()), (Some("1h"), Some(3300)));
+    assert_eq!((envelope["status"].as_str(), envelope["max_s"].as_u64()), (Some("pending"), Some(3000)), "{envelope}");
+    assert_eq!((envelope["cache"]["ttl"].as_str(), envelope["cache"]["interval_s"].as_u64()), (Some("1h"), Some(3000)));
     assert_eq!(envelope["next"], "call keepalive again");
 
     let other = rig();
@@ -279,7 +279,7 @@ async fn a_hold_on_a_running_process_never_raises_the_default_stall() {
     // why: H8. The default stall rule (900 s without file/glob/cmd output while
     //      a process input runs) would wake the orchestrator every 15 minutes
     //      for a hold, which is waiting by definition. A long window over a
-    //      hold on a live pid returns pending at 3300 s with no event.
+    //      hold on a live pid returns pending at 3000 s with no event.
     //      Control (the existing rule, AI5): the same pid in a `condition`
     //      watch with a file raises `stalled` at 900.
     // proves: CLAIM(H8)
@@ -289,8 +289,8 @@ async fn a_hold_on_a_running_process_never_raises_the_default_stall() {
     let sleeper = Sleeper::start();
     let pid = sleeper.0.id();
     vigil.create(hold_request("h", vec![Input::Process { pid, want: Some(ProcessWant::Exited) }])).await.unwrap();
-    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(3300), orchestrator: Some(true) }).await.unwrap()).unwrap();
-    assert_eq!((envelope["status"].as_str(), envelope["waited_s"].as_u64()), (Some("pending"), Some(3300)), "{envelope}");
+    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(3000), orchestrator: Some(true) }).await.unwrap()).unwrap();
+    assert_eq!((envelope["status"].as_str(), envelope["waited_s"].as_u64()), (Some("pending"), Some(3000)), "{envelope}");
     assert_eq!(envelope["events"], json!([]));
     assert!(envelope["cache"].get("interval_s").is_some());
 
@@ -300,7 +300,7 @@ async fn a_hold_on_a_running_process_never_raises_the_default_stall() {
     control.fire = FireKind::Condition;
     control.inputs.push(Input::Process { pid, want: Some(ProcessWant::Exited) });
     vigil.create(control).await.unwrap();
-    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("control").unwrap()), max_s: Some(3300), orchestrator: Some(true) }).await.unwrap()).unwrap();
+    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("control").unwrap()), max_s: Some(3000), orchestrator: Some(true) }).await.unwrap()).unwrap();
     assert_eq!(envelope["events"][0]["reason"], "stalled", "control: {envelope}");
 }
 

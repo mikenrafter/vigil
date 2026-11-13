@@ -24,8 +24,9 @@ use crate::credit::CreditCheck;
 
 /// AI1': the default window, and the window for a 5-minute or unknown TTL.
 pub const DEFAULT_WINDOW_S: u64 = 270;
-/// AI1' / D1: a 1 h TTL minus a 5 minute margin.
-pub const ONE_HOUR_WINDOW_S: u64 = 3300;
+/// AI1' / D1: a 1 h TTL minus a 10 minute margin (3000 s). Owner 2026-11-13:
+/// at most 50 minutes. Was 3300 s (5 minute margin).
+pub const ONE_HOUR_WINDOW_S: u64 = 3000;
 /// A2: explicit windows are clamped to at least this ...
 pub const MIN_WINDOW_S: u64 = 30;
 /// ... and at most `ONE_HOUR_WINDOW_S`, or `CODEX_MAX_WINDOW_S` for Codex.
@@ -103,11 +104,12 @@ pub enum Identity<'a> {
 }
 
 impl Identity<'_> {
-    /// The largest window an explicit `max_s` may ask for (A2): 3300, the
+    /// The largest window an explicit `max_s` may ask for (A2): 3000 (50 min,
+    /// owner 2026-11-13: at most 50 minutes), the
     /// largest vigil ever picks itself. Codex's tool timeout (300 s) is a hard
     /// limit, so a caller that may be Codex, and one that is both Claude and
     /// Codex, get 270 (R2-A1, S4). The old fixed 270 ceiling is gone for every
-    /// other caller: the engine tests that ask for 3300 without any agent
+    /// other caller: the engine tests that ask for 3000 without any agent
     /// signal pin that.
     pub const fn window_ceiling_s(self) -> u64 {
         match self {
@@ -359,7 +361,7 @@ mod tests {
     fn the_newest_five_minute_write_wins_over_an_older_one_hour_write() {
         // why: AI1' + AI2': after usage credits start (and the hook flips
         //      promptCacheTtl to 5m) the session's writes become 5m; an old 1h
-        //      write must not keep the window at 3300 s, or the cache goes
+        //      write must not keep the window at 3000 s, or the cache goes
         //      cold between calls. Mirror of the test above: "any 1h write"
         //      would pass that one and fail this one.
         // proves: CLAIM(AI1')
@@ -645,9 +647,9 @@ mod tests {
     fn the_window_is_270_unless_an_orchestrator_on_a_known_one_hour_cache() {
         // why: AI1' (Rev 2, Rev 4): the default is always 270 s; only an
         //      orchestrator gets the TTL-derived window. Table, derived from
-        //      the spec (3300 = 3600 - 300 margin, D1):
+        //      the spec (3000 = 3600 - 600 margin, D1; owner 2026-11-13: at most 50 minutes):
         //        subagent (no flag) on a 1h Claude cache  -> 270, unknown/default
-        //        orchestrator, 1h                         -> 3300, 1h/claude-transcript
+        //        orchestrator, 1h                         -> 3000, 1h/claude-transcript
         //        orchestrator, 5m                         -> 270, 5m/claude-transcript
         //        orchestrator, no usable write / no file / unreadable -> 270, unknown/default
         //        orchestrator on Codex                    -> 270, 5m/codex-default
@@ -660,7 +662,7 @@ mod tests {
         use TtlSource::*;
         let cases = [
             ("subagent, 1h cache", choose(None, false, true, false, OneHourWrite), note(Unknown, Default, 270)),
-            ("orchestrator, 1h", choose(None, true, true, false, OneHourWrite), note(OneHour, ClaudeTranscript, 3300)),
+            ("orchestrator, 1h", choose(None, true, true, false, OneHourWrite), note(OneHour, ClaudeTranscript, 3000)),
             ("orchestrator, 5m", choose(None, true, true, false, FiveMinuteWrite), note(FiveMinutes, ClaudeTranscript, 270)),
             ("orchestrator, zero writes", choose(None, true, true, false, NoWrite), note(Unknown, Default, 270)),
             ("orchestrator, no file", choose(None, true, true, false, Absent), note(Unknown, Default, 270)),
@@ -678,13 +680,14 @@ mod tests {
     #[test]
     fn an_explicit_max_s_wins_and_is_clamped_to_the_transport_limit() {
         // why: AI1' "explicit max_s still wins, clamped to transport limits
-        //      (Codex MCP <= 270 s)" with the A2 bounds: 30..=3300 normally,
+        //      (Codex MCP <= 270 s)" with the A2 bounds: 30..=3000 normally,
         //      30..=270 on Codex. An explicit call reports ttl unknown and
         //      source explicit (A4): vigil did not look. Table:
         //        100            -> 100          (even for an orchestrator on a 1h cache)
         //        5, 0           -> 30           (floor)
         //        3000           -> 3000
-        //        9999           -> 3300         (claude), 270 (codex)
+        //        3001           -> 3000         (one past the 50 minute ceiling)
+        //        9999           -> 3000         (claude), 270 (codex)
         //        271            -> 271 (claude), 270 (codex)
         //        non-orchestrator 1000 -> 1000  (explicit means explicit)
         // proves: CLAIM(AI1'), CLAIM(AI3)
@@ -694,7 +697,8 @@ mod tests {
         assert_eq!(choose(Some(5), true, true, false, OneHourWrite), explicit(30));
         assert_eq!(choose(Some(0), false, false, false, Absent), explicit(30));
         assert_eq!(choose(Some(3000), true, true, false, OneHourWrite), explicit(3000));
-        assert_eq!(choose(Some(9999), true, true, false, OneHourWrite), explicit(3300));
+        assert_eq!(choose(Some(3001), true, true, false, OneHourWrite), explicit(3000));
+        assert_eq!(choose(Some(9999), true, true, false, OneHourWrite), explicit(3000));
         assert_eq!(choose(Some(271), false, true, false, OneHourWrite), explicit(271));
         assert_eq!(choose(Some(1000), false, true, false, OneHourWrite), explicit(1000));
         assert_eq!(choose(Some(9999), true, false, true, Absent), explicit(270));
@@ -710,7 +714,7 @@ mod tests {
         //      (AI6: short calls add nothing beyond these three keys).
         // proves: CLAIM(AI3)
         let cases = [
-            (note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3300), r#"{"ttl":"1h","source":"claude-transcript","interval_s":3300}"#),
+            (note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3000), r#"{"ttl":"1h","source":"claude-transcript","interval_s":3000}"#),
             (note(Ttl::FiveMinutes, TtlSource::CodexDefault, 270), r#"{"ttl":"5m","source":"codex-default","interval_s":270}"#),
             (note(Ttl::Unknown, TtlSource::Default, 270), r#"{"ttl":"unknown","source":"default","interval_s":270}"#),
             (note(Ttl::Unknown, TtlSource::Explicit, 60), r#"{"ttl":"unknown","source":"explicit","interval_s":60}"#),
@@ -728,12 +732,12 @@ mod tests {
         // why: S4 (reverses red default A3). A Claude Code started from a Codex
         //      shell inherits CODEX_*; a Codex started from a Claude Code shell
         //      inherits CLAUDE_CODE_SESSION_ID. vigil cannot tell which one is
-        //      calling, and guessing Claude hands a Codex session a 3300 s call
+        //      calling, and guessing Claude hands a Codex session a 3000 s call
         //      that its 300 s tool timeout kills. Both nesting directions, each
         //      with an orchestrator flag and a transcript whose newest write is
         //      1h: the window stays 270 s, unknown / default, and the
         //      transcript is not trusted. Positive control: the same transcript
-        //      with only the Claude signal gives 3300 s, so the 270 comes from
+        //      with only the Claude signal gives 3000 s, so the 270 comes from
         //      the second signal and not from a broken transcript reader.
         // proves: CLAIM(S4)
         let root = tempfile::tempdir().unwrap();
@@ -744,7 +748,7 @@ mod tests {
         };
         let (claude_only, note_claude) = window_for(&[("CLAUDE_CODE_SESSION_ID", "sess-1")]);
         assert_eq!(claude_only, AgentEnv { claude_session_id: Some("sess-1".into()), codex: false });
-        assert_eq!(note_claude, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3300), "control: Claude alone is trusted");
+        assert_eq!(note_claude, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3000), "control: Claude alone is trusted");
 
         let nestings = [
             ("claude started from a codex shell (CODEX_HOME)", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("CODEX_HOME", "/x")]),
@@ -762,12 +766,12 @@ mod tests {
     fn an_explicit_max_s_under_an_ambiguous_identity_keeps_the_codex_ceiling() {
         // why: S4 + A2. If the caller may be Codex its 300 s tool timeout is a
         //      hard limit, so an explicit 9999 under both signals is clamped to
-        //      270 (not 3300) and an explicit 60 stays 60. Default taken, the
+        //      270 (not 3000) and an explicit 60 stays 60. Default taken, the
         //      spec only says "ambiguous -> 270 s" (report: R2-A1). Control:
-        //      Claude alone gets 3300 for 9999.
+        //      Claude alone gets 3000 for 9999.
         // proves: CLAIM(S4)
         use Transcript::*;
-        assert_eq!(choose(Some(9999), true, true, false, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 3300), "control: Claude alone");
+        assert_eq!(choose(Some(9999), true, true, false, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 3000), "control: Claude alone");
         assert_eq!(choose(Some(9999), true, true, true, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 270));
         assert_eq!(choose(Some(60), true, true, true, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 60));
     }
@@ -922,7 +926,7 @@ mod tests {
         let tap = crate::meter::ReadTap::on(root.path());
         let agent = AgentEnv { claude_session_id: Some("sess-1".into()), codex: false };
         let got = choose_window(&WindowRequest { explicit_s: None, orchestrator: true, agent: &agent, projects_dir: Some(root.path()) });
-        assert_eq!(got, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3300));
+        assert_eq!(got, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3000));
         let tally = tap.of(&big);
         assert!(tally.bytes_read > 0, "the meter must see the production read: {tally:?}");
         assert!(tally.bytes_read <= 524_289, "consumed {} bytes of a {len}-byte transcript", tally.bytes_read);

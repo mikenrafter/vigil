@@ -29,7 +29,7 @@ manual tick as backup; the agent should not think about tick length.
   - Codex (`CODEX_*` / codex env, or `AGENT=codex`): 5 min (no TTL is
     recorded; owner decision).
   - Anything else, unreadable file, parse error: unknown.
-  - Interval: 1 h → 3300 s; 5 min or unknown → 270 s. An explicit
+  - Interval: 1 h → 3000 s; 5 min or unknown → 270 s. An explicit
     `max_s`/`--max-s` still wins, clamped to the transport limit.
 - **AI2 — transport limits respected.** MCP calls from Codex never exceed
   270 s (Codex tool timeout 300 s). Detection runs at every call, so a session
@@ -68,7 +68,7 @@ must, to pass `--max-s 270`). Recorded in the vigil skill.
 
 ## Defaults taken (owner may override)
 
-- D1: 1 h → 3300 s (5 minute margin).
+- D1: 1 h → 3000 s (10 minute margin). Owner 2026-11-13: at most 50 minutes; this was 3300 s (5 minute margin).
 - D2: attention threshold = the build-loop rule (1.5x or +9 min, first).
 - D3: default stall 900 s only for long ticks with a running process input.
 - D4: transcript tail cap 512 KiB.
@@ -78,7 +78,7 @@ must, to pass `--max-s 270`). Recorded in the vigil skill.
 - **AI1' — 270 s unless the caller is the orchestrator.** The default interval
   is always 270 s. Only a call that marks itself as the main orchestrator
   session (CLI `--orchestrator`; MCP `orchestrator: true`; the watch can also
-  store it at create) gets the TTL-derived interval (1 h → 3300 s). Subagents
+  store it at create) gets the TTL-derived interval (1 h → 3000 s). Subagents
   therefore stay at 270 s with no special instruction, which removes the
   subagent limit above.
 - **AI2' — credit check every 4 minutes, account-wide.** Usage credits can
@@ -179,7 +179,7 @@ are accepted as written, except:
   last check (recorded per state root, see S9) is ≥ 240 s old, whatever its
   window; long windows also re-check every 240 s inside the call. Test the
   full automatic sequence 1 h → credits → 5 min (270 s calls keep checking)
-  → credits end → hook restores 1 h → 3300 s.
+  → credits end → hook restores 1 h → 3000 s.
 - **S3.** `wait --orchestrator` uses the TTL window and the credit checks.
   `wait` returns on an `attention` or `credit_state_changed` event with a new
   exit code **5** ("attention; the watch is still live"); 0/3/4 unchanged.
