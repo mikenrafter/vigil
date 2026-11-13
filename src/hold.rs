@@ -248,6 +248,35 @@ pub struct HoldRequest {
     pub expect_s: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<bool>,
+    /// W42-H1: the label of the hold's first item (`--label`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// W42-H2: one item to add to a live hold (`vigil hold add`, MCP `hold_add`).
+/// `work` is a `--for` spec, or `none` for a bare labelled item that only
+/// `hold done` (or `expect_s`) acts on (W42-H5).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HoldItemRequest {
+    #[serde(rename = "for")]
+    pub work: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl Vigil {
+    /// RED STUB (W42-H2): add an item to the live hold `id`. Not implemented.
+    pub async fn hold_add(&self, id: &crate::watch::WatchId, item: HoldItemRequest) -> Result<Created, VigilError> {
+        let _ = item;
+        Err(VigilError::NotFound(format!("{id}: hold items are not implemented")))
+    }
+
+    /// RED STUB (W42-H5): end the item `label` of the live hold `id`. Not implemented.
+    pub async fn hold_done(&self, id: &crate::watch::WatchId, label: &str) -> Result<(), VigilError> {
+        Err(VigilError::NotFound(format!("{id}/{label}: hold items are not implemented")))
+    }
 }
 
 impl Vigil {

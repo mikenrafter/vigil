@@ -235,7 +235,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
         Command::Hold { id, work, until_idle, deadline_s, expect_s, orchestrator } => {
-            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator }).await?)?;
+            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, ..Default::default() }).await?)?;
             Ok(0)
         }
         Command::Status { id } => print_json(&vigil.status(&WatchId::parse(&id)?).await?).map(|()| 0),

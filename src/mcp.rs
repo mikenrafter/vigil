@@ -331,6 +331,7 @@ impl VigilServer {
             deadline_s: args.deadline_s,
             expect_s: args.expect_s,
             orchestrator: args.orchestrator,
+            ..Default::default()
         };
         Ok(tokio::select! {
             biased;

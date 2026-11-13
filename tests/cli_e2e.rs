@@ -1940,3 +1940,142 @@ fn a_hold_made_on_a_name_stores_the_job_id_and_survives_the_name_being_reused() 
     assert!(stderr.contains("nightly") && stderr.contains("ambiguous") && stderr.contains("names 2 jobs"), "{stderr}");
     assert!(sandbox.watch_file("again").is_none());
 }
+
+// ---- hold items (W42) and the removal of `vigil wait` ------------------------
+//
+// Claim ids W42-H1..W42-H5 / W42-W1 are the hold-items spec's own
+// (knowledge/research/agentic-practice-2026-11/vigil-hold-items-spec.md).
+
+#[test]
+fn hold_add_and_hold_done_work_across_separate_processes_through_the_binary() {
+    // why: W42-H1..H5 through the real binary and watch file. `vigil hold
+    //      --for QEX --label build`, then `hold add ID --for none --label t3
+    //      --expect-s 600`, then `hold done ID t3` are three separate
+    //      processes; a keepalive in a fourth sees `item ended: t3: done` with
+    //      the hold still live, and the qex job ending later releases it.
+    // proves: W42-H1, W42-H2, W42-H3, W42-H5
+    // catches: a CLI whose `hold add` / `hold done` subcommands do not exist
+    //      (clap exit 2) or only mutate in memory; a `done` that releases the
+    //      whole hold; an add that does not persist the item.
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    let created = run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", J1_SPEC, "--label", "build", "--expect-s", "600"]);
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let added = run_with_qex(&sandbox, &qex, &["hold", "add", "h", "--for", "none", "--label", "t3", "--expect-s", "600"]);
+    assert!(added.status.success(), "hold add: {}", String::from_utf8_lossy(&added.stderr));
+    let done = run_with_qex(&sandbox, &qex, &["hold", "done", "h", "t3"]);
+    assert!(done.status.success(), "hold done: {}", String::from_utf8_lossy(&done.stderr));
+
+    let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
+    assert_eq!((envelope["status"].as_str(), envelope["next"].as_str()), (Some("pending"), Some("act on events")), "{envelope}");
+    assert_eq!(envelope["events"][0]["summary"], "item ended: t3: done", "{envelope}");
+    assert_eq!(envelope["events"][0]["kind"], "attention", "{envelope}");
+
+    qex.set_job(J1, "completed");
+    let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
+    assert_eq!(released["status"], "fired", "{released}");
+}
+
+#[test]
+fn hold_add_to_an_ended_hold_and_hold_done_with_a_wrong_label_exit_1_and_say_why() {
+    // why: W42-H2, W42-H5 through the CLI: errors are exit 1 with the cause on
+    //      stderr and nothing on stdout (the same contract as `hold` with a
+    //      bad spec above).
+    // proves: W42-H2, W42-H5
+    // catches: an add that succeeds on a released hold; a `done` that exits 0
+    //      for a label that names no item.
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "completed");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", J1_SPEC, "--label", "build"]).status.success());
+    let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30"]));
+    assert_eq!(released["status"], "fired", "setup: {released}");
+    let refused = run_with_qex(&sandbox, &qex, &["hold", "add", "h", "--for", "none", "--label", "t3"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("ended"), "{}", String::from_utf8_lossy(&refused.stderr));
+
+    qex.set_job(J1, "running");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "live", "--for", J1_SPEC, "--label", "build"]).status.success());
+    let wrong = run_with_qex(&sandbox, &qex, &["hold", "done", "live", "nope"]);
+    assert_eq!(wrong.status.code(), Some(1), "{}", String::from_utf8_lossy(&wrong.stderr));
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("nope"));
+}
+
+#[test]
+fn an_until_item_in_the_past_ends_at_the_first_keepalive_with_an_item_event() {
+    // why: W42-H5 through the real readers (no scripted reader): an `until:`
+    //      item whose time has passed ends at the first tick, and the hold
+    //      stays live for the other item (a marker file that does not exist).
+    // proves: W42-H3, W42-H5
+    // catches: until items rejected by the CLI, or ended without an event.
+    let sandbox = Sandbox::new();
+    let marker = sandbox.input("done.marker");
+    let created = sandbox.run(&["hold", "--id", "h", "--for", &format!("file:{}", marker.display()), "--label", "marker"]);
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let added = sandbox.run(&["hold", "add", "h", "--for", "until:2020-01-01T00:00:00Z", "--label", "eta"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let envelope = stdout_json(&finish_within(piped({
+        let mut command = sandbox.command();
+        command.args(["keepalive", "h", "--max-s", "30"]);
+        command
+    }), Duration::from_secs(10)));
+    assert_eq!(envelope["status"], "pending", "{envelope}");
+    assert_eq!(envelope["events"][0]["summary"], "item ended: eta: reached", "{envelope}");
+}
+
+#[test]
+fn vigil_wait_is_an_unknown_subcommand_and_is_not_advertised() {
+    // why: W42-W1. `vigil wait` is removed: clap rejects it as an unknown
+    //      subcommand (exit 2, the usage code), for a real and an unknown
+    //      watch alike, and no help text offers it. Controls: `keepalive`
+    //      still works on the same watch, and `hold --help` lists the new
+    //      `add` and `done` subcommands.
+    // proves: W42-W1
+    // catches: `wait` kept as an alias or hidden subcommand (exit 1 or 0); help
+    //      text that still tells agents to `wait ID`; a removal that took
+    //      keepalive with it.
+    let sandbox = Sandbox::new();
+    create_via_cli(&sandbox, "w", &sandbox.input("w.log"));
+    for args in [&["wait", "w"][..], &["wait", "ghost"], &["wait", "w", "--orchestrator"]] {
+        // Bounded: while `wait` exists it blocks on the pending watch, so a hang is killed and fails.
+        let mut command = sandbox.command();
+        command.args(args);
+        let output = finish_within(piped(command), Duration::from_secs(5));
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("wait"), "{args:?}: clap names the unknown subcommand");
+        assert!(output.stdout.is_empty(), "{args:?}: nothing on stdout");
+    }
+    for args in [&["--help"][..], &["hold", "--help"], &["keepalive", "--help"]] {
+        let text = String::from_utf8_lossy(&sandbox.run(args).stdout).to_string();
+        assert!(!text.contains("vigil wait") && !text.contains("`wait ID`") && !text.lines().any(|line| line.trim_start().starts_with("wait ")), "{args:?} still offers wait:\n{text}");
+    }
+    let hold_help = String::from_utf8_lossy(&sandbox.run(&["hold", "--help"]).stdout).to_string();
+    assert!(hold_help.contains("add") && hold_help.contains("done") && hold_help.contains("--label"), "{hold_help}");
+    let alive = sandbox.run(&["keepalive", "ghost", "--max-s", "30"]);
+    assert_eq!(alive.status.code(), Some(1), "control: keepalive on an unknown watch is a runtime error, not a usage error");
+}
+
+#[test]
+fn no_wait_code_path_is_left_in_the_source_tree() {
+    // why: W42-W1 "remove the subcommand and its code paths". A whole-tree scan
+    //      (the legitimate kind of source guard): the identifiers of the old
+    //      delivery path must not survive in src/. Positive control: the same
+    //      scan finds `fn keepalive`, so a wrong directory or an unreadable
+    //      tree cannot pass it.
+    // proves: W42-W1
+    // catches: the CLI arm removed while `wait_uncommitted`, `wait_exit_code`
+    //      or the `Command::Wait` variant live on as dead public API.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut text = String::new();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            text.push_str(&std::fs::read_to_string(&path).unwrap());
+        }
+    }
+    assert!(text.contains("fn keepalive"), "control: the scan reads the source tree");
+    for needle in ["wait_uncommitted", "wait_exit_code", "Command::Wait"] {
+        assert!(!text.contains(needle), "{needle} is still in src/");
+    }
+}

@@ -61,3 +61,5 @@ mod auto_interval_tests;
 mod disk_full_tests;
 #[cfg(test)]
 mod hold_tests;
+#[cfg(test)]
+mod hold_items_tests;

@@ -84,8 +84,8 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     let tools = client.list_all_tools().await.unwrap();
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    // The five watch tools of the SPEC, `hold` (SPEC "Holds") and the six advisory tools (SPEC "Advisories").
-    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "hold", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
+    // The five watch tools of the SPEC, `hold` (SPEC "Holds"), `hold_add` (W42-H2) and the six advisory tools (SPEC "Advisories").
+    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "hold", "hold_add", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
     for tool in &tools {
         assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()), "{} has no description", tool.name);
     }
@@ -791,5 +791,66 @@ async fn the_hold_tool_holds_on_qex_work_and_a_keepalive_releases_it_with_the_re
     assert_eq!(typo.is_error, Some(true));
     assert!(typo.content[0].as_text().unwrap().text.contains("not found"));
     assert!(sandbox.watch_file("bad").is_none() && sandbox.watch_file("typo").is_none());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_hold_add_tool_is_listed_with_its_arguments() {
+    // why: W42-H2. `hold_add {watch_id, for, expect_s, label}`: one item per
+    //      call, so `for` is one string (not an array like `hold`'s). The
+    //      `hold` tool gains `label` for its first item (W42-H1).
+    // proves: W42-H2, W42-H1
+    // catches: a tool missing from the server; `for` typed as an array (a
+    //      client sending one spec string would fail); `label` missing.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let add = tools.iter().find(|t| t.name == "hold_add").expect("the hold_add tool is listed");
+    assert!(add.description.as_deref().is_some_and(|d| d.contains("hold")));
+    let schema = serde_json::Value::Object((*add.input_schema).clone());
+    for field in ["watch_id", "for", "expect_s", "label"] {
+        assert!(schema["properties"].get(field).is_some(), "{field} missing: {schema}");
+    }
+    assert_eq!(schema["properties"]["for"]["type"], "string", "{schema}");
+    let hold = tools.iter().find(|t| t.name == "hold").unwrap();
+    assert!(hold.input_schema.get("properties").and_then(|p| p.get("label")).is_some(), "hold takes a label for its first item");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn hold_add_over_the_wire_adds_an_item_that_the_keepalive_reports_and_an_ended_hold_refuses() {
+    // why: W42-H2, W42-H3 over MCP. Hold on a running qex job (label first),
+    //      add a marker-file item (label marker); the job ends -> keepalive
+    //      returns `item ended: first: completed` with the hold pending; the
+    //      marker appears -> the hold is released; a further hold_add is a
+    //      tool error that says the hold ended.
+    // proves: W42-H2, W42-H3
+    // catches: a hold_add tool that is not wired to the engine (error or
+    //      no-op); an item that is not persisted; adding to an ended hold
+    //      reported as success.
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    let client = connect_with_env(&sandbox, &[("PATH", std::ffi::OsStr::new(&qex.path()))]).await;
+    let peer = client.peer();
+    let marker = sandbox.input("done.marker");
+
+    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": [format!("qex:{J1}")], "label": "first"})).await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    let added = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": format!("file:{}", marker.display()), "label": "marker", "expect_s": 600})).await;
+    assert_ne!(added.is_error, Some(true), "{added:?}");
+
+    qex.set_job(J1, "completed");
+    let first = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h", "max_s": 30})).await);
+    assert_eq!((first["status"].as_str(), first["next"].as_str()), (Some("pending"), Some("act on events")), "{first}");
+    assert_eq!(first["events"][0]["summary"], "item ended: first: completed", "{first}");
+
+    std::fs::write(&marker, "done\n").unwrap();
+    let released = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h", "max_s": 30})).await);
+    assert_eq!(released["status"], "fired", "{released}");
+
+    let late = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "pid:1", "label": "late"})).await;
+    assert_eq!(late.is_error, Some(true), "{late:?}");
+    assert!(late.content[0].as_text().unwrap().text.contains("ended"));
     client.cancel().await.unwrap();
 }

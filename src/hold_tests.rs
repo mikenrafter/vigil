@@ -20,11 +20,11 @@ use crate::{SystemClock, Vigil};
 
 const WEEK: u64 = 604_800;
 
-fn rig() -> Env {
+pub(crate) fn rig() -> Env {
     Env::with_clock(Arc::new(TokioClock::new(spec_instant())))
 }
 
-fn qex(job: &str) -> Input {
+pub(crate) fn qex(job: &str) -> Input {
     Input::Qex { job: job.into() }
 }
 
@@ -45,12 +45,12 @@ fn hold_request(id: &str, inputs: Vec<Input>) -> CreateRequest {
     }
 }
 
-async fn call(vigil: &Vigil, id: &str, max_s: Option<u64>) -> Value {
+pub(crate) async fn call(vigil: &Vigil, id: &str, max_s: Option<u64>) -> Value {
     let request = KeepaliveRequest { watch_id: Some(WatchId::parse(id).unwrap()), max_s, orchestrator: None };
     serde_json::to_value(vigil.keepalive(request).await.unwrap()).unwrap()
 }
 
-fn watch_file(vigil: &Vigil, id: &str) -> WatchFile {
+pub(crate) fn watch_file(vigil: &Vigil, id: &str) -> WatchFile {
     vigil.store().load(&WatchId::parse(id).unwrap()).unwrap()
 }
 
@@ -323,7 +323,7 @@ async fn expect_s_on_a_hold_raises_overdue_like_any_watch() {
 
 // ---- the front door: Vigil::hold ----------------------------------------
 
-fn request_for(work: &[&str]) -> HoldRequest {
+pub(crate) fn request_for(work: &[&str]) -> HoldRequest {
     HoldRequest { id: Some("h".into()), work: work.iter().map(|spec| spec.to_string()).collect(), ..HoldRequest::default() }
 }
 
