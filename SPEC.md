@@ -978,6 +978,14 @@ attention pass raises item overdue through `attention::due`.
   one made with `watch_create`) keeps the old rule: no item events, the
   release names each input and its reading. `hold add` and `hold done` refuse
   it (make a new hold).
+- **Error readings are no news (Fable S3, 2026-11-13).** An item whose input
+  reads `error:` (a qex status timeout, an unreadable file) is neither ended nor
+  un-ended at that tick: `ended_at` and its end event stay as they were, and it
+  does not count as ended for the release. A never-ended item that only reads
+  errors still goes overdue once at its deadline.
+- **Status (W42).** `vigil status <hold>` / MCP `watch_status` carry `items`:
+  each item's label and `live` or `ended`. Watches without items omit the key.
+  Keepalive envelopes do not carry it.
 
 **Wire compatibility (H12).** `fire: "hold"` and the new `kind`s are additions.
 A new binary reads every existing watch file unchanged. An old binary does not
