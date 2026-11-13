@@ -28,6 +28,11 @@ enum Command {
     Status { id: String },
     List,
     Cancel { id: String },
+    /// Going cold (the work is done): cancel the named watches and holds, then
+    /// print the instruction to post a BabelTele summary and end the turn, and
+    /// the ids still pending. With no ids it cancels nothing: the CLI cannot
+    /// tell which watches are this session's.
+    Cold { ids: Vec<String> },
     /// Block up to --max-s (30..=270) and print the envelope JSON.
     Keepalive {
         id: String,
@@ -277,6 +282,11 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             let envelope = vigil.cancel(&WatchId::parse(&id)?).await?;
             print_json(&envelope)?;
             warn_about_unsaved(vigil.store().root(), &envelope);
+            Ok(0)
+        }
+        Command::Cold { ids } => {
+            let ids = ids.iter().map(|id| WatchId::parse(id)).collect::<Result<Vec<_>, _>>()?;
+            print_json(&vigil.cold(Some(ids)).await?)?;
             Ok(0)
         }
         Command::Keepalive { id, max_s, orchestrator } => {

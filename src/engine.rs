@@ -38,6 +38,18 @@ pub struct Created {
     pub deadline_at: Timestamp,
 }
 
+/// The instruction `cold` returns (W45-C1).
+pub const COLD_NEXT: &str = "Going cold: post an inline BabelTele summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
+
+/// What `cold` did: the watches it cancelled, the ids still pending, and the
+/// instruction to follow.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ColdReport {
+    pub cancelled: Vec<WatchId>,
+    pub pending: Vec<WatchId>,
+    pub next: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchSummary {
     pub id: WatchId,
@@ -333,6 +345,33 @@ impl Vigil {
                 deadline_at: watch.deadline_at,
             })
             .collect())
+    }
+
+    /// `vigil cold` / MCP `cold` (W45-C1, C2). Cancels `ids`, or with `None`
+    /// the watches this process created that are still pending. Naming an
+    /// unknown id is an error before anything is cancelled. `pending` is read
+    /// after the cancels, so it lists what is still live in the state root.
+    pub async fn cold(&self, ids: Option<Vec<WatchId>>) -> Result<ColdReport, VigilError> {
+        let ids = match ids {
+            Some(ids) => ids,
+            None => {
+                let created: Vec<WatchId> = self.session.lock().expect("session mutex poisoned").created.iter().cloned().collect();
+                created
+            }
+        };
+        for id in &ids {
+            self.store.load(id)?;
+        }
+        let mut cancelled = Vec::new();
+        for id in ids {
+            let was_pending = !self.store.load(&id)?.status.is_finished();
+            let envelope = self.cancel(&id).await?;
+            if was_pending && envelope.status == WatchStatus::Cancelled {
+                cancelled.push(id);
+            }
+        }
+        let pending = self.list().await?.into_iter().filter(|w| w.status == WatchStatus::Pending).map(|w| w.id).collect();
+        Ok(ColdReport { cancelled, pending, next: COLD_NEXT })
     }
 
     /// `watch_cancel`. Cancel on an already finished watch returns the stored

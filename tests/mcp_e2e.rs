@@ -93,7 +93,7 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
     // The five watch tools of the SPEC, `hold` (SPEC "Holds"), `hold_add` (W42-H2), `hold_done` (W42-D7) and the six advisory tools (SPEC "Advisories").
-    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "cold", "hold", "hold_add", "cold", "hold_done", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
+    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "cold", "hold", "hold_add", "hold_done", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
     for tool in &tools {
         assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()), "{} has no description", tool.name);
     }

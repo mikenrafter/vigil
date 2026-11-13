@@ -32,7 +32,8 @@ pub fn server_instructions() -> String {
     "vigil keeps your turn open while a cheap judge watches things. watch_create says what to watch; then call \
      keepalive again and again. Read `next`: while it is exactly \"call keepalive again\", call it again; otherwise stop \
      (\"act on events\": act on them; \"watch ended; create a new watch if still needed\": expired or cancelled). \
-     Results carry `advice`: operator rules to follow; advisory_set changes them."
+     Results carry `advice`: operator rules to follow; advisory_set changes them. \
+     When done, call `cold` (cancels your holds), post an inline BabelTele summary, end the turn."
         .to_string()
 }
 
@@ -184,6 +185,12 @@ pub struct AdvisoryAddArgs {
     /// Replace an advisory that already has this id.
     #[serde(default)]
     pub replace: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ColdArgs {
+    /// Watches or holds to cancel; without it, the watches this server created.
+    pub watch_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -348,6 +355,18 @@ impl VigilServer {
                 created = self.vigil.create(request) => reply(created),
             },
             Err(message) => text_result(true, message),
+        })
+    }
+
+    #[tool(description = "Going cold (your work is done): cancels the named watch_ids, or with none the watches this server created, and returns what to do next (post an inline BabelTele summary, end your turn) plus the ids still pending.")]
+    async fn cold(&self, Parameters(args): Parameters<ColdArgs>) -> Result<CallToolResult, ErrorData> {
+        let ids = match args.watch_ids {
+            Some(ids) if !ids.is_empty() => ids.iter().map(|raw| parse_id(raw)).collect::<Result<Vec<_>, _>>().map(Some),
+            _ => Ok(None),
+        };
+        Ok(match ids {
+            Ok(ids) => reply(self.vigil.cold(ids).await),
+            Err(error) => reply::<()>(Err(error)),
         })
     }
 
