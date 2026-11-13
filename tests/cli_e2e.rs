@@ -1700,6 +1700,8 @@ fn hold_add_and_hold_done_work_across_separate_processes_through_the_binary() {
     assert_eq!(envelope["events"][0]["kind"], "attention", "{envelope}");
 
     qex.set_job(J1, "completed");
+    // The next tick is due 30 s after the last (cadence across calls), so wait it out (orchestrator, W42 green: test timing fix).
+    std::thread::sleep(std::time::Duration::from_secs(31));
     let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
     assert_eq!(released["status"], "fired", "{released}");
 }
@@ -1898,7 +1900,7 @@ fn expect_s_through_the_cli_raises_overdue_for_the_initial_item_and_every_item_o
     let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
     let mut summaries: Vec<String> = envelope["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap().to_string()).collect();
     summaries.sort();
-    assert_eq!(summaries, vec![format!("item overdue: {J1_SPEC}"), "item overdue: pid:1".to_string(), "item overdue: t3".to_string()], "{envelope}");
+    assert_eq!(summaries, vec!["item overdue: pid:1".to_string(), format!("item overdue: {J1_SPEC}"), "item overdue: t3".to_string()], "{envelope}");
     assert_eq!(envelope["status"], "pending", "{envelope}");
 }
 

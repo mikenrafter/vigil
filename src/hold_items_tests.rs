@@ -444,7 +444,7 @@ async fn a_retried_qex_item_is_live_again_blocks_the_release_and_raises_a_new_ev
     assert_eq!(summaries(&blocked), vec!["item ended: qex:b: completed"], "{blocked}");
 
     env.reader.set_text("qex:a", "completed");
-    let released = call(&env.vigil, "h", Some(30)).await;
+    let released = call(&env.vigil, "h", Some(60)).await;
     assert_eq!(released["status"], "fired", "both are ended at this tick: {released}");
     let events = summaries(&released);
     assert_eq!(events.iter().filter(|summary| summary.as_str() == "item ended: qex:a: completed").count(), 1, "a ended again, one new event: {released}");
@@ -771,7 +771,7 @@ async fn every_item_of_a_new_hold_raises_item_ended_unlabelled_ones_and_the_last
     let half = call(&env.vigil, "h", Some(30)).await;
     assert_eq!((half["status"].as_str(), summaries(&half)), (Some("pending"), vec!["item ended: qex:a: completed".to_string()]), "{half}");
     env.reader.set_text("qex:b", "completed");
-    let released = call(&env.vigil, "h", Some(30)).await;
+    let released = call(&env.vigil, "h", Some(60)).await;
     assert_eq!(released["status"], "fired", "{released}");
     assert_eq!(released["events"].as_array().unwrap().len(), 2, "{released}");
     assert!(summaries(&released).contains(&"item ended: qex:b: completed".to_string()), "{released}");

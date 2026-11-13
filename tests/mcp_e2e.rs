@@ -851,7 +851,7 @@ async fn hold_add_over_the_wire_adds_an_item_that_the_keepalive_reports_and_an_e
     assert_eq!(first["events"][0]["summary"], "item ended: first: completed", "{first}");
 
     std::fs::write(&marker, "done\n").unwrap();
-    let released = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h", "max_s": 30})).await);
+    let released = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h", "max_s": 45})).await);
     assert_eq!(released["status"], "fired", "{released}");
 
     let late = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "pid:1", "label": "late"})).await;
