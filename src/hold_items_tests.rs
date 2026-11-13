@@ -290,6 +290,92 @@ async fn one_keepalive_on_the_hold_id_covers_every_item_even_from_another_proces
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_error_reading_never_ends_or_un_ends_an_item() {
+    // why: Fable S3. `a` (expect 100 s) ends; a later read fails
+    //      (`error: timeout after 10s`, a flaky qex) and then reads
+    //      `completed` again. A failed read says nothing about the work: `a`
+    //      stays ended through it, so there is no `item overdue: a` (its
+    //      overdue is 150 s, the error read is at 200 s) and no second
+    //      `item ended: a`. `b` runs on so the hold stays live.
+    // proves: S3
+    // catches: an error reading that un-ends the item (forgets ended_at and
+    //      last_end_event): overdue then fires at 200 s and the next
+    //      `completed` raises a second `item ended`.
+    let env = rig();
+    env.reader.set_text("qex:a", "completed");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "a", Some(100))).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:b", None, Some("b"))).await;
+    let ended = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(summaries(&ended), vec!["item ended: a: completed"], "setup: {ended}");
+
+    env.reader.set_text("qex:a", "error: timeout after 10s");
+    let errored = call(&env.vigil, "h", Some(200)).await;
+    assert_eq!((errored["status"].as_str(), summaries(&errored)), (Some("pending"), Vec::<String>::new()), "{errored}");
+
+    env.reader.set_text("qex:a", "completed");
+    let again = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((again["status"].as_str(), summaries(&again)), (Some("pending"), Vec::<String>::new()), "no second end event: {again}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_item_that_only_ever_reads_errors_still_goes_overdue_once() {
+    // why: Fable S3, control for the test above: an error reading must not
+    //      hide a stuck item. `a` (expect 100 s, overdue at 150 s) never
+    //      reads anything but an error, and is raised overdue once.
+    // proves: S3
+    // catches: an error reading that counts as an end (the item never goes
+    //      overdue); overdue raised on every tick.
+    let env = rig();
+    env.reader.set_text("qex:a", "error: timeout after 10s");
+    env.vigil.hold(first_item("qex:a", "a", Some(100))).await.unwrap();
+    let due = call(&env.vigil, "h", Some(200)).await;
+    assert_eq!(summaries(&due), vec!["item overdue: a"], "{due}");
+    let after = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(summaries(&after), Vec::<String>::new(), "{after}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_lists_a_holds_items_live_or_ended_and_a_watch_without_items_has_no_key() {
+    // why: the agent reads the item count and states from `vigil status
+    //      <hold>` (build-loop pre-launch). `a` ended, `b` runs. A plain
+    //      watch's status has no `items` key at all.
+    // proves: status-items
+    // catches: items missing from status; an ended item shown live; the key
+    //      present (null or empty) for a watch that has no items.
+    let env = rig();
+    env.reader.set_text("qex:a", "completed");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "a", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:b", None, Some("b"))).await;
+    call(&env.vigil, "h", Some(30)).await;
+    let status = serde_json::to_value(env.vigil.status(&wid("h")).await.unwrap()).unwrap();
+    assert_eq!(status["items"], serde_json::json!([{"label": "a", "state": "ended"}, {"label": "b", "state": "live"}]), "{status}");
+
+    let plain = env.input_path("p.log");
+    let id = env.vigil.create(crate::testing::change_request("plain", &plain, 20)).await.unwrap().watch_id;
+    let plain_status = serde_json::to_value(env.vigil.status(&id).await.unwrap()).unwrap();
+    assert!(plain_status.get("items").is_none(), "{plain_status}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_seventeenth_item_is_refused_with_make_a_new_hold() {
+    // why: ended items count toward the cap of 16, so the refusal must say
+    //      what to do: make a new hold. Item 1 ended; 15 more fill the hold.
+    // proves: D5
+    // catches: a refusal that does not tell the agent the way out.
+    let env = rig();
+    env.reader.set_text("qex:a", "completed");
+    env.vigil.hold(first_item("qex:a", "i0", None)).await.unwrap();
+    for n in 1..16 {
+        env.reader.set_text(&format!("qex:j{n}"), "running");
+        add_ok(&env.vigil, "h", item(&format!("qex:j{n}"), None, Some(&format!("i{n}")))).await;
+    }
+    let refused = env.vigil.hold_add(&wid("h"), item("none", None, Some("i16"))).await.expect_err("the 17th is refused").to_string();
+    assert!(refused.contains("make a new hold") && refused.contains("at most 16"), "{refused}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_none_item_is_ended_by_hold_done_and_a_wrong_label_is_refused() {
     // why: W42-H5. A T3 delegate cannot be sensed, so a bare labelled item
     //      (`--for none`) is ended by `vigil hold done <id> <label>`; the end
@@ -310,6 +396,7 @@ async fn a_none_item_is_ended_by_hold_done_and_a_wrong_label_is_refused() {
 
     let unknown = env.vigil.hold_done(&wid("h"), "nope").await.expect_err("an unknown label is an error").to_string();
     assert!(unknown.contains("nope"), "the error names the label: {unknown}");
+    assert!(unknown.contains("its items are: build, t3"), "and lists the hold's labels: {unknown}");
     let done = env.vigil.hold_done(&wid("h"), "t3").await;
     assert!(done.is_ok(), "{done:?}");
     let ended = call(&env.vigil, "h", Some(30)).await;

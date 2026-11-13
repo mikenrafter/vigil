@@ -223,7 +223,7 @@ pub enum ItemError {
     #[error("hold {0} has no items (made by watch_create or an older vigil); make a new hold with `vigil hold`")]
     NoItems(String),
     /// D5: items count toward the input cap.
-    #[error("a hold has at most {max} items, and this one would have {wanted}")]
+    #[error("a hold has at most {max} items (ended ones count), and this one would have {wanted}; make a new hold")]
     TooManyItems { max: usize, wanted: usize },
     /// D5: labels are unique per hold (an unlabelled item is labelled by its spec).
     #[error("this hold already has an item labelled {0:?}; labels are unique per hold, give --label")]
@@ -241,8 +241,8 @@ pub enum ItemError {
     #[error("expect_s applies to each item, and a bare hold has none; add items with `vigil hold add <id> --for ... --expect-s N`")]
     ExpectWithoutItems,
     /// W42-H5: `hold done` names an item that is not there.
-    #[error("hold {id} has no item labelled {label:?}")]
-    UnknownLabel { id: String, label: String },
+    #[error("hold {id} has no item labelled {label:?}; its items are: {labels}")]
+    UnknownLabel { id: String, label: String, labels: String },
     /// D5: a sensed item ends by itself; `hold done` is for `none` items.
     #[error("item {label:?} is sensed ({spec}) and ends by itself; `hold done` ends only `none` items")]
     SensedItem { label: String, spec: String },

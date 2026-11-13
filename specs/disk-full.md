@@ -68,7 +68,7 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
 ## Amendments after red (orchestrator, 2026-11-10; answers red report A1–A10)
 
 - **A1 → DF1a.** A tick whose save failed ends the call and returns its
-  envelope (no in-memory re-ticking, no spin). `vigil wait`, after a pending
+  envelope (no in-memory re-ticking, no spin). `vigil wait` (removed 2026-11-13, W42-W1), after a pending
   envelope with `persist.ok = false`, sleeps one interval before calling again.
 - **A2 → DF3a.** `redelivery: true` only when something is at risk: the
   envelope has events, or a terminal status (fired/expired/cancelled) that
@@ -139,7 +139,7 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
 ## Decisions after red round 3 (orchestrator, 2026-11-10)
 
 - `redelivered: true` is set by the process that failed to save (MCP server,
-  or `vigil wait`). A fresh CLI process cannot know, so its events are
+  or `vigil wait`, removed 2026-11-13, W42-W1). A fresh CLI process cannot know, so its events are
   unflagged; the skill tells agents to treat any event after an envelope with
   `persist.ok = false` as possibly repeated.
 - `persist.first_error` is present whenever a retry was made and failed, even

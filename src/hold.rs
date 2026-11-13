@@ -441,7 +441,8 @@ impl Vigil {
         check_editable(&watch, now)?;
         let inputs = &watch.spec.inputs;
         let Some(item) = watch.items.iter_mut().flatten().find(|item| item.label == label) else {
-            return Err(ItemError::UnknownLabel { id: id.to_string(), label: label.to_string() }.into());
+            let labels = watch.items.iter().flatten().map(|item| item.label.as_str()).collect::<Vec<_>>().join(", ");
+            return Err(ItemError::UnknownLabel { id: id.to_string(), label: label.to_string(), labels }.into());
         };
         if let Some(input) = item.input {
             let spec = inputs.get(input).map_or_else(|| "an input".to_string(), Input::label);

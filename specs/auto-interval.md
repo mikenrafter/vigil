@@ -165,7 +165,7 @@ pinned 1 h, which is the correct state off credits.
 
 The red report's A1–A22 (`host-config.research/vigil-auto-interval/red-report.md`)
 are accepted as written, except:
-- **A12 amended.** `vigil wait`'s final envelope also carries `clock` (and
+- **A12 amended.** `vigil wait` (removed 2026-11-13, W42-W1)'s final envelope also carries `clock` (and
   `cache`), since a background `vigil wait` is the main way Claude sessions
   use vigil; status and cancel envelopes do not.
 

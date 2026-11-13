@@ -188,12 +188,19 @@ fn item_event(watch_id: &WatchId, tick: u64, index: usize, item: &HoldItem, summ
 /// not announced yet raises one `item ended: <label>: <why>` event (`why` is
 /// the reading, or `done`). A sensed item that reads live again (a retried
 /// qex job, D1) is live: its end is forgotten and a later end is announced
-/// anew. The hold is released when every item is ended at this tick and it
-/// has at least one (a bare hold never releases, W42-H3).
+/// anew. An error reading (`is_error`) changes nothing: the item neither
+/// ends nor un-ends, and it is not counted as ended at that tick. The hold
+/// is released when every item is ended at this tick and it has at least one (a bare hold never releases, W42-H3).
 pub(crate) fn tick_items(items: &mut [HoldItem], watch_id: &WatchId, tick: u64, readings: &[Reading], now: Timestamp) -> ItemTick {
     let mut events = Vec::new();
     let mut ended = Vec::new();
     for (index, item) in items.iter_mut().enumerate() {
+        // S3: a failed read says nothing about the work, so it neither ends
+        // an item nor un-ends one (ended_at and last_end_event stay as they
+        // are); the item is not counted as ended this tick.
+        if item.input.and_then(|input| readings.get(input)).is_some_and(|reading| reading.is_error) {
+            continue;
+        }
         let (is_ended, why) = match item.input {
             // A missing reading (a hand-damaged file) is not an end: a hold errs towards staying live.
             Some(input) => readings.get(input).map_or((false, String::new()), |reading| (reading.want_met == Some(true), reading.text.clone())),

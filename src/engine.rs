@@ -47,12 +47,30 @@ pub struct WatchSummary {
     pub deadline_at: Timestamp,
 }
 
-/// `watch_status`: the envelope plus judge reachability.
+/// `watch_status`: the envelope plus judge reachability, and for a hold its
+/// items (a watch without items has no `items` key).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusReport {
     #[serde(flatten)]
     pub envelope: Envelope,
     pub judge_reachable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<ItemStatus>>,
+}
+
+/// One hold item as `watch_status` shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemStatus {
+    pub label: String,
+    /// `live` or `ended`.
+    pub state: ItemState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemState {
+    Live,
+    Ended,
 }
 
 /// In-memory, per-process state (the only thing a restart loses; V7).
@@ -291,7 +309,10 @@ impl Vigil {
         let now = self.clock.now();
         let watch = expired_if_overdue(self.load_watch(id)?, now);
         let envelope = self.envelope_for(&watch, now);
-        Ok(StatusReport { envelope, judge_reachable: self.judge.healthy().await })
+        let items = watch.items.as_ref().map(|items| {
+            items.iter().map(|item| ItemStatus { label: item.label.clone(), state: if item.ended_at.is_some() { ItemState::Ended } else { ItemState::Live } }).collect()
+        });
+        Ok(StatusReport { envelope, judge_reachable: self.judge.healthy().await, items })
     }
 
     /// `watch_list`: every watch in the state root, any session. Prunes.
