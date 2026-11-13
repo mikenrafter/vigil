@@ -474,6 +474,11 @@ async fn an_items_overdue_uses_the_capped_formula_so_expect_s_2000_is_overdue_at
     let after = call(&env.vigil, "h", Some(100)).await;
     assert_eq!((after["events"][0]["kind"].as_str(), after["events"][0]["reason"].as_str()), (Some("attention"), Some("overdue")), "2600 s is past 2540 s: {after}");
     assert!(after["events"][0]["summary"].as_str().unwrap().contains("big"), "{after}");
+    // S13: exactly at 2540 s of the hold's life, not merely inside the second
+    //      window: the second call starts at 2500 s, so it waits 40 s.
+    // catches: an overdue moment that is not a wake of its own (found only at
+    //      the next 30 s tick, 2550 s), or a formula off by a few seconds.
+    assert_eq!((after["elapsed_s"].as_u64(), after["waited_s"].as_u64()), (Some(2540), Some(40)), "{after}");
 }
 
 // -- D3 ----------------------------------------------------------------------
@@ -839,6 +844,14 @@ async fn the_release_summary_names_the_item_count_first_and_as_many_labels_as_fi
     assert!(release.len() <= 200, "{} bytes: {release}", release.len());
     assert!(release.starts_with("hold released:") && release.contains("16 items"), "{release}");
     assert!(release.contains(&labels[0]) && !release.contains(&labels[15]), "{release}");
+    // S12: the labels are a prefix that fits, and every label that fits is
+    //      there. "hold released: 16 items ended (" is 31 bytes, each label 40,
+    //      each ", " 2, the closing ")" 1: four labels are 31 + 4 x 40 + 3 x 2 +
+    //      1 = 198 <= 200, a fifth would be 240. So exactly labels 0-3.
+    // catches: a fit check that reserves room it does not use or is off by one
+    //      (only three labels shown), or an ellipsis that pushes the fourth out.
+    assert!(release.contains(&labels[3]) && !release.contains(&labels[4]), "the fourth label fits, the fifth does not: {release}");
+    assert_eq!(release, format!("hold released: 16 items ended ({})", labels[..4].join(", ")), "D9 wording");
 
     let small = rig();
     small.vigil.hold(first_item("none", "build", None)).await.unwrap();
@@ -851,6 +864,7 @@ async fn the_release_summary_names_the_item_count_first_and_as_many_labels_as_fi
     let released = call(&small.vigil, "h", Some(30)).await;
     let release = released["events"].as_array().unwrap().iter().find(|event| event["input"] == "hold").expect("a release event")["summary"].as_str().unwrap().to_string();
     assert!(release.contains("3 items") && ["build", "tests", "deploy"].iter().all(|label| release.contains(label)), "{release}");
+    assert_eq!(release, "hold released: 3 items ended (build, tests, deploy)", "D9 wording, labels in item order");
 }
 
 // -- D8 ----------------------------------------------------------------------
@@ -884,4 +898,169 @@ async fn hold_add_resolves_a_qex_name_to_the_full_id_and_refuses_an_ambiguous_na
     env.reader.set_text(&format!("qex:{full}"), "completed");
     let ended = call(&env.vigil, "h", Some(30)).await;
     assert_eq!(summaries(&ended), vec!["item ended: nightly: completed"], "{ended}");
+}
+
+// ---- spec review round 2 leftovers (S4, S11, S12, S13) ---------------------------
+
+/// Run `operation` while this test holds the watch lock of `h`, and let
+/// `meddle` change the stored hold (as a concurrent writer that held the lock
+/// would) once `operation` has had time to reach the lock. Fails if
+/// `operation` finished while the lock was held (it did not wait for it).
+async fn while_locked<T>(env: &crate::testing::Env, operation: impl std::future::Future<Output = T>, meddle: impl FnOnce(&mut Value)) -> T {
+    let guard = env.vigil.store().lock_watch(&wid("h")).unwrap();
+    let finished = std::cell::Cell::new(false);
+    let run = async {
+        let outcome = operation.await;
+        finished.set(true);
+        outcome
+    };
+    let interfere = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!finished.get(), "the operation finished while the watch lock was held: it took no lock");
+        let mut raw = raw_watch(env, "h");
+        meddle(&mut raw);
+        std::fs::write(env.root().join("watches/h.json"), serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+        drop(guard);
+    };
+    let (outcome, ()) = tokio::join!(run, interfere);
+    outcome
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_done_waiting_on_the_lock_keeps_an_item_that_was_added_meanwhile() {
+    // why: W42-D4 / S4. `hold done` is a read-modify-write of the hold. One that
+    //      loads the hold before it takes the watch lock (or takes none) writes
+    //      its stale copy back and silently drops an item another process added
+    //      in between: that item's work would never hold the session. Here the
+    //      test holds the lock, `hold done t3` must wait for it, and while it
+    //      waits a concurrent add lands (`late`, a copy of the none item t3
+    //      under another label, as the add would store it). Afterwards BOTH
+    //      changes are there: t3 is announced ended, `late` still holds the
+    //      session and can itself be ended by `done`.
+    // proves: W42-D4
+    // catches: hold_done that loads before locking (stale write drops `late`:
+    //      the final `done late` is refused as an unknown label, and the hold
+    //      releases early); hold_done that takes no lock (finishes while the
+    //      lock is held).
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.vigil.hold(first_item("qex:a", "build", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("none", None, Some("t3"))).await;
+    let other = env.another_process();
+    let done = while_locked(&env, other.hold_done(&wid("h"), "t3"), |raw| {
+        let mut late = raw["items"][1].clone();
+        late["label"] = "late".into();
+        raw["items"].as_array_mut().unwrap().push(late);
+    })
+    .await;
+    assert!(done.is_ok(), "{done:?}");
+
+    let ended = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((ended["status"].as_str(), summaries(&ended)), (Some("pending"), vec!["item ended: t3: done".to_string()]), "{ended}");
+    env.reader.set_text("qex:a", "completed");
+    let still = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(still["status"], "pending", "late (added while done waited) still holds the session: {still}");
+    env.vigil.hold_done(&wid("h"), "late").await.expect("the item added meanwhile is still there");
+    assert_eq!(call(&env.vigil, "h", Some(60)).await["status"], "fired");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_add_waiting_on_the_lock_keeps_a_done_made_meanwhile() {
+    // why: W42-D4 / S4, the other order. `hold add` waits for the lock while a
+    //      concurrent `hold done t3` lands (t3 gets its `ended_at`, as done
+    //      stores it). The add must append to the hold as it is AFTER the done:
+    //      t3 is still announced ended, and the added `b` holds the session.
+    // proves: W42-D4
+    // catches: hold_add that loads before locking (its stale copy un-ends t3:
+    //      no `item ended: t3: done` event ever comes); hold_add without a lock.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "build", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("none", None, Some("t3"))).await;
+    let other = env.another_process();
+    let added = while_locked(&env, other.hold_add(&wid("h"), item("qex:b", None, Some("b"))), |raw| {
+        raw["items"][1]["ended_at"] = raw["created_at"].clone();
+    })
+    .await;
+    assert!(added.is_ok(), "{added:?}");
+
+    let ended = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((ended["status"].as_str(), summaries(&ended)), (Some("pending"), vec!["item ended: t3: done".to_string()]), "the done made while the add waited survived: {ended}");
+    env.reader.set_text("qex:a", "completed");
+    let still = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((still["status"].as_str(), summaries(&still)), (Some("pending"), vec!["item ended: build: completed".to_string()]), "b holds the session: {still}");
+    env.reader.set_text("qex:b", "completed");
+    assert_eq!(call(&env.vigil, "h", Some(60)).await["status"], "fired");
+}
+
+#[tokio::test(start_paused = true)]
+async fn hold_add_and_hold_done_on_an_expired_hold_are_refused_and_change_nothing() {
+    // why: W42-D4 / S4: "recheck status and expiry under the lock". A hold
+    //      whose deadline has passed is ended even if no keepalive has written
+    //      `expired` yet (V16): adding work to it, or ending one of its items,
+    //      would act on a hold nobody keeps alive. Both refuse, saying it
+    //      ended, and the stored file is byte-for-byte what it was. Control:
+    //      the same done one second before the deadline works.
+    // proves: W42-D4, W42-H2
+    // catches: a status check that reads only `status` (still `pending` on
+    //      disk) and accepts the add or done; a refusal that writes the expiry
+    //      or the item anyway.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.vigil.hold(HoldRequest { deadline_s: Some(100), ..first_item("qex:a", "build", None) }).await.unwrap();
+    add_ok(&env.vigil, "h", item("none", None, Some("t3"))).await;
+    add_ok(&env.vigil, "h", item("none", None, Some("t4"))).await;
+    tokio::time::advance(Duration::from_secs(99)).await;
+    env.vigil.hold_done(&wid("h"), "t4").await.expect("control: before the deadline done works");
+    tokio::time::advance(Duration::from_secs(2)).await;
+
+    let before = std::fs::read(env.root().join("watches/h.json")).unwrap();
+    let added = env.vigil.hold_add(&wid("h"), item("none", None, Some("late"))).await.expect_err("add to an expired hold").to_string();
+    assert!(added.contains("ended"), "{added}");
+    let done = env.vigil.hold_done(&wid("h"), "t3").await.expect_err("done on an expired hold").to_string();
+    assert!(done.contains("ended"), "{done}");
+    assert_eq!(std::fs::read(env.root().join("watches/h.json")).unwrap(), before, "refusals write nothing");
+}
+
+#[tokio::test(start_paused = true)]
+async fn sixteen_none_items_fill_a_hold_and_a_seventeenth_of_any_kind_is_refused() {
+    // why: W42-D5 / S11. The cap counts ITEMS, not sensed inputs: a `none`
+    //      item has no input, so a cap on `spec.inputs` alone would let a hold
+    //      grow without bound. One none item at creation + 15 added = 16 (the
+    //      cap, allowed); the 17th, none or sensed, is refused naming 16 and
+    //      the file is byte-for-byte unchanged. Mixed hold: 4 sensed + 12
+    //      none = 16, then the same two refusals.
+    // proves: W42-D5
+    // catches: a cap checked against `spec.inputs.len()` (17 none items pass);
+    //      a cap off by one (the 16th refused, or a 17th accepted); a refusal
+    //      that still writes.
+    let env = rig();
+    env.reader.set_text("qex:s", "running");
+    env.vigil.hold(first_item("none", "n00", None)).await.unwrap();
+    for index in 1..16 {
+        add_ok(&env.vigil, "h", item("none", None, Some(&format!("n{index:02}")))).await;
+    }
+    let full = std::fs::read(env.root().join("watches/h.json")).unwrap();
+    for refused in [item("none", None, Some("n16")), item("qex:s", None, Some("s16"))] {
+        let error = env.vigil.hold_add(&wid("h"), refused.clone()).await.expect_err("the 17th item").to_string();
+        assert!(error.contains("16"), "{refused:?}: the error names the cap: {error}");
+        assert_eq!(std::fs::read(env.root().join("watches/h.json")).unwrap(), full, "{refused:?}: nothing written");
+    }
+
+    for job in ["a", "b", "c", "d"] {
+        env.reader.set_text(&format!("qex:{job}"), "running");
+    }
+    let mut mixed = request_for(&["qex:a", "qex:b", "qex:c", "qex:d"]);
+    mixed.id = Some("m".into());
+    env.vigil.hold(mixed).await.unwrap();
+    for index in 0..12 {
+        add_ok(&env.vigil, "m", item("none", None, Some(&format!("t{index:02}")))).await;
+    }
+    let full = std::fs::read(env.root().join("watches/m.json")).unwrap();
+    for refused in [item("none", None, Some("t12")), item("qex:s", None, Some("s"))] {
+        let error = env.vigil.hold_add(&wid("m"), refused.clone()).await.expect_err("the 17th item of a mixed hold").to_string();
+        assert!(error.contains("16"), "{refused:?}: {error}");
+        assert_eq!(std::fs::read(env.root().join("watches/m.json")).unwrap(), full, "{refused:?}: nothing written");
+    }
 }
