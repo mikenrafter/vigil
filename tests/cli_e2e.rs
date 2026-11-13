@@ -2079,3 +2079,146 @@ fn no_wait_code_path_is_left_in_the_source_tree() {
         assert!(!text.contains(needle), "{needle} is still in src/");
     }
 }
+
+// ---- spec round 1 decisions (W42 D4, D5, D6, D8) through the binary -------------
+
+#[test]
+fn hold_add_blocked_on_the_watch_lock_rechecks_the_hold_after_it_gets_the_lock() {
+    // why: W42-D4 release-before-add with real processes. The test holds the
+    //      watch's lock; `vigil hold add` must WAIT for it (still running,
+    //      file untouched). While the lock is held, the hold is released (the
+    //      test writes what a keepalive would: status fired). When the lock
+    //      is dropped the add must see the released hold and refuse (exit 1,
+    //      "ended"), leaving the released file byte for byte as it was.
+    // proves: W42-D4
+    // catches: an add that loads the watch before taking the lock (it would
+    //      append to its stale pending copy and write it over the release);
+    //      an add that takes no lock at all (does not wait).
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", J1_SPEC, "--label", "build"]).status.success());
+    let store = vigil::Store::new(sandbox.state_root());
+    let guard = store.lock_watch(&vigil::WatchId::parse("h").unwrap()).unwrap();
+    let mut child = piped({
+        let mut command = sandbox.command();
+        command.args(["hold", "add", "h", "--for", "none", "--label", "t3"]).env("PATH", qex.path());
+        command
+    });
+    wait_for_exec(&child);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(child.try_wait().unwrap().is_none(), "hold add finished while the watch lock was held");
+
+    let path = sandbox.state_root().join("watches/h.json");
+    let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    raw["status"] = "fired".into();
+    raw["finished_at"] = raw["created_at"].clone();
+    std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    let released_bytes = std::fs::read(&path).unwrap();
+    drop(guard);
+
+    let output = finish_within(child, Duration::from_secs(5));
+    assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ended"), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read(&path).unwrap(), released_bytes, "the released hold is not rewritten");
+}
+
+#[test]
+fn a_duplicate_label_exits_2_naming_it_and_a_label_with_several_for_is_refused_writing_nothing() {
+    // why: W42-D5. "A duplicate label is refused (exit 2, names the label)".
+    //      `--label` with more than one `--for` is refused; `--for none`
+    //      without a label too (it could never be ended). Nothing is written
+    //      by any refusal. (Exit 2 is the spec's number: every other runtime
+    //      refusal here is exit 1, flagged in the red report.)
+    // proves: W42-D5
+    // catches: a duplicate accepted, or refused with another code; the label
+    //      of a multi-`--for` hold silently given to the first item.
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "d", "--for", J1_SPEC, "--label", "build"]).status.success());
+    let before = sandbox.watch_file("d").unwrap();
+    let duplicate = run_with_qex(&sandbox, &qex, &["hold", "add", "d", "--for", "none", "--label", "build"]);
+    assert_eq!(duplicate.status.code(), Some(2), "{}", String::from_utf8_lossy(&duplicate.stderr));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("build"), "{}", String::from_utf8_lossy(&duplicate.stderr));
+    assert!(duplicate.stdout.is_empty());
+    assert_eq!(sandbox.watch_file("d").unwrap(), before, "nothing written");
+
+    let several = run_with_qex(&sandbox, &qex, &["hold", "--id", "m", "--for", J1_SPEC, "--for", "pid:1", "--label", "x"]);
+    assert!(!several.status.success() && String::from_utf8_lossy(&several.stderr).contains("label"), "{}", String::from_utf8_lossy(&several.stderr));
+    let unlabelled = run_with_qex(&sandbox, &qex, &["hold", "--id", "u", "--for", "none"]);
+    assert!(!unlabelled.status.success() && String::from_utf8_lossy(&unlabelled.stderr).contains("label"), "{}", String::from_utf8_lossy(&unlabelled.stderr));
+    assert!(sandbox.watch_file("m").is_none() && sandbox.watch_file("u").is_none(), "nothing written");
+}
+
+#[test]
+fn expect_s_through_the_cli_raises_overdue_for_the_initial_item_and_every_item_of_several_for() {
+    // why: W42-D8 + W42-D5. `--expect-s 2` (overdue at min(3, 542) = 3 s)
+    //      given to `vigil hold --for A --for B` applies to EACH item, and to
+    //      an item added with `hold add --expect-s 2`. Real time (separate
+    //      processes): one 4 s sleep, then the first keepalive tick sees all
+    //      three.
+    // proves: W42-D8, W42-D5, W42-H3
+    // catches: --expect-s dropped by the CLI layer; applied to the first
+    //      item only; applied to the hold but not to added items.
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    let created = run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", J1_SPEC, "--for", "pid:1", "--expect-s", "2"]);
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let added = run_with_qex(&sandbox, &qex, &["hold", "add", "h", "--for", "none", "--label", "t3", "--expect-s", "2"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    std::thread::sleep(Duration::from_secs(4));
+    let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
+    let mut summaries: Vec<String> = envelope["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap().to_string()).collect();
+    summaries.sort();
+    assert_eq!(summaries, vec![format!("item overdue: {J1_SPEC}"), "item overdue: pid:1".to_string(), "item overdue: t3".to_string()], "{envelope}");
+    assert_eq!(envelope["status"], "pending", "{envelope}");
+}
+
+#[test]
+fn an_initial_for_none_with_a_label_works_through_the_cli_and_its_last_item_raises_item_ended_with_the_release() {
+    // why: W42-D8 + W42-D6. `vigil hold --for none --label x` (the first
+    //      item is a T3 delegate), `hold done`, then keepalive: fired, with
+    //      `item ended: x: done` AND the release event.
+    // proves: W42-D8, W42-D6
+    // catches: `none` accepted only by `hold add`; a last item whose event is
+    //      swallowed by the release.
+    let sandbox = Sandbox::new();
+    let created = sandbox.run(&["hold", "--id", "n", "--for", "none", "--label", "x", "--expect-s", "600"]);
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let done = sandbox.run(&["hold", "done", "n", "x"]);
+    assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    let envelope = stdout_json(&sandbox.run(&["keepalive", "n", "--max-s", "30"]));
+    assert_eq!(envelope["status"], "fired", "{envelope}");
+    let summaries: Vec<&str> = envelope["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert!(summaries.contains(&"item ended: x: done"), "{envelope}");
+    assert!(summaries.iter().any(|summary| summary.starts_with("hold released:")), "{envelope}");
+}
+
+#[test]
+fn hold_add_resolves_a_qex_name_to_the_full_id_and_refuses_an_ambiguous_name_through_the_cli() {
+    // why: W42-D8 (S8-S10) through the binary, like `hold --for qex:nightly`
+    //      (see the S3 test above). The stored watch holds the job id the name
+    //      resolves to; an ambiguous name exits 1 naming the cause and writes
+    //      nothing.
+    // proves: W42-D8
+    // catches: `hold add` storing the raw name; an ambiguous name accepted.
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    qex.set_name("nightly", J1);
+    qex.set_ambiguous("dupe");
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "h", "--for", "none", "--label", "first"]).status.success());
+    let added = run_with_qex(&sandbox, &qex, &["hold", "add", "h", "--for", "qex:nightly", "--label", "n"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let stored = sandbox.watch_file("h").unwrap();
+    assert!(stored.to_string().contains(J1), "the full id is stored: {stored}");
+    assert!(!stored.to_string().contains("\"job\":\"nightly\""), "the name is not stored as the job: {stored}");
+
+    let refused = run_with_qex(&sandbox, &qex, &["hold", "add", "h", "--for", "qex:dupe", "--label", "d"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("dupe") && stderr.contains("ambiguous"), "{stderr}");
+    assert_eq!(sandbox.watch_file("h").unwrap(), stored, "nothing written");
+}

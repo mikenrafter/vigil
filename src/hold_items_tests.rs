@@ -7,18 +7,21 @@
 //! Claim ids are `W42-H1`..`W42-H5` (the hold-items spec's own H1-H5), to keep
 //! them apart from SPEC "Holds" CLAIM(H1)-CLAIM(H12).
 //!
-//! Choices where the spec is silent (red phase; green changes one only by
-//! changing the test and saying why):
-//!   - An item's label defaults to its work spec (`qex:b`).
-//!   - An initial `--for` input given with no `--label` stays a plain input:
-//!     it ends silently, exactly as before (old holds unchanged). Items that
-//!     carry a label, or were added with `hold add`, raise `item ended` events.
-//!   - The item whose ending also releases the hold raises only the release
-//!     event (`hold released: ...`), not an `item ended` event as well.
+//! Decisions (orchestrator; "Spec round 1 decisions" D1-D8 at the end of the
+//! spec replace two earlier red-phase choices):
+//!   - An item's label defaults to its work spec (`qex:b`); labels are unique
+//!     per hold (D5).
+//!   - EVERY item of a hold created by this version raises `item ended`, with
+//!     or without a label, and the item whose end releases the hold raises it
+//!     too, beside the release event (D6). A hold stored without an `items`
+//!     field (older version) keeps the old silent behaviour.
 //!   - `item ended` events have `kind: "attention"`; `why` is the item's
 //!     reading (`completed`, `reached`), or `done` for `hold done`.
-//!   - An item's `expect_s` clock starts when the item is added.
+//!   - An item's `expect_s` clock starts when the item is added; overdue is
+//!     min(1.5 x expect_s, expect_s + 540) from there (D2).
 //!   - `--for none` needs a label (it could never be ended otherwise).
+//! Claim ids are `W42-H1`..`W42-H5` and `W42-D1`..`W42-D8` for the round-1
+//! decisions.
 
 use std::time::Duration;
 
@@ -88,37 +91,42 @@ async fn hold_add_to_an_ended_hold_fails_says_so_and_changes_nothing() {
     // proves: W42-H2
     // catches: an add that appends to any watch file whatever its status, an
     //      add that fails with a message that does not say the hold ended,
-    //      and one that reopens the hold.
+    //      one that reopens the hold, and one that refuses but still rewrites
+    //      part of the file (a touched `tick`, `items` or `last_tick_at` that
+    //      an inputs-only comparison would not see; D-nit: whole-watch compare).
     let env = rig();
     env.reader.set_text("qex:a", "completed");
     env.vigil.hold(first_item("qex:a", "a", None)).await.unwrap();
     assert_eq!(call(&env.vigil, "h", Some(30)).await["status"], "fired", "setup: the hold is released");
+    let released_watch = watch_file(&env.vigil, "h");
 
     let error = env.vigil.hold_add(&wid("h"), item("qex:b", None, Some("b"))).await.expect_err("adding to a released hold must fail").to_string();
     assert!(error.contains('h') && error.contains("ended"), "the message names the hold and says it ended: {error}");
-    assert_eq!(watch_file(&env.vigil, "h").spec.inputs, vec![qex("a")], "a refused add writes nothing");
+    assert_eq!(watch_file(&env.vigil, "h"), released_watch, "a refused add writes nothing: the whole stored watch is unchanged");
 
     env.reader.set_text("qex:c", "running");
     let mut cancelled = first_item("qex:c", "c", None);
     cancelled.id = Some("gone".into());
     env.vigil.hold(cancelled).await.unwrap();
     env.vigil.cancel(&wid("gone")).await.unwrap();
+    let cancelled_watch = watch_file(&env.vigil, "gone");
     let refused = env.vigil.hold_add(&wid("gone"), item("qex:b", None, Some("b"))).await;
     assert!(refused.is_err(), "a cancelled hold is ended too: {refused:?}");
-    assert_eq!(watch_file(&env.vigil, "gone").spec.inputs, vec![qex("c")]);
+    assert_eq!(watch_file(&env.vigil, "gone"), cancelled_watch, "the cancelled watch is unchanged too");
 }
 
 #[tokio::test(start_paused = true)]
 async fn an_item_ending_raises_one_attention_event_and_the_hold_stays_live_until_the_last_item_ends() {
     // why: W42-H3. Each item ends on its own: one `item ended: <label>: <why>`
     //      attention event per item, delivered once, hold still pending. An
-    //      item added without a label is named by its spec. The last item's
-    //      end is the release (one `hold released` event, no extra item event).
-    // proves: W42-H3
+    //      item added without a label is named by its spec. D6: the last
+    //      item's end raises its own `item ended` event beside the release.
+    // proves: W42-H3, W42-D6
     // catches: releasing the hold when the first item ends; an item end that
     //      is silent (the agent never learns `a` finished); an item event
     //      repeated on every call; a label that is lost (event names the
-    //      wrong thing); a release that also emits a second item event.
+    //      wrong thing); a release that swallows the last item's event (the
+    //      red-phase "release only" rule D6 replaced).
     let env = rig();
     for job in ["a", "b", "c"] {
         env.reader.set_text(&format!("qex:{job}"), "running");
@@ -144,10 +152,12 @@ async fn an_item_ending_raises_one_attention_event_and_the_hold_stays_live_until
     env.reader.set_text("qex:c", "completed");
     let released = call(&env.vigil, "h", Some(60)).await;
     assert_eq!(released["status"], "fired", "{released}");
+    // D6: the last item raises `item ended` too, beside the release.
     let events = summaries(&released);
-    assert_eq!(events.len(), 1, "the last item's end is the release, nothing more: {released}");
-    assert!(events[0].starts_with("hold released:") && events[0].contains("qex:c completed"), "{released}");
-    assert_eq!(released["events"][0]["input"], "hold");
+    assert_eq!(events.len(), 2, "the last item's end raises its own event and the release: {released}");
+    assert!(events.contains(&"item ended: c: completed".to_string()), "{released}");
+    let release = released["events"].as_array().unwrap().iter().find(|event| event["input"] == "hold").expect("a release event");
+    assert!(release["summary"].as_str().unwrap().starts_with("hold released:"), "{released}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -373,33 +383,505 @@ async fn an_until_item_ends_when_its_time_is_reached() {
     assert_eq!(reached["status"], "pending", "{reached}");
 }
 
+
+// ---- spec round 1 decisions (D1-D8) ---------------------------------------------
+
+fn event_ids(envelope: &Value) -> Vec<String> {
+    envelope["events"].as_array().unwrap().iter().map(|event| event["event_id"].as_str().expect("every event has an event_id").to_string()).collect()
+}
+
+fn distinct(ids: &[String]) -> bool {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    sorted.len() == ids.len()
+}
+
+/// One keepalive whose delivery the caller never commits (the client went
+/// away before the envelope arrived), as in `auto_interval_tests` S6.
+async fn call_uncommitted(vigil: &Vigil, id: &str, max_s: u64) -> Value {
+    let request = KeepaliveRequest { watch_id: Some(wid(id)), max_s: Some(max_s), orchestrator: None };
+    let (envelope, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().expect("not cancelled");
+    drop(delivery);
+    serde_json::to_value(&envelope).unwrap()
+}
+
+fn raw_watch(env: &crate::testing::Env, id: &str) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(env.root().join(format!("watches/{id}.json"))).unwrap()).unwrap()
+}
+
+// -- D1 ----------------------------------------------------------------------
+
 #[tokio::test(start_paused = true)]
-async fn old_holds_without_labels_behave_exactly_as_before() {
-    // why: W42-H1 "today's flags keep working" (control, passes before the
-    //      feature). An unlabelled two-`--for` hold stays silent when one
-    //      input ends and releases with the unchanged summary; a one-item
-    //      hold made with `--label` releases with the single release event
-    //      (no item event beside it).
-    // proves: W42-H1, W42-H3
-    // catches: an implementation that turns every old input into an item that
-    //      raises `item ended` (changing every existing hold's envelopes) or
-    //      that emits two events on the last item.
+async fn a_retried_qex_item_is_live_again_blocks_the_release_and_raises_a_new_event_when_it_ends_again() {
+    // why: W42-D1. Items follow the existing sensed-state rule (SPEC Holds: a
+    //      job that fails and is queued for a retry reads live again). `a`
+    //      ends (event), is retried (`queued`), then `b` ends: the hold must
+    //      stay live because `a` is live NOW. When `a` ends again the hold
+    //      releases and `a` raises a NEW `item ended` event (new event_id).
+    // proves: W42-D1
+    // catches: an item whose ended state is sticky (ended_at never cleared):
+    //      the hold releases when `b` ends while the retried `a` still runs;
+    //      and one that raises `item ended` only once per item (no second
+    //      event for `a`), or reuses the first event_id.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(request_for(&["qex:a", "qex:b"])).await.unwrap();
+
+    env.reader.set_text("qex:a", "completed");
+    let first = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((first["status"].as_str(), summaries(&first)), (Some("pending"), vec!["item ended: qex:a: completed".to_string()]), "{first}");
+    let first_id = event_ids(&first).remove(0);
+
+    env.reader.set_text("qex:a", "queued");
+    let retried = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((retried["status"].as_str(), summaries(&retried).len()), (Some("pending"), 0), "a retry is quiet: {retried}");
+
+    env.reader.set_text("qex:b", "completed");
+    let blocked = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(blocked["status"], "pending", "a is live again, so b ending must not release the hold: {blocked}");
+    assert_eq!(summaries(&blocked), vec!["item ended: qex:b: completed"], "{blocked}");
+
+    env.reader.set_text("qex:a", "completed");
+    let released = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(released["status"], "fired", "both are ended at this tick: {released}");
+    let events = summaries(&released);
+    assert_eq!(events.iter().filter(|summary| summary.as_str() == "item ended: qex:a: completed").count(), 1, "a ended again, one new event: {released}");
+    assert!(!events.iter().any(|summary| summary == "item ended: qex:b: completed"), "b's event is not repeated: {released}");
+    let ids = event_ids(&released);
+    assert!(distinct(&ids) && !ids.contains(&first_id), "a new event, not the first one again: {ids:?} vs {first_id}");
+}
+
+// -- D2 ----------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn an_items_overdue_uses_the_capped_formula_so_expect_s_2000_is_overdue_at_2540_not_3000() {
+    // why: W42-D2. The hold formula is min(1.5 x expect_s, expect_s + 540):
+    //      for 2000 s the cap wins (2000 + 540 = 2540, the plain 1.5x would be
+    //      3000). Hand arithmetic: 1.5 x 2000 = 3000 > 2540. The first call
+    //      (window 2500 s) ends before 2540, the next one crosses it.
+    // proves: W42-D2
+    // catches: an item clock that uses a bare 1.5x (the event would come at
+    //      3000 s, not inside the second window); one that fires inside the
+    //      first window (grace dropped).
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.vigil.hold(first_item("qex:a", "big", Some(2000))).await.unwrap();
+
+    let before = call(&env.vigil, "h", Some(2500)).await;
+    assert_eq!((before["status"].as_str(), summaries(&before).len()), (Some("pending"), 0), "2500 s is before 2540 s: {before}");
+    let after = call(&env.vigil, "h", Some(100)).await;
+    assert_eq!((after["events"][0]["kind"].as_str(), after["events"][0]["reason"].as_str()), (Some("attention"), Some("overdue")), "2600 s is past 2540 s: {after}");
+    assert!(after["events"][0]["summary"].as_str().unwrap().contains("big"), "{after}");
+}
+
+// -- D3 ----------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn two_items_ending_in_one_tick_give_two_events_with_distinct_event_ids() {
+    // why: W42-D3. Every item event has its own event_id. `a` and `b` are
+    //      both completed when the tick runs (`c` still runs, so the hold
+    //      stays live): the envelope carries two events, one per item, and
+    //      their ids differ (ids are the acknowledgement keys; a clash would
+    //      lose one of them).
+    // proves: W42-D3
+    // catches: one merged event naming both items; two events sharing an
+    //      event_id (watch:tick:index with the index not advancing); an item
+    //      loop that stops after the first ended item.
+    let env = rig();
+    for job in ["a", "b", "c"] {
+        env.reader.set_text(&format!("qex:{job}"), "running");
+    }
+    env.vigil.hold(first_item("qex:a", "a", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:b", None, Some("b"))).await;
+    add_ok(&env.vigil, "h", item("qex:c", None, Some("c"))).await;
+    env.reader.set_text("qex:a", "completed");
+    env.reader.set_text("qex:b", "completed");
+    let envelope = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(envelope["status"], "pending", "{envelope}");
+    let mut events = summaries(&envelope);
+    events.sort();
+    assert_eq!(events, vec!["item ended: a: completed", "item ended: b: completed"], "{envelope}");
+    assert!(distinct(&event_ids(&envelope)), "distinct event ids: {envelope}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_items_going_overdue_in_one_tick_give_two_events_with_distinct_event_ids() {
+    // why: W42-D3 for overdue. Both items were added at the same instant with
+    //      expect_s 100, so both are overdue at the same tick (150 s). Reason
+    //      text is `item overdue: <label>`; two events, two ids.
+    // proves: W42-D3
+    // catches: a single hold-wide overdue flag (one event only); a flag per
+    //      reason instead of per item (the second item is swallowed); equal
+    //      event ids.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "one", Some(100))).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:b", Some(100), Some("two"))).await;
+    let envelope = call(&env.vigil, "h", Some(200)).await;
+    let mut events = summaries(&envelope);
+    events.sort();
+    assert_eq!(events, vec!["item overdue: one", "item overdue: two"], "{envelope}");
+    assert!(envelope["events"].as_array().unwrap().iter().all(|event| event["reason"] == "overdue" && event["kind"] == "attention"), "{envelope}");
+    assert!(distinct(&event_ids(&envelope)), "distinct event ids: {envelope}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_before_and_after_acknowledgement_never_repeats_an_overdue_event() {
+    // why: W42-D3. The overdue flag is persisted per item. Process 1 raises
+    //      the event but its delivery is never committed: process 2 gets the
+    //      SAME event again (same event_id, redelivered: true). That call is
+    //      committed; process 3 (another restart) gets nothing: the flag
+    //      survived, so the item is not raised overdue a second time.
+    // proves: W42-D3
+    // catches: an overdue flag kept only in memory (process 3 raises a new
+    //      overdue); an event not stored in the outbox (process 2 gets
+    //      nothing, the agent never learns); a redelivery with a new id.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "slow", Some(100))).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:b", None, Some("b"))).await;
+
+    let first = call_uncommitted(&env.vigil, "h", 200).await;
+    assert_eq!(summaries(&first), vec!["item overdue: slow"], "{first}");
+    let first_id = event_ids(&first).remove(0);
+
+    let second = call(&env.another_process(), "h", Some(30)).await;
+    assert_eq!((event_ids(&second), second["events"][0]["redelivered"].as_bool()), (vec![first_id], Some(true)), "before acknowledgement: the same event again: {second}");
+
+    let third = call(&env.another_process(), "h", Some(200)).await;
+    assert_eq!((third["status"].as_str(), summaries(&third).len()), (Some("pending"), 0), "after acknowledgement: not raised again: {third}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_before_and_after_acknowledgement_never_repeats_an_item_ended_event() {
+    // why: W42-D3. Same shape for `item ended`: ended_at and last_end_event
+    //      are persisted per item. An item that stays ended is not announced
+    //      again by a later process.
+    // proves: W42-D3
+    // catches: per-item ended state kept in memory (a restarted process
+    //      announces `a` again at its first tick); an unpersisted outbox.
+    let env = rig();
+    env.reader.set_text("qex:a", "completed");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "a", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:b", None, Some("b"))).await;
+
+    let first = call_uncommitted(&env.vigil, "h", 30).await;
+    assert_eq!(summaries(&first), vec!["item ended: a: completed"], "{first}");
+    let first_id = event_ids(&first).remove(0);
+    let second = call(&env.another_process(), "h", Some(30)).await;
+    assert_eq!((event_ids(&second), second["events"][0]["redelivered"].as_bool()), (vec![first_id], Some(true)), "{second}");
+    let third = call(&env.another_process(), "h", Some(60)).await;
+    assert_eq!((third["status"].as_str(), summaries(&third).len()), (Some("pending"), 0), "{third}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_items_overdue_clock_survives_a_restart() {
+    // why: W42-D3 "restart keeps overdue clocks". `slow` (expect 100 s,
+    //      overdue at 150 s) is watched for 100 s by process 1, then by a new
+    //      process for another 100 s: the event must come inside the second
+    //      window (150 s < 200 s). Restarting the clock at the new process
+    //      would put the deadline at 100 + 150 = 250 s.
+    // proves: W42-D3
+    // catches: added_at not persisted (re-stamped by the process that loads
+    //      the hold), which pushes the overdue past the second window.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.vigil.hold(first_item("qex:a", "slow", Some(100))).await.unwrap();
+    let early = call(&env.vigil, "h", Some(100)).await;
+    assert_eq!((early["status"].as_str(), summaries(&early).len()), (Some("pending"), 0), "{early}");
+    let later = call(&env.another_process(), "h", Some(100)).await;
+    assert_eq!(summaries(&later), vec!["item overdue: slow"], "{later}");
+}
+
+// -- D4 ----------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn an_item_added_before_the_releasing_tick_keeps_the_hold_alive() {
+    // why: W42-D4 add-before-release. `a` has already ended when `b` is added
+    //      and nothing has ticked yet: the next tick must see two items, so
+    //      the hold stays pending with only `a`'s item event. (The opposite
+    //      order, release-before-add, is the ended-hold refusal above and the
+    //      lock test in cli_e2e.)
+    // proves: W42-D4
+    // catches: an add that is applied to a stale copy and lost, or a hold
+    //      whose release was already decided from the pre-add items.
+    let env = rig();
+    env.reader.set_text("qex:a", "completed");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "a", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:b", None, Some("b"))).await;
+    let envelope = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((envelope["status"].as_str(), summaries(&envelope)), (Some("pending"), vec!["item ended: a: completed".to_string()]), "{envelope}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_running_keepalive_picks_up_an_item_added_by_another_process_at_the_next_tick() {
+    // why: W42-D4. One keepalive call (window 300 s) is running; at 45 s a
+    //      different process adds `b` (running, expect 40 s). The call
+    //      reloads the hold every tick, so `b`'s overdue deadline (45 + 60 =
+    //      105 s) is seen at the next tick after it, inside the same call.
+    // proves: W42-D4, W42-H4
+    // catches: a keepalive that snapshots the hold when the call starts (the
+    //      call runs to its 300 s end with no event); a deadline for the
+    //      added item measured from the call start.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:a", "a", None)).await.unwrap();
+    let adder = env.another_process();
+    let add = async move {
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        add_ok(&adder, "h", item("qex:b", Some(40), Some("b"))).await;
+    };
+    let (envelope, ()) = tokio::join!(call(&env.vigil, "h", Some(300)), add);
+    assert_eq!(summaries(&envelope), vec!["item overdue: b"], "{envelope}");
+    let waited = envelope["waited_s"].as_u64().unwrap();
+    assert!((105..=140).contains(&waited), "overdue 60 s after the add at 45 s, at the next tick: waited {waited}: {envelope}");
+}
+
+// -- D5 ----------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_duplicate_label_is_refused_naming_it_and_an_unlabelled_item_is_labelled_by_its_spec() {
+    // why: W42-D5. Labels are unique per hold; an unlabelled item's label is
+    //      its work spec, so that counts too: adding `qex:a` unlabelled to a
+    //      hold that already has an unlabelled `qex:a`, or labelling an item
+    //      `qex:a` there, is a duplicate. The error names the label; the
+    //      whole stored watch is unchanged.
+    // proves: W42-D5
+    // catches: uniqueness checked on explicit labels only (the spec-labelled
+    //      clash passes); a refusal after the item was already written;
+    //      `done` that would end the wrong one of two same-named items.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(first_item("qex:b", "build", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:a", None, None)).await;
+    let stored = watch_file(&env.vigil, "h");
+    for (what, request, label) in [
+        ("same explicit label", item("qex:b", None, Some("build")), "build"),
+        ("unlabelled spec equal to an unlabelled item", item("qex:a", None, None), "qex:a"),
+        ("explicit label equal to another item's spec label", item("qex:b", None, Some("qex:a")), "qex:a"),
+    ] {
+        let error = env.vigil.hold_add(&wid("h"), request).await.expect_err(what).to_string();
+        assert!(error.contains(label), "{what}: the error names the label {label:?}: {error}");
+        assert_eq!(watch_file(&env.vigil, "h"), stored, "{what}: nothing written");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn several_for_make_several_items_expect_s_applies_to_each_and_a_label_with_several_for_is_refused() {
+    // why: W42-D5. `vigil hold --for A --for B --expect-s 100` is two items,
+    //      each with expect_s 100 (both overdue at 150 s, each named by its
+    //      spec). `--label` with more than one `--for` is refused (which item
+    //      would it name?), writing nothing.
+    // proves: W42-D5, W42-H1
+    // catches: expect_s applied to the first item only (one overdue event);
+    //      the label silently given to the first/every item; the hold
+    //      created before the refusal.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    let refused = HoldRequest { label: Some("both".into()), ..request_for(&["qex:a", "qex:b"]) };
+    let error = env.vigil.hold(refused).await.expect_err("a label with two --for").to_string();
+    assert!(error.contains("label"), "{error}");
+    assert!(!env.vigil.store().watch_path(&wid("h")).exists(), "nothing written");
+
+    env.vigil.hold(HoldRequest { expect_s: Some(100), ..request_for(&["qex:a", "qex:b"]) }).await.unwrap();
+    let envelope = call(&env.vigil, "h", Some(200)).await;
+    let mut events = summaries(&envelope);
+    events.sort();
+    assert_eq!(events, vec!["item overdue: qex:a", "item overdue: qex:b"], "{envelope}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn hold_done_refuses_a_sensed_item_and_an_item_that_already_ended() {
+    // why: W42-D5. `done` is for `none` items only. A sensed item (qex)
+    //      cannot be ended by hand: refused, says why, the item stays live.
+    //      `done` twice on a none item: the second is refused with "already
+    //      ended" and raises no second event.
+    // proves: W42-D5
+    // catches: `done` that ends any item (a running qex job would be
+    //      dropped from the hold); a second `done` that succeeds and raises a
+    //      second `item ended` event.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.vigil.hold(first_item("qex:a", "build", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("none", None, Some("t3"))).await;
+
+    let sensed = env.vigil.hold_done(&wid("h"), "build").await.expect_err("a sensed item cannot be ended by hand").to_string();
+    assert!(sensed.contains("build") && (sensed.contains("sensed") || sensed.contains("none")), "the error says why: {sensed}");
+    let quiet = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((quiet["status"].as_str(), summaries(&quiet).len()), (Some("pending"), 0), "the sensed item is still live and silent: {quiet}");
+
+    env.vigil.hold_done(&wid("h"), "t3").await.expect("the first done works");
+    let again = env.vigil.hold_done(&wid("h"), "t3").await.expect_err("done twice").to_string();
+    assert!(again.contains("already ended") && again.contains("t3"), "{again}");
+    let ended = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(summaries(&ended), vec!["item ended: t3: done"], "exactly one event for t3: {ended}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn items_count_toward_the_sixteen_input_cap() {
+    // why: W42-D5. "Items count toward the existing input cap" (SPEC Holds:
+    //      at most 16 inputs). 15 created + 1 added = 16 is allowed; the 17th
+    //      is refused naming 16, writing nothing.
+    // proves: W42-D5
+    // catches: items stored outside the cap (a hold grows without bound); a
+    //      cap off by one in either direction (15 or 17).
+    let env = rig();
+    let specs: Vec<String> = (0..15).map(|index| format!("file:/vigil-test-absent/{index}")).collect();
+    let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+    env.vigil.hold(request_for(&specs)).await.unwrap();
+    add_ok(&env.vigil, "h", item("file:/vigil-test-absent/15", None, Some("sixteenth"))).await;
+    let full = watch_file(&env.vigil, "h");
+    let error = env.vigil.hold_add(&wid("h"), item("file:/vigil-test-absent/16", None, Some("seventeenth"))).await.expect_err("the 17th item").to_string();
+    assert!(error.contains("16"), "the error names the cap: {error}");
+    assert_eq!(watch_file(&env.vigil, "h"), full, "nothing written");
+}
+
+// -- D6 ----------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn every_item_of_a_new_hold_raises_item_ended_unlabelled_ones_and_the_last_one_included() {
+    // why: W42-D6 (replaces the red-phase "initial unlabelled inputs are
+    //      silent" and "release only" rules). Two unlabelled `--for`: `a`
+    //      ending is announced by its spec; `b` ending releases the hold AND
+    //      raises its own event; a labelled single item does the same. Event
+    //      ids are distinct.
+    // proves: W42-D6
+    // catches: the old silent initial inputs; the last item swallowed by
+    //      the release event; the release event dropped in favour of the
+    //      item event.
     let env = rig();
     env.reader.set_text("qex:a", "running");
     env.reader.set_text("qex:b", "running");
     env.vigil.hold(request_for(&["qex:a", "qex:b"])).await.unwrap();
     env.reader.set_text("qex:a", "completed");
     let half = call(&env.vigil, "h", Some(30)).await;
-    assert_eq!((half["status"].as_str(), half["next"].as_str(), summaries(&half).len()), (Some("pending"), Some("call keepalive again"), 0), "{half}");
+    assert_eq!((half["status"].as_str(), summaries(&half)), (Some("pending"), vec!["item ended: qex:a: completed".to_string()]), "{half}");
     env.reader.set_text("qex:b", "completed");
-    let released = call(&env.vigil, "h", Some(60)).await;
-    assert_eq!(summaries(&released), vec!["hold released: qex:a completed; qex:b completed"], "{released}");
-    assert!(released["events"][0].get("kind").is_none(), "{released}");
+    let released = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(released["status"], "fired", "{released}");
+    assert_eq!(released["events"].as_array().unwrap().len(), 2, "{released}");
+    assert!(summaries(&released).contains(&"item ended: qex:b: completed".to_string()), "{released}");
+    assert!(released["events"].as_array().unwrap().iter().any(|event| event["input"] == "hold" && event["summary"].as_str().unwrap().starts_with("hold released:")), "{released}");
+    assert!(distinct(&event_ids(&released)), "{released}");
 
     env.reader.set_text("qex:c", "completed");
     let mut single = first_item("qex:c", "only", None);
     single.id = Some("single".into());
     env.vigil.hold(single).await.unwrap();
     let once = call(&env.vigil, "single", Some(30)).await;
-    assert_eq!((once["status"].as_str(), summaries(&once)), (Some("fired"), vec!["hold released: qex:c completed".to_string()]), "{once}");
+    assert_eq!((once["status"].as_str(), once["events"].as_array().unwrap().len()), (Some("fired"), 2), "item event plus release: {once}");
+    assert!(summaries(&once).contains(&"item ended: only: completed".to_string()), "{once}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_stored_without_the_items_field_keeps_the_old_silent_behaviour() {
+    // why: W42-D6. A hold written by an older vigil has no `items` field and
+    //      must behave exactly as it did: no item events, release summary by
+    //      input. The fixture is made from a real new hold with the `items`
+    //      key deleted from its JSON (and a positive control that the new
+    //      hold does store `items`, so this is not a vacuous strip).
+    // proves: W42-D6
+    // catches: treating a missing `items` as "make every input an item now"
+    //      (item events appear in old holds); a deserialiser that rejects
+    //      the old file; a new hold that stores no `items` at all.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text("qex:b", "running");
+    env.vigil.hold(request_for(&["qex:a", "qex:b"])).await.unwrap();
+    let mut raw = raw_watch(&env, "h");
+    assert!(raw.get("items").is_some(), "control: a hold created by this version stores `items`: {raw}");
+    raw.as_object_mut().unwrap().remove("items");
+    std::fs::write(env.root().join("watches/h.json"), serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+    env.reader.set_text("qex:a", "completed");
+    let half = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!((half["status"].as_str(), summaries(&half).len()), (Some("pending"), 0), "{half}");
+    env.reader.set_text("qex:b", "completed");
+    let released = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(summaries(&released), vec!["hold released: qex:a completed; qex:b completed"], "{released}");
+    assert!(released["events"][0].get("kind").is_none(), "{released}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_release_summary_names_the_item_count_first_and_as_many_labels_as_fit_the_cap() {
+    // why: W42-D6. "The release summary names the item count and as many
+    //      labels as fit its cap" (200 bytes, MAX_SUMMARY_BYTES). Sixteen
+    //      none-items with 40-byte labels cannot all fit (16 x 40 = 640 > 200):
+    //      the count must not be the part that gets cut, the first label is
+    //      there and the last one is not. A 3-item hold names all three.
+    //      Wording pinned: `<N> items`.
+    // proves: W42-D6
+    // catches: the count appended after the labels (truncated away); an
+    //      uncapped summary; a summary with no labels.
+    let env = rig();
+    let labels: Vec<String> = (0..16).map(|index| format!("delegate-{index:02}-{}", "x".repeat(28))).collect();
+    assert!(labels.iter().all(|label| label.len() == 40));
+    env.vigil.hold(first_item("none", &labels[0], None)).await.unwrap();
+    for label in &labels[1..] {
+        add_ok(&env.vigil, "h", item("none", None, Some(label))).await;
+    }
+    for label in &labels {
+        let done = env.vigil.hold_done(&wid("h"), label).await;
+        assert!(done.is_ok(), "{done:?}");
+    }
+    let released = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(released["status"], "fired", "{released}");
+    let release = released["events"].as_array().unwrap().iter().find(|event| event["input"] == "hold").expect("a release event")["summary"].as_str().unwrap().to_string();
+    assert!(release.len() <= 200, "{} bytes: {release}", release.len());
+    assert!(release.starts_with("hold released:") && release.contains("16 items"), "{release}");
+    assert!(release.contains(&labels[0]) && !release.contains(&labels[15]), "{release}");
+
+    let small = rig();
+    small.vigil.hold(first_item("none", "build", None)).await.unwrap();
+    add_ok(&small.vigil, "h", item("none", None, Some("tests"))).await;
+    add_ok(&small.vigil, "h", item("none", None, Some("deploy"))).await;
+    for label in ["build", "tests", "deploy"] {
+        let done = small.vigil.hold_done(&wid("h"), label).await;
+        assert!(done.is_ok(), "{done:?}");
+    }
+    let released = call(&small.vigil, "h", Some(30)).await;
+    let release = released["events"].as_array().unwrap().iter().find(|event| event["input"] == "hold").expect("a release event")["summary"].as_str().unwrap().to_string();
+    assert!(release.contains("3 items") && ["build", "tests", "deploy"].iter().all(|label| release.contains(label)), "{release}");
+}
+
+// -- D8 ----------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn hold_add_resolves_a_qex_name_to_the_full_id_and_refuses_an_ambiguous_name_like_creation() {
+    // why: W42-D8 (S8-S10). `hold add --for qex:nightly` stores the job id
+    //      the name resolves to (a reused name must not redirect the item),
+    //      as `vigil hold` does. The item then follows the full id: scripting
+    //      only `qex:<full id>` as completed ends it. An ambiguous name is
+    //      refused naming the cause and the watch is unchanged.
+    // proves: W42-D8
+    // catches: hold_add that skips resolution and stores the name (the item
+    //      reads `qex:nightly`, which is never scripted, and never ends);
+    //      an ambiguous name accepted; an error without the name.
+    let env = rig();
+    let full = "0d31c8ac-25e4-4ab2-8a3b-9b24ccd533c9";
+    env.reader.set_text("qex:a", "running");
+    env.reader.set_text(&format!("qex:{full}"), "running");
+    env.reader.set_qex_resolution("nightly", Ok(full.to_string()));
+    env.reader.set_qex_resolution("dup", Err(crate::error::CreateError::QexJobAmbiguous { job: "dup".into(), detail: "`dup` names 2 jobs. Give the id".into() }));
+    env.vigil.hold(first_item("qex:a", "a", None)).await.unwrap();
+    add_ok(&env.vigil, "h", item("qex:nightly", None, Some("nightly"))).await;
+    assert!(std::fs::read_to_string(env.root().join("watches/h.json")).unwrap().contains(full), "the full id is stored");
+
+    let before = watch_file(&env.vigil, "h");
+    let ambiguous = env.vigil.hold_add(&wid("h"), item("qex:dup", None, Some("d"))).await.expect_err("ambiguous").to_string();
+    assert!(ambiguous.contains("dup") && ambiguous.contains("ambiguous"), "{ambiguous}");
+    assert_eq!(watch_file(&env.vigil, "h"), before, "nothing written");
+
+    env.reader.set_text(&format!("qex:{full}"), "completed");
+    let ended = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(summaries(&ended), vec!["item ended: nightly: completed"], "{ended}");
 }

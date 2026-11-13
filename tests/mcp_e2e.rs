@@ -78,14 +78,17 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     //      watch_list, watch_cancel, and "Advisories": advice, advisory_* - no
     //      more, no fewer. keepalive's schema
     //      exposes watch_id and max_s.
-    // proves: CLAIM(tool-list)
+    //      W42-D7: the list is exact and includes `hold_done` (a pure-MCP
+    //      agent must be able to end a `none` item).
+    // proves: CLAIM(tool-list), W42-D7
+    // catches: a hold_done CLI subcommand with no MCP tool.
     let sandbox = Sandbox::new();
     let (client, _) = connect(&sandbox).await;
     let tools = client.list_all_tools().await.unwrap();
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    // The five watch tools of the SPEC, `hold` (SPEC "Holds"), `hold_add` (W42-H2) and the six advisory tools (SPEC "Advisories").
-    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "hold", "hold_add", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
+    // The five watch tools of the SPEC, `hold` (SPEC "Holds"), `hold_add` (W42-H2), `hold_done` (W42-D7) and the six advisory tools (SPEC "Advisories").
+    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "hold", "hold_add", "hold_done", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
     for tool in &tools {
         assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()), "{} has no description", tool.name);
     }
@@ -852,5 +855,119 @@ async fn hold_add_over_the_wire_adds_an_item_that_the_keepalive_reports_and_an_e
     let late = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "pid:1", "label": "late"})).await;
     assert_eq!(late.is_error, Some(true), "{late:?}");
     assert!(late.content[0].as_text().unwrap().text.contains("ended"));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_hold_done_tool_is_listed_with_watch_id_and_label() {
+    // why: W42-D7. `hold_done {watch_id, label}` ends a `none` item.
+    // proves: W42-D7
+    // catches: a tool whose schema lacks `label` (it could not name the item)
+    //      or `watch_id`.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let done = tools.iter().find(|t| t.name == "hold_done").expect("the hold_done tool is listed");
+    assert!(done.description.as_deref().is_some_and(|d| d.contains("hold")));
+    let schema = serde_json::Value::Object((*done.input_schema).clone());
+    for field in ["watch_id", "label"] {
+        assert!(schema["properties"].get(field).is_some(), "{field} missing: {schema}");
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_initial_none_item_is_ended_by_the_hold_done_tool_and_an_unknown_label_is_a_tool_error() {
+    // why: W42-D7 + W42-D8. A pure-MCP agent holds on a T3 delegate with
+    //      `hold {for: ["none"], label: "x"}` (initial `none` item through
+    //      the MCP front door), then ends it with `hold_done`. Success: the
+    //      keepalive then fires with `item ended: x: done` AND the release
+    //      (the last item, D6). An unknown label is a tool error (isError)
+    //      naming the label, and the hold stays live.
+    // proves: W42-D7, W42-D8, W42-D6
+    // catches: a hold_done tool that is not wired (error or no-op); an unknown
+    //      label reported as success; `for: ["none"]` refused at the MCP
+    //      front door although the CLI allows it.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let peer = client.peer();
+    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": ["none"], "label": "x"})).await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+
+    let wrong = call(peer, "hold_done", serde_json::json!({"watch_id": "h", "label": "nope"})).await;
+    assert_eq!(wrong.is_error, Some(true), "{wrong:?}");
+    assert!(wrong.content[0].as_text().unwrap().text.contains("nope"));
+    let status = text_json(&call(peer, "watch_status", serde_json::json!({"watch_id": "h"})).await);
+    assert_eq!(status["status"], "pending", "a refused done leaves the hold live: {status}");
+
+    let done = call(peer, "hold_done", serde_json::json!({"watch_id": "h", "label": "x"})).await;
+    assert_ne!(done.is_error, Some(true), "{done:?}");
+    let released = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h", "max_s": 30})).await);
+    assert_eq!(released["status"], "fired", "{released}");
+    let summaries: Vec<&str> = released["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert!(summaries.contains(&"item ended: x: done"), "{released}");
+    assert!(summaries.iter().any(|summary| summary.starts_with("hold released:")), "{released}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn expect_s_given_through_the_mcp_tools_raises_overdue_for_the_initial_and_the_added_item() {
+    // why: W42-D8. `expect_s` on `hold` (initial item) and on `hold_add`
+    //      (added item) must each produce an overdue event naming its label.
+    //      expect_s 2 -> overdue at min(3, 2 + 540) = 3 s; real time (a
+    //      process boundary has no fake clock), so the test sleeps 4 s once
+    //      and the first keepalive tick sees both.
+    // proves: W42-D8, W42-H3
+    // catches: an MCP `expect_s` accepted by the schema but dropped on the
+    //      way to the engine (no overdue, silently).
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    let client = connect_with_env(&sandbox, &[("PATH", std::ffi::OsStr::new(&qex.path()))]).await;
+    let peer = client.peer();
+    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": [format!("qex:{J1}")], "label": "build", "expect_s": 2})).await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    let added = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "none", "label": "t3", "expect_s": 2})).await;
+    assert_ne!(added.is_error, Some(true), "{added:?}");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let envelope = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h", "max_s": 30})).await);
+    let mut summaries: Vec<&str> = envelope["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    summaries.sort();
+    assert_eq!(summaries, vec!["item overdue: build", "item overdue: t3"], "{envelope}");
+    assert_eq!(envelope["status"], "pending", "{envelope}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn hold_add_over_the_wire_resolves_qex_names_refuses_ambiguous_ones_and_duplicate_labels() {
+    // why: W42-D8 + W42-D5 through MCP. `hold_add {for: "qex:nightly"}` stores
+    //      the full job id (like `hold`); an ambiguous name is a tool error
+    //      naming the cause; a duplicate label is a tool error naming the
+    //      label; the stored watch is unchanged by either refusal.
+    // proves: W42-D8, W42-D5
+    // catches: hold_add that stores the name instead of the id; an ambiguous
+    //      name accepted; a duplicate label silently shadowing the first item.
+    let sandbox = Sandbox::new();
+    let qex = FakeQex::new(&sandbox);
+    qex.set_job(J1, "running");
+    qex.set_name("nightly", J1);
+    qex.set_ambiguous("dupe");
+    let client = connect_with_env(&sandbox, &[("PATH", std::ffi::OsStr::new(&qex.path()))]).await;
+    let peer = client.peer();
+    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": ["none"], "label": "first"})).await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    let added = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "qex:nightly", "label": "n"})).await;
+    assert_ne!(added.is_error, Some(true), "{added:?}");
+    let stored = sandbox.watch_file("h").unwrap();
+    assert!(stored.to_string().contains(J1), "the full id is stored: {stored}");
+
+    let ambiguous = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "qex:dupe", "label": "d"})).await;
+    assert_eq!(ambiguous.is_error, Some(true), "{ambiguous:?}");
+    let text = ambiguous.content[0].as_text().unwrap().text.clone();
+    assert!(text.contains("dupe") && text.contains("ambiguous"), "{text}");
+    let duplicate = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "pid:1", "label": "first"})).await;
+    assert_eq!(duplicate.is_error, Some(true), "{duplicate:?}");
+    assert!(duplicate.content[0].as_text().unwrap().text.contains("first"));
+    assert_eq!(sandbox.watch_file("h").unwrap(), stored, "refusals write nothing");
     client.cancel().await.unwrap();
 }
