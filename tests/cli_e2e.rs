@@ -2124,12 +2124,11 @@ fn hold_add_blocked_on_the_watch_lock_rechecks_the_hold_after_it_gets_the_lock()
 }
 
 #[test]
-fn a_duplicate_label_exits_2_naming_it_and_a_label_with_several_for_is_refused_writing_nothing() {
-    // why: W42-D5. "A duplicate label is refused (exit 2, names the label)".
+fn a_duplicate_label_exits_1_naming_it_and_a_label_with_several_for_is_refused_writing_nothing() {
+    // why: W42-D5. A duplicate label is refused (exit 1 like every other runtime refusal; names the label).
     //      `--label` with more than one `--for` is refused; `--for none`
     //      without a label too (it could never be ended). Nothing is written
-    //      by any refusal. (Exit 2 is the spec's number: every other runtime
-    //      refusal here is exit 1, flagged in the red report.)
+    //      by any refusal.
     // proves: W42-D5
     // catches: a duplicate accepted, or refused with another code; the label
     //      of a multi-`--for` hold silently given to the first item.
@@ -2139,7 +2138,7 @@ fn a_duplicate_label_exits_2_naming_it_and_a_label_with_several_for_is_refused_w
     assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "d", "--for", J1_SPEC, "--label", "build"]).status.success());
     let before = sandbox.watch_file("d").unwrap();
     let duplicate = run_with_qex(&sandbox, &qex, &["hold", "add", "d", "--for", "none", "--label", "build"]);
-    assert_eq!(duplicate.status.code(), Some(2), "{}", String::from_utf8_lossy(&duplicate.stderr));
+    assert_eq!(duplicate.status.code(), Some(1), "{}", String::from_utf8_lossy(&duplicate.stderr));
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("build"), "{}", String::from_utf8_lossy(&duplicate.stderr));
     assert!(duplicate.stdout.is_empty());
     assert_eq!(sandbox.watch_file("d").unwrap(), before, "nothing written");
