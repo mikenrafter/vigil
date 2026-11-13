@@ -69,6 +69,10 @@ async fn initialize_sends_short_instructions_that_teach_the_loop() {
         assert!(instructions.contains(needle), "missing {needle:?} in {instructions:?}");
     }
     assert!(instructions.to_lowercase().contains("stop"), "must say when to stop: {instructions:?}");
+    // why: W45-C3: an agent that is done must find `cold` without a skill.
+    // proves: W45-C3
+    // catches: the instructions line for `cold` left out.
+    assert!(instructions.contains("call `cold`") && instructions.contains("BabelTele"), "missing the cold line in {instructions:?}");
     client.cancel().await.unwrap();
 }
 
@@ -80,7 +84,8 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     //      exposes watch_id and max_s.
     //      W42-D7: the list is exact and includes `hold_done` (a pure-MCP
     //      agent must be able to end a `none` item).
-    // proves: CLAIM(tool-list), W42-D7
+    //      W45-C2: and `cold`.
+    // proves: CLAIM(tool-list), W42-D7, W45-C2
     // catches: a hold_done CLI subcommand with no MCP tool.
     let sandbox = Sandbox::new();
     let (client, _) = connect(&sandbox).await;
@@ -88,7 +93,7 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
     // The five watch tools of the SPEC, `hold` (SPEC "Holds"), `hold_add` (W42-H2), `hold_done` (W42-D7) and the six advisory tools (SPEC "Advisories").
-    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "hold", "hold_add", "hold_done", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
+    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "cold", "hold", "hold_add", "cold", "hold_done", "keepalive", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
     for tool in &tools {
         assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()), "{} has no description", tool.name);
     }
@@ -971,5 +976,58 @@ async fn hold_add_over_the_wire_resolves_qex_names_refuses_ambiguous_ones_and_du
     assert_eq!(duplicate.is_error, Some(true), "{duplicate:?}");
     assert!(duplicate.content[0].as_text().unwrap().text.contains("first"));
     assert_eq!(sandbox.watch_file("h").unwrap(), stored, "refusals write nothing");
+    client.cancel().await.unwrap();
+}
+
+const COLD_NEXT: &str = "Going cold: post an inline BabelTele summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
+
+#[tokio::test]
+async fn cold_without_ids_cancels_only_the_watches_this_server_created() {
+    // why: W45-C2: `cold` with no ids ends this session's own watches, as
+    //      keepalive without an id covers them; another session's watch
+    //      (here made through the CLI, a different process) stays pending
+    //      and is listed under `pending`, so the agent can see what it left.
+    // proves: W45-C2
+    // catches: cold cancelling every pending watch in the state root; cold
+    //      cancelling nothing; a reply without the instruction in `next`.
+    let sandbox = Sandbox::new();
+    let mine = sandbox.input("mine.log");
+    let theirs = sandbox.input("theirs.log");
+    std::fs::write(&mine, "boot\n").unwrap();
+    std::fs::write(&theirs, "boot\n").unwrap();
+    assert!(sandbox.command().args(["create", &change_watch_json("theirs", &theirs, 1)]).output().unwrap().status.success());
+    let (client, _) = connect(&sandbox).await;
+    assert!(!call(client.peer(), "watch_create", watch_args("mine", &mine)).await.is_error.unwrap_or(false));
+
+    let cold = call(client.peer(), "cold", serde_json::json!({})).await;
+    assert!(!cold.is_error.unwrap_or(false), "{cold:?}");
+    let cold = text_json(&cold);
+    assert_eq!(cold["cancelled"], serde_json::json!(["mine"]));
+    assert_eq!(cold["pending"], serde_json::json!(["theirs"]));
+    assert_eq!(cold["next"], COLD_NEXT);
+    assert_eq!(sandbox.watch_file("mine").unwrap()["status"], "cancelled");
+    assert_eq!(sandbox.watch_file("theirs").unwrap()["status"], "pending");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_with_ids_cancels_exactly_those_and_an_unknown_id_is_an_error() {
+    // why: W45-C2: named ids are cancelled even when this server did not
+    //      create them; an id that does not exist is a tool error, not a
+    //      silent success that leaves the agent believing it went cold.
+    // proves: W45-C2
+    // catches: cold ignoring `watch_ids`; an unknown id reported as cancelled.
+    let sandbox = Sandbox::new();
+    let theirs = sandbox.input("theirs.log");
+    std::fs::write(&theirs, "boot\n").unwrap();
+    assert!(sandbox.command().args(["create", &change_watch_json("theirs", &theirs, 1)]).output().unwrap().status.success());
+    let (client, _) = connect(&sandbox).await;
+
+    let ghost = call(client.peer(), "cold", serde_json::json!({"watch_ids": ["ghost"]})).await;
+    assert_eq!(ghost.is_error, Some(true), "{ghost:?}");
+    let cold = text_json(&call(client.peer(), "cold", serde_json::json!({"watch_ids": ["theirs"]})).await);
+    assert_eq!(cold["cancelled"], serde_json::json!(["theirs"]));
+    assert_eq!(cold["pending"], serde_json::json!([]));
+    assert_eq!(sandbox.watch_file("theirs").unwrap()["status"], "cancelled");
     client.cancel().await.unwrap();
 }

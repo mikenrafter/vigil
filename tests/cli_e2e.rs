@@ -1950,3 +1950,55 @@ fn hold_add_resolves_a_qex_name_to_the_full_id_and_refuses_an_ambiguous_name_thr
     assert!(stderr.contains("dupe") && stderr.contains("ambiguous"), "{stderr}");
     assert_eq!(sandbox.watch_file("h").unwrap(), stored, "nothing written");
 }
+
+const COLD_NEXT: &str = "Going cold: post an inline BabelTele summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
+
+#[test]
+fn cold_with_no_ids_cancels_nothing_and_lists_what_is_pending() {
+    // why: W45-C1: the CLI cannot know which watches are this session's, so
+    //      bare `vigil cold` must not cancel another session's work. It
+    //      prints the instruction and the ids still pending (`vigil list`
+    //      data), exit 0.
+    // proves: W45-C1
+    // catches: cold cancelling every pending watch; a missing or reworded
+    //      instruction; pending left out.
+    let sandbox = Sandbox::new();
+    let input = sandbox.input("a.log");
+    std::fs::write(&input, "boot\n").unwrap();
+    assert!(sandbox.command().args(["create", &change_watch_json("w", &input, 1)]).output().unwrap().status.success());
+
+    let cold = sandbox.run(&["cold"]);
+    assert!(cold.status.success(), "{cold:?}");
+    let cold = stdout_json(&cold);
+    assert_eq!(cold["next"], COLD_NEXT);
+    assert_eq!(cold["cancelled"], serde_json::json!([]));
+    assert_eq!(cold["pending"], serde_json::json!(["w"]));
+    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
+}
+
+#[test]
+fn cold_with_ids_cancels_those_watches_and_leaves_the_others() {
+    // why: W45-C1: named watches are cancelled, the rest stay pending and
+    //      are listed so the agent sees what it left running; an unknown id
+    //      fails (exit 1) rather than claiming the session is cold.
+    // proves: W45-C1
+    // catches: cold cancelling all pending watches; cold ignoring its ids;
+    //      an unknown id exiting 0.
+    let sandbox = Sandbox::new();
+    for id in ["a", "b"] {
+        let input = sandbox.input(&format!("{id}.log"));
+        std::fs::write(&input, "boot\n").unwrap();
+        assert!(sandbox.command().args(["create", &change_watch_json(id, &input, 1)]).output().unwrap().status.success());
+    }
+    let cold = sandbox.run(&["cold", "a"]);
+    assert!(cold.status.success(), "{cold:?}");
+    let cold = stdout_json(&cold);
+    assert_eq!(cold["cancelled"], serde_json::json!(["a"]));
+    assert_eq!(cold["pending"], serde_json::json!(["b"]));
+    assert_eq!(cold["next"], COLD_NEXT);
+    assert_eq!(sandbox.watch_file("a").unwrap()["status"], "cancelled");
+    assert_eq!(sandbox.watch_file("b").unwrap()["status"], "pending");
+
+    let ghost = sandbox.run(&["cold", "ghost"]);
+    assert_eq!(ghost.status.code(), Some(1));
+}
