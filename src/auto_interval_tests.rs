@@ -16,8 +16,7 @@
 //! RED phase: all of these fail against the stubs (no `cache`/`clock` fields,
 //! no attention, no credit events), except the few marked "guard".
 //!
-//! Round 2 (spec review amendments S1-S10) adds, in this file: `wait` (S1, S3),
-//! the automatic 1h -> credits -> 5m -> credits end -> 1h sequence and the
+//! Round 2 (spec review amendments S1-S10) adds, in this file: the automatic 1h -> credits -> 5m -> credits end -> 1h sequence and the
 //! cadence kept in `credit-state.json` (S2, S9), identity (S4), tri-state (S5),
 //! attention events as ordinary events (S6), bounded probes and hook (S7),
 //! two processes on one root (S9) and no-id multi-watch calls (S10). The hook
@@ -439,30 +438,20 @@ async fn a_fired_envelope_also_gets_cache_and_clock_and_nothing_else_new() {
 #[tokio::test(start_paused = true)]
 async fn only_envelopes_that_come_from_a_call_carry_cache_and_clock() {
     // why: A12 as amended by S1. `watch_status` and `watch_cancel` have no
-    //      call, so they carry neither `cache` nor `clock`. `wait` does: its
-    //      final envelope carries both (S1, the assertion of absence here was
-    //      wrong), but still no top-level `waited_s`/`max_s` (those are the
-    //      window of ONE call; the clock block holds the wait's total). The
-    //      full contents of wait's block are pinned in the next tests.
-    //      Positive control: a blocking keepalive carries both, so the
-    //      absence on status and cancel means something.
+    //      call, so they carry neither `cache` nor `clock`. (The `vigil wait`
+    //      half of S1 went with the command, W42-W1.) Positive control: a
+    //      blocking keepalive carries both, so the absence on status and
+    //      cancel means something.
     // proves: CLAIM(AI6), CLAIM(S1)
     let rig = Rig::new();
     let probe = quiet_probe();
     let vigil = rig.vigil(AgentEnv::default(), &probe);
-    let (id, path) = quiet_watch(&rig, &vigil, "w", 20, 3600, |_| {}).await;
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 20, 3600, |_| {}).await;
     let status = serde_json::to_value(vigil.status(&id).await.unwrap()).unwrap();
     assert!(status.get("cache").is_none() && status.get("clock").is_none(), "{status}");
     let (blocking, _) = quiet_watch(&rig, &vigil, "blocking", 20, 3600, |_| {}).await;
     let blocking = call(&vigil, &blocking, Some(30), None).await;
     assert!(blocking.get("cache").is_some() && blocking.get("clock").is_some(), "{blocking}");
-    append_file(&path, "boom\n");
-    let waited = serde_json::to_value(vigil.wait(&id).await.unwrap()).unwrap();
-    assert_eq!(waited["status"], "fired");
-    assert!(waited.get("cache").is_some() && waited.get("clock").is_some(), "S1: wait's final envelope carries cache and clock: {waited}");
-    for key in ["waited_s", "max_s"] {
-        assert!(waited.get(key).is_none(), "wait's final envelope has no per-call {key}: {waited}");
-    }
     let (other, _) = quiet_watch(&rig, &vigil, "x", 20, 3600, |_| {}).await;
     let cancelled = serde_json::to_value(vigil.cancel(&other).await.unwrap()).unwrap();
     assert!(cancelled.get("cache").is_none() && cancelled.get("clock").is_none(), "{cancelled}");
@@ -1086,138 +1075,6 @@ fn is_w1_id(id: &str, watch: &str) -> bool {
 }
 
 // ------------------------------------------------ S1 / S3: wait ----
-
-#[tokio::test(start_paused = true)]
-async fn the_final_envelope_of_wait_carries_cache_and_a_clock_that_spans_the_whole_wait() {
-    // why: S1. `wait` runs several 270 s calls internally; the agent sees ONE
-    //      envelope, so `clock` must describe the whole wait, not the last
-    //      internal call. Quiet watch (cadence 20, deadline 3600), a change
-    //      written at virtual t = 590, seen by the tick at 600: internal calls
-    //      are 0-270, 270-540, 540-600 (a fire). Whole wait: waited 600,
-    //      watch age 600. The first internal call has no earlier call, and the
-    //      second and third would report 270 / 60 s "since last call" if the
-    //      clock were taken from them: the wait's own value is null (first call
-    //      ever for this watch). `cache` comes from the last internal call: a
-    //      plain wait is not the orchestrator and did not set a window, so
-    //      unknown / default / 270 (R2-A2: not "explicit", the caller chose
-    //      nothing). No top-level waited_s / max_s (one call's window).
-    // proves: CLAIM(S1)
-    let rig = Rig::new();
-    let probe = quiet_probe();
-    let vigil = rig.vigil(AgentEnv::default(), &probe);
-    let (id, path) = quiet_watch(&rig, &vigil, "w", 20, 3600, |_| {}).await;
-    let appender = async {
-        tokio::time::sleep(Duration::from_secs(590)).await;
-        append_file(&path, "boom\n");
-    };
-    let (waited, ()) = tokio::join!(vigil.wait(&id), appender);
-    let envelope = serde_json::to_value(waited.unwrap()).unwrap();
-    assert_eq!(envelope["status"], "fired");
-    assert_eq!(
-        envelope["clock"],
-        json!({"waited_s": 600, "watch_age_s": 600, "since_last_call_s": null, "summary": "waited 10m 0s this call; watching for 10m 0s; first call"})
-    );
-    assert_eq!(envelope["cache"], json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
-    assert!(envelope.get("waited_s").is_none() && envelope.get("max_s").is_none(), "{envelope}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_second_wait_measures_the_gap_from_the_envelope_the_first_one_returned() {
-    // why: S1 + S3 + A13. The first wait ends early on an attention event
-    //      (expect_s 100 -> overdue at 150) and returns at t = 150; the agent
-    //      thinks for 30 s; the second wait starts at 180 and sees a change
-    //      written at 590 on the tick at 600. Second wait: waited 600 - 180 =
-    //      420 (7m 0s), watch age 600, since_last_call_s = 600 - 150 = 450
-    //      (the first wait's return, not one of the second wait's own internal
-    //      calls), summary "last call 7m ago" (450 s = 7m 30s, seconds dropped
-    //      from a minute up, A14). Internal calls inside the first wait must
-    //      not leak into the second wait's "last call".
-    // proves: CLAIM(S1), CLAIM(S3)
-    let rig = Rig::new();
-    let probe = quiet_probe();
-    let vigil = rig.vigil(AgentEnv::default(), &probe);
-    let (id, path) = quiet_watch(&rig, &vigil, "w", 20, 3600, |request| request.expect_s = Some(100)).await;
-    let first = serde_json::to_value(vigil.wait(&id).await.unwrap()).unwrap();
-    assert_eq!((&first["status"], &first["clock"]["waited_s"]), (&json!("pending"), &json!(150)), "{first}");
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    let appender = async {
-        tokio::time::sleep(Duration::from_secs(410)).await;
-        append_file(&path, "boom\n");
-    };
-    let (second, ()) = tokio::join!(vigil.wait(&id), appender);
-    let second = serde_json::to_value(second.unwrap()).unwrap();
-    assert_eq!(second["status"], "fired", "{second}");
-    assert_eq!(
-        second["clock"],
-        json!({"waited_s": 420, "watch_age_s": 600, "since_last_call_s": 450, "summary": "waited 7m 0s this call; watching for 10m 0s; last call 7m ago"})
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn wait_returns_on_an_attention_event_with_the_watch_still_pending() {
-    // why: S3. A plain `wait` must hand an attention event to the agent (it
-    //      would otherwise sit in a loop for the rest of a stuck build). Quiet
-    //      watch, deadline 20 000, expect_s 2000 -> overdue at min(3000, 2540)
-    //      = 2540. wait runs nine 270 s calls (2430) and the tenth ends at
-    //      2540: the returned envelope is pending, `next` "act on events", has
-    //      the single attention event, `wait_exit_code` is 5, and its clock
-    //      says waited 2540 (not the 110 s of the last internal call). The
-    //      watch is still live: a later change fires it with exit code 0
-    //      (control that 5 is not "any pending").
-    // proves: CLAIM(S3), CLAIM(S1)
-    let rig = Rig::new();
-    let probe = quiet_probe();
-    let vigil = rig.vigil(AgentEnv::default(), &probe);
-    let (id, path) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |request| request.expect_s = Some(2000)).await;
-    let envelope = vigil.wait(&id).await.unwrap();
-    assert_eq!(crate::keepalive::wait_exit_code(&envelope), Some(5), "{envelope:?}");
-    let value = serde_json::to_value(&envelope).unwrap();
-    assert_eq!((&value["status"], &value["next"]), (&json!("pending"), &json!("act on events")));
-    assert!(is_attention(only_event(&value), "overdue"), "{value}");
-    assert_eq!(value["clock"]["waited_s"], 2540);
-    assert_eq!(value["elapsed_s"], 2540);
-
-    append_file(&path, "boom\n");
-    let fired = vigil.wait(&id).await.unwrap();
-    assert_eq!(fired.status, crate::watch::WatchStatus::Fired);
-    assert_eq!(crate::keepalive::wait_exit_code(&fired), Some(0));
-}
-
-#[tokio::test(start_paused = true)]
-async fn an_orchestrator_wait_uses_the_ttl_window_and_returns_on_a_credit_change() {
-    // why: S3. `wait --orchestrator` is how a background wait stays alive for
-    //      an hour. On a 1h cache its internal call is 3000 s (cache 1h /
-    //      claude-transcript / 3000 in the final envelope) and it runs the
-    //      credit checks: probe says off at the baseline (0) and on at 240, so
-    //      the wait returns at 240 with a credit_state_changed event, pending,
-    //      exit code 5, credit_check recorded at +240. Negative control in the
-    //      same test: a plain `wait` over the same Vigil makes no credit check
-    //      at all (probe untouched) and fires normally on a change.
-    // proves: CLAIM(S3), CLAIM(S1)
-    let rig = Rig::new();
-    rig.one_hour_cache();
-    let probe = quiet_probe();
-    probe.push(credit_state(false, CreditSource::Uw));
-    probe.push(credit_state(true, CreditSource::Uw));
-    let vigil = rig.vigil(claude(), &probe);
-    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |_| {}).await;
-    let envelope = vigil.wait_with(&id, true).await.unwrap();
-    assert_eq!(crate::keepalive::wait_exit_code(&envelope), Some(5), "{envelope:?}");
-    let value = serde_json::to_value(&envelope).unwrap();
-    assert_eq!(only_event(&value)["kind"], "credit_state_changed");
-    assert_eq!(value["cache"]["ttl"], "1h");
-    assert_eq!(value["cache"]["source"], "claude-transcript");
-    assert_eq!(value["cache"]["interval_s"], 3000);
-    assert_eq!(value["cache"]["credit_check"]["at"], serde_json::to_value(spec_instant().plus_secs(240)).unwrap());
-    assert_eq!(value["clock"]["waited_s"], 240);
-
-    let before = probe.asked_count();
-    let (plain, path) = quiet_watch(&rig, &vigil, "plain", 20, 3600, |_| {}).await;
-    append_file(&path, "boom\n");
-    let fired = serde_json::to_value(vigil.wait(&plain).await.unwrap()).unwrap();
-    assert_eq!(fired["status"], "fired");
-    assert_eq!(probe.asked_count(), before, "a plain wait is not the orchestrator: no credit check");
-}
 
 // ------------------------------------------------ S2: the full sequence ----
 
@@ -2055,31 +1912,6 @@ async fn a_watch_finishing_at_its_attention_threshold_emits_only_its_terminal_ev
 }
 
 // ---- Spec review round 2: S1-S10 -----------------------------------------
-
-#[tokio::test(start_paused = true)]
-async fn orchestrator_wait_uses_ttl_checks_and_keeps_the_final_calls_changed_cache() {
-    // why: S1/S3. First window 3000, transcript drops at 2700, last window
-    //      270 and expiry at 3200. This separates last cache from first cache
-    //      and total time from the final internal call's 200 s.
-    // proves: CLAIM(S1), CLAIM(S3)
-    let rig = Rig::new();
-    let path = rig.one_hour_cache();
-    let probe = quiet_probe();
-    let vigil = rig.vigil(claude(), &probe);
-    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 3200, |_| {}).await;
-    let writer = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2700)).await;
-        append_file(&path, &(assistant_line(0, 500) + "\n"));
-    });
-    let envelope = serde_json::to_value(vigil.wait_with(&id, true).await.unwrap()).unwrap();
-    writer.await.unwrap();
-    assert_eq!(envelope["status"], "expired");
-    assert_eq!(envelope["cache"]["interval_s"], 270);
-    assert_eq!(envelope["cache"]["ttl"], "5m");
-    assert_eq!(envelope["clock"]["waited_s"], 3200);
-    assert_eq!(envelope["clock"]["watch_age_s"], 3200);
-    assert_eq!(probe.asked_count(), 13, "0..2880, then the short last call is not due at 3000");
-}
 
 #[tokio::test(start_paused = true)]
 async fn unknown_checks_keep_either_known_state_without_event_or_hook() {

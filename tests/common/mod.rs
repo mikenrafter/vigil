@@ -334,7 +334,7 @@ pub fn stderr_lines(output: &Output) -> Vec<String> {
 /// ABSENT. `retried`: `Some(true)` when the rescue deleted the reserve and the
 /// retry failed too, so the note also holds `first_error` (S4); `Some(false)`
 /// when no retry was made, so the key is ABSENT; `None` when real time decides
-/// (a CLI `wait`).
+/// (a CLI call).
 pub fn assert_failed_persist(envelope: &serde_json::Value, kind: &str, os_text: &str, file: &Path, redelivery: bool, retried: Option<bool>) {
     let persist = envelope.get("persist").unwrap_or_else(|| panic!("the envelope has no `persist` field: {envelope}"));
     let object = persist.as_object().unwrap_or_else(|| panic!("persist is not an object: {persist}"));

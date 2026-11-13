@@ -1,5 +1,5 @@
 //! End-to-end suite for advisories through the real binary: the CLI
-//! (`vigil advice`, `vigil advisory ...`, `keepalive`, `wait`) and the MCP
+//! (`vigil advice`, `vigil advisory ...`, `keepalive`) and the MCP
 //! tools. A fake `boat` script stands in for the Boat CLI, so the default
 //! `boat-budget` advisory is exercised exactly as shipped (argv, extraction,
 //! condition, messages, seeding) without a network. Real processes, no fake
@@ -210,14 +210,15 @@ fn add_show_list_and_rm_round_trip() {
 }
 
 #[test]
-fn keepalive_and_wait_envelopes_carry_the_advice() {
-    // why: owner item 4: "every keepalive/wait envelope (CLI and MCP) carries
-    //      an advice list". CLI half: a watch that fires on its first tick,
-    //      read through `keepalive` and through `wait`.
+fn keepalive_envelopes_carry_the_advice() {
+    // why: owner item 4: "every keepalive envelope (CLI and MCP) carries an
+    //      advice list" (it said keepalive/wait; `vigil wait` is gone, W42-W1).
+    //      CLI half: a watch that fires on its first tick, read through
+    //      `keepalive`.
     // proves: CLAIM(advisory-delivery)
     let rig = Rig::new(479.01);
     let input = rig.sandbox.input("w.log");
-    for (id, subcommand) in [("k", "keepalive"), ("w", "wait")] {
+    for (id, subcommand) in [("k", "keepalive")] {
         std::fs::write(&input, "boot\n").unwrap();
         assert!(rig.run(&["create", &change_watch_json(id, &input, 1)]).status.success());
         {

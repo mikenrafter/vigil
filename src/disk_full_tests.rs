@@ -170,7 +170,7 @@ fn no_id_for(max_s: u64) -> KeepaliveRequest {
 /// reported, the first is kept in persist.first_error"; here both attempts
 /// fail with the same errno, so it carries the same OS text); `Some(false)`
 /// when no retry was made (non-disk error, or no reserve to free: DF4a), so
-/// the key is ABSENT; `None` when real time decides (a CLI `wait`).
+/// the key is ABSENT; `None` when real time decides (a CLI call).
 fn assert_failed_persist(envelope: &Value, kind: &str, os_text: &str, file: &Path, redelivery: bool, retried: Option<bool>) {
     let persist = persist_of(envelope);
     let object = persist.as_object().unwrap_or_else(|| panic!("persist is not an object: {persist}"));
@@ -500,41 +500,6 @@ fn a_hold_ends_at_the_deadline_when_the_watch_expires_during_it() {
 
         assert_eq!(envelope.status, WatchStatus::Expired, "{envelope:?}");
         assert_eq!(envelope.next, Next::WatchEnded);
-    });
-}
-
-#[test]
-fn wait_paces_a_pending_envelope_that_could_not_be_saved_by_one_interval_not_two() {
-    // why: DF1a (revised, T1): the one-interval pacing after a pending
-    //      envelope with persist.ok = false lives in the call itself, so MCP,
-    //      CLI keepalive and `wait` share it. `wait` loops `keepalive` until
-    //      the watch finishes; it must not add a sleep of its own on top of
-    //      the call's hold (a double sleep: one interval of hold, one of
-    //      sleep, ticks every 40 s instead of 20), and it must not call again
-    //      at once (the watchdog fails a hot loop that hammers a full disk).
-    //      Quiet watch, interval 20 s, every write fails. `wait` runs
-    //      for 50 s of virtual time, then is stopped: it must still be
-    //      running (the watch is not finished). Ticks are scripted reads of
-    //      `cmd:probe`: the baseline at create (t=0) and ticks at t=0, 20, 40
-    //      (hand-derived: one call per interval, 0 + 20 k < 50 for k = 0..2),
-    //      and each read started exactly that long after the first, so the
-    //      pacing is one interval, not "some sleep". Each call saved (tried
-    //      to) once, so at least 3 attempts to write a watch file.
-    // proves: CLAIM(DF1a)
-    scenario(|| async {
-        let env = paused_env();
-        let id = quiet_probe_watch(&env).await;
-        let plan = FaultPlan::from_rules(disk_stays_full(28));
-        let vigil = env.another_process().with_write_faults(plan.clone());
-
-        let outcome = tokio::time::timeout(Duration::from_secs(50), vigil.wait(&id)).await;
-
-        assert!(outcome.is_err(), "the watch cannot finish within 50 s, so wait must still be running: {outcome:?}");
-        assert!(plan.attempts(WriteKind::Watch) >= 3, "precondition: each of the 3 calls tried to save and failed, got {}", plan.attempts(WriteKind::Watch));
-        let reads = env.reader.reads();
-        let starts: Vec<_> = reads.iter().filter(|read| read.label == "cmd:probe").map(|read| read.started).collect();
-        let offsets: Vec<u64> = starts.iter().map(|start| start.duration_since(starts[0]).as_secs()).collect();
-        assert_eq!(offsets, [0, 0, 20, 40], "baseline, then one tick per 20 s interval");
     });
 }
 

@@ -40,17 +40,21 @@ pub(crate) struct TickReport {
     /// S1: this process's last save of the watch failed, so events this tick
     /// fired are redeliveries.
     pub redelivered: bool,
+    /// W42-H3: the tick put attention events in the watch's outbox (items of
+    /// a hold that ended while the hold stays live), so the call ends now and
+    /// delivers them.
+    pub raised_attention: bool,
 }
 
 impl TickReport {
     fn without_changes(outcome: TickOutcome) -> TickReport {
-        TickReport { outcome, changed: Vec::new(), after: None, persisted: Persisted::Saved, redelivered: false }
+        TickReport { outcome, changed: Vec::new(), after: None, persisted: Persisted::Saved, redelivered: false, raised_attention: false }
     }
 
     /// A tick that wrote `after` (or failed to) and changed nothing the digest
     /// reports: an expiry.
     fn wrote(outcome: TickOutcome, after: WatchFile, persisted: Persisted) -> TickReport {
-        TickReport { outcome, changed: Vec::new(), after: Some(after), persisted, redelivered: false }
+        TickReport { outcome, changed: Vec::new(), after: Some(after), persisted, redelivered: false, raised_attention: false }
     }
 }
 
@@ -160,10 +164,11 @@ impl Vigil {
             watch.last_digest = digest_of(&changed);
         }
 
+        let outbox_before = watch.events.len();
         let fired_events = match &watch.spec.fire {
             FireRule::Change => change_events(&watch, tick, &readings),
             FireRule::Condition => condition_events(&mut watch, tick, &readings),
-            FireRule::Hold => hold_events(&mut watch, tick, &readings),
+            FireRule::Hold => hold_events(&mut watch, tick, &readings, now),
             FireRule::Judge { .. } => {
                 if changed.is_empty() && watch.pending_change.is_none() {
                     Vec::new()
@@ -187,6 +192,7 @@ impl Vigil {
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
 
+        let raised_attention = watch.events.len() > outbox_before;
         watch.tick = tick;
         watch.last_tick_at = Some(now);
         watch.activity = Some(activity_after(&watch, &readings, now));
@@ -210,9 +216,10 @@ impl Vigil {
             after: Some(watch.clone()),
             persisted,
             redelivered,
+            raised_attention,
         };
         let persisted = self.persist_retaining(retained, budget_end, &watch, report).await?;
-        Ok(TickReport { outcome: TickOutcome::Ticked, changed, after: Some(watch), persisted, redelivered })
+        Ok(TickReport { outcome: TickOutcome::Ticked, changed, after: Some(watch), persisted, redelivered, raised_attention })
     }
 
     /// Save `watch` for a tick. `report` builds the tick's report for a given
@@ -427,10 +434,37 @@ fn condition_events(watch: &mut WatchFile, tick: u64, readings: &[Reading]) -> V
     }]
 }
 
-/// fire = hold (H6): fires once every work input has ended; a hold with no
-/// work never fires (H5). One event, `input: "hold"`, whose summary is the
-/// reason: each input's label and what it read.
-fn hold_events(watch: &mut WatchFile, tick: u64, readings: &[Reading]) -> Vec<Event> {
+/// fire = hold (H6): fires once all of its work has ended; a hold with no
+/// work never fires (H5).
+///
+/// A hold with items (W42) asks `items::tick_items`, the one place item events
+/// are decided. While it stays live, the `item ended` events go to the outbox
+/// (attention, acknowledged like any other, S6). When it is released they are
+/// terminal events beside the release, `input: "hold"`, whose summary counts
+/// the items and names the labels that fit (D6, D9), id CLAIM(item-event-id).
+///
+/// A hold without items (an older vigil's, or `watch_create`'s) keeps the old
+/// rule: one release event whose summary is each input's label and reading.
+fn hold_events(watch: &mut WatchFile, tick: u64, readings: &[Reading], now: Timestamp) -> Vec<Event> {
+    if let Some(items) = watch.items.as_mut() {
+        let decided = crate::items::tick_items(items, &watch.spec.id, tick, readings, now);
+        if !decided.released {
+            watch.events.extend(decided.events);
+            return Vec::new();
+        }
+        watch.last_digest = digest_of(&decided.ended);
+        let release = Event {
+            event_id: Event::make_id(watch.spec.id.as_str(), tick, items.len()),
+            tick,
+            watch_id: watch.spec.id.to_string(),
+            input: "hold".to_string(),
+            summary: crate::items::release_summary(items),
+            judge: None,
+            redelivered: false,
+            detail: None,
+        };
+        return decided.events.into_iter().chain([release]).collect();
+    }
     if readings.is_empty() || !readings.iter().all(|reading| reading.want_met == Some(true)) {
         return Vec::new();
     }

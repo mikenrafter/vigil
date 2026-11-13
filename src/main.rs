@@ -7,7 +7,6 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use vigil::judge::HttpJudge;
 use vigil::store::state_root;
-use vigil::keepalive::wait_exit_code;
 use vigil::{Config, CreateRequest, Envelope, KeepaliveRequest, PersistNote, SystemClock, Vigil, WatchId};
 
 #[derive(Debug, Parser)]
@@ -38,31 +37,21 @@ enum Command {
         #[arg(long)]
         orchestrator: bool,
     },
-    /// Hold the session: a watch on the work itself, live until all of it has
-    /// ended, then released. Work specs (`--for`, repeatable): `qex:JOB`,
-    /// `pid:N`, `file:PATH` (ends when it exists), `until:RFC3339`,
-    /// `idle:DIR` (no qex job at or under DIR is running). With no work it is a
-    /// bare hold, live until cancelled (7 days at most). Then `keepalive ID`
-    /// (main session: add --orchestrator, a hold stores it by default) or
-    /// `wait ID`. A T3 task cannot be sensed here: hold on a pid or a marker file.
+    /// Hold the session: a watch on the work itself. Each `--for` is one item
+    /// of work: `qex:JOB`, `pid:N`, `file:PATH` (ends when it exists),
+    /// `until:RFC3339`, `idle:DIR` (no qex job at or under DIR is running), or
+    /// `none` (a T3 delegate: needs --label, ended by `vigil hold done`). Each
+    /// item that ends raises `item ended: LABEL: WHY`; the hold is released
+    /// when every item has ended. With no work it is a bare hold, live until
+    /// cancelled (7 days at most); `vigil hold add` gives it items. Then
+    /// `keepalive ID` (main session: add --orchestrator, a hold stores it by
+    /// default).
+    #[command(args_conflicts_with_subcommands = true)]
     Hold {
-        #[arg(long)]
-        id: Option<String>,
-        /// A unit of work to wait on (repeatable).
-        #[arg(long = "for", value_name = "SPEC")]
-        work: Vec<String>,
-        /// Also wait for every qex job at or under the current directory.
-        #[arg(long)]
-        until_idle: bool,
-        /// Seconds until the hold expires, 1..=604800 (default 604800).
-        #[arg(long)]
-        deadline_s: Option<u64>,
-        /// Seconds the work should take; one `overdue` attention event after 1.5x.
-        #[arg(long)]
-        expect_s: Option<u64>,
-        /// Store whether keepalive calls are the main session's (default true).
-        #[arg(long, value_name = "BOOL")]
-        orchestrator: Option<bool>,
+        #[command(subcommand)]
+        item: Option<HoldItemCommand>,
+        #[command(flatten)]
+        create: HoldArgs,
     },
     /// Print the current advice (operator rules for agents), for hooks and
     /// scripts: one `id: message` line per advisory, or JSON with --json.
@@ -75,17 +64,53 @@ enum Command {
         #[command(subcommand)]
         command: AdvisoryCommand,
     },
-    /// Block with no ceiling until the watch finishes; print ONE final
-    /// envelope JSON (all events in it; no streaming, R8/V21).
-    ///
-    /// Exit codes: 0 fired, 1 error, 2 usage, 3 expired, 4 cancelled,
-    /// 5 attention (the watch is still live).
-    Wait {
+}
+
+#[derive(Debug, clap::Args)]
+struct HoldArgs {
+    #[arg(long)]
+    id: Option<String>,
+    /// One item of work to wait on (repeatable): qex:JOB, pid:N, file:PATH,
+    /// until:RFC3339, idle:DIR, or none.
+    #[arg(long = "for", value_name = "SPEC")]
+    work: Vec<String>,
+    /// Name of the item (with one --for only; default: its spec). Unique per hold.
+    #[arg(long)]
+    label: Option<String>,
+    /// Also wait for every qex job at or under the current directory (an item).
+    #[arg(long)]
+    until_idle: bool,
+    /// Seconds until the hold expires, 1..=604800 (default 604800).
+    #[arg(long)]
+    deadline_s: Option<u64>,
+    /// Seconds each item should take; one `item overdue` attention event
+    /// after 1.5x (or 9 minutes over, whichever comes first).
+    #[arg(long)]
+    expect_s: Option<u64>,
+    /// Store whether keepalive calls are the main session's (default true).
+    #[arg(long, value_name = "BOOL")]
+    orchestrator: Option<bool>,
+}
+
+/// `vigil hold add` / `vigil hold done` (W42): change the items of a live hold.
+#[derive(Debug, Subcommand)]
+enum HoldItemCommand {
+    /// Add one item of work to the live hold ID; one keepalive on ID covers it.
+    Add {
         id: String,
-        /// Use the orchestrator window and credit checks (AI1', S3).
+        /// The work: qex:JOB, pid:N, file:PATH, until:RFC3339, idle:DIR, or
+        /// none (a T3 delegate; needs --label).
+        #[arg(long = "for", value_name = "SPEC")]
+        work: String,
+        /// Name of the item (default: its spec). Unique per hold.
         #[arg(long)]
-        orchestrator: bool,
+        label: Option<String>,
+        /// Seconds this item should take; one `item overdue` event after 1.5x.
+        #[arg(long)]
+        expect_s: Option<u64>,
     },
+    /// End the `none` item LABEL of the live hold ID (a T3 delegate finished).
+    Done { id: String, label: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -234,8 +259,16 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&vigil.create(request).await?)?;
             Ok(0)
         }
-        Command::Hold { id, work, until_idle, deadline_s, expect_s, orchestrator } => {
-            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, ..Default::default() }).await?)?;
+        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator } } => {
+            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label }).await?)?;
+            Ok(0)
+        }
+        Command::Hold { item: Some(HoldItemCommand::Add { id, work, label, expect_s }), .. } => {
+            print_json(&vigil.hold_add(&WatchId::parse(&id)?, vigil::HoldItemRequest { work, expect_s, label }).await?)?;
+            Ok(0)
+        }
+        Command::Hold { item: Some(HoldItemCommand::Done { id, label }), .. } => {
+            print_json(&vigil.hold_done(&WatchId::parse(&id)?, &label).await?)?;
             Ok(0)
         }
         Command::Status { id } => print_json(&vigil.status(&WatchId::parse(&id)?).await?).map(|()| 0),
@@ -258,13 +291,6 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             vigil.commit_delivery(delivery);
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(0)
-        }
-        Command::Wait { id, orchestrator } => {
-            let (envelope, delivery) = vigil.wait_uncommitted(&WatchId::parse(&id)?, orchestrator).await?;
-            deliver_json(&envelope)?;
-            vigil.commit_delivery(delivery);
-            warn_about_unsaved(vigil.store().root(), &envelope);
-            Ok(wait_exit_code(&envelope).unwrap_or(0))
         }
         Command::Advice { json } => {
             let report = vigil.advice_report().await?;

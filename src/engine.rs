@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::attention::AttentionReason;
+use crate::attention::Attention;
 use crate::clock::{Clock, Timestamp};
 use crate::config::Config;
 use crate::envelope::{cut_digest, Envelope, Next, PersistFailure, PersistNote};
@@ -74,7 +74,7 @@ pub(crate) struct Session {
     /// when a successful save leaves nothing to flag, or by `commit_delivery`.
     pub repeat_risk: BTreeSet<WatchId>,
     /// Review S5: the attention events this process built and could not save,
-    /// by watch and reason. The envelope that carried them reached the agent,
+    /// by watch and attention (a reason, or an item's overdue). The envelope that carried them reached the agent,
     /// so the retry must be the SAME event (same id, same text): rebuilding it
     /// from the watch as it is by then (a tick may have moved `tick` in
     /// between) would give the agent a second notification for one fact.
@@ -82,7 +82,7 @@ pub(crate) struct Session {
     /// found raised in the file (someone else saved it). A fresh process
     /// cannot know what a dead one showed; that limit is the same as for
     /// `repeat_risk`.
-    pub unsaved_attention: BTreeMap<(WatchId, AttentionReason), Event>,
+    pub unsaved_attention: BTreeMap<(WatchId, Attention), Event>,
 }
 
 /// How one save of a watch file went, for a caller that must not fail because
@@ -237,6 +237,13 @@ impl Vigil {
     /// watch proceeds meanwhile. No tick runs (`tick` stays 0). Does not prune
     /// (the binary prunes on every run, `list` prunes too).
     pub async fn create(&self, request: CreateRequest) -> Result<Created, VigilError> {
+        self.create_with_items(request, None).await
+    }
+
+    /// `create`, storing `items` (W42-H1: `Vigil::hold`'s items, each sensed
+    /// by the input its `input` indexes) with `added_at` = the watch's
+    /// `created_at`, so the items' overdue clocks start with the hold.
+    pub(crate) async fn create_with_items(&self, request: CreateRequest, items: Option<Vec<crate::items::HoldItem>>) -> Result<Created, VigilError> {
         let spec = WatchSpec::parse(request)?.absolutize(&self.cwd);
         if matches!(spec.fire, FireRule::Judge { .. }) && !self.judge.healthy().await {
             return Err(CreateError::JudgeUnreachable.into());
@@ -244,6 +251,7 @@ impl Vigil {
         let id = spec.id.clone();
         let _watch_lock = self.lock_watch(&id).await?;
         let mut watch = WatchFile::new(spec, self.clock.now());
+        watch.items = items.map(|items| items.into_iter().map(|item| crate::items::HoldItem { added_at: watch.created_at, ..item }).collect());
         {
             // X3: the global lock only covers the id check and the placeholder
             // write that reserves the id; the baseline is read after it is gone.
@@ -421,36 +429,34 @@ impl Vigil {
         self.session.lock().expect("session mutex poisoned").repeat_risk.contains(id)
     }
 
-    /// Review S5: the attention event of `reason` that this process built for
-    /// `id` and could not save, if there is one.
-    pub(crate) fn unsaved_attention(&self, id: &WatchId, reason: AttentionReason) -> Option<Event> {
-        self.session.lock().expect("session mutex poisoned").unsaved_attention.get(&(id.clone(), reason)).cloned()
+    /// Review S5: the attention event of `attention` that this process built
+    /// for `id` and could not save, if there is one.
+    pub(crate) fn unsaved_attention(&self, id: &WatchId, attention: Attention) -> Option<Event> {
+        self.session.lock().expect("session mutex poisoned").unsaved_attention.get(&(id.clone(), attention)).cloned()
     }
 
     /// Review S5: after one save of `id` that raised `raised`: a failed save
     /// keeps the events (the agent holds them, the retry must repeat them), a
     /// save that landed drops them.
-    pub(crate) fn remember_attention_save(&self, id: &WatchId, raised: &[(AttentionReason, Event)], persisted: &Persisted) {
+    pub(crate) fn remember_attention_save(&self, id: &WatchId, raised: &[(Attention, Event)], persisted: &Persisted) {
         let mut session = self.session.lock().expect("session mutex poisoned");
-        for (reason, event) in raised {
+        for (attention, event) in raised {
             match persisted {
                 Persisted::NotSaved(_) => {
-                    session.unsaved_attention.insert((id.clone(), *reason), event.clone());
+                    session.unsaved_attention.insert((id.clone(), *attention), event.clone());
                 }
                 Persisted::Saved | Persisted::SavedOnReserve => {
-                    session.unsaved_attention.remove(&(id.clone(), *reason));
+                    session.unsaved_attention.remove(&(id.clone(), *attention));
                 }
             }
         }
     }
 
-    /// Review S5: `reasons` are already raised in `id`'s file (another process
-    /// saved them), so a copy of ours that never landed is moot.
-    pub(crate) fn forget_unsaved_attention(&self, id: &WatchId, reasons: &[AttentionReason]) {
+    /// Review S5: attention already raised in `watch`'s file (another process
+    /// saved it), so a copy of ours that never landed is moot.
+    pub(crate) fn forget_unsaved_attention(&self, watch: &WatchFile) {
         let mut session = self.session.lock().expect("session mutex poisoned");
-        for reason in reasons {
-            session.unsaved_attention.remove(&(id.clone(), *reason));
-        }
+        session.unsaved_attention.retain(|(id, attention), _| !(*id == watch.spec.id && crate::attention::is_raised(watch, *attention)));
     }
 
     /// The events of a stored result as this process returns them: flagged

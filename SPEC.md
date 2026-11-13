@@ -70,8 +70,9 @@ mcp` (new session, harness restart) picks up where the file says.
 
 - `vigil mcp`: stdio MCP server. Runs ticks only inside a `keepalive` call,
   in-process.
-- `vigil` CLI subcommands (`create`, `hold`, `status`, `list`, `cancel`, `keepalive`,
-  `wait`, `advice`, `advisory`) run the same code against the same files. Programmatic monitors, with no
+- `vigil` CLI subcommands (`create`, `hold` with `hold add` / `hold done`,
+  `status`, `list`, `cancel`, `keepalive`, `advice`, `advisory`) run the same
+  code against the same files (`wait` was removed 2026-11-13, W42-W1). Programmatic monitors, with no
   agent involved, use these; `vigil keepalive` blocks in the shell the same
   way.
 
@@ -98,18 +99,13 @@ and Codex has no equivalent (`FINDINGS.md` §2).
    `notifications/progress` with the tick count. Clients that honour
    `resetTimeoutOnProgress` stay alive longer. Claude Code's behaviour here
    is disputed in the sources found, so never depend on it.
-3. **`vigil wait` (Claude Code, no re-trigger).** `vigil wait <id>` blocks
-   with no 270 s ceiling until the watch fires, expires or is cancelled,
-   prints the final envelope and exits (0 fired, 3 expired, 4 cancelled,
-   5 attention, 2 usage, 1 error). Exit 5 means an `attention` or
-   `credit_state_changed` event ended the wait while the watch is still live;
-   `--orchestrator` gives `wait` the orchestrator's window and credit checks
-   (see "Cache-aware window, time and early attention"). The agent runs it
-   once as a background command; Claude Code wakes the agent when it exits.
-   Trade-off: no model calls while waiting, so the prompt cache goes cold
-   after its TTL. Use `keepalive` to stay warm, `wait` for long waits where
-   a cold cache is fine. Codex has no background wake, so it uses
-   `keepalive` only.
+3. *History (removed 2026-11-13, W42-W1):* `vigil wait <id>` blocked with
+   no ceiling until the watch finished and printed one final envelope (exit
+   0 fired, 3 expired, 4 cancelled, 5 attention), for long waits where a cold
+   prompt cache was acceptable. Removed because there is always a session to
+   keep warm (owner, 2026-11-13); a session whose work is done posts its
+   summary and ends its turn instead (vigil skill, "Going cold"). Its
+   decisions D11, R8, V21 and W6 below are history notes.
 
 ### Interval and long deadlines
 
@@ -205,8 +201,10 @@ an immediate re-call does not cause an extra tick.
 ### `hold`
 
 Creates a hold (a watch on the work itself): see "Holds". Arguments `{id?, for?,
-until_idle?, deadline_s?, expect_s?, orchestrator?}`; returns what `watch_create`
-returns. Then `keepalive`.
+label?, until_idle?, deadline_s?, expect_s?, orchestrator?}`; returns what
+`watch_create` returns. Then `keepalive`. `hold_add {watch_id, for, expect_s?,
+label?}` adds one item to a live hold and `hold_done {watch_id, label}` ends a
+`none` item (W42, "Hold items").
 
 ### `watch_status`, `watch_list`, `watch_cancel`
 
@@ -245,8 +243,8 @@ Non-blocking reads and cancel. `watch_status` also reports judge reachability
 - `events` is empty on a pure timeout. Then `status` is `pending`, `next` is
   `"call keepalive again"`, and the envelope is short, so a quiet hour costs
   a few hundred tokens per tick, not thousands.
-- `cache` and `clock` ride on every blocking return (a `keepalive`, and the
-  final envelope of a `wait`), never on status or cancel:
+- `cache` and `clock` ride on every blocking return (a `keepalive`), never on
+  status or cancel:
   `"cache": {"ttl": "1h"|"5m"|"unknown", "source": "claude-transcript"|"codex-default"|"default"|"explicit", "interval_s": 270}`
   (plus `credit_check` after an orchestrator's credit check) and
   `"clock": {"waited_s", "watch_age_s", "since_last_call_s" (null on the first call), "summary"}`.
@@ -348,14 +346,13 @@ must be named as such.
 - **The answer survives (DF1).** If sensing works and the watch-file write
   fails, `keepalive` (MCP and CLI) still returns the full envelope for the tick,
   built from memory: the same `events`, `digest`, `status`, `next` as a
-  successful tick. The CLI exits as it would have (`keepalive` 0; `wait` keeps
-  its outcome code). A tick whose save failed stops the call's sensing and is
+  successful tick. The CLI exits as it would have (`keepalive` 0). A tick whose save failed stops the call's sensing and is
   answered as is (DF1a): no in-memory re-ticking, so a full disk is not hammered.
   An envelope with events or a terminal status is returned at once. A pending
   one (nothing to act on) is first held for `min(interval_s, budget left)`
   without ticking again, so a disk that stays full never turns into back-to-back
   agent turns; the hold is part of the call (cancellable, counted in
-  `waited_s`) and the same for the MCP server, CLI `keepalive` and `wait`. It
+  `waited_s`) and the same for the MCP server and CLI `keepalive`. It
   uses the shortest `interval_s` of the watches whose save failed.
 - **The failure is visible (DF2).** The envelope carries
   `"persist": {"ok": false, "kind": "disk_full" | "io", "error": "<OS text>", "path": "<file>"}`.
@@ -383,7 +380,7 @@ must be named as such.
   A result that could not be saved is not marked returned (V7), so the next
   no-id call covers it again. `redelivered: true` is set on every event of a tick
   that follows a failed save, by the process that failed to save (the MCP
-  server, or `vigil wait`); a fresh CLI process cannot know, so its events are
+  server); a fresh CLI process cannot know, so its events are
   unflagged. Agents must not deduplicate by `event_id` across a persist failure
   (the tick number did not advance, so ids can repeat with other content) and
   treat any event after an envelope with `persist.ok = false` as possibly
@@ -527,7 +524,7 @@ server that returns canned answers.
 - D6: Claude Code gets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=280000` through
   agent-integration, so `keepalive` stays one round trip.
 - D7: URL inputs are http only (no TLS stack, to avoid aws-lc-rs on 8 GB hosts).
-- D11: `vigil wait` added (delivery path 3) so Claude Code agents can wait with no re-trigger.
+- D11 (history): `vigil wait` was added as delivery path 3 so Claude Code agents could wait with no re-trigger; removed 2026-11-13 (W42-W1).
 - D8: the live hour-long test uses `change`/`condition`; Laya stays on host-c.
 
 ## Resolved details (from the red phase, 2026-10-29)
@@ -553,8 +550,8 @@ server that returns canned answers.
 - R7 judge down across several changes: the pending change accumulates; the
   next request carries all content changed since the last judged tick,
   newest first, cut to `VIGIL_JUDGE_STATE_BYTES`.
-- R8 `vigil wait` has no `--stream`: under D1 a watch fires once, so a stream
-  would only ever print one event. Removed.
+- R8 (history): `vigil wait` had no `--stream` (under D1 a watch fires once);
+  the whole command was removed 2026-11-13 (W42-W1).
 
 ## Spec review round 1 (Sol, 2026-10-29)
 
@@ -569,7 +566,7 @@ These override anything above that disagrees.
   consumed; the next call sees it again.
 - V3 (replaces `delivered_through`): under D1 the only events are terminal.
   The terminal result is stored once and replayed unchanged on every later
-  `keepalive`, `wait` or `watch_status` for that id. Events carry a stable
+  `keepalive` or `watch_status` for that id (and `wait`, until W42-W1). Events carry a stable
   `event_id` (`<watch_id>:<tick>:<n>`, W1). Delivery is at least once.
 - V4/V5: see State (one global lock, never deleted; terminal immutable).
 - V6: any id that still has a file (pending or finished) cannot be reused.
@@ -615,7 +612,7 @@ These override anything above that disagrees.
   `"act on events"`, `"watch ended; create a new watch if still needed"`.
   Server instructions say: stop calling when `next` is not
   `"call keepalive again"`.
-- V21: R8 applies; `--stream` tests are removed.
+- V21 (history): R8 applied; the `--stream` tests, and with W42-W1 every `wait` test, are removed.
 - V26 D9: the envelope has `max_s` (the clamped ceiling used) and `waited_s`
   (time actually waited). D10: `interval_s` default 20, clamped 1..=3600.
 - V27: `VIGIL_DIGEST_MAX_BYTES` bounds the whole digest including the
@@ -635,8 +632,9 @@ These override anything above that disagrees.
   and the newest kept; the offset moves to the end.
 - W5 a cancel that arrives after `deadline_at` finds the watch expired
   (`finished_at = deadline_at`) and returns that.
-- W6 `vigil wait` exit codes: 0 fired, 1 error, 2 usage (clap), 3 expired,
-  4 cancelled.
+- W6 (history): `vigil wait` exited 0 fired, 1 error, 2 usage (clap), 3
+  expired, 4 cancelled (5 attention, S3); removed 2026-11-13 (W42-W1). `vigil
+  wait` is now an unknown subcommand (exit 2).
 - W7 the persisted pending change is capped at 64 KiB per input, newest
   kept, with `[truncated]` when cut.
 
@@ -722,7 +720,8 @@ envelope this watch returned, kept in the watch file as `last_call_at` (best
 effort: a failed save of it is silent and never holds or shortens a call).
 Finishing a watch keeps the value, so the envelope that reports a fire or an
 expiry still says how long it had been since the call before.
-`wait` measures the whole wait and records only its own final return.
+(Until W42-W1, `wait` measured the whole wait and recorded only its own
+final return.)
 
 **Credit check (AI2', AI8, S2, S5, S7, S9).** Every orchestrator call checks
 the account's credit state when the last check is at least 240 s old
@@ -868,10 +867,12 @@ stays reserved for seven days). An expired hold gives
 A hold with **no work** (a bare `vigil hold`) never fires: it stays live until
 cancelled or the 7 days are up.
 
-**Release (H6).** When all work has ended the hold fires once with one event:
+**Release (H6).** (Holds made before W42, and `watch_create` holds; for holds
+with items see "Hold items" below.) When all work has ended the hold fires
+once with one event:
 `input: "hold"`, `summary: "hold released: <why>"` where `<why>` lists each
 input and what it read (`qex:ab12 completed; process:4242 exited`; each input's label, then its reading), cut to 200
-bytes. `next` is `"act on events"`; `vigil wait` exits 0. While any work is live
+bytes. `next` is `"act on events"`. While any work is live
 the envelope is `pending` with `next: "call keepalive again"` and no events
 (CLAIM(H7)). A hold that expires or is cancelled gives the ordinary terminal
 envelope, with no release event.
@@ -898,14 +899,85 @@ idle"), the correct answer to "is anything running?". A directory that no longer
 exists is an `error:` reading (the hold stays live): cancel it. Deferred:
 scoping by the submitting process tree (qex records `submitter` pids).
 
-**CLI (H11).** `vigil hold [--id ID] [--for SPEC]... [--until-idle]
+**CLI (H11).** `vigil hold [--id ID] [--for SPEC]... [--label L] [--until-idle]
 [--deadline-s N] [--expect-s N] [--orchestrator BOOL]`. `--for` repeats, one spec per use. Prints the created watch like `vigil
 create` (`watch_id`, `status`, `created_at`, `deadline_at`); then `keepalive
-<id>` / `wait <id>` as for any watch. `--orchestrator` on `keepalive` and
-`wait` is the existing flag (AI1'): main session only, selects the 50 minute
-window on a 1 hour cache. MCP: tool `hold {id?, for?: [spec], until_idle?,
-deadline_s?, expect_s?, orchestrator?}`, same errors as `watch_create`.
-`vigil hold` with neither `--for` nor `--until-idle` is the bare hold (H5).
+<id>` as for any watch. `--orchestrator` on `keepalive` is the existing flag
+(AI1'): main session only, selects the 50 minute window on a 1 hour cache.
+MCP: tool `hold {id?, for?: [spec], label?, until_idle?, deadline_s?,
+expect_s?, orchestrator?}`, same errors as `watch_create`. `vigil hold` with
+neither `--for` nor `--until-idle` is the bare hold (H5). Since W42 every
+`--for` is an item; see "Hold items" below for `--label`, `hold add`, `hold
+done` and what changed in the release (H6).
+
+### Hold items: one hold, many units of work (W42)
+
+Claims `W42-H1`..`W42-H5`, decisions `W42-D1`..`W42-D9` (full text:
+`knowledge/research/agentic-practice-2026-11/vigil-hold-items-spec.md`). Built
+2026-11-13 (owner: "there is always a session/cache to keep warm"). Proof:
+`src/items.rs` (unit), `src/hold_items_tests.rs` (engine, virtual time),
+`tests/cli_e2e.rs` and `tests/mcp_e2e.rs` (binary). Code: the model and the
+one place that decides item events is `src/items.rs`; the front doors are in
+`src/hold.rs`; the tick asks `items::tick_items` (`tick::hold_events`); the
+attention pass raises item overdue through `attention::due`.
+
+- **Items (W42-H1).** A hold made by `vigil hold` stores `items`: one per
+  `--for` (and `--until-idle`), each `{label, input?, expect_s?, added_at,
+  ended_at?, overdue_raised, last_end_event?}` (D3). `input` is the index of
+  the sensing input in `inputs`; a `none` item has none. `--expect-s` applies
+  to each item (D5); the hold itself stores no `expect_s`, so a bare hold
+  refuses `--expect-s`. `--label` names the one item and is refused with more
+  than one `--for`. An unlabelled item is labelled by its spec as written
+  (`qex:nightly`, `pid:1`). Labels are unique per hold (refused naming the
+  label, exit 1, D5/D9) and at most 64 bytes, printable, not padded. Items
+  count toward the 16-input cap: a hold has at most 16 items (S11).
+- **`vigil hold add ID --for SPEC [--expect-s N] [--label L]` (W42-H2)**, MCP
+  `hold_add {watch_id, for, expect_s?, label?}`: adds one item to a live hold.
+  Under the watch's lock (`lock_and_load`, D4) it rechecks that the hold is a
+  live hold with items: released, cancelled or expired (also when the deadline
+  passed and nothing wrote it yet) is refused with "has ended" and writes
+  nothing. A qex name resolves to the full job id, an ambiguous one is refused
+  (D8). The item's clock starts at the add; a running keepalive senses it from
+  its next tick (it reloads the hold every tick); the call's window is
+  unchanged.
+- **Each item ends on its own (W42-H3).** At every tick an item is ended when
+  its input reads ended (H2), or, for `none`, when `hold done` ended it. Its
+  end raises ONE attention event (`kind: attention`, `reason: ended`,
+  `input: <label>`), summary `item ended: <label>: <why>` (`why` is the
+  reading, or `done`). A sensed item that reads live again (a retried qex job)
+  is live: its end is forgotten and its next end is a new event (D1). The
+  hold is released when every item is ended at the same tick and it has at
+  least one item; a bare hold (no items ever) lives until cancelled. While
+  the hold stays live the events go to the outbox and end the call like any
+  attention (S6 acknowledgement and redelivery apply unchanged). At the
+  release every item ending at that tick raises its event too, beside the
+  release event (D6), whose summary is `hold released: <N> items ended
+  (<labels>)` (`1 item ended` for one), the labels in item order for as many
+  as fit the 200-byte cap (D9).
+- **Item overdue (W42-H3, D2).** An item with `expect_s` raises one attention
+  event `item overdue: <label>` (`reason: overdue`) at
+  `min(1.5 x expect_s, expect_s + 540)` after its `added_at`, unless it has
+  ended. The moment is a wake of its own (not the next tick), and the flag
+  and clock are in the file, so a restart neither repeats nor resets it (D3).
+- **Event ids (D3).** CLAIM(item-event-id): an item's events are
+  `<watch>:<tick>:<item index>` and the release `<watch>:<tick>:<item
+  count>`; an item raises at most one event per tick number (its end at a
+  tick, its overdue once ever, after a tick and only while not ended; a `hold
+  done` is announced by the next tick), so two items ending or going overdue
+  together get two ids.
+- **One keepalive covers every item (W42-H4)**: all items live in the one
+  hold watch.
+- **`none` items (W42-H5).** A T3 delegate cannot be sensed: `--for none
+  --label L` (label required) with an optional `--expect-s`. `vigil hold done
+  ID LABEL` / MCP `hold_done {watch_id, label}` ends it under the lock: an
+  unknown label, a sensed item ("ends by itself"), an item that already ended
+  ("already ended") and an ended hold are refused and write nothing. The next
+  tick announces `item ended: L: done`. `until:<RFC3339>` is the other item
+  for work with a known end time.
+- **Older holds (D6).** A hold stored without `items` (an older vigil's, or
+  one made with `watch_create`) keeps the old rule: no item events, the
+  release names each input and its reading. `hold add` and `hold done` refuse
+  it (make a new hold).
 
 **Wire compatibility (H12).** `fire: "hold"` and the new `kind`s are additions.
 A new binary reads every existing watch file unchanged. An old binary does not
@@ -995,7 +1067,7 @@ shown, and nothing is silent. Probes run one after another, so many slow
 advisories add up (at most 32 x 20 s; keep probes cheap).
 
 **Delivery (CLAIM(advisory-delivery)).** `advice` is on the final envelope of
-every `keepalive` (CLI and MCP) and of `wait`, evaluated when the call returns
+every `keepalive` (CLI and MCP), evaluated when the call returns
 (a probe adds at most its own time, only on a cache miss). `vigil advice` prints
 one `id: message` line per advisory (`--json`: `{"advice": [...]}`) for hooks
 and scripts; it exits 0 even when a probe failed (the failure is a line), and 1

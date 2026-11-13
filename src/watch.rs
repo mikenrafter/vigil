@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::attention::{Activity, AttentionReason};
+use crate::attention::{Activity, AttentionReason, EventReason};
 use crate::clock::Timestamp;
 use crate::credit::{CreditSource, HookOutcome};
 use crate::error::CreateError;
@@ -181,6 +181,28 @@ impl Input {
             Input::Until { at } => format!("until:{}", serde_json::to_string(at).unwrap_or_default().trim_matches('"')),
         }
     }
+    /// V11 for one input: relative paths, glob patterns and a `cmd` working
+    /// directory resolve against `cwd`; a `cmd` without one gets `cwd`.
+    /// Absolute values are left alone. `create` and `hold add` both use it.
+    pub fn absolutize(mut self, cwd: &std::path::Path) -> Input {
+        match &mut self {
+            Input::File { path, .. } => *path = cwd.join(&*path),
+            Input::Glob { pattern, .. } => {
+                // `Path::join` keeps an absolute right-hand side as is.
+                *pattern = cwd.join(&*pattern).to_string_lossy().into_owned();
+            }
+            Input::Cmd { cwd: command_cwd, .. } => {
+                *command_cwd = Some(match command_cwd.take() {
+                    Some(given) => cwd.join(given),
+                    None => cwd.to_path_buf(),
+                });
+            }
+            Input::PathExists { path } => *path = cwd.join(&*path),
+            Input::QexIdle { dir } => *dir = cwd.join(&*dir),
+            Input::Url { .. } | Input::Port { .. } | Input::Process { .. } | Input::Qex { .. } | Input::Until { .. } => {}
+        }
+        self
+    }
     /// Does this input carry a `want` (used by fire = condition)?
     pub fn has_want(&self) -> bool {
         match self {
@@ -286,6 +308,20 @@ pub(crate) fn validate_input(input: &Input) -> Result<(), CreateError> {
     Ok(())
 }
 
+/// AI5 (A16, review S8): an `expect_s` / `stall_s` limit is 1..=604800: zero
+/// would raise attention at once, and no watch lives longer than the upper
+/// bound, so a larger limit could never fire. Shared by watches and hold items.
+pub(crate) fn check_seconds(field: &'static str, value: Option<u64>) -> Result<(), CreateError> {
+    if value == Some(0) {
+        return Err(CreateError::BelowOneSecond { field });
+    }
+    // ↳ CLAIM(S8-overflow): refused here, and the arithmetic is total anyway
+    if let Some(value) = value.filter(|value| *value > MAX_DEADLINE_S) {
+        return Err(CreateError::AboveLongestWatch { field, max: MAX_DEADLINE_S, value });
+    }
+    Ok(())
+}
+
 /// H4: a hold waits on work and takes no stall limit.
 fn validate_hold(request: &CreateRequest) -> Result<(), CreateError> {
     if request.stall_s.is_some() {
@@ -375,15 +411,8 @@ impl WatchSpec {
         if !(MIN_DEADLINE_S..=MAX_DEADLINE_S).contains(&deadline_s) {
             return Err(CreateError::DeadlineOutOfRange(deadline_s));
         }
-        for (field, value) in [("expect_s", request.expect_s), ("stall_s", request.stall_s)] {
-            if value == Some(0) {
-                return Err(CreateError::BelowOneSecond { field });
-            }
-            // ↳ CLAIM(S8-overflow): refused here, and the arithmetic is total anyway
-            if let Some(value) = value.filter(|value| *value > MAX_DEADLINE_S) {
-                return Err(CreateError::AboveLongestWatch { field, max: MAX_DEADLINE_S, value });
-            }
-        }
+        check_seconds("expect_s", request.expect_s)?;
+        check_seconds("stall_s", request.stall_s)?;
         let interval_s = request.interval_s.unwrap_or(DEFAULT_INTERVAL_S).clamp(MIN_INTERVAL_S, MAX_INTERVAL_S);
         for input in &request.inputs {
             validate_input(input)?;
@@ -433,24 +462,7 @@ impl WatchSpec {
     /// directories against `cwd` (the creating process's cwd); a `cmd` without
     /// a `cwd` gets `cwd`. Absolute values are left alone.
     pub fn absolutize(mut self, cwd: &std::path::Path) -> WatchSpec {
-        for input in &mut self.inputs {
-            match input {
-                Input::File { path, .. } => *path = cwd.join(&*path),
-                Input::Glob { pattern, .. } => {
-                    // `Path::join` keeps an absolute right-hand side as is.
-                    *pattern = cwd.join(&*pattern).to_string_lossy().into_owned();
-                }
-                Input::Cmd { cwd: command_cwd, .. } => {
-                    *command_cwd = Some(match command_cwd.take() {
-                        Some(given) => cwd.join(given),
-                        None => cwd.to_path_buf(),
-                    });
-                }
-                Input::PathExists { path } => *path = cwd.join(&*path),
-                Input::QexIdle { dir } => *dir = cwd.join(&*dir),
-                Input::Url { .. } | Input::Port { .. } | Input::Process { .. } | Input::Qex { .. } | Input::Until { .. } => {}
-            }
-        }
+        self.inputs = self.inputs.into_iter().map(|input| input.absolutize(cwd)).collect();
         self
     }
 }
@@ -558,13 +570,14 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventDetail {
-    /// AI5: the watch needs the agent (`overdue` or `stalled`). Saved with the
-    /// watch until a delivery is committed (S6). vigil always sets `reason`;
-    /// it is optional on READ only, so that `kind` alone decides what an
-    /// envelope means (a tolerant reader, see `keepalive::wait_exit_code`).
+    /// AI5: the watch needs the agent (`overdue` or `stalled`), or W42-H3: an
+    /// item of a hold ended (`ended`) or ran past its own `expect_s`
+    /// (`overdue`). Saved with the watch until a delivery is committed (S6).
+    /// vigil always sets `reason`; it is optional on READ only, so that `kind`
+    /// alone decides what an envelope means (a tolerant reader).
     Attention {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<AttentionReason>,
+        reason: Option<EventReason>,
     },
     /// AI8: the account's credit state changed. Not saved (A18). The fields
     /// are optional on read for the same reason as above.
@@ -673,6 +686,12 @@ pub struct WatchFile {
     /// the call before (review S7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_call_at: Option<Timestamp>,
+    /// W42-H1: the work items of a hold made by `vigil hold` (`[]` for a bare
+    /// one), see `items.rs`. Absent for every other watch, and for a hold
+    /// stored by an older vigil or made with `watch_create`, which keeps the
+    /// old behaviour (D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<crate::items::HoldItem>>,
 }
 
 impl WatchFile {
@@ -695,6 +714,7 @@ impl WatchFile {
             attention_raised: Vec::new(),
             activity: None,
             last_call_at: None,
+            items: None,
         }
     }
     /// V3/V4: store the terminal result. Succeeds exactly once; afterwards the
@@ -1111,7 +1131,7 @@ mod tests {
             summary: "overdue: running for 2m 0s, expected 1m 0s".into(),
             judge: None,
             redelivered: false,
-            detail: Some(EventDetail::Attention { reason: Some(AttentionReason::Overdue) }),
+            detail: Some(EventDetail::Attention { reason: Some(EventReason::Overdue) }),
         };
         let pending = || WatchFile::new(WatchSpec::parse(change_request("w", Path::new("/tmp/x"), 20)).unwrap(), at("2026-10-29T14:03:11Z"));
         for status in [TerminalStatus::Fired, TerminalStatus::Expired, TerminalStatus::Cancelled] {

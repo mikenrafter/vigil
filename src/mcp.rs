@@ -1,4 +1,5 @@
-//! stdio MCP front: the five watch tools and the advisory tools over `Vigil`.
+//! stdio MCP front: the five watch tools, the hold tools (`hold`, `hold_add`,
+//! `hold_done`) and the advisory tools over `Vigil`.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -99,21 +100,49 @@ pub struct CreateArgs {
 pub struct HoldArgs {
     /// Optional stable id, `[A-Za-z0-9_-]{1,64}`; generated when absent.
     pub id: Option<String>,
-    /// Work to wait on: `qex:JOB`, `pid:N`, `file:PATH` (ends when it exists),
-    /// `until:RFC3339`, `idle:DIR` (no qex job at or under DIR is running).
-    /// Omit for a bare hold that lives until cancelled.
+    /// Work to wait on, one item each: `qex:JOB`, `pid:N`, `file:PATH` (ends
+    /// when it exists), `until:RFC3339`, `idle:DIR` (no qex job at or under
+    /// DIR is running), or `none` (a T3 delegate: needs `label`, ended by
+    /// `hold_done`). Omit for a bare hold that lives until cancelled.
     #[serde(default, rename = "for")]
     #[schemars(rename = "for")]
     pub work: Vec<String>,
+    /// Name of the item (with one `for` only; default: its spec). Unique per hold.
+    pub label: Option<String>,
     /// Also wait for every qex job at or under the server's working directory.
     #[serde(default)]
     pub until_idle: bool,
     /// Seconds until the hold expires, 1..=604800 (default 604800).
     pub deadline_s: Option<u64>,
-    /// Seconds the work should take; one `overdue` attention event after 1.5x.
+    /// Seconds each item should take; one `item overdue` attention event after 1.5x.
     pub expect_s: Option<u64>,
     /// Whether keepalive calls for this hold are the main session's (default true).
     pub orchestrator: Option<bool>,
+}
+
+/// `hold_add` arguments (W42-H2): one item per call.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HoldAddArgs {
+    /// The live hold to add to.
+    pub watch_id: String,
+    /// The work: `qex:JOB`, `pid:N`, `file:PATH`, `until:RFC3339`, `idle:DIR`,
+    /// or `none` (a T3 delegate: needs `label`, ended by `hold_done`).
+    #[serde(rename = "for")]
+    #[schemars(rename = "for")]
+    pub work: String,
+    /// Seconds this item should take; one `item overdue` attention event after 1.5x.
+    pub expect_s: Option<u64>,
+    /// Name of the item (default: its spec). Unique per hold.
+    pub label: Option<String>,
+}
+
+/// `hold_done` arguments (W42-H5, D7).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HoldDoneArgs {
+    /// The live hold.
+    pub watch_id: String,
+    /// The `none` item that has finished.
+    pub label: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -322,7 +351,7 @@ impl VigilServer {
         })
     }
 
-    #[tool(description = "Hold the session in cache by watching the work itself: qex jobs, pids, marker files, times, or a qex queue (for: [\"qex:ID\", \"pid:N\", \"file:PATH\", \"until:RFC3339\", \"idle:DIR\"]). Live until all of it has ended, then keepalive returns \"hold released: why\". With no work it lives until cancelled. Then call keepalive.")]
+    #[tool(description = "Hold the session in cache by watching the work itself, one item per spec: qex jobs, pids, marker files, times, a qex queue, or none for a T3 delegate (for: [\"qex:ID\", \"pid:N\", \"file:PATH\", \"until:RFC3339\", \"idle:DIR\", \"none\"]). Each item that ends raises \"item ended: LABEL: WHY\"; when all have ended keepalive returns \"hold released: ...\". With no work it lives until cancelled. Then call keepalive.")]
     async fn hold(&self, Parameters(args): Parameters<HoldArgs>, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
         let request = crate::hold::HoldRequest {
             id: args.id,
@@ -331,12 +360,28 @@ impl VigilServer {
             deadline_s: args.deadline_s,
             expect_s: args.expect_s,
             orchestrator: args.orchestrator,
-            ..Default::default()
+            label: args.label,
         };
         Ok(tokio::select! {
             biased;
             () = ctx.ct.cancelled() => cancelled_result(),
             created = self.vigil.hold(request) => reply(created),
+        })
+    }
+
+    #[tool(description = "Add one item of work to a live hold (for: one spec, or \"none\" with a label for a T3 delegate). The same keepalive on the hold covers it; it raises \"item ended\" when it ends and \"item overdue\" past 1.5x expect_s.")]
+    async fn hold_add(&self, Parameters(args): Parameters<HoldAddArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(match parse_id(&args.watch_id) {
+            Ok(id) => reply(self.vigil.hold_add(&id, crate::hold::HoldItemRequest { work: args.work, expect_s: args.expect_s, label: args.label }).await),
+            Err(error) => reply::<()>(Err(error)),
+        })
+    }
+
+    #[tool(description = "End the none item `label` of a live hold (a T3 delegate finished). The next tick reports \"item ended: LABEL: done\" and releases the hold if it was the last item.")]
+    async fn hold_done(&self, Parameters(args): Parameters<HoldDoneArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(match parse_id(&args.watch_id) {
+            Ok(id) => reply(self.vigil.hold_done(&id, &args.label).await),
+            Err(error) => reply::<()>(Err(error)),
         })
     }
 
@@ -522,7 +567,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_mcp_call_is_held_one_interval_after_a_quiet_failed_save_and_a_cancel_ends_the_hold() {
-        // why: DF1a (revised, T1): MCP, CLI keepalive and `wait` share one
+        // why: DF1a (revised, T1): MCP and CLI keepalive share one
         //      pacing path. `run_keepalive` is the MCP server's call. Quiet
         //      watch, interval 20 s, every write fails: the call is held 20 s
         //      (virtual) and returns pending with persist.ok=false. A cancel

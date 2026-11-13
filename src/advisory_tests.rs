@@ -94,17 +94,6 @@ async fn a_keepalive_return_carries_the_current_advice() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_final_envelope_of_a_wait_carries_advice() {
-    // why: `vigil wait` is the other delivery path (SPEC delivery 3); its one
-    //      final envelope must carry the advice too.
-    // proves: CLAIM(advisory-delivery)
-    let rig = rig();
-    let id = fired_watch(&rig.env, "w").await;
-    let (envelope, _) = rig.env.vigil.wait_uncommitted(&id, false).await.unwrap();
-    assert_eq!(messages(&wire(&envelope)), ["Low: 15 (< 20)"]);
-}
-
-#[tokio::test(start_paused = true)]
 async fn status_and_cancel_do_not_carry_advice() {
     // why: like `cache` and `clock`, advice rides on blocking returns only; a
     //      status poll must stay cheap and must not run probes.

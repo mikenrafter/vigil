@@ -1,4 +1,4 @@
-//! The blocking `keepalive` call and the `wait` variant.
+//! The blocking `keepalive` call.
 
 use std::time::Duration;
 
@@ -6,7 +6,7 @@ use tokio::time::Instant;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::attention::{due_reasons, event_for, overdue_at, AttentionReason, LONG_WINDOW_S};
+use crate::attention::{Attention, LONG_WINDOW_S};
 use crate::cache::{choose_window, CacheNote, WindowRequest};
 use crate::clock::Timestamp;
 use crate::credit::CreditCheck;
@@ -15,7 +15,7 @@ use crate::envelope::{cut_digest, ClockNote, Envelope, Next, OtherWatch, Persist
 use crate::error::VigilError;
 use crate::monitor::CreditPlan;
 use crate::tick::{digest_of, is_due, Retained, TickOutcome, TickReport};
-use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId, WatchStatus};
+use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId};
 
 /// CLAIM(S4-outbox): how long a waiting call may sleep before it looks at the
 /// watches' outboxes again. Attention that another process saves (and then
@@ -86,20 +86,6 @@ impl ProgressSink for NoProgress {
     fn progress(&self, _update: &ProgressUpdate) {}
 }
 
-/// Process exit code of `vigil wait` (W6, S3): fired 0, expired 3, cancelled 4,
-/// and 5 for a still-pending envelope that `wait` returned because of an
-/// `attention` or `credit_state_changed` event ("attention; the watch is still
-/// live"). 1 is an error and 2 a usage error (clap); neither is returned here,
-/// and any other pending envelope has no code.
-pub fn wait_exit_code(envelope: &Envelope) -> Option<i32> {
-    match envelope.status {
-        WatchStatus::Fired => Some(0),
-        WatchStatus::Expired => Some(3),
-        WatchStatus::Cancelled => Some(4),
-        WatchStatus::Pending => envelope.events.iter().any(Event::is_call_ending).then_some(5),
-    }
-}
-
 /// A save that needs saying: the watch as the call left it, and how its save
 /// went. Clean saves are not kept (the envelope of a healthy call has no
 /// `persist` field).
@@ -121,7 +107,8 @@ struct CallRecord {
     /// S6: ids of the attention events already in the covered watches' files
     /// when the call began; whatever is returned of them is a redelivery.
     carried: BTreeSet<String>,
-    /// AI5: some covered watch raised attention in this call.
+    /// AI5: some covered watch raised attention in this call (an attention
+    /// pass, or a tick whose hold items ended, W42-H3).
     raised_attention: bool,
     /// AI8: the call's credit event, if the check saw a change (not saved, A18).
     credit_events: Vec<Event>,
@@ -138,6 +125,8 @@ impl CallRecord {
         if report.redelivered {
             self.redelivered.insert(id.clone());
         }
+        // W42-H3: items that ended while their hold stays live are attention.
+        self.raised_attention |= report.raised_attention;
         let Some(watch) = report.after else { return };
         self.note_save(id, watch, report.persisted);
     }
@@ -320,7 +309,7 @@ impl crate::engine::Vigil {
         progress: &dyn ProgressSink,
         cancel: impl std::future::Future<Output = ()>,
     ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
-        let mut outcome = self.blocking_call(request, progress, cancel, true).await?;
+        let mut outcome = self.blocking_call(request, progress, cancel).await?;
         if let Some((envelope, _)) = outcome.as_mut() {
             // CLAIM(advisory-delivery) ↳ every blocking return of keepalive carries `advice`
             envelope.advice = self.envelope_advice().await;
@@ -328,15 +317,13 @@ impl crate::engine::Vigil {
         Ok(outcome)
     }
 
-    /// One blocking call. `remember_call` is whether the watch files record
-    /// this return as "the last call" (AI4): `wait` records only its own final
-    /// return, not the calls it makes inside.
+    /// One blocking call; the watch files record its return as "the last
+    /// call" (AI4).
     async fn blocking_call(
         &self,
         request: KeepaliveRequest,
         progress: &dyn ProgressSink,
         cancel: impl std::future::Future<Output = ()>,
-        remember_call: bool,
     ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
         let covered = self.covered_ids(request.watch_id.as_ref())?;
         let plan = self.plan_call(&request, &covered);
@@ -346,7 +333,7 @@ impl crate::engine::Vigil {
         let finish = async {
             let call = self.sense(&covered, budget_end, progress, &plan).await?;
             let answer = self.keepalive_envelope(&covered, &call, &plan, started.elapsed().as_secs())?;
-            // ↳ CLAIM(DF1a-hold): the one pacing for MCP, CLI keepalive and `wait` [spec DF1a revised, review T1; disk_full_tests a_quiet_tick_that_cannot_save_is_held_for_one_interval_and_not_ticked_again, mcp::tests the_mcp_call_is_held_one_interval_after_a_quiet_failed_save_and_a_cancel_ends_the_hold]
+            // ↳ CLAIM(DF1a-hold): the one pacing for MCP and CLI keepalive [spec DF1a revised, review T1; disk_full_tests a_quiet_tick_that_cannot_save_is_held_for_one_interval_and_not_ticked_again, mcp::tests the_mcp_call_is_held_one_interval_after_a_quiet_failed_save_and_a_cancel_ends_the_hold]
             let answer = match self.hold_after_unsaved_quiet_tick(&answer.0, &call, budget_end) {
                 None => answer,
                 Some(hold) => {
@@ -356,9 +343,7 @@ impl crate::engine::Vigil {
                     self.keepalive_envelope(&covered, &call, &plan, started.elapsed().as_secs())?
                 }
             };
-            if remember_call {
-                self.remember_last_call(&covered, &call, answer.0.now).await;
-            }
+            self.remember_last_call(&covered, &call, answer.0.now).await;
             Ok(answer)
         };
         tokio::select! {
@@ -534,8 +519,8 @@ impl crate::engine::Vigil {
                 let due_at = watch.last_tick_at.map_or(now, |last| last.plus_secs(watch.spec.interval_s));
                 // A due tick the reserve forbids is not waited for; its deadline still is.
                 let wake = if is_due(&watch, now) && self.reserve_blocks(&watch, budget_end) { watch.deadline_at } else { due_at.min(watch.deadline_at) };
-                // AI5: the overdue moment is a wake of its own, however rarely the watch ticks.
-                let wake = overdue_at(&watch).map_or(wake, |overdue| wake.min(overdue.max(now)));
+                // AI5, W42-D2: an overdue moment (the watch's or an item's) is a wake of its own, however rarely the watch ticks.
+                let wake = crate::attention::next_due_at(&watch).map_or(wake, |overdue| wake.min(overdue.max(now)));
                 next_wake = Some(next_wake.map_or(wake, |current| current.min(wake)));
             }
             // AI2' / S2 / S3: the orchestrator's credit check, after the watches
@@ -610,7 +595,8 @@ impl crate::engine::Vigil {
         (!hold.is_zero()).then_some(hold)
     }
 
-    /// AI5 / S6: raise the attention events that are due for `id`, if any.
+    /// AI5 / S6, W42-H3: raise the attention events that are due for `id` (the
+    /// watch's own reasons and its items' overdue), if any.
     /// Cheap when nothing is due (one read, no lock). Otherwise the watch's
     /// lock is taken, the rule is evaluated again under it, and the events are
     /// appended to the watch's outbox together with the once-per-reason flags
@@ -623,7 +609,7 @@ impl crate::engine::Vigil {
     /// An attention that could not be raised in time is still due, so the next
     /// call raises it at once.
     async fn raise_attention(&self, id: &WatchId, long_window: bool, budget_end: Instant, call: &mut CallRecord) -> Result<(), VigilError> {
-        if due_reasons(&self.load_watch(id)?, self.clock.now(), long_window).is_empty() {
+        if crate::attention::due(&self.load_watch(id)?, self.clock.now(), long_window).is_empty() {
             return Ok(());
         }
         // ↳ CLAIM(V2-attention)
@@ -635,8 +621,8 @@ impl crate::engine::Vigil {
             return Ok(());
         }
         let now = self.clock.now();
-        self.forget_unsaved_attention(id, &watch.attention_raised);
-        let due = due_reasons(&watch, now, long_window);
+        self.forget_unsaved_attention(&watch);
+        let due = crate::attention::due(&watch, now, long_window);
         if due.is_empty() {
             return Ok(());
         }
@@ -648,24 +634,25 @@ impl crate::engine::Vigil {
         // auto_interval_tests::an_attention_event_keeps_its_id_when_a_tick_lands_between_a_failed_save_and_the_retry].
         // The remembered ones go in first so a new event's id (counted from
         // what is already there) cannot collide with one of them.
-        let mut raised: Vec<(AttentionReason, Event)> = Vec::new();
-        let mut fresh: Vec<AttentionReason> = Vec::new();
-        for reason in due {
-            match self.unsaved_attention(id, reason) {
-                Some(event) => raised.push((reason, event)),
-                None => fresh.push(reason),
+        let mut raised: Vec<(Attention, Event)> = Vec::new();
+        let mut fresh: Vec<Attention> = Vec::new();
+        for attention in due {
+            match self.unsaved_attention(id, attention) {
+                Some(event) => raised.push((attention, event)),
+                None => fresh.push(attention),
             }
         }
         let any_retried = !raised.is_empty();
-        for (reason, event) in &raised {
+        for (attention, event) in &raised {
             watch.events.push(event.clone());
-            watch.attention_raised.push(*reason);
+            crate::attention::mark_raised(&mut watch, *attention);
         }
-        for reason in fresh {
-            let event = event_for(&watch, reason, now);
+        for attention in fresh {
+            // Built before it is marked: a watch-level id counts the reasons raised before it.
+            let Some(event) = crate::attention::event(&watch, attention, now) else { continue };
             watch.events.push(event.clone());
-            watch.attention_raised.push(reason);
-            raised.push((reason, event));
+            crate::attention::mark_raised(&mut watch, attention);
+            raised.push((attention, event));
         }
         let persisted = self.persist(&watch, Some(budget_end)).await?;
         self.remember_attention_save(id, &raised, &persisted);
@@ -681,62 +668,6 @@ impl crate::engine::Vigil {
     fn reserve_blocks(&self, watch: &WatchFile, budget_end: Instant) -> bool {
         let reserve = tick_reserve(&watch.spec.inputs, matches!(watch.spec.fire, FireRule::Judge { .. }), self.config.judge_timeout);
         budget_end.saturating_duration_since(Instant::now()) < reserve
-    }
-
-    /// `wait_with` for a caller that is not the orchestrator (270 s windows).
-    pub async fn wait(&self, id: &WatchId) -> Result<Envelope, VigilError> {
-        self.wait_with(id, false).await
-    }
-
-    /// `vigil wait` (S1, S3): like keepalive for one watch but with no 270 s
-    /// ceiling: returns when the watch is finished, or when a call ends on an
-    /// `attention` or `credit_state_changed` event (the watch is then still
-    /// pending: exit code 5), with ONE final envelope that holds the whole
-    /// event batch (no streaming, R8/V21). With `orchestrator` the internal
-    /// calls use the TTL-derived window and run the credit checks. The final
-    /// envelope carries `cache` (from its last internal call) and a `clock`
-    /// that measures the whole wait.
-    pub async fn wait_with(&self, id: &WatchId, orchestrator: bool) -> Result<Envelope, VigilError> {
-        let (envelope, delivery) = self.wait_uncommitted(id, orchestrator).await?;
-        self.commit_delivery(delivery);
-        Ok(envelope)
-    }
-
-    /// `wait_with` that leaves its final delivery for the caller to commit once
-    /// the envelope is printed (N3). Intermediate quiet returns are committed
-    /// here: they carry nothing the agent has not got.
-    pub async fn wait_uncommitted(&self, id: &WatchId, orchestrator: bool) -> Result<(Envelope, Delivery), VigilError> {
-        let started = Instant::now();
-        let last_call_before = self.load_watch(id)?.last_call_at;
-        loop {
-            // R2-A2: a plain wait chooses nothing itself (automatic window, the
-            // stored flag decides); `--orchestrator` says so.
-            let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: orchestrator.then_some(true) };
-            let (mut envelope, delivery) = self
-                .blocking_call(request, &NoProgress, std::future::pending::<()>(), false)
-                .await?
-                .expect("a call that cannot be cancelled always finishes");
-            let ends_here = envelope.status.is_finished() || envelope.events.iter().any(Event::is_call_ending);
-            if !ends_here {
-                // DF1a: a pending envelope whose save failed was already held one
-                // interval inside the call (`hold_after_unsaved_quiet_tick`), so
-                // calling again now does not spin on a full disk and `wait` adds
-                // no sleep of its own (that would tick every two intervals).
-                self.commit_delivery(delivery);
-                continue;
-            }
-            envelope.waited_s = None;
-            envelope.max_s = None;
-            let waited_s = started.elapsed().as_secs();
-            let since_last_call_s = last_call_before.map(|at| envelope.now.secs_since(at).max(0) as u64);
-            envelope.clock = Some(ClockNote::new(waited_s, envelope.elapsed_s, since_last_call_s));
-            // CLAIM(advisory-delivery) ↳ the final envelope of `wait` carries `advice`
-            envelope.advice = self.envelope_advice().await;
-            if !envelope.status.is_finished() {
-                self.remember_last_call(std::slice::from_ref(id), &CallRecord::default(), envelope.now).await;
-            }
-            return Ok((envelope, delivery));
-        }
     }
 
     /// The watches a call covers. With an id: that watch (`NotFound` if it
@@ -976,86 +907,6 @@ mod tests {
         }
     }
 
-    fn envelope_with(status: WatchStatus) -> Envelope {
-        Envelope {
-            watch_id: wid("w"),
-            status,
-            now: spec_instant(),
-            tick: 1,
-            session_ticks: 1,
-            elapsed_s: 0,
-            deadline_in_s: 0,
-            waited_s: None,
-            max_s: None,
-            events: vec![],
-            digest: String::new(),
-            judge_status: JudgeStatus::Skipped,
-            next: Next::ActOnEvents,
-            others: vec![],
-            persist: None,
-            persist_failures: vec![],
-            cache: None,
-            clock: None,
-            advice: None,
-        }
-    }
-
-    #[test]
-    fn wait_exit_codes_are_0_fired_3_expired_4_cancelled() {
-        // why: W6 (T2): `vigil wait` exits 0 fired, 1 error, 2 usage (clap),
-        //      3 expired, 4 cancelled. The round-2 mapping (2 expired, 3
-        //      cancelled) made an expired watch indistinguishable from a
-        //      usage error. 1 and 2 are never returned here (an error and a
-        //      usage error have no envelope); a still-pending envelope has no
-        //      exit code. No status may map to 1 or 2.
-        // proves: CLAIM(wait-exit-codes)
-        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Fired)), Some(0));
-        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Expired)), Some(3));
-        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Cancelled)), Some(4));
-        assert_eq!(wait_exit_code(&envelope_with(WatchStatus::Pending)), None);
-        for status in [WatchStatus::Fired, WatchStatus::Expired, WatchStatus::Cancelled] {
-            assert!(!matches!(wait_exit_code(&envelope_with(status)), Some(1 | 2)), "{status:?} must not collide with error (1) or usage (2)");
-        }
-    }
-
-    fn envelope_json(status: &str, next: &str, events: serde_json::Value) -> Envelope {
-        serde_json::from_value(serde_json::json!({
-            "watch_id": "w", "status": status, "now": "2026-10-29T14:03:11Z", "tick": 3, "session_ticks": 1, "elapsed_s": 90,
-            "deadline_in_s": 100, "events": events, "digest": "", "judge_status": "skipped", "next": next,
-        }))
-        .expect("a well-formed envelope")
-    }
-
-    #[test]
-    fn wait_exits_5_for_a_pending_envelope_that_carries_an_attention_or_credit_event() {
-        // why: S3. `vigil wait` returns early on `attention` and
-        //      `credit_state_changed`, with the watch still live; the exit code
-        //      for that is 5 ("attention; the watch is still live"), and 0/3/4
-        //      stay as they are. Table, from the spec: pending + attention -> 5;
-        //      pending + credit_state_changed -> 5; pending + no event -> None
-        //      (wait would not have returned it); a terminal status keeps its
-        //      own code even with an attention event beside it (terminal is
-        //      primary, S10): fired+attention -> 0, expired+credit -> 3. The
-        //      positive control for "kind decides" is the pending envelope with
-        //      an event without a kind: not 5.
-        // proves: CLAIM(S3)
-        let event = |kind: Option<&str>| {
-            let mut event = serde_json::json!({"event_id": "w:3:0", "tick": 3, "watch_id": "w", "input": "", "summary": "s"});
-            if let Some(kind) = kind {
-                event["kind"] = kind.into();
-            }
-            event
-        };
-        let attention = serde_json::json!([event(Some("attention"))]);
-        let credit = serde_json::json!([event(Some("credit_state_changed"))]);
-        assert_eq!(wait_exit_code(&envelope_json("pending", "act on events", attention.clone())), Some(5));
-        assert_eq!(wait_exit_code(&envelope_json("pending", "act on events", credit.clone())), Some(5));
-        assert_eq!(wait_exit_code(&envelope_json("pending", "call keepalive again", serde_json::json!([]))), None);
-        assert_eq!(wait_exit_code(&envelope_json("pending", "act on events", serde_json::json!([event(None)]))), None, "an event with no kind is not attention");
-        assert_eq!(wait_exit_code(&envelope_json("fired", "act on events", attention)), Some(0));
-        assert_eq!(wait_exit_code(&envelope_json("expired", "watch ended; create a new watch if still needed", credit)), Some(3));
-    }
-
     // ---- blocking window (V26) ----
 
     #[tokio::test(start_paused = true)]
@@ -1148,10 +999,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_terminal_result_is_replayed_unchanged_by_every_later_call_with_the_same_event_ids() {
         // why: V3 (S3): the terminal result is stored once and replayed on
-        //      every later keepalive, wait or watch_status; delivery is at
+        //      every later keepalive or watch_status; delivery is at
         //      least once, so a lost reply is recoverable. Fire at tick 2,
         //      then: keepalive (same process), keepalive (new process, later),
-        //      wait, status. Every one returns the identical events (incl.
+        //      status. Every one returns the identical events (incl.
         //      event_id "w:2:0", W1), digest, status, tick and next, instantly.
         //      The old `events_are_returned_once` demanded EMPTY events on the
         //      second call, which loses the event if the first reply was lost.
@@ -1174,7 +1025,6 @@ mod tests {
         let replays = [
             vigil.keepalive(by_id(&id, None)).await.unwrap(),
             restarted.keepalive(by_id(&id, Some(30))).await.unwrap(),
-            restarted.wait(&id).await.unwrap(),
             restarted.status(&id).await.unwrap().envelope,
         ];
         assert_eq!(started.elapsed(), Duration::ZERO, "a finished watch never blocks");
@@ -2049,108 +1899,6 @@ mod tests {
         let tick_reads: Vec<_> = env.reader.reads().into_iter().filter(|r| r.finished.is_some_and(|f| f - r.started == Duration::from_secs(10))).collect();
         assert_eq!(tick_reads.len(), 2, "both reads took 10 s: {:?}", env.reader.reads());
         assert_eq!(tick_reads[0].started, tick_reads[1].started, "the two reads overlapped completely");
-    }
-
-    // ---- wait ----
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_has_no_270_s_ceiling_and_returns_the_fired_envelope() {
-        // why: coordinator scope addition: `vigil wait` blocks with no ceiling
-        //      until the watch fires. The file is written at t=995 s, so with
-        //      20 s ticks the fire is seen at t=1000 s - well past 270.
-        // proves: CLAIM(wait-no-ceiling)
-        let env = paused_env();
-        let vigil = process(&env);
-        let (id, path) = quiet_watch(&env, &vigil, "w", 20, 7200).await;
-        let call = {
-            let (vigil, id) = (vigil.clone(), id.clone());
-            tokio::spawn(async move { vigil.wait(&id).await.unwrap() })
-        };
-        tokio::time::sleep(Duration::from_secs(995)).await;
-        append_file(&path, "done\n");
-        let envelope = call.await.unwrap();
-        assert_eq!(envelope.status, WatchStatus::Fired);
-        assert_eq!(envelope.elapsed_s, 1000);
-        assert_eq!(envelope.events.len(), 1);
-        assert_eq!(wait_exit_code(&envelope), Some(0));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_returns_expired_at_the_deadline() {
-        // why: coordinator scope addition: wait ends on expiry too (exit 3, W6).
-        //      Deadline 500 s, interval 20.
-        let env = paused_env();
-        let vigil = process(&env);
-        let (id, _) = quiet_watch(&env, &vigil, "w", 20, 500).await;
-        let started = Instant::now();
-        let envelope = vigil.wait(&id).await.unwrap();
-        assert_eq!(started.elapsed(), Duration::from_secs(500));
-        assert_eq!(envelope.status, WatchStatus::Expired);
-        assert_eq!(wait_exit_code(&envelope), Some(3));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_returns_cancelled_within_one_interval_of_the_cancel() {
-        // why: coordinator scope addition: wait ends when the watch is
-        //      cancelled (exit 4, W6), noticed on a tick: cancel at t=100 s with
-        //      20 s ticks is seen no later than t=120 s.
-        let env = paused_env();
-        let vigil = process(&env);
-        let (id, _) = quiet_watch(&env, &vigil, "w", 20, 7200).await;
-        let call = {
-            let (vigil, id) = (vigil.clone(), id.clone());
-            tokio::spawn(async move { vigil.wait(&id).await.unwrap() })
-        };
-        tokio::time::sleep(Duration::from_secs(100)).await;
-        env.another_process().cancel(&id).await.unwrap();
-        let envelope = call.await.unwrap();
-        assert_eq!(envelope.status, WatchStatus::Cancelled);
-        assert!((100..=120).contains(&envelope.elapsed_s), "elapsed {}", envelope.elapsed_s);
-        assert_eq!(wait_exit_code(&envelope), Some(4));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_returns_one_final_envelope_holding_the_whole_event_batch() {
-        // why: S21/V21/R8: `wait` has no streaming. Two inputs change in the
-        //      same tick; the single returned envelope carries both events, in
-        //      input order, equal to what is stored. (Replaces the
-        //      `--stream`/EventSink test, whose sink contract is gone.)
-        // proves: CLAIM(wait-final-batch)
-        let env = paused_env();
-        let vigil = process(&env);
-        let first = env.input_path("first.log");
-        let second = env.input_path("second.log");
-        write_file(&first, "a\n");
-        write_file(&second, "b\n");
-        let mut request = change_request("w", &first, 20);
-        request.inputs.push(Input::File { path: second.clone(), tail_bytes: None });
-        let id = vigil.create(request).await.unwrap().watch_id;
-        append_file(&first, "first-new\n");
-        append_file(&second, "second-new\n");
-        let envelope = vigil.wait(&id).await.unwrap();
-        assert_eq!(envelope.status, WatchStatus::Fired);
-        assert_eq!(envelope.events.len(), 2, "the whole batch in one envelope");
-        assert!(envelope.events[0].summary.contains("first-new"), "input order: {:?}", envelope.events);
-        assert!(envelope.events[1].summary.contains("second-new"));
-        assert_eq!(envelope.events, env.vigil.store().load(&id).unwrap().events);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_on_a_finished_watch_returns_at_once_and_unknown_ids_error() {
-        // why: coordinator scope: same watch files as keepalive. A watch that
-        //      already fired must not block `wait`; a typo is an error (exit 1).
-        let env = paused_env();
-        let vigil = process(&env);
-        let (id, _) = quiet_watch(&env, &vigil, "w", 20, 3600).await;
-        vigil.cancel(&id).await.unwrap();
-        let started = Instant::now();
-        let envelope = vigil.wait(&id).await.unwrap();
-        assert_eq!((envelope.status, started.elapsed()), (WatchStatus::Cancelled, Duration::ZERO));
-        assert_eq!(envelope.next, Next::WatchEnded);
-        assert_eq!(
-            vigil.wait(&crate::testing::wid("ghost")).await.unwrap_err(),
-            VigilError::NotFound("ghost".into())
-        );
     }
 
     #[tokio::test(start_paused = true)]

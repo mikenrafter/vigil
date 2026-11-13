@@ -2,11 +2,12 @@
 //! orchestrator is waiting on, so it ends exactly when the work ends and the
 //! agent never re-arms it while work is live.
 //!
-//! This module owns the front door (`Work` specs, `HoldRequest`,
-//! `Vigil::hold`) and the pure readers of qex's output. The rest lives where
-//! the watch machinery lives: `Input::{Qex, QexIdle, PathExists, Until}` and
-//! `FireRule::Hold` in `watch.rs`, their reads in `inputs.rs`, the release in
-//! `tick.rs`.
+//! This module owns the front doors (`Work` specs, `HoldRequest`,
+//! `Vigil::hold`, and W42's `Vigil::hold_add` / `Vigil::hold_done`) and the
+//! pure readers of qex's output. The rest lives where the watch machinery
+//! lives: `Input::{Qex, QexIdle, PathExists, Until}` and `FireRule::Hold` in
+//! `watch.rs`, their reads in `inputs.rs`, the release in `tick.rs`, and the
+//! item model and item events in `items.rs`.
 
 use std::path::PathBuf;
 
@@ -14,8 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Timestamp;
 use crate::engine::{Created, Vigil};
-use crate::error::{CreateError, VigilError};
-use crate::watch::{CreateRequest, FireKind, Input, ProcessWant, MAX_DEADLINE_S};
+use crate::error::{CreateError, ItemError, VigilError};
+use crate::items::{HoldItem, ItemDraft, ItemWork, MAX_ITEMS};
+use crate::watch::{CreateRequest, FireKind, FireRule, Input, ProcessWant, WatchFile, WatchId, MAX_DEADLINE_S};
 
 /// H5: a hold lives this long unless asked for less (the longest any watch lives).
 pub const HOLD_DEADLINE_S: u64 = MAX_DEADLINE_S;
@@ -248,7 +250,8 @@ pub struct HoldRequest {
     pub expect_s: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<bool>,
-    /// W42-H1: the label of the hold's first item (`--label`).
+    /// W42-H1: the label of the hold's one item (`--label`; with one `--for`
+    /// only, D5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
@@ -266,38 +269,112 @@ pub struct HoldItemRequest {
     pub label: Option<String>,
 }
 
-impl Vigil {
-    /// RED STUB (W42-H2): add an item to the live hold `id`. Not implemented.
-    pub async fn hold_add(&self, id: &crate::watch::WatchId, item: HoldItemRequest) -> Result<Created, VigilError> {
-        let _ = item;
-        Err(VigilError::NotFound(format!("{id}: hold items are not implemented")))
-    }
+/// What `hold add` and `hold done` answer: the item as it now stands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemReport {
+    pub watch_id: WatchId,
+    pub label: String,
+    pub added_at: Timestamp,
+    /// Set once `hold done` ended it (a sensed item's end is the tick's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Timestamp>,
+    /// How many items the hold has now.
+    pub items: usize,
+}
 
-    /// RED STUB (W42-H5): end the item `label` of the live hold `id`. Not implemented.
-    pub async fn hold_done(&self, id: &crate::watch::WatchId, label: &str) -> Result<(), VigilError> {
-        Err(VigilError::NotFound(format!("{id}/{label}: hold items are not implemented")))
+impl ItemReport {
+    fn of(watch: &WatchFile, item: &HoldItem) -> ItemReport {
+        ItemReport {
+            watch_id: watch.spec.id.clone(),
+            label: item.label.clone(),
+            added_at: item.added_at,
+            ended_at: item.ended_at,
+            items: watch.items.as_ref().map_or(0, Vec::len),
+        }
     }
 }
 
+/// D4: may `watch` (just loaded under its lock) have its items changed at
+/// `now`? Only a live hold that has items: not another kind of watch, not a
+/// released, cancelled or expired hold (expired by the clock counts before
+/// any keepalive writes it, V16), not a hold stored without items (D6).
+fn check_editable(watch: &WatchFile, now: Timestamp) -> Result<(), ItemError> {
+    let id = watch.spec.id.to_string();
+    if !matches!(watch.spec.fire, FireRule::Hold) {
+        return Err(ItemError::NotAHold(id));
+    }
+    let how = match crate::engine::expired_if_overdue(watch.clone(), now).status {
+        crate::watch::WatchStatus::Pending => None,
+        crate::watch::WatchStatus::Fired => Some("released"),
+        crate::watch::WatchStatus::Expired => Some("expired"),
+        crate::watch::WatchStatus::Cancelled => Some("cancelled"),
+    };
+    if let Some(how) = how {
+        return Err(ItemError::HoldEnded { id, how });
+    }
+    if watch.items.is_none() {
+        return Err(ItemError::NoItems(id));
+    }
+    Ok(())
+}
+
 impl Vigil {
-    /// Create a hold (H1-H5, H10).
-    ///
-    /// Every spec is parsed before anything is read or written. Each `qex` job
-    /// is resolved to its full job id, which is what the hold stores (H3): a
-    /// name reused later cannot make the hold read another job, a job qex does
-    /// not know is refused (a typo must not become a hold), and so is a name
-    /// that is ambiguous.
-    pub async fn hold(&self, request: HoldRequest) -> Result<Created, VigilError> {
-        let mut inputs = request.work.iter().map(|spec| Work::parse(spec).map(Work::into_input)).collect::<Result<Vec<_>, _>>()?;
-        if request.until_idle {
-            inputs.push(Work::Idle(self.cwd.clone()).into_input());
+    /// The input that senses `work`, ready to store: paths absolute (V11),
+    /// a qex job resolved to its full id (H3, D8).
+    async fn sensing_input(&self, work: Work) -> Result<Input, VigilError> {
+        let mut input = work.into_input().absolutize(&self.cwd);
+        if let Input::Qex { job } = &mut input {
+            *job = self.reader.resolve_qex(job).await?;
         }
-        for input in &mut inputs {
-            if let Input::Qex { job } = input {
-                *job = self.reader.resolve_qex(job).await?;
+        Ok(input)
+    }
+
+    /// Create a hold (H1-H5, H10; W42-H1, D5, D6).
+    ///
+    /// Each `--for` spec (and `--until-idle`, as `idle:<cwd>`) is one item,
+    /// with `expect_s` for each and `label` for the one item there may then be
+    /// (D5). Every spec and label is checked before anything is read or
+    /// written. Each `qex` job is resolved to its full job id, which is what
+    /// the hold stores (H3): a name reused later cannot make the hold read
+    /// another job, a job qex does not know is refused (a typo must not
+    /// become a hold), and so is a name that is ambiguous. The hold stores
+    /// `items` (`[]` for a bare hold) and no watch-level `expect_s`.
+    pub async fn hold(&self, request: HoldRequest) -> Result<Created, VigilError> {
+        let count = request.work.len() + usize::from(request.until_idle);
+        if request.label.is_some() && count != 1 {
+            return Err(ItemError::LabelNeedsOneItem(count).into());
+        }
+        if count == 0 && request.expect_s.is_some() {
+            return Err(ItemError::ExpectWithoutItems.into());
+        }
+        if count > MAX_ITEMS {
+            return Err(ItemError::TooManyItems { max: MAX_ITEMS, wanted: count }.into());
+        }
+        let mut drafts = request.work.iter().map(|spec| ItemDraft::parse(spec, request.label.as_deref(), request.expect_s)).collect::<Result<Vec<_>, _>>()?;
+        if request.until_idle {
+            // H10: `idle:<cwd>`, labelled as written; the stored dir is the cwd itself (no lossy round trip).
+            let draft = ItemDraft::parse(&format!("idle:{}", self.cwd.display()), request.label.as_deref(), request.expect_s)?;
+            drafts.push(ItemDraft { work: ItemWork::Sensed(Work::Idle(self.cwd.clone())), ..draft });
+        }
+        for (index, draft) in drafts.iter().enumerate() {
+            if drafts[..index].iter().any(|earlier| earlier.label == draft.label) {
+                return Err(ItemError::DuplicateLabel(draft.label.clone()).into());
             }
         }
-        self.create(CreateRequest {
+        let mut inputs = Vec::new();
+        let mut items = Vec::new();
+        for draft in drafts {
+            let input = match draft.work {
+                ItemWork::Sensed(work) => {
+                    inputs.push(self.sensing_input(work).await?);
+                    Some(inputs.len() - 1)
+                }
+                ItemWork::Unsensed => None,
+            };
+            // `added_at` is set by `create_with_items` to the hold's `created_at`.
+            items.push(HoldItem::new(draft.label, input, draft.expect_s, self.clock.now()));
+        }
+        let request = CreateRequest {
             id: request.id,
             prompt: String::new(),
             inputs,
@@ -306,11 +383,77 @@ impl Vigil {
             fire: FireKind::Hold,
             judge_questions: None,
             judge_rule: None,
-            expect_s: request.expect_s,
+            expect_s: None,
             stall_s: None,
             orchestrator: request.orchestrator,
-        })
-        .await
+        };
+        self.create_with_items(request, Some(items)).await
+    }
+
+    /// W42-H2, D4, D5, D8: add one item to the live hold `id`.
+    ///
+    /// The request is checked first (spec, label, `expect_s`); then, under
+    /// the watch's lock and on the hold as it is then (`lock_and_load`, so a
+    /// concurrent release, `hold done` or add is never overwritten): the hold
+    /// must be live and have items, the item must fit the cap and have a label
+    /// no other item has; a qex name is resolved to its job id. The item's
+    /// overdue clock starts now; a running keepalive senses it from its next
+    /// tick (it reloads the hold at every tick). Refusals write nothing.
+    pub async fn hold_add(&self, id: &WatchId, request: HoldItemRequest) -> Result<ItemReport, VigilError> {
+        let draft = ItemDraft::parse(&request.work, request.label.as_deref(), request.expect_s)?;
+        let (_lock, mut watch) = self.lock_and_load(id).await?;
+        let now = self.clock.now();
+        check_editable(&watch, now)?;
+        let items = watch.items.as_ref().map_or(0, Vec::len);
+        if items >= MAX_ITEMS {
+            return Err(ItemError::TooManyItems { max: MAX_ITEMS, wanted: items + 1 }.into());
+        }
+        if watch.items.iter().flatten().any(|item| item.label == draft.label) {
+            return Err(ItemError::DuplicateLabel(draft.label).into());
+        }
+        let input = match draft.work {
+            ItemWork::Sensed(work) => {
+                let input = self.sensing_input(work).await?;
+                // A placeholder may hold fewer states than inputs; each input keeps its own.
+                watch.input_states.resize(watch.spec.inputs.len(), crate::watch::InputState::default());
+                watch.spec.inputs.push(input);
+                watch.input_states.push(crate::watch::InputState::default());
+                Some(watch.spec.inputs.len() - 1)
+            }
+            ItemWork::Unsensed => None,
+        };
+        let item = HoldItem::new(draft.label, input, draft.expect_s, now);
+        watch.items.get_or_insert_with(Vec::new).push(item.clone());
+        self.store.save_async(&watch).await?;
+        Ok(ItemReport::of(&watch, &item))
+    }
+
+    /// W42-H5, D4, D5: end the `none` item `label` of the live hold `id`.
+    ///
+    /// Under the watch's lock (`lock_and_load`): the hold must be live and
+    /// have items; the item must exist, be a `none` item (a sensed one ends by
+    /// itself) and not have ended. Its `ended_at` is set now; the next tick
+    /// announces `item ended: <label>: done` (and releases the hold if it was
+    /// the last live item). Refusals write nothing.
+    pub async fn hold_done(&self, id: &WatchId, label: &str) -> Result<ItemReport, VigilError> {
+        let (_lock, mut watch) = self.lock_and_load(id).await?;
+        let now = self.clock.now();
+        check_editable(&watch, now)?;
+        let inputs = &watch.spec.inputs;
+        let Some(item) = watch.items.iter_mut().flatten().find(|item| item.label == label) else {
+            return Err(ItemError::UnknownLabel { id: id.to_string(), label: label.to_string() }.into());
+        };
+        if let Some(input) = item.input {
+            let spec = inputs.get(input).map_or_else(|| "an input".to_string(), Input::label);
+            return Err(ItemError::SensedItem { label: item.label.clone(), spec }.into());
+        }
+        if item.ended_at.is_some() {
+            return Err(ItemError::AlreadyEnded(item.label.clone()).into());
+        }
+        item.ended_at = Some(now);
+        let item = item.clone();
+        self.store.save_async(&watch).await?;
+        Ok(ItemReport::of(&watch, &item))
     }
 }
 

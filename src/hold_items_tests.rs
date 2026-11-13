@@ -958,8 +958,9 @@ async fn a_hold_done_waiting_on_the_lock_keeps_an_item_that_was_added_meanwhile(
     let ended = call(&env.vigil, "h", Some(30)).await;
     assert_eq!((ended["status"].as_str(), summaries(&ended)), (Some("pending"), vec!["item ended: t3: done".to_string()]), "{ended}");
     env.reader.set_text("qex:a", "completed");
-    let still = call(&env.vigil, "h", Some(30)).await;
-    assert_eq!(still["status"], "pending", "late (added while done waited) still holds the session: {still}");
+    // 60 s: the call above returned at once on its item event, so the next tick is 30 s away.
+    let still = call(&env.vigil, "h", Some(60)).await;
+    assert_eq!((still["status"].as_str(), summaries(&still)), (Some("pending"), vec!["item ended: build: completed".to_string()]), "late (added while done waited) still holds the session: {still}");
     env.vigil.hold_done(&wid("h"), "late").await.expect("the item added meanwhile is still there");
     assert_eq!(call(&env.vigil, "h", Some(60)).await["status"], "fired");
 }
@@ -988,7 +989,8 @@ async fn a_hold_add_waiting_on_the_lock_keeps_a_done_made_meanwhile() {
     let ended = call(&env.vigil, "h", Some(30)).await;
     assert_eq!((ended["status"].as_str(), summaries(&ended)), (Some("pending"), vec!["item ended: t3: done".to_string()]), "the done made while the add waited survived: {ended}");
     env.reader.set_text("qex:a", "completed");
-    let still = call(&env.vigil, "h", Some(30)).await;
+    // 60 s: the call above returned at once on its item event, so the next tick is 30 s away.
+    let still = call(&env.vigil, "h", Some(60)).await;
     assert_eq!((still["status"].as_str(), summaries(&still)), (Some("pending"), vec!["item ended: build: completed".to_string()]), "b holds the session: {still}");
     env.reader.set_text("qex:b", "completed");
     assert_eq!(call(&env.vigil, "h", Some(60)).await["status"], "fired");

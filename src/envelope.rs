@@ -195,8 +195,8 @@ pub struct Envelope {
     /// when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub persist_failures: Vec<SecondaryFailure>,
-    /// AI3: how the call window was chosen. Only blocking returns (a keepalive,
-    /// and the final envelope of a `wait`, S1); absent from status and cancel.
+    /// AI3: how the call window was chosen. Only blocking returns (a
+    /// keepalive); absent from status and cancel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheNote>,
     /// AI4: how long this call waited and how long the watch has lived.
@@ -213,7 +213,7 @@ pub struct Envelope {
 /// wire, `null` on the first call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClockNote {
-    /// Seconds this call (or this whole `wait`) waited.
+    /// Seconds this call waited.
     pub waited_s: u64,
     /// Seconds since the watch was created (A13: equals `elapsed_s`).
     pub watch_age_s: u64,

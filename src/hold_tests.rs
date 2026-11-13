@@ -415,7 +415,9 @@ async fn until_idle_holds_on_the_creating_directory_and_releases_when_the_queue_
     env.reader.set_text("idle:/work/repo", "idle");
     let released = call(&vigil, "h", Some(60)).await;
     assert_eq!(released["status"], "fired", "{released}");
-    assert_eq!(released["events"][0]["summary"], "hold released: idle:/work/repo idle");
+    // W42-D6/D9: the item ends with its own event; the release counts the items and names them.
+    let summaries: Vec<&str> = released["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert_eq!(summaries, ["item ended: idle:/work/repo: idle", "hold released: 1 item ended (idle:/work/repo)"], "{released}");
 }
 
 #[tokio::test]
@@ -498,7 +500,9 @@ async fn a_hold_made_on_a_name_follows_the_job_it_resolved_to_even_after_the_nam
     env.reader.set_text(&format!("qex:{JOB_ID}"), "completed");
     let released = call(&env.vigil, "h", Some(60)).await;
     assert_eq!(released["status"], "fired", "{released}");
-    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{JOB_ID} completed"));
+    // W42-D6/D9: the item (labelled by its spec as given, `qex:build`) ends with its own event; the release counts the items.
+    let summaries: Vec<&str> = released["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert_eq!(summaries, ["item ended: qex:build: completed", "hold released: 1 item ended (qex:build)"], "{released}");
     assert_eq!(env.reader.started_count("qex:build"), 0, "the name is never read after creation");
 }
 

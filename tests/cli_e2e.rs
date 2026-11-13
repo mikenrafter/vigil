@@ -240,11 +240,11 @@ fn keepalive_subcommand_returns_the_fired_envelope() {
 }
 
 #[test]
-fn a_fired_result_is_replayed_by_status_keepalive_and_wait_with_the_same_event_ids() {
+fn a_fired_result_is_replayed_by_status_and_keepalive_with_the_same_event_ids() {
     // why: V3 (S3): the terminal result is stored once and replayed unchanged
-    //      on every later call, across processes. Four separate `vigil`
-    //      processes (keepalive, then status, keepalive, wait) must print the
-    //      same events with the same event_id and digest, and none may block.
+    //      on every later call, across processes. Three separate `vigil`
+    //      processes (keepalive, then status, keepalive) must print the same
+    //      events with the same event_id and digest, and none may block.
     // proves: CLAIM(terminal-replay)
     let sandbox = Sandbox::new();
     let input = sandbox.input("a.log");
@@ -253,7 +253,7 @@ fn a_fired_result_is_replayed_by_status_keepalive_and_wait_with_the_same_event_i
     let first = stdout_json(&sandbox.run(&["keepalive", "w", "--max-s", "30"]));
     assert_eq!(first["status"], "fired");
     let started = std::time::Instant::now();
-    for args in [vec!["status", "w"], vec!["keepalive", "w", "--max-s", "30"], vec!["wait", "w"]] {
+    for args in [vec!["status", "w"], vec!["keepalive", "w", "--max-s", "30"]] {
         let output = sandbox.run(&args);
         let replay = stdout_json(&output);
         assert_eq!(replay["status"], "fired", "{args:?}");
@@ -586,149 +586,6 @@ fn a_below_floor_digest_env_value_is_raised_to_64_by_the_binary() {
     }
 }
 
-// ---- vigil wait ----
-
-#[test]
-fn wait_exits_0_with_the_fired_envelope_on_stdout() {
-    // why: coordinator scope: `vigil wait <id>` blocks until the watch fires,
-    //      prints the final envelope JSON, exits 0. E2E through the real
-    //      binary and watch files: create via CLI, one write, wait.
-    // proves: CLAIM(wait-exit-codes)
-    let sandbox = Sandbox::new();
-    let input = sandbox.input("a.log");
-    create_via_cli(&sandbox, "w", &input);
-    append_once(&input, "wait-line");
-    let output = finish_within(piped({
-        let mut c = sandbox.command();
-        c.args(["wait", "w"]);
-        c
-    }), Duration::from_secs(5));
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
-    let envelope = stdout_json(&output);
-    assert_eq!(envelope["status"], "fired");
-    assert!(envelope["digest"].as_str().unwrap().contains("wait-line"));
-}
-
-#[test]
-fn wait_prints_one_final_envelope_with_the_whole_event_batch() {
-    // why: S21/V21/R8: `wait` does not stream. Two inputs change before the
-    //      first tick; stdout must be exactly ONE JSON document (one line)
-    //      whose `events` holds both events, in input order, and exit 0.
-    // proves: CLAIM(wait-final-batch)
-    let sandbox = Sandbox::new();
-    let (first, second) = (sandbox.input("one.log"), sandbox.input("two.log"));
-    std::fs::write(&first, "a\n").unwrap();
-    std::fs::write(&second, "b\n").unwrap();
-    let request = serde_json::json!({"id": "w", "inputs": [{"kind": "file", "path": first}, {"kind": "file", "path": second}],
-        "interval_s": 1, "fire": "change"}).to_string();
-    assert!(sandbox.run(&["create", &request]).status.success());
-    append_once(&first, "first-new");
-    append_once(&second, "second-new");
-    let output = finish_within(piped({
-        let mut c = sandbox.command();
-        c.args(["wait", "w"]);
-        c
-    }), Duration::from_secs(5));
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(text.lines().count(), 1, "one final envelope, nothing streamed: {text:?}");
-    let envelope: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-    let events = envelope["events"].as_array().unwrap();
-    assert_eq!(events.len(), 2);
-    assert!(events[0]["summary"].as_str().unwrap().contains("first-new"));
-    assert!(events[1]["summary"].as_str().unwrap().contains("second-new"));
-    assert_eq!((events[0]["event_id"].as_str(), events[1]["event_id"].as_str()), (Some("w:1:0"), Some("w:1:1")), "W1: ids count from 0 within the tick");
-}
-
-#[test]
-fn wait_has_no_stream_flag() {
-    // why: S21/V21: `--stream` is removed (a watch fires once under D1, so a
-    //      stream could only ever print one event). The flag must be refused
-    //      and must not print an envelope. W6 (T2): clap's usage-error exit
-    //      code 2 no longer collides with "expired" (now 3), so the exit code
-    //      is asserted to be exactly 2. This passes in the red phase because
-    //      clap already rejects the flag: deliberate control.
-    let sandbox = Sandbox::new();
-    let output = sandbox.run(&["wait", "w", "--stream"]);
-    assert_eq!(output.status.code(), Some(2), "a usage error is exit 2");
-    assert!(output.stdout.is_empty(), "{:?}", String::from_utf8_lossy(&output.stdout));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--stream"));
-}
-
-#[test]
-fn wait_exits_3_when_the_watch_expires() {
-    // why: W6 (T2): exit 3 = expired (was 2, which is clap's usage-error
-    //      code). deadline_s 1 / interval 1. V20: the envelope carries the
-    //      terminal `next`.
-    // proves: CLAIM(wait-exit-codes)
-    let sandbox = Sandbox::new();
-    let input = sandbox.input("a.log");
-    std::fs::write(&input, "boot\n").unwrap();
-    let request = serde_json::json!({"id": "short", "inputs": [{"kind": "file", "path": input}],
-        "interval_s": 1, "deadline_s": 1, "fire": "change"})
-    .to_string();
-    assert!(sandbox.run(&["create", &request]).status.success());
-    let child = piped({
-        let mut c = sandbox.command();
-        c.args(["wait", "short"]);
-        c
-    });
-    let output = finish_within(child, Duration::from_secs(5));
-    assert_eq!(output.status.code(), Some(3));
-    let envelope = stdout_json(&output);
-    assert_eq!(envelope["status"], "expired");
-    assert_eq!(envelope["next"], "watch ended; create a new watch if still needed");
-}
-
-#[test]
-fn wait_exits_4_when_the_watch_is_cancelled() {
-    // why: W6 (T2): exit 4 = cancelled (was 3); another process cancels the
-    //      watch while `wait` is blocked and wait notices on its next tick.
-    // proves: CLAIM(wait-exit-codes)
-    let sandbox = Sandbox::new();
-    let input = sandbox.input("a.log");
-    create_via_cli(&sandbox, "w", &input);
-    let child = piped({
-        let mut c = sandbox.command();
-        c.args(["wait", "w"]);
-        c
-    });
-    assert!(wait_until(Duration::from_secs(3), || sandbox.watch_file("w").is_some_and(|w| w["tick"].as_u64() >= Some(1))), "wait never ticked");
-    assert!(sandbox.run(&["cancel", "w"]).status.success());
-    let output = finish_within(child, Duration::from_secs(5));
-    assert_eq!(output.status.code(), Some(4));
-    assert_eq!(stdout_json(&output)["status"], "cancelled");
-}
-
-#[test]
-fn wait_on_an_unknown_watch_exits_1() {
-    // why: coordinator scope: 1 = error.
-    let sandbox = Sandbox::new();
-    let output = sandbox.run(&["wait", "ghost"]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(!output.stderr.is_empty());
-}
-
-#[test]
-fn wait_help_lists_every_exit_code() {
-    // why: W6 (T2): the exit codes are a contract for scripts and agents, so
-    //      `vigil wait --help` must state all five, with the new numbers:
-    //      0 fired, 1 error, 2 usage, 3 expired, 4 cancelled (whitespace is
-    //      normalized, so clap's line handling does not matter). The text
-    //      lives in the clap doc comment of `Command::Wait`, which the red
-    //      stub already carries, so this passes in the red phase: deliberate
-    //      control (it fails the moment the doc and the codes drift apart).
-    // proves: CLAIM(wait-exit-codes)
-    let sandbox = Sandbox::new();
-    let output = sandbox.run(&["wait", "--help"]);
-    assert_eq!(output.status.code(), Some(0));
-    let help = String::from_utf8_lossy(&output.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
-    for line in ["0 fired", "1 error", "2 usage", "3 expired", "4 cancelled"] {
-        assert!(help.contains(line), "help is missing {line:?}: {help}");
-    }
-    assert!(!help.contains("2 expired") && !help.contains("3 cancelled"), "stale round-2 codes in the help: {help}");
-}
-
 // ---- code review round 1: C9 (signals), C10 (prune never blocks) ----
 
 /// Start `vigil <args>` on a watch whose next tick hangs in a long-running
@@ -760,14 +617,15 @@ fn signal_stops_vigil_and_its_command_group(args: &[&str], signal: &str, code: i
 }
 
 #[test]
-fn sigterm_to_a_waiting_vigil_exits_143_and_kills_the_command_it_was_running() {
+fn sigterm_to_a_blocked_keepalive_exits_143_and_kills_the_command_it_was_running() {
     // why: code review C9: SIGTERM ended vigil without dropping its futures,
     //      and command inputs run in their own session, so a stopped
-    //      background `vigil wait` left its command tree running with its
-    //      timeout gone. The binary now handles the signal: cancel active
-    //      work, let the command cleanup run, exit 143.
+    //      background vigil (found with the old `vigil wait`, removed in
+    //      W42-W1) left its command tree running with its timeout gone. The
+    //      binary now handles the signal: cancel active work, let the command
+    //      cleanup run, exit 143.
     // proves: CLAIM(signal-cleanup)
-    signal_stops_vigil_and_its_command_group(&["wait", "w"], "-TERM", 143);
+    signal_stops_vigil_and_its_command_group(&["keepalive", "w", "--max-s", "30"], "-TERM", 143);
 }
 
 #[test]
@@ -950,38 +808,6 @@ fn the_next_process_on_a_healthy_disk_reports_the_events_the_full_disk_run_could
     assert!(again.get("persist").is_none(), "{again}");
     assert!(stderr_lines(&output).is_empty(), "{:?}", stderr_lines(&output));
     assert_eq!(sandbox.watch_file("w").unwrap()["status"], "fired");
-}
-
-#[test]
-fn wait_keeps_its_exit_code_when_the_final_save_fails() {
-    // why: DF1: "`wait` keeps its outcome code" (W6: fired 0, expired 3). The
-    //      envelope is printed with persist.ok=false and the exit code is the
-    //      one the outcome decides, not 1. Fired: the change is sensed on the
-    //      first tick. Expired: deadline_s 1, nothing changes. DF1a: the first
-    //      tick cannot save and returns a pending envelope, `wait` sleeps one
-    //      interval (1 s) and calls again, the watch is overdue and the
-    //      expiry write is the one that fails: ONE envelope on stdout, exit 3.
-    //      DF3a: both are terminal statuses that were not saved, so both say
-    //      `redelivery: true`.
-    // proves: CLAIM(DF1), CLAIM(DF1a), CLAIM(DF2), CLAIM(DF3a)
-    let fired = Sandbox::new();
-    change_ready(&fired);
-    let output = run_with(&fired, Some(DISK_STAYS_FULL), &["wait", "w"]);
-    assert_eq!(output.status.code(), Some(0), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
-    let envelope = stdout_json(&output);
-    assert_eq!(envelope["status"], "fired");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &fired.watch_path("w"), true, Some(true));
-
-    let expired = Sandbox::new();
-    let input = expired.input("e.log");
-    std::fs::write(&input, "boot\n").unwrap();
-    let short = serde_json::json!({"id": "e", "prompt": "", "inputs": [{"kind": "file", "path": input}], "interval_s": 1, "deadline_s": 1, "fire": "change"});
-    assert!(expired.run(&["create", &short.to_string()]).status.success());
-    let output = run_with(&expired, Some(DISK_STAYS_FULL), &["wait", "e"]);
-    assert_eq!(output.status.code(), Some(3), "stderr {:?}", String::from_utf8_lossy(&output.stderr));
-    let envelope = stdout_json(&output);
-    assert_eq!(envelope["status"], "expired");
-    assert_failed_persist(&envelope, "disk_full", "No space left on device", &expired.watch_path("e"), true, None);
 }
 
 #[test]
@@ -1385,29 +1211,6 @@ fn codex_is_recognised_from_the_environment_and_gets_the_codex_default() {
 }
 
 #[test]
-fn the_cli_wait_final_envelope_carries_cache_and_clock() {
-    // why: S1 reverses A12. `wait` carries its last cache and total clock.
-    //      Positive control first: a `keepalive` of
-    //      another watch in the same sandbox does carry both.
-    // proves: CLAIM(AI6), CLAIM(S1)
-    let (sandbox, fake_uw) = auto_sandbox(true);
-    assert!(create_with(&sandbox, "k", serde_json::json!({})).status.success());
-    let blocking = fire_and_keepalive(&sandbox, &fake_uw, "k", &[], &[]);
-    assert!(blocking.get("cache").is_some() && blocking.get("clock").is_some(), "{blocking}");
-    assert!(create_with(&sandbox, "w", serde_json::json!({})).status.success());
-    append_once(&sandbox.input("w.log"), "go");
-    let output = finish_within(piped({
-        let mut command = sandbox.command();
-        command.args(["wait", "w"]);
-        command
-    }), Duration::from_secs(10));
-    let envelope = stdout_json(&output);
-    assert_eq!(envelope["status"], "fired");
-    assert_eq!(envelope["cache"], serde_json::json!({"ttl":"unknown", "source":"default", "interval_s":270}));
-    assert!(envelope["clock"]["waited_s"].is_u64(), "{envelope}");
-}
-
-#[test]
 fn creating_a_watch_with_a_zero_expect_s_fails() {
     // why: A16 through the CLI: exit status 1 and a message on stderr, nothing
     //      on stdout. (Engine-level coverage is in auto_interval_tests.)
@@ -1416,76 +1219,6 @@ fn creating_a_watch_with_a_zero_expect_s_fails() {
     let output = create_with(&sandbox, "w", serde_json::json!({"expect_s": 0}));
     assert_eq!(output.status.code(), Some(1), "stdout {:?}", String::from_utf8_lossy(&output.stdout));
     assert!(!output.stderr.is_empty());
-}
-
-#[test]
-fn cli_wait_orchestrator_reports_the_ttl_window_and_checks_credits() {
-    // why: S1/S3. A quiet watch expires after 8s, allowing its credit probe
-    //      to run before expiry. The final envelope must retain both the
-    //      3000s selected TTL window and the real probe result. The deadline
-    //      leaves the probe its full 5s budget plus margin.
-    // proves: CLAIM(S1), CLAIM(S3)
-    let (sandbox, fake_uw) = auto_sandbox(true);
-    assert!(create_with(&sandbox, "w", serde_json::json!({"deadline_s":8})).status.success());
-    let output = finish_within(piped({
-        let mut command = sandbox.command();
-        command.args(["wait", "w", "--orchestrator"]).env("CLAUDE_CODE_SESSION_ID", SESSION).env("VIGIL_UW_COMMAND", fake_uw);
-        command
-    }), Duration::from_secs(11));
-    assert_eq!(output.status.code(), Some(3));
-    let answer = stdout_json(&output);
-    assert_eq!(answer["cache"]["ttl"], "1h");
-    assert_eq!(answer["cache"]["credit_check"]["on_credits"], false);
-    assert_eq!(answer["cache"]["interval_s"], 3000);
-    assert!(answer["clock"]["waited_s"].is_u64());
-}
-
-#[test]
-fn cli_wait_attention_exits_5_and_leaves_the_watch_pending() {
-    // why: S3. An unchanged watch with expect_s=2 is overdue after 3 whole
-    //      seconds. wait must deliver attention and exit 5; looping until
-    //      expiry would exit 3, and prematurely ending the watch is wrong.
-    // proves: CLAIM(S3)
-    let (sandbox, fake_uw) = auto_sandbox(true);
-    assert!(create_with(&sandbox, "w", serde_json::json!({"expect_s":2, "deadline_s":5})).status.success());
-    let output = finish_within(piped({
-        let mut command = sandbox.command();
-        command.args(["wait", "w"]).env("VIGIL_UW_COMMAND", fake_uw);
-        command
-    }), Duration::from_secs(7));
-    assert_eq!(output.status.code(), Some(5), "{}", String::from_utf8_lossy(&output.stderr));
-    let answer = stdout_json(&output);
-    assert_eq!(answer["status"], "pending");
-    assert_eq!(answer["next"], "act on events");
-    assert_eq!(answer["events"].as_array().unwrap().len(), 1);
-    assert_eq!(answer["events"][0]["kind"], "attention");
-    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
-}
-
-#[test]
-fn cli_wait_orchestrator_credit_change_exits_5_and_reaches_the_agent() {
-    // why: S3/S2. Persisted off baseline + a real fake-uw answering on.
-    //      Only wait --orchestrator checks this short 5m session. CLI stdout
-    //      carries the change, exit 5, while the watch remains pending.
-    // proves: CLAIM(S3), CLAIM(S2)
-    let (sandbox, fake_uw) = auto_sandbox(false);
-    vigil::testing::write_script(&fake_uw, "echo '{\"usage\":[{\"provider\":\"ClaudeCode\",\"windows\":[{\"window\":\"weekly\",\"exceeded\":true}]}]}'");
-    assert!(create_with(&sandbox, "w", serde_json::json!({"deadline_s":8})).status.success());
-    std::fs::write(sandbox.state_root().join("credit-state.json"), r#"{"on_credits":false,"checked_at":"2020-01-01T00:00:00Z"}"#).unwrap();
-    let output = finish_within(piped({
-        let mut command = sandbox.command();
-        command.args(["wait", "w", "--orchestrator"]).env("CLAUDE_CODE_SESSION_ID", SESSION).env("VIGIL_UW_COMMAND", fake_uw);
-        command
-    }), Duration::from_secs(11));
-    assert_eq!(output.status.code(), Some(5));
-    let answer = stdout_json(&output);
-    assert_eq!(answer["status"], "pending");
-    assert_eq!(answer["events"].as_array().unwrap().len(), 1);
-    assert_eq!(answer["events"][0]["kind"], "credit_state_changed");
-    assert_eq!(answer["events"][0]["on_credits"], true);
-    assert_eq!(answer["cache"]["interval_s"], 270);
-    assert_eq!(answer["cache"]["credit_check"]["on_credits"], true);
-    assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
 }
 
 #[test]
@@ -1721,24 +1454,13 @@ fn hold_on_a_finished_qex_job_releases_at_the_first_keepalive_and_says_why() {
     assert!(envelope.status.success(), "{}", String::from_utf8_lossy(&envelope.stderr));
     let envelope = stdout_json(&envelope);
     assert_eq!((envelope["status"].as_str(), envelope["next"].as_str()), (Some("fired"), Some("act on events")), "{envelope}");
-    let event = &envelope["events"][0];
-    assert_eq!((event["input"].as_str(), event["summary"].as_str()), (Some("hold"), Some(format!("hold released: qex:{J1} completed").as_str())), "{envelope}");
+    // W42-D6/D9: the item's own `item ended` (attention), then the release
+    // (ordinary), which counts the items and names their labels.
+    let (item, event) = (&envelope["events"][0], &envelope["events"][1]);
+    assert_eq!((item["kind"].as_str(), item["summary"].as_str()), (Some("attention"), Some(format!("item ended: {J1_SPEC}: completed").as_str())), "{envelope}");
+    assert_eq!((event["input"].as_str(), event["summary"].as_str()), (Some("hold"), Some(format!("hold released: 1 item ended ({J1_SPEC})").as_str())), "{envelope}");
     assert!(event.get("kind").is_none());
     assert!(qex.calls().contains(&format!("status {J1} --json --no-logs")), "{:?}", qex.calls());
-}
-
-#[test]
-fn wait_on_a_hold_exits_0_when_its_work_has_ended() {
-    // why: H6: `vigil wait` is the no-model-calls way to hold; a release is a
-    //      fire, exit 0, the same envelope.
-    // proves: CLAIM(H6)
-    let sandbox = Sandbox::new();
-    let qex = FakeQex::new(&sandbox);
-    qex.set_job(J1, "failed");
-    assert!(run_with_qex(&sandbox, &qex, &["hold", "--id", "w", "--for", J1_SPEC]).status.success());
-    let output = run_with_qex(&sandbox, &qex, &["wait", "w"]);
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(stdout_json(&output)["events"][0]["summary"], format!("hold released: qex:{J1} failed"));
 }
 
 #[test]
@@ -1801,7 +1523,9 @@ fn a_bare_hold_and_until_idle_are_holds_on_nothing_and_on_the_cwd() {
     assert_eq!(sandbox.watch_file("idle").unwrap()["inputs"], serde_json::json!([{"kind": "qex_idle", "dir": cwd}]));
     let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "idle"]));
     assert_eq!(envelope["status"], "fired", "{envelope}");
-    assert_eq!(envelope["events"][0]["summary"], format!("hold released: idle:{} idle", cwd.display()));
+    // W42-D6/D9: the item's own event, then the release naming it.
+    let summaries: Vec<&str> = envelope["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert_eq!(summaries, [format!("item ended: idle:{}: idle", cwd.display()), format!("hold released: 1 item ended (idle:{})", cwd.display())], "{envelope}");
     assert!(qex.calls().contains(&format!("list --under {} --state active --json", cwd.display())), "{:?}", qex.calls());
 }
 
@@ -1831,7 +1555,7 @@ fn a_hold_defaults_to_the_orchestrator_window_and_hold_orchestrator_false_turns_
 
 #[test]
 fn the_cli_help_documents_hold_and_the_orchestrator_flag() {
-    // why: the `--orchestrator` flag exists on `keepalive` and `wait` (AI1')
+    // why: the `--orchestrator` flag exists on `keepalive` (AI1')
     //      but an old vigil in a user profile once shadowed it, and agents
     //      could not find it. The help text of the binary in use must name it
     //      (and say it is for the main session), and `hold` and its options
@@ -1841,7 +1565,6 @@ fn the_cli_help_documents_hold_and_the_orchestrator_flag() {
     for (args, needles) in [
         (&["--help"][..], &["hold"][..]),
         (&["keepalive", "--help"], &["--orchestrator", "main"]),
-        (&["wait", "--help"], &["--orchestrator"]),
         (&["hold", "--help"], &["--for", "--until-idle", "--id", "--deadline-s", "--orchestrator"]),
     ] {
         let output = sandbox.run(args);
@@ -1906,7 +1629,9 @@ fn a_hold_on_a_job_whose_record_is_cleaned_before_the_next_tick_releases() {
     qex.set_removed(J1);
     let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30"]));
     assert_eq!((released["status"].as_str(), released["next"].as_str()), (Some("fired"), Some("act on events")), "{released}");
-    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{J1} gone"));
+    // W42-D6/D9: the item ends `gone`, then the release.
+    let summaries: Vec<&str> = released["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert_eq!(summaries, [format!("item ended: {J1_SPEC}: gone"), format!("hold released: 1 item ended ({J1_SPEC})")], "{released}");
 }
 
 #[test]
@@ -1929,7 +1654,9 @@ fn a_hold_made_on_a_name_stores_the_job_id_and_survives_the_name_being_reused() 
     qex.set_job(J1, "completed");
     let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30"]));
     assert_eq!(released["status"], "fired", "{released}");
-    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{J1} completed"));
+    // W42-D6/D9: the item is labelled by its spec as given (`qex:nightly`); the stored input is the id.
+    let summaries: Vec<&str> = released["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert_eq!(summaries, ["item ended: qex:nightly: completed", "hold released: 1 item ended (qex:nightly)"], "{released}");
     let by_name = qex.calls().iter().filter(|call| call.starts_with("status nightly")).count();
     assert_eq!(by_name, 1, "only the creation asked by name: {:?}", qex.calls());
 

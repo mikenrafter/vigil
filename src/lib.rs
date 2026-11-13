@@ -3,7 +3,8 @@
 //!
 //! Module map: `watch`/`store`/`tick` (watches and their files), `keepalive`
 //! (the blocking call), `cache` (call window from the prompt-cache TTL),
-//! `attention` (early wake rules), `credit` + `monitor` (the orchestrator's
+//! `attention` (early wake rules), `hold` + `items` (holds and their work
+//! items), `credit` + `monitor` (the orchestrator's
 //! credit check and hook), `advisory`/`advisory_store`/`advisory_eval` (rules
 //! that tell agents what to do, on every envelope), `envelope` (what the agent reads), `mcp` (the
 //! server front), `fault`/`meter`/`testing` (test seams).
@@ -24,6 +25,7 @@ pub mod error;
 pub mod fault;
 pub mod hold;
 pub mod inputs;
+pub mod items;
 pub mod judge;
 pub mod meter;
 pub(crate) mod monitor;
@@ -41,9 +43,9 @@ pub use clock::{Clock, SystemClock, Timestamp};
 pub use config::Config;
 pub use engine::Vigil;
 pub use envelope::{Envelope, Next, OtherWatch, PersistFailure, PersistNote, SecondaryFailure};
-pub use error::{CreateError, FailureKind, StoreError, VigilError};
+pub use error::{CreateError, FailureKind, ItemError, StoreError, VigilError};
 pub use fault::{Attempt, FaultPlan, FaultRule, Stage, WriteKind};
-pub use hold::{HoldRequest, Work};
+pub use hold::{HoldItemRequest, HoldRequest, ItemReport, Work};
 pub use judge::{Answer, Answers, Judge, JudgeError, JudgeRequest, JudgeRule, RuleTest};
 pub use keepalive::{KeepaliveRequest, ProgressSink};
 pub use store::{Store, StoreLock, WatchLock, WriteOutcome};

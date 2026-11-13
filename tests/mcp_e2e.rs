@@ -779,7 +779,9 @@ async fn the_hold_tool_holds_on_qex_work_and_a_keepalive_releases_it_with_the_re
     assert_eq!((created["watch_id"].as_str(), created["status"].as_str()), (Some("h"), Some("pending")));
     let released = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h"})).await);
     assert_eq!((released["status"].as_str(), released["next"].as_str()), (Some("fired"), Some("act on events")), "{released}");
-    assert_eq!(released["events"][0]["summary"], format!("hold released: qex:{J1} completed"));
+    // W42-D6/D9: the item's own event, then the release that counts and names the items.
+    let summaries: Vec<&str> = released["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
+    assert_eq!(summaries, [format!("item ended: qex:{J1}: completed"), format!("hold released: 1 item ended (qex:{J1})")], "{released}");
 
     let bare = call(peer, "hold", serde_json::json!({"id": "bare"})).await;
     assert_ne!(bare.is_error, Some(true), "{bare:?}");

@@ -7,11 +7,17 @@
 //! (keepalive.rs) turns each due reason into an event, persists it with the
 //! watch and delivers it like any other event.
 //!
+//! W42-H3: a hold's items raise their own `overdue` (per item, once, from the
+//! item's own clock, `items.rs`); [`Attention`] names either kind, and
+//! [`due`], [`next_due_at`], [`event`], [`mark_raised`] are the one entry the
+//! keepalive loop uses for both.
+//!
 //! Invariants: a reason is raised at most once per watch (`attention_raised`
-//! is saved together with the event, S6); a finished watch raises nothing
-//! (A15); `Stalled` needs a process input that the last tick saw running.
+//! is saved together with the event, S6), an item's overdue at most once per
+//! item (`overdue_raised`, D3); a finished watch raises nothing (A15);
+//! `Stalled` needs a process input that the last tick saw running.
 //! Mating parts: `tick.rs` (keeps `Activity`), `watch::WatchFile` (stores the
-//! flags and the event until it is acknowledged).
+//! flags and the event until it is acknowledged), `items.rs` (item clocks).
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +40,90 @@ pub enum AttentionReason {
     Overdue,
     /// Nothing changed for `stall_s` while its process input still runs.
     Stalled,
+}
+
+/// The wire `reason` of an attention event: a watch-level reason, or W42-H3
+/// `ended` (an item of a hold ended; an item's own overdue is `overdue`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventReason {
+    Overdue,
+    Stalled,
+    Ended,
+}
+
+impl From<AttentionReason> for EventReason {
+    fn from(reason: AttentionReason) -> EventReason {
+        match reason {
+            AttentionReason::Overdue => EventReason::Overdue,
+            AttentionReason::Stalled => EventReason::Stalled,
+        }
+    }
+}
+
+/// One attention event a watch can owe its agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Attention {
+    /// A watch-level reason (the watch's own `expect_s` / `stall_s`, AI5).
+    Watch(AttentionReason),
+    /// Item `index` of a hold ran past its own `expect_s` (W42-H3, D2).
+    ItemOverdue(usize),
+}
+
+/// Every attention due for `watch` at `now`: the watch-level reasons (as
+/// [`due_reasons`]), then each item that is overdue, in item order.
+pub fn due(watch: &WatchFile, now: Timestamp, long_window: bool) -> Vec<Attention> {
+    let mut due: Vec<Attention> = due_reasons(watch, now, long_window).into_iter().map(Attention::Watch).collect();
+    if watch.status == WatchStatus::Pending {
+        for (index, item) in watch.items.iter().flatten().enumerate() {
+            if crate::items::overdue_at(item).is_some_and(|at| now >= at) {
+                due.push(Attention::ItemOverdue(index));
+            }
+        }
+    }
+    due
+}
+
+/// The earliest moment an overdue (the watch's or an item's) can still come
+/// due: a wake of its own however rarely the watch ticks (AI5, D2).
+pub fn next_due_at(watch: &WatchFile) -> Option<Timestamp> {
+    if watch.status != WatchStatus::Pending {
+        return None;
+    }
+    let items = watch.items.iter().flatten().filter_map(crate::items::overdue_at);
+    overdue_at(watch).into_iter().chain(items).min()
+}
+
+/// The event for `attention` (watch-level: [`event_for`]; an item: its
+/// `item overdue: <label>`, CLAIM(item-event-id)).
+pub fn event(watch: &WatchFile, attention: Attention, now: Timestamp) -> Option<Event> {
+    match attention {
+        Attention::Watch(reason) => Some(event_for(watch, reason, now)),
+        Attention::ItemOverdue(index) => {
+            let item = watch.items.as_ref()?.get(index)?;
+            Some(crate::items::overdue_event(&watch.spec.id, watch.tick, index, item))
+        }
+    }
+}
+
+/// Record that `attention` was raised, so it is never raised again.
+pub fn mark_raised(watch: &mut WatchFile, attention: Attention) {
+    match attention {
+        Attention::Watch(reason) => watch.attention_raised.push(reason),
+        Attention::ItemOverdue(index) => {
+            if let Some(item) = watch.items.as_mut().and_then(|items| items.get_mut(index)) {
+                item.overdue_raised = true;
+            }
+        }
+    }
+}
+
+/// Is `attention` already raised in `watch` (by this process or another)?
+pub fn is_raised(watch: &WatchFile, attention: Attention) -> bool {
+    match attention {
+        Attention::Watch(reason) => watch.attention_raised.contains(&reason),
+        Attention::ItemOverdue(index) => watch.items.as_ref().and_then(|items| items.get(index)).is_some_and(|item| item.overdue_raised),
+    }
 }
 
 /// What the ticks have seen so far, kept in the watch file so a new process
@@ -117,7 +207,7 @@ pub fn event_for(watch: &WatchFile, reason: AttentionReason, now: Timestamp) -> 
         summary: crate::tick::cap_bytes(&summary, MAX_SUMMARY_BYTES),
         judge: None,
         redelivered: false,
-        detail: Some(EventDetail::Attention { reason: Some(reason) }),
+        detail: Some(EventDetail::Attention { reason: Some(reason.into()) }),
     }
 }
 

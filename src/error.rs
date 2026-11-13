@@ -208,10 +208,55 @@ pub struct WriteFailure<'a> {
     pub first_error: Option<&'a str>,
 }
 
+/// Why `vigil hold` / `hold add` / `hold done` refused to make or change a
+/// hold's items (W42; `items.rs`). Every refusal changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ItemError {
+    /// Items belong to holds only.
+    #[error("watch {0} is not a hold; `hold add` and `hold done` change holds made with `vigil hold`")]
+    NotAHold(String),
+    /// W42-H2, D4: the hold was released, cancelled or has expired (an expired
+    /// hold counts even before a keepalive writes it, V16).
+    #[error("hold {id} has ended ({how}); nothing keeps it alive any more, make a new hold")]
+    HoldEnded { id: String, how: &'static str },
+    /// D6: a hold stored without items (an older vigil's, or `watch_create`'s).
+    #[error("hold {0} has no items (made by watch_create or an older vigil); make a new hold with `vigil hold`")]
+    NoItems(String),
+    /// D5: items count toward the input cap.
+    #[error("a hold has at most {max} items, and this one would have {wanted}")]
+    TooManyItems { max: usize, wanted: usize },
+    /// D5: labels are unique per hold (an unlabelled item is labelled by its spec).
+    #[error("this hold already has an item labelled {0:?}; labels are unique per hold, give --label")]
+    DuplicateLabel(String),
+    /// D5: `--label` names one item.
+    #[error("--label names one item, but {0} were given; use one --for with --label, and `hold add` for more")]
+    LabelNeedsOneItem(usize),
+    /// W42-H5: only `hold done <id> <label>` ends a `none` item, so it needs a label.
+    #[error("a `none` item needs a --label: only `vigil hold done <id> <label>` ends it")]
+    NoneNeedsLabel,
+    /// An explicit label that cannot be shown in a one-line event.
+    #[error("invalid label {label:?}: {reason}")]
+    InvalidLabel { label: String, reason: &'static str },
+    /// D5: `--expect-s` applies to each item; a hold with no work has none.
+    #[error("expect_s applies to each item, and a bare hold has none; add items with `vigil hold add <id> --for ... --expect-s N`")]
+    ExpectWithoutItems,
+    /// W42-H5: `hold done` names an item that is not there.
+    #[error("hold {id} has no item labelled {label:?}")]
+    UnknownLabel { id: String, label: String },
+    /// D5: a sensed item ends by itself; `hold done` is for `none` items.
+    #[error("item {label:?} is sensed ({spec}) and ends by itself; `hold done` ends only `none` items")]
+    SensedItem { label: String, spec: String },
+    /// D5: `done` on an item that has already ended.
+    #[error("item {0:?} already ended")]
+    AlreadyEnded(String),
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum VigilError {
     #[error(transparent)]
     Create(#[from] CreateError),
+    #[error(transparent)]
+    Item(#[from] ItemError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("watch {0} not found")]
