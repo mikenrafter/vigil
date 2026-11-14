@@ -49,13 +49,18 @@ pub struct CapStatus {
     pub review_limit: usize,
 }
 
+/// The items of `class` that still hold a slot (W46-K5).
+fn live_items(items: &[HoldItem], class: CapClass) -> impl Iterator<Item = &HoldItem> {
+    items.iter().filter(move |item| item.cap == Some(class) && item.ended_at.is_none())
+}
+
 impl CapLimits {
     fn limit(&self, class: CapClass) -> usize {
         match class { CapClass::Work => self.work.get(), CapClass::Review => self.review.get() }
     }
 
     pub(crate) fn status(&self, items: &[HoldItem]) -> CapStatus {
-        let live = |class| items.iter().filter(|item| item.cap == Some(class) && item.ended_at.is_none()).count();
+        let live = |class| live_items(items, class).count();
         CapStatus { work: live(CapClass::Work), work_limit: self.work.get(), review: live(CapClass::Review), review_limit: self.review.get() }
     }
 
@@ -63,23 +68,31 @@ impl CapLimits {
     /// [spec K3; w46_two_racing_work_adds_have_exactly_one_winner_at_limit_one].
     /// `labels` is the new batch; creation checks every initial item together.
     pub(crate) fn admit(&self, class: CapClass, items: &[HoldItem], labels: &[&str]) -> Result<(), ItemError> {
-        let live: Vec<_> = items.iter().filter(|item| item.cap == Some(class) && item.ended_at.is_none()).collect();
+        let live: Vec<_> = live_items(items, class).collect();
         let limit = self.limit(class);
         if live.len().saturating_add(labels.len()) <= limit {
             return Ok(());
         }
+        // The smallest limit that admits the whole batch. With nothing live this is a
+        // creation: nothing is running, so there is nothing to wait for.
+        let needed = live.len().saturating_add(labels.len());
         let (prefix, adjective, settings) = match class {
-            CapClass::Work => ("agent", "working", format!("--work {}", limit.saturating_add(1))),
-            CapClass::Review => ("reviewer", "reviewing", format!("--work {} --review {}", self.work, limit.saturating_add(1))),
+            CapClass::Work => ("agent", "working", format!("--work {needed}")),
+            CapClass::Review => ("reviewer", "reviewing", format!("--work {} --review {needed}", self.work)),
         };
-        let names: Vec<_> = if live.is_empty() { labels.to_vec() } else { live.iter().map(|item| item.label.as_str()).collect() };
-        let count = if live.is_empty() { labels.len() } else { live.len() };
-        Err(ItemError::CapReached(format!("{prefix} cap reached: {count} {adjective} Claude runs (cap {limit}): {}. Wait for one to end, or the owner raises it: vigil cap set {settings} --until <time>", names.join(", "))))
+        let (names, count, way_out) = if live.is_empty() {
+            (labels.to_vec(), labels.len(), "The owner raises it")
+        } else {
+            (live.iter().map(|item| item.label.as_str()).collect(), live.len(), "Wait for one to end, or the owner raises it")
+        };
+        Err(ItemError::CapReached(format!("{prefix} cap reached: {count} {adjective} Claude runs (cap {limit}): {}. {way_out}: vigil cap set {settings} --until <time>", names.join(", "))))
     }
 }
 
 impl Vigil {
     /// W46-K2: read on every operation so expiry needs no reset or daemon.
+    /// A file that cannot be parsed is `Corrupt` and names the way out; admission
+    /// fails closed on it, while displays and `cap set` do not need it (S1).
     pub fn cap_limits(&self) -> Result<CapLimits, VigilError> {
         let path = self.store.root().join("cap.json");
         let bytes = match std::fs::read(&path) {
@@ -87,11 +100,12 @@ impl Vigil {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(CapLimits::default()),
             Err(error) => return Err(StoreError::io(error).into()),
         };
-        let limits: CapLimits = serde_json::from_slice(&bytes).map_err(|error| StoreError::Corrupt(format!("{}: {error}", path.display())))?;
+        let limits: CapLimits = serde_json::from_slice(&bytes).map_err(|error| StoreError::Corrupt(format!("{}: {error}; the owner can replace it with `vigil cap reset`", path.display())))?;
         Ok(if limits.source == CapSource::Owner && limits.until.is_some_and(|until| until > self.clock.now()) { limits } else { CapLimits::default() })
     }
 
-    /// Shell-only owner control. Omitted review keeps the effective review limit.
+    /// Shell-only owner control. Omitted review keeps the effective review limit
+    /// (the default when cap.json cannot be read: this call replaces that file).
     pub async fn cap_set(&self, work: NonZeroUsize, review: Option<NonZeroUsize>, until: Timestamp) -> Result<CapLimits, VigilError> {
         if until <= self.clock.now() {
             return Err(ItemError::CapUntil.into());
@@ -100,7 +114,7 @@ impl Vigil {
         if until <= self.clock.now() {
             return Err(ItemError::CapUntil.into());
         }
-        let limits = CapLimits { work, review: review.unwrap_or(self.cap_limits()?.review), until: Some(until), source: CapSource::Owner };
+        let limits = CapLimits { work, review: review.unwrap_or_else(|| self.cap_limits().map_or(CapLimits::default().review, |current| current.review)), until: Some(until), source: CapSource::Owner };
         crate::store::write_atomic(&self.store.root().join("cap.json"), &limits)?;
         Ok(limits)
     }

@@ -2106,7 +2106,7 @@ fn w46_creation_counts_all_initial_classed_items_before_writing() {
     // why: W46-K3 applies the default limit to every initial --for item, not just subsequent adds; a refused creation names a limit that admits the whole batch, says nothing about waiting (nothing is running), and leaves no lock file.
     // catches: bypassing admission at hold creation, creating a partial hold before refusing, suggesting `--work 2` for three items, telling the owner to wait on creation, or leaving a stray `<id>.lock`.
     let sandbox = Sandbox::new();
-    let refused = sandbox.run(&["hold", "--id", "h", "--for", "pid:1", "--for", "until:2099-01-01T00:00:00Z", "--for", "none", "--label", "x", "--cap", "work"]);
+    let refused = sandbox.run(&["hold", "--id", "h", "--for", "pid:1", "--for", "pid:2", "--for", "until:2099-01-01T00:00:00Z", "--cap", "work"]);
     assert_eq!(refused.status.code(), Some(1), "{refused:?}");
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("agent cap reached"), "{refused:?}");

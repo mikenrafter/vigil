@@ -244,6 +244,9 @@ pub enum ItemError {
     /// D5: `--expect-s` applies to each item; a hold with no work has none.
     #[error("expect_s applies to each item, and a bare hold has none; add items with `vigil hold add <id> --for ... --expect-s N`")]
     ExpectWithoutItems,
+    /// W46-K1: `--cap` classes each item; a hold with no items has nothing to class.
+    #[error("cap applies to each item, and a bare hold has none; add items with `vigil hold add <id> --for ... --cap work`")]
+    CapWithoutItems,
     /// W42-H5: `hold done` names an item that is not there.
     #[error("hold {id} has no item labelled {label:?}; its items are: {labels}")]
     UnknownLabel { id: String, label: String, labels: String },

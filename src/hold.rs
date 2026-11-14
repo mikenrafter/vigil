@@ -353,6 +353,9 @@ impl Vigil {
         if count == 0 && request.expect_s.is_some() {
             return Err(ItemError::ExpectWithoutItems.into());
         }
+        if count == 0 && request.cap.is_some() {
+            return Err(ItemError::CapWithoutItems.into());
+        }
         if count > MAX_ITEMS {
             return Err(ItemError::TooManyItems { max: MAX_ITEMS, wanted: count }.into());
         }

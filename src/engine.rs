@@ -285,12 +285,9 @@ impl Vigil {
             return Err(CreateError::JudgeUnreachable.into());
         }
         let id = spec.id.clone();
-        let _watch_lock = self.lock_watch(&id).await?;
-        let mut watch = WatchFile::new(spec, self.clock.now());
-        watch.items = items.map(|items| items.into_iter().map(|item| crate::items::HoldItem { added_at: watch.created_at, ..item }).collect());
-        // W46-K3: check every initial classed item while owning the hold lock,
-        // before reserving the id or writing any part of the hold.
-        if let Some(items) = &watch.items {
+        // W46-K3: check every initial classed item before the hold's lock file or id
+        // exist or any part of it is written. A new hold has no items to race with.
+        if let Some(items) = &items {
             if items.iter().any(|item| item.cap.is_some()) {
                 let limits = self.cap_limits()?;
                 for class in [crate::cap::CapClass::Work, crate::cap::CapClass::Review] {
@@ -299,6 +296,9 @@ impl Vigil {
                 }
             }
         }
+        let _watch_lock = self.lock_watch(&id).await?;
+        let mut watch = WatchFile::new(spec, self.clock.now());
+        watch.items = items.map(|items| items.into_iter().map(|item| crate::items::HoldItem { added_at: watch.created_at, ..item }).collect());
         {
             // X3: the global lock only covers the id check and the placeholder
             // write that reserves the id; the baseline is read after it is gone.
@@ -368,8 +368,9 @@ impl Vigil {
     /// the watches this process created that are still pending. Naming an
     /// unknown id does not stop the others: it goes into `errors` and the call
     /// still returns `Ok` (W46-C6; callers turn `errors` into exit 1 or a tool
-    /// error). A cancel that could not be saved goes into `warnings` (W46-C7). `pending` is read
-    /// after the cancels, so it lists what is still live in the state root.
+    /// error). A cancel that could not be saved goes into `warnings` (W46-C7) and
+    /// not into `cancelled`: the file still says pending. `pending` is read after
+    /// the cancels, so it lists what is still live in the state root.
     pub async fn cold(&self, ids: Option<Vec<WatchId>>) -> Result<ColdReport, VigilError> {
         let ids = match ids {
             Some(ids) => ids,
@@ -393,8 +394,7 @@ impl Vigil {
                 Ok((was_pending, envelope)) => {
                     if let Some(PersistNote::NotSaved { failure, .. }) = &envelope.persist {
                         warnings.push(format!("{id}: could not save cancellation to {}: {}", failure.path.display(), failure.error));
-                    }
-                    if was_pending && envelope.status == WatchStatus::Cancelled {
+                    } else if was_pending && envelope.status == WatchStatus::Cancelled {
                         cancelled.push(id);
                     }
                 }
@@ -643,7 +643,9 @@ impl Vigil {
         // `status` neither delivers nor acknowledges them, so it shows none.
         let events = if terminal { self.replayed_events(watch) } else { Vec::new() };
         let cap = match watch.items.as_deref() {
-            Some(items) if items.iter().any(|item| item.cap.is_some()) => Some(self.cap_limits()?.status(items)),
+            // S1: a cap.json that cannot be read must not break a display or a cancel; the
+            // counts are left out (admission still refuses, naming `vigil cap reset`).
+            Some(items) if items.iter().any(|item| item.cap.is_some()) => self.cap_limits().ok().map(|limits| limits.status(items)),
             _ => None,
         };
         Ok(Envelope {

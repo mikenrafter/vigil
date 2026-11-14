@@ -999,7 +999,9 @@ Proof: `src/hold_items_tests.rs`, `tests/cli_e2e.rs`, `tests/mcp_e2e.rs` (tests 
   defaults are 1/1, null, `default`. `cap set --work N [--review M] --until RFC3339`
   stores an atomic owner override in the state root. Expiry is required and must
   be future (past: exit 2); on expiry the next read uses defaults. `cap reset`
-  restores defaults. MCP has no cap setter.
+  restores defaults. MCP has no cap setter. A `cap.json` that cannot be read
+  fails admission and `vigil cap` (the error names `vigil cap reset`); keepalive,
+  status, cancel and `cap set` do not depend on it (status leaves `cap` out).
 - **Admission (W46-K3).** Under the hold lock, a classed add at its class limit
   fails (CLI exit 1, MCP tool error), leaves the file unchanged, and names the
   live runs, cap, and owner command to raise it. Work errors begin `agent cap
@@ -1009,7 +1011,8 @@ Proof: `src/hold_items_tests.rs`, `tests/cli_e2e.rs`, `tests/mcp_e2e.rs` (tests 
   carry `{cap: {work, work_limit, review, review_limit}}` when the hold has any
   classed item. With none, the key is absent and envelope bytes are unchanged.
 - **Scope and release (W46-K5).** Counts are per hold; other holds do not count.
-  An item ended by `hold done` or sensing immediately frees its class slot.
+  An item ended by `hold done` frees its class slot at once. One ended by
+  sensing frees it at the next tick, which is when `ended_at` is recorded.
 - **Empty cold ids (W46-C5).** MCP `cold {watch_ids: []}` cancels nothing and
   returns the instruction and pending ids; only an absent list means mine.
 - **Mixed cold ids (W46-C6).** Valid ids are cancelled even beside unknown ids;
