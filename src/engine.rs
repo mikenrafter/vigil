@@ -48,6 +48,10 @@ pub struct ColdReport {
     pub cancelled: Vec<WatchId>,
     pub pending: Vec<WatchId>,
     pub next: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,6 +80,8 @@ pub struct ItemStatus {
     pub label: String,
     /// `live` or `ended`.
     pub state: ItemState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<crate::cap::CapClass>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +288,17 @@ impl Vigil {
         let _watch_lock = self.lock_watch(&id).await?;
         let mut watch = WatchFile::new(spec, self.clock.now());
         watch.items = items.map(|items| items.into_iter().map(|item| crate::items::HoldItem { added_at: watch.created_at, ..item }).collect());
+        // W46-K3: check every initial classed item while owning the hold lock,
+        // before reserving the id or writing any part of the hold.
+        if let Some(items) = &watch.items {
+            if items.iter().any(|item| item.cap.is_some()) {
+                let limits = self.cap_limits()?;
+                for class in [crate::cap::CapClass::Work, crate::cap::CapClass::Review] {
+                    let labels: Vec<_> = items.iter().filter(|item| item.cap == Some(class)).map(|item| item.label.as_str()).collect();
+                    limits.admit(class, &[], &labels)?;
+                }
+            }
+        }
         {
             // X3: the global lock only covers the id check and the placeholder
             // write that reserves the id; the baseline is read after it is gone.
@@ -320,9 +337,9 @@ impl Vigil {
     pub async fn status(&self, id: &WatchId) -> Result<StatusReport, VigilError> {
         let now = self.clock.now();
         let watch = expired_if_overdue(self.load_watch(id)?, now);
-        let envelope = self.envelope_for(&watch, now);
+        let envelope = self.envelope_for(&watch, now)?;
         let items = watch.items.as_ref().map(|items| {
-            items.iter().map(|item| ItemStatus { label: item.label.clone(), state: if item.ended_at.is_some() { ItemState::Ended } else { ItemState::Live } }).collect()
+            items.iter().map(|item| ItemStatus { label: item.label.clone(), cap: item.cap, state: if item.ended_at.is_some() { ItemState::Ended } else { ItemState::Live } }).collect()
         });
         Ok(StatusReport { envelope, judge_reachable: self.judge.healthy().await, items })
     }
@@ -349,7 +366,7 @@ impl Vigil {
 
     /// `vigil cold` / MCP `cold` (W45-C1, C2). Cancels `ids`, or with `None`
     /// the watches this process created that are still pending. Naming an
-    /// unknown id is an error before anything is cancelled. `pending` is read
+    /// unknown id is an error after valid ids are cancelled (W46-C6). `pending` is read
     /// after the cancels, so it lists what is still live in the state root.
     pub async fn cold(&self, ids: Option<Vec<WatchId>>) -> Result<ColdReport, VigilError> {
         let ids = match ids {
@@ -359,19 +376,31 @@ impl Vigil {
                 created
             }
         };
-        for id in &ids {
-            self.store.load(id)?;
-        }
         let mut cancelled = Vec::new();
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
         for id in ids {
-            let was_pending = !self.store.load(&id)?.status.is_finished();
-            let envelope = self.cancel(&id).await?;
-            if was_pending && envelope.status == WatchStatus::Cancelled {
-                cancelled.push(id);
+            // W46-C6: an unknown id must not prevent cancellation of valid ids.
+            let result = async {
+                let was_pending = !self.store.load(&id)?.status.is_finished();
+                let envelope = self.cancel(&id).await?;
+                Ok::<_, VigilError>((was_pending, envelope))
+            }
+            .await;
+            match result {
+                Ok((was_pending, envelope)) => {
+                    if let Some(PersistNote::NotSaved { failure, .. }) = &envelope.persist {
+                        warnings.push(format!("{id}: could not save cancellation to {}: {}", failure.path.display(), failure.error));
+                    }
+                    if was_pending && envelope.status == WatchStatus::Cancelled {
+                        cancelled.push(id);
+                    }
+                }
+                Err(error) => errors.push(error.to_string()),
             }
         }
         let pending = self.list().await?.into_iter().filter(|w| w.status == WatchStatus::Pending).map(|w| w.id).collect();
-        Ok(ColdReport { cancelled, pending, next: COLD_NEXT })
+        Ok(ColdReport { cancelled, pending, next: COLD_NEXT, warnings, errors })
     }
 
     /// `watch_cancel`. Cancel on an already finished watch returns the stored
@@ -397,7 +426,7 @@ impl Vigil {
             watch.finish(terminal).expect("a pending watch accepts its terminal result");
             persisted = self.persist(&watch, None).await?;
         }
-        let mut envelope = self.envelope_for(&watch, now);
+        let mut envelope = self.envelope_for(&watch, now)?;
         // A cancel's envelope always has a terminal status: at risk if unsaved.
         envelope.persist = persisted.note(true);
         Ok(envelope)
@@ -556,7 +585,7 @@ impl Vigil {
         }
     }
 
-    async fn lock_global(&self) -> Result<StoreLock, VigilError> {
+    pub(crate) async fn lock_global(&self) -> Result<StoreLock, VigilError> {
         loop {
             if let Some(lock) = self.store.try_lock_async().await? {
                 return Ok(lock);
@@ -603,7 +632,7 @@ impl Vigil {
     /// `waited_s` / `max_s`. A terminal envelope carries the stored events
     /// and `last_digest` cut to the configured bound (V14, V27); a pending
     /// one has no digest (V14: that is built per blocking call).
-    pub(crate) fn envelope_for(&self, watch: &WatchFile, now: Timestamp) -> Envelope {
+    pub(crate) fn envelope_for(&self, watch: &WatchFile, now: Timestamp) -> Result<Envelope, VigilError> {
         let end = watch.finished_at.unwrap_or(now);
         let terminal = watch.status.is_finished();
         // Before the literal: the session lock taken for `session_ticks` below
@@ -611,7 +640,11 @@ impl Vigil {
         // S6: a pending watch's file holds only the outbox of attention events;
         // `status` neither delivers nor acknowledges them, so it shows none.
         let events = if terminal { self.replayed_events(watch) } else { Vec::new() };
-        Envelope {
+        let cap = match watch.items.as_deref() {
+            Some(items) if items.iter().any(|item| item.cap.is_some()) => Some(self.cap_limits()?.status(items)),
+            _ => None,
+        };
+        Ok(Envelope {
             watch_id: watch.spec.id.clone(),
             status: watch.status,
             now,
@@ -635,7 +668,8 @@ impl Vigil {
             cache: None,
             clock: None,
             advice: None,
-        }
+            cap,
+        })
     }
 }
 

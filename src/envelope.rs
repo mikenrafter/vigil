@@ -207,6 +207,9 @@ pub struct Envelope {
     /// list means "on, nothing configured".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice: Option<Vec<crate::advisory_eval::Advice>>,
+    /// W46-K4: absent unless the hold contains classed items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<crate::cap::CapStatus>,
 }
 
 /// The envelope's `clock` (AI4). `since_last_call_s` is always present on the
@@ -313,6 +316,7 @@ mod tests {
             cache: None,
             clock: None,
             advice: None,
+            cap: None,
         }
     }
 

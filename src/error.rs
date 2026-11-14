@@ -212,6 +212,10 @@ pub struct WriteFailure<'a> {
 /// hold's items (W42; `items.rs`). Every refusal changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ItemError {
+    #[error("{0}")]
+    CapReached(String),
+    #[error("cap --until must be a future RFC3339 time")]
+    CapUntil,
     /// Items belong to holds only.
     #[error("watch {0} is not a hold; `hold add` and `hold done` change holds made with `vigil hold`")]
     NotAHold(String),

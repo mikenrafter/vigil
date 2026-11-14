@@ -33,6 +33,11 @@ enum Command {
     /// the ids still pending. With no ids it cancels nothing: the CLI cannot
     /// tell which watches are this session's.
     Cold { ids: Vec<String> },
+    /// Read or set the owner's expiring Claude run limits (default work/review: 1/1).
+    Cap {
+        #[command(subcommand)]
+        command: Option<CapCommand>,
+    },
     /// Block up to --max-s (30..=270) and print the envelope JSON.
     Keepalive {
         id: String,
@@ -73,6 +78,9 @@ enum Command {
 
 #[derive(Debug, clap::Args)]
 struct HoldArgs {
+    /// Count every initial item as a Claude work or review run; omit for uncounted work.
+    #[arg(long, value_enum)]
+    cap: Option<vigil::cap::CapClass>,
     #[arg(long)]
     id: Option<String>,
     /// One item of work to wait on (repeatable): qex:JOB, pid:N, file:PATH,
@@ -113,9 +121,27 @@ enum HoldItemCommand {
         /// Seconds this item should take; one `item overdue` event after 1.5x.
         #[arg(long)]
         expect_s: Option<u64>,
+        /// Count this item as a Claude work or review run; omit for uncounted work.
+        #[arg(long, value_enum)]
+        cap: Option<vigil::cap::CapClass>,
     },
     /// End the `none` item LABEL of the live hold ID (a T3 delegate finished).
     Done { id: String, label: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum CapCommand {
+    /// Set positive limits until a required future RFC3339 time.
+    Set {
+        #[arg(long)]
+        work: std::num::NonZeroUsize,
+        #[arg(long)]
+        review: Option<std::num::NonZeroUsize>,
+        #[arg(long)]
+        until: chrono::DateTime<chrono::FixedOffset>,
+    },
+    /// Restore work/review limits to 1/1.
+    Reset,
 }
 
 #[derive(Debug, Subcommand)]
@@ -264,12 +290,12 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&vigil.create(request).await?)?;
             Ok(0)
         }
-        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator } } => {
-            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label }).await?)?;
+        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator, cap } } => {
+            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label, cap }).await?)?;
             Ok(0)
         }
-        Command::Hold { item: Some(HoldItemCommand::Add { id, work, label, expect_s }), .. } => {
-            print_json(&vigil.hold_add(&WatchId::parse(&id)?, vigil::HoldItemRequest { work, expect_s, label }).await?)?;
+        Command::Hold { item: Some(HoldItemCommand::Add { id, work, label, expect_s, cap }), .. } => {
+            print_json(&vigil.hold_add(&WatchId::parse(&id)?, vigil::HoldItemRequest { work, expect_s, label, cap }).await?)?;
             Ok(0)
         }
         Command::Hold { item: Some(HoldItemCommand::Done { id, label }), .. } => {
@@ -286,7 +312,28 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Cold { ids } => {
             let ids = ids.iter().map(|id| WatchId::parse(id)).collect::<Result<Vec<_>, _>>()?;
-            print_json(&vigil.cold(Some(ids)).await?)?;
+            let report = vigil.cold(Some(ids)).await?;
+            print_json(&report)?;
+            for warning in &report.warnings { eprintln!("vigil: warning: {warning}"); }
+            for error in &report.errors { eprintln!("vigil: {error}"); }
+            Ok(if report.errors.is_empty() { 0 } else { 1 })
+        }
+        Command::Cap { command } => {
+            let limits = match command {
+                None => vigil.cap_limits()?,
+                Some(CapCommand::Reset) => vigil.cap_reset().await?,
+                Some(CapCommand::Set { work, review, until }) => {
+                    match vigil.cap_set(work, review, vigil::Timestamp(until.with_timezone(&chrono::Utc))).await {
+                        Ok(limits) => limits,
+                        Err(vigil::VigilError::Item(vigil::ItemError::CapUntil)) => {
+                            eprintln!("vigil: cap --until must be a future RFC3339 time");
+                            return Ok(2);
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            };
+            print_json(&limits)?;
             Ok(0)
         }
         Command::Keepalive { id, max_s, orchestrator } => {

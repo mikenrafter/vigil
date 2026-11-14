@@ -53,6 +53,9 @@ pub const NONE_SPEC: &str = "none";
 pub struct HoldItem {
     /// Unique in the hold. `--label`, else the `--for` spec as given (D5).
     pub label: String,
+    /// W46-K1: absent means uncounted, including items stored by older vigil.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<crate::cap::CapClass>,
     /// Index of the input in `spec.inputs` that senses this item; absent for
     /// a `none` item, which only `hold done` ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,7 +138,7 @@ fn checked_label(label: &str) -> Result<String, ItemError> {
 impl HoldItem {
     /// A live item added at `added_at`, sensed by `spec.inputs[input]` if any.
     pub fn new(label: String, input: Option<usize>, expect_s: Option<u64>, added_at: Timestamp) -> HoldItem {
-        HoldItem { label, input, expect_s, added_at, ended_at: None, overdue_raised: false, last_end_event: None }
+        HoldItem { label, cap: None, input, expect_s, added_at, ended_at: None, overdue_raised: false, last_end_event: None }
     }
 }
 

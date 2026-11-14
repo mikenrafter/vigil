@@ -254,6 +254,9 @@ pub struct HoldRequest {
     /// only, D5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// W46-K1: class every requested item; omitted items are uncounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<crate::cap::CapClass>,
 }
 
 /// W42-H2: one item to add to a live hold (`vigil hold add`, MCP `hold_add`).
@@ -267,6 +270,9 @@ pub struct HoldItemRequest {
     pub expect_s: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// W46-K1: class every requested item; omitted items are uncounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<crate::cap::CapClass>,
 }
 
 /// What `hold add` and `hold done` answer: the item as it now stands.
@@ -372,7 +378,9 @@ impl Vigil {
                 ItemWork::Unsensed => None,
             };
             // `added_at` is set by `create_with_items` to the hold's `created_at`.
-            items.push(HoldItem::new(draft.label, input, draft.expect_s, self.clock.now()));
+            let mut item = HoldItem::new(draft.label, input, draft.expect_s, self.clock.now());
+            item.cap = request.cap;
+            items.push(item);
         }
         let request = CreateRequest {
             id: request.id,
@@ -411,6 +419,10 @@ impl Vigil {
         if watch.items.iter().flatten().any(|item| item.label == draft.label) {
             return Err(ItemError::DuplicateLabel(draft.label).into());
         }
+        // ↳ CLAIM(W46-K3): lock_and_load above still owns the hold lock.
+        if let Some(class) = request.cap {
+            self.cap_limits()?.admit(class, watch.items.as_deref().unwrap_or_default(), &[&draft.label])?;
+        }
         let input = match draft.work {
             ItemWork::Sensed(work) => {
                 let input = self.sensing_input(work).await?;
@@ -422,7 +434,8 @@ impl Vigil {
             }
             ItemWork::Unsensed => None,
         };
-        let item = HoldItem::new(draft.label, input, draft.expect_s, now);
+        let mut item = HoldItem::new(draft.label, input, draft.expect_s, now);
+        item.cap = request.cap;
         watch.items.get_or_insert_with(Vec::new).push(item.clone());
         self.store.save_async(&watch).await?;
         Ok(ItemReport::of(&watch, &item))

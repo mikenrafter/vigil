@@ -758,7 +758,7 @@ impl crate::engine::Vigil {
         let delivered: Vec<WatchId> =
             finished.iter().map(|watch| watch.spec.id.clone()).filter(|id| call.unsaved_watch(id).is_none()).collect();
 
-        let mut envelope = self.envelope_for(&primary, now);
+        let mut envelope = self.envelope_for(&primary, now)?;
         // Not yet recorded: the caller commits once the envelope is really
         // handed over (C2). The count shown already includes this return.
         envelope.session_ticks += 1;

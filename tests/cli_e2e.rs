@@ -704,9 +704,10 @@ fn sigterm_to_vigil_create_waiting_on_stdin_exits_143() {
     assert!(wait_until(Duration::from_secs(3), handled), "vigil never installed its SIGTERM handler");
     // ... and only once some thread is parked in a pipe read (stdin): a
     // signal that lands earlier is seen by the runtime before the read starts.
+    // Boat's Linux 6.8 calls this wait channel pipe_read; newer kernels use anon_pipe_read.
     let reading_stdin = || {
         std::fs::read_dir(format!("/proc/{}/task", child.id())).is_ok_and(|tasks| {
-            tasks.flatten().any(|task| std::fs::read_to_string(task.path().join("wchan")).is_ok_and(|wchan| wchan.trim() == "anon_pipe_read"))
+            tasks.flatten().any(|task| std::fs::read_to_string(task.path().join("wchan")).is_ok_and(|wchan| matches!(wchan.trim(), "anon_pipe_read" | "pipe_read")))
         })
     };
     assert!(wait_until(Duration::from_secs(3), reading_stdin), "vigil never blocked reading stdin");
@@ -2047,7 +2048,7 @@ fn w46_cli_cap_classes_are_stored_and_refusal_is_atomic_and_instructive() {
     let before = sandbox.watch_bytes("h");
     for (class, expected) in [
         ("work", "agent cap reached: 1 working Claude runs (cap 1): first. Wait for one to end, or the owner raises it: vigil cap set --work 2 --until <time>"),
-        ("review", "reviewer cap reached: 1 reviewing Claude runs (cap 1): reviewer. Wait for one to end, or the owner raises it: vigil cap set --review 2 --until <time>"),
+        ("review", "reviewer cap reached: 1 reviewing Claude runs (cap 1): reviewer. Wait for one to end, or the owner raises it: vigil cap set --work 1 --review 2 --until <time>"),
     ] {
         let refused = sandbox.run(&["hold", "add", "h", "--for", "none", "--label", "blocked", "--cap", class]);
         assert_eq!(refused.status.code(), Some(1), "{refused:?}");

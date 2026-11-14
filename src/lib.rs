@@ -16,6 +16,7 @@ pub mod advisory_ops;
 pub mod advisory_store;
 pub mod attention;
 pub mod cache;
+pub mod cap;
 pub mod clock;
 pub mod config;
 pub mod credit;

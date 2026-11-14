@@ -39,7 +39,7 @@ fn wid(id: &str) -> WatchId {
 }
 
 fn item(work: &str, expect_s: Option<u64>, label: Option<&str>) -> HoldItemRequest {
-    HoldItemRequest { work: work.into(), expect_s, label: label.map(String::from) }
+    HoldItemRequest { work: work.into(), expect_s, label: label.map(String::from), cap: None }
 }
 
 /// `hold_add` that must succeed, failing by assertion (not by unwrap) so a
@@ -1222,7 +1222,7 @@ async fn w46_unclassed_hold_envelope_remains_byte_identical() {
     let env = rig();
     env.vigil.hold(first_item("none", "sol", None)).await.unwrap();
     let watch = watch_file(&env.vigil, "h");
-    let bytes = serde_json::to_string(&env.vigil.envelope_for(&watch, watch.created_at)).unwrap();
+    let bytes = serde_json::to_string(&env.vigil.envelope_for(&watch, watch.created_at).unwrap()).unwrap();
     let expected = r#"{"watch_id":"h","status":"pending","now":"2026-10-29T14:03:11Z","tick":0,"session_ticks":0,"elapsed_s":0,"deadline_in_s":604800,"events":[],"digest":"","judge_status":"skipped","next":"call keepalive again"}"#;
     assert_eq!(bytes, expected);
     let quiet = call(&env.vigil, "h", Some(30)).await;

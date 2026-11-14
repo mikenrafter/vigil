@@ -119,6 +119,8 @@ pub struct HoldArgs {
     pub expect_s: Option<u64>,
     /// Whether keepalive calls for this hold are the main session's (default true).
     pub orchestrator: Option<bool>,
+    /// Count each initial item as a working or reviewing Claude run; omit for uncounted work.
+    pub cap: Option<crate::cap::CapClass>,
 }
 
 /// `hold_add` arguments (W42-H2): one item per call.
@@ -135,6 +137,8 @@ pub struct HoldAddArgs {
     pub expect_s: Option<u64>,
     /// Name of the item (default: its spec). Unique per hold.
     pub label: Option<String>,
+    /// Count this item as a working or reviewing Claude run; omit for uncounted work.
+    pub cap: Option<crate::cap::CapClass>,
 }
 
 /// `hold_done` arguments (W42-H5, D7).
@@ -358,14 +362,22 @@ impl VigilServer {
         })
     }
 
-    #[tool(description = "Going cold (your work is done): cancels the named watch_ids, or with none the watches this server created, and returns what to do next (post an inline BabelTele summary, end your turn) plus the ids still pending.")]
+    #[tool(description = "Going cold (your work is done): cancels the named watch_ids (an empty list cancels nothing), or with watch_ids omitted the watches this server created, and returns what to do next (post an inline BabelTele summary, end your turn) plus the ids still pending.")]
     async fn cold(&self, Parameters(args): Parameters<ColdArgs>) -> Result<CallToolResult, ErrorData> {
         let ids = match args.watch_ids {
-            Some(ids) if !ids.is_empty() => ids.iter().map(|raw| parse_id(raw)).collect::<Result<Vec<_>, _>>().map(Some),
+            Some(ids) => ids.iter().map(|raw| parse_id(raw)).collect::<Result<Vec<_>, _>>().map(Some),
             _ => Ok(None),
         };
         Ok(match ids {
-            Ok(ids) => reply(self.vigil.cold(ids).await),
+            Ok(ids) => match self.vigil.cold(ids).await {
+                Ok(report) => {
+                    let is_error = !report.errors.is_empty();
+                    let mut result = reply(Ok(report));
+                    result.is_error = Some(is_error);
+                    result
+                }
+                Err(error) => reply::<()>(Err(error)),
+            },
             Err(error) => reply::<()>(Err(error)),
         })
     }
@@ -380,6 +392,7 @@ impl VigilServer {
             expect_s: args.expect_s,
             orchestrator: args.orchestrator,
             label: args.label,
+            cap: args.cap,
         };
         Ok(tokio::select! {
             biased;
@@ -391,7 +404,7 @@ impl VigilServer {
     #[tool(description = "Add one item of work to a live hold (for: one spec, or \"none\" with a label for a T3 delegate). The same keepalive on the hold covers it; it raises \"item ended\" when it ends and \"item overdue\" past 1.5x expect_s.")]
     async fn hold_add(&self, Parameters(args): Parameters<HoldAddArgs>) -> Result<CallToolResult, ErrorData> {
         Ok(match parse_id(&args.watch_id) {
-            Ok(id) => reply(self.vigil.hold_add(&id, crate::hold::HoldItemRequest { work: args.work, expect_s: args.expect_s, label: args.label }).await),
+            Ok(id) => reply(self.vigil.hold_add(&id, crate::hold::HoldItemRequest { work: args.work, expect_s: args.expect_s, label: args.label, cap: args.cap }).await),
             Err(error) => reply::<()>(Err(error)),
         })
     }
