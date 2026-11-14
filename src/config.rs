@@ -52,6 +52,9 @@ pub struct Config {
     pub advisories_file: Option<PathBuf>,
     /// `$HOME`, for the default advisory's absolute `boat` path.
     pub home: Option<String>,
+    /// Orchestrator mode asks for the day's token (owner 2026-11-14,
+    /// `orchestrator.rs`). Off only in this crate's own test sandboxes.
+    pub orchestrator_confirm: bool,
 }
 
 impl Config {
@@ -90,6 +93,7 @@ impl Config {
                     .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".config/vigil/advisories.toml"))),
             },
             home: non_empty("HOME"),
+            orchestrator_confirm: lookup("VIGIL_ORCHESTRATOR_CONFIRM").as_deref() != Some("off"),
         }
     }
 }

@@ -67,6 +67,9 @@ pub struct KeepaliveRequest {
     /// watch that stores it makes a no-id call an orchestrator call).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<bool>,
+    /// The day's token, from the challenge (`orchestrator.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
 }
 
 /// One best-effort progress notification (SPEC delivery path 2, V18).
@@ -333,6 +336,8 @@ impl crate::engine::Vigil {
         cancel: impl std::future::Future<Output = ()>,
     ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
         let covered = self.covered_ids(request.watch_id.as_ref())?;
+        let orchestrator = self.gate_orchestrator(request.orchestrator, request.confirm.as_deref(), &covered)?;
+        let request = KeepaliveRequest { orchestrator, ..request };
         let plan = self.plan_call(&request, &covered);
         let max_s = plan.window.interval_s;
         let started = Instant::now();
@@ -888,11 +893,11 @@ mod tests {
     }
 
     fn by_id(id: &crate::watch::WatchId, max_s: Option<u64>) -> KeepaliveRequest {
-        KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator: None }
+        KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator: None, confirm: None }
     }
 
     fn no_id(max_s: Option<u64>) -> KeepaliveRequest {
-        KeepaliveRequest { watch_id: None, max_s, orchestrator: None }
+        KeepaliveRequest { watch_id: None, max_s, orchestrator: None, confirm: None }
     }
 
     async fn quiet_watch(env: &Env, vigil: &Vigil, id: &str, interval_s: u64, deadline_s: u64) -> (crate::watch::WatchId, std::path::PathBuf) {

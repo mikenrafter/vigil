@@ -41,6 +41,7 @@ pub fn default_config() -> Config {
         credit_check_every: Duration::from_secs(240),
         credit_hook_timeout: Duration::from_secs(10),
         advisories_file: None,
+        orchestrator_confirm: false,
         home: None,
     }
 }
@@ -664,6 +665,7 @@ pub fn change_request(id: &str, path: &Path, interval_s: u64) -> CreateRequest {
         expect_s: None,
         stall_s: None,
         orchestrator: None,
+        confirm: None,
     }
 }
 
@@ -693,6 +695,7 @@ pub fn judge_request(id: &str, path: &Path, interval_s: u64) -> CreateRequest {
         expect_s: None,
         stall_s: None,
         orchestrator: None,
+        confirm: None,
     }
 }
 

@@ -267,6 +267,9 @@ pub struct CreateRequest {
     /// AI1' (A8): store "keepalive calls for this watch are the orchestrator's".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<bool>,
+    /// The day's token, needed with an explicit `orchestrator: true` (`orchestrator.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
 }
 
 /// The fire rule with its data: judge fields exist only for `Judge`, so an

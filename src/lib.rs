@@ -29,6 +29,7 @@ pub mod inputs;
 pub mod items;
 pub mod judge;
 pub mod meter;
+pub mod orchestrator;
 pub(crate) mod monitor;
 pub(crate) mod process;
 pub mod keepalive;

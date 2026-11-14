@@ -728,6 +728,7 @@ mod tests {
             expect_s: None,
             stall_s: None,
             orchestrator: None,
+            confirm: None,
         }
     }
 

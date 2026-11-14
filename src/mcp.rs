@@ -86,6 +86,9 @@ pub struct CreateArgs {
     /// session's (the same as passing `orchestrator: true` to keepalive).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<bool>,
+    /// The token an orchestrator challenge gave; only with orchestrator: true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
     /// fire = judge: Laya questions keyed by id, types noul, choice, score.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<serde_json::Map<String, Value>>")]
@@ -119,6 +122,8 @@ pub struct HoldArgs {
     pub expect_s: Option<u64>,
     /// Whether keepalive calls for this hold are the main session's (default true).
     pub orchestrator: Option<bool>,
+    /// The token an orchestrator challenge gave; only with orchestrator: true.
+    pub confirm: Option<String>,
     /// Count each initial item as a working or reviewing Claude run; omit for uncounted work.
     pub cap: Option<crate::cap::CapClass>,
 }
@@ -159,6 +164,8 @@ pub struct KeepaliveArgs {
     pub max_s: Option<u64>,
     /// True only for the main orchestrator session; a subagent never sets it.
     pub orchestrator: Option<bool>,
+    /// The token an orchestrator challenge gave; only with orchestrator: true.
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -393,6 +400,7 @@ impl VigilServer {
             orchestrator: args.orchestrator,
             label: args.label,
             cap: args.cap,
+            confirm: args.confirm,
         };
         Ok(tokio::select! {
             biased;
@@ -430,7 +438,7 @@ impl VigilServer {
             Ok(id) => id,
             Err(error) => return Ok(reply::<()>(Err(error))),
         };
-        let request = KeepaliveRequest { watch_id, max_s: args.max_s, orchestrator: args.orchestrator };
+        let request = KeepaliveRequest { watch_id, max_s: args.max_s, orchestrator: args.orchestrator, confirm: args.confirm };
         let token = ctx.meta.get_progress_token();
         let outcome = run_keepalive(&self.vigil, request, ctx.ct.cancelled(), |update| {
             let peer = ctx.peer.clone();
@@ -558,7 +566,7 @@ mod tests {
         write_file(&path, "old\n");
         env.vigil.create(change_request("w", &path, 20)).await.unwrap();
         let started = tokio::time::Instant::now();
-        let call = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: None }, std::future::pending::<()>(), |_update| std::future::pending::<()>());
+        let call = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: None, confirm: None }, std::future::pending::<()>(), |_update| std::future::pending::<()>());
         let envelope = tokio::time::timeout(std::time::Duration::from_secs(60), call)
             .await
             .expect("the result was held back by a progress notification that never completes")
@@ -586,11 +594,11 @@ mod tests {
         env.vigil.create(change_request("w", &path, 20)).await.unwrap();
         append_file(&path, "new\n");
         let cancel = async { tokio::time::sleep(std::time::Duration::from_millis(100)).await };
-        let first = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: None }, cancel, |_update| std::future::pending::<()>())
+        let first = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: None, confirm: None }, cancel, |_update| std::future::pending::<()>())
             .await
             .unwrap();
         assert!(first.is_none(), "the call was cancelled");
-        let second = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: None }, std::future::pending::<()>(), |_update| std::future::ready(()))
+        let second = run_keepalive(&env.vigil, KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: None, confirm: None }, std::future::pending::<()>(), |_update| std::future::ready(()))
             .await
             .expect("the result was marked returned by the cancelled call")
             .expect("not cancelled");
@@ -616,7 +624,7 @@ mod tests {
         let vigil = env.another_process().with_write_faults(plan);
 
         let started = tokio::time::Instant::now();
-        let envelope = run_keepalive(&vigil, KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30), orchestrator: None }, std::future::pending::<()>(), |_update| std::future::ready(()))
+        let envelope = run_keepalive(&vigil, KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30), orchestrator: None, confirm: None }, std::future::pending::<()>(), |_update| std::future::ready(()))
             .await
             .unwrap()
             .expect("not cancelled");
@@ -627,7 +635,7 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let cancel = async { tokio::time::sleep(std::time::Duration::from_secs(5)).await };
-        let cancelled = run_keepalive(&vigil, KeepaliveRequest { watch_id: Some(id), max_s: Some(30), orchestrator: None }, cancel, |_update| std::future::ready(())).await.unwrap();
+        let cancelled = run_keepalive(&vigil, KeepaliveRequest { watch_id: Some(id), max_s: Some(30), orchestrator: None, confirm: None }, cancel, |_update| std::future::ready(())).await.unwrap();
         assert!(cancelled.is_none(), "the cancel ended the hold");
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
     }

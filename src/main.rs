@@ -46,6 +46,9 @@ enum Command {
         /// This call is the main orchestrator session's (AI1').
         #[arg(long)]
         orchestrator: bool,
+        /// The token an orchestrator challenge printed.
+        #[arg(long, value_name = "TOKEN")]
+        confirm: Option<String>,
     },
     /// Hold the session: a watch on the work itself. Each `--for` is one item
     /// of work: `qex:JOB`, `pid:N`, `file:PATH` (ends when it exists),
@@ -103,6 +106,9 @@ struct HoldArgs {
     /// Store whether keepalive calls are the main session's (default true).
     #[arg(long, value_name = "BOOL")]
     orchestrator: Option<bool>,
+    /// The token an orchestrator challenge printed.
+    #[arg(long, value_name = "TOKEN")]
+    confirm: Option<String>,
 }
 
 /// `vigil hold add` / `vigil hold done` (W42): change the items of a live hold.
@@ -290,8 +296,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&vigil.create(request).await?)?;
             Ok(0)
         }
-        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator, cap } } => {
-            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label, cap }).await?)?;
+        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator, cap, confirm } } => {
+            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label, cap, confirm }).await?)?;
             Ok(0)
         }
         Command::Hold { item: Some(HoldItemCommand::Add { id, work, label, expect_s, cap }), .. } => {
@@ -336,8 +342,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&limits)?;
             Ok(0)
         }
-        Command::Keepalive { id, max_s, orchestrator } => {
-            let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s, orchestrator: orchestrator.then_some(true) };
+        Command::Keepalive { id, max_s, orchestrator, confirm } => {
+            let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s, orchestrator: orchestrator.then_some(true), confirm };
             let (envelope, delivery) = vigil
                 .keepalive_uncommitted(request, &vigil::keepalive::NoProgress, std::future::pending::<()>())
                 .await?

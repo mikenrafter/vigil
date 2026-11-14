@@ -2177,3 +2177,24 @@ fn w46_cold_cancels_a_hold_with_live_items_and_returns_the_cold_instruction() {
     assert_eq!(sandbox.watch_file("h").unwrap()["status"], "cancelled");
     assert!(sandbox.watch_file("h").unwrap()["items"][0].get("ended_at").is_none());
 }
+
+#[test]
+fn keepalive_orchestrator_from_the_cli_is_challenged_and_confirm_answers_it() {
+    // why: owner 2026-11-14: the main session's background `vigil keepalive ID
+    //      --orchestrator` gets the challenge once (exit 1, the question and token
+    //      on stderr, nothing blocks), then `--confirm TOKEN`; later calls need none.
+    // catches: the CLI not passing --confirm through; the challenge not reaching stderr.
+    let sandbox = Sandbox::new();
+    let run = |args: &[&str]| sandbox.command().env_remove("VIGIL_ORCHESTRATOR_CONFIRM").args(args).stdin(std::process::Stdio::null()).output().unwrap();
+    assert!(run(&["hold", "--id", "h"]).status.success());
+    let challenged = run(&["keepalive", "h", "--max-s", "30", "--orchestrator"]);
+    let stderr = String::from_utf8_lossy(&challenged.stderr).to_string();
+    assert_eq!(challenged.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("spoken directly with the user"), "{stderr}");
+    let start = stderr.find("--confirm ").expect("names the flag") + "--confirm ".len();
+    let token: String = stderr[start..].chars().take(8).collect();
+    let confirmed = run(&["keepalive", "h", "--max-s", "30", "--orchestrator", "--confirm", &token]);
+    assert!(confirmed.status.success(), "{}", String::from_utf8_lossy(&confirmed.stderr));
+    let again = run(&["keepalive", "h", "--max-s", "30", "--orchestrator"]);
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+}

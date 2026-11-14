@@ -280,6 +280,12 @@ impl Vigil {
     /// by the input its `input` indexes) with `added_at` = the watch's
     /// `created_at`, so the items' overdue clocks start with the hold.
     pub(crate) async fn create_with_items(&self, request: CreateRequest, items: Option<Vec<crate::items::HoldItem>>) -> Result<Created, VigilError> {
+        // Owner 2026-11-14: an explicit orchestrator watch needs the day's token
+        // before anything is written; the new watch is then confirmed.
+        let confirmed = self.config.orchestrator_confirm && request.orchestrator == Some(true);
+        if confirmed {
+            self.check_orchestrator_token(request.confirm.as_deref())?;
+        }
         let spec = WatchSpec::parse(request)?.absolutize(&self.cwd);
         if matches!(spec.fire, FireRule::Judge { .. }) && !self.judge.healthy().await {
             return Err(CreateError::JudgeUnreachable.into());
@@ -321,6 +327,9 @@ impl Vigil {
             // placeholder that stays is the pre-DF7 behaviour, not a new loss.
             let _ = std::fs::remove_file(self.store.watch_path(&id));
             return Err(error.into());
+        }
+        if confirmed {
+            self.mark_orchestrator_confirmed(&watch)?;
         }
 
         self.session.lock().expect("session mutex poisoned").created.insert(id.clone());

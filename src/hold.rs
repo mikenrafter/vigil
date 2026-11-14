@@ -257,6 +257,9 @@ pub struct HoldRequest {
     /// W46-K1: class every requested item; omitted items are uncounted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<crate::cap::CapClass>,
+    /// The day's token, needed with an explicit `orchestrator: true` (`orchestrator.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
 }
 
 /// W42-H2: one item to add to a live hold (`vigil hold add`, MCP `hold_add`).
@@ -397,6 +400,7 @@ impl Vigil {
             expect_s: None,
             stall_s: None,
             orchestrator: request.orchestrator,
+            confirm: request.confirm,
         };
         self.create_with_items(request, Some(items)).await
     }

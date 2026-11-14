@@ -884,6 +884,18 @@ prompt cache (and the credit checks). `"orchestrator": false` at creation, or
 `watch_id` to `keepalive`: a no-id call covers every watch this process
 created, holds included.
 
+**Orchestrator confirmation (owner 2026-11-14, `src/orchestrator.rs`).**
+Orchestrator mode is only for the main session that speaks with the user.
+`orchestrator: true` on keepalive, hold or watch_create, for a watch that is
+not yet confirmed, needs `confirm` (CLI `--confirm`) set to the day's token;
+without it the call does not block or write anything and fails (CLI exit 1,
+MCP tool error) with a challenge that asks whether this session has spoken
+directly with the user and, only there, states the token. The right token
+confirms every watch the call covers (or the new watch) for its life; later
+calls on it need none. A stored default (a hold's `orchestrator: true`) counts
+only for a confirmed watch; unconfirmed, keepalive uses the plain window and
+asks nothing. The token is per UTC day and kept in the state root.
+
 **`vigil hold --until-idle` (H10).** `idle:<dir>` with `<dir>` the creating cwd:
 live while any qex job whose cwd is that directory or below has not ended. The
 query is `qex list --under DIR --state active --json` (`active` is every state

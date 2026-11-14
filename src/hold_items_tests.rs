@@ -284,7 +284,7 @@ async fn one_keepalive_on_the_hold_id_covers_every_item_even_from_another_proces
 
     env.reader.set_text("qex:c", "completed");
     let other = env.another_process();
-    let request = KeepaliveRequest { watch_id: Some(wid("h")), max_s: Some(30), orchestrator: Some(true) };
+    let request = KeepaliveRequest { watch_id: Some(wid("h")), max_s: Some(30), orchestrator: Some(true), confirm: None };
     let envelope = serde_json::to_value(other.keepalive(request).await.unwrap()).unwrap();
     assert_eq!(summaries(&envelope), vec!["item ended: c: completed"], "{envelope}");
 }
@@ -487,7 +487,7 @@ fn distinct(ids: &[String]) -> bool {
 /// One keepalive whose delivery the caller never commits (the client went
 /// away before the envelope arrived), as in `auto_interval_tests` S6.
 async fn call_uncommitted(vigil: &Vigil, id: &str, max_s: u64) -> Value {
-    let request = KeepaliveRequest { watch_id: Some(wid(id)), max_s: Some(max_s), orchestrator: None };
+    let request = KeepaliveRequest { watch_id: Some(wid(id)), max_s: Some(max_s), orchestrator: None, confirm: None };
     let (envelope, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().expect("not cancelled");
     drop(delivery);
     serde_json::to_value(&envelope).unwrap()

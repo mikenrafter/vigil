@@ -273,6 +273,9 @@ pub enum VigilError {
     NothingToCover,
     #[error(transparent)]
     Advisory(#[from] crate::advisory::AdvisoryError),
+    /// Orchestrator mode asked for without the day's token: the challenge.
+    #[error("{0}")]
+    OrchestratorUnconfirmed(String),
 }
 
 impl VigilError {
