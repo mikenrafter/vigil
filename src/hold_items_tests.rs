@@ -1228,3 +1228,25 @@ async fn w46_unclassed_hold_envelope_remains_byte_identical() {
     let quiet = call(&env.vigil, "h", Some(30)).await;
     assert!(quiet.get("cap").is_none(), "{quiet}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn w46_bad_cap_json_does_not_break_keepalive_cancel_or_cap_set_but_admission_fails_closed() {
+    // why: W46 S1: local data is untrusted, so a hand-edited cap.json must not stop an orchestrator's keepalive loop or a cancel.
+    // catches: envelope_for or cap_set propagating the cap.json parse error, or admission failing open on a bad file.
+    let env = rig();
+    env.vigil.hold(w46_request(serde_json::json!({"id": "h", "for": ["none"], "label": "first", "cap": "work"}))).await.unwrap();
+    env.vigil.hold(w46_request(serde_json::json!({"id": "c", "for": ["none"], "label": "first", "cap": "work"}))).await.unwrap();
+    let path = env.vigil.store().root().join("cap.json");
+    std::fs::write(&path, r#"{"work":0}"#).unwrap();
+    let kept = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(kept["status"], "pending", "{kept}");
+    assert!(env.vigil.status(&wid("h")).await.is_ok());
+    let cancelled = env.vigil.cancel(&wid("c")).await.expect("cancel of a classed hold with a bad cap.json");
+    assert_eq!(cancelled.status, crate::WatchStatus::Cancelled);
+    let second: HoldItemRequest = serde_json::from_value(serde_json::json!({"for": "none", "label": "second", "cap": "work"})).unwrap();
+    let refused = env.vigil.hold_add(&wid("h"), second).await.expect_err("admission fails closed on a bad cap.json").to_string();
+    assert!(refused.contains("vigil cap reset"), "{refused}");
+    let until = env.clock.now().plus_secs(60);
+    let set = env.vigil.cap_set(std::num::NonZeroUsize::new(2).unwrap(), None, until).await.expect("cap set replaces a bad cap.json");
+    assert_eq!((set.work.get(), set.review.get()), (2, 1));
+}
