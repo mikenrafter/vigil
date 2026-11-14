@@ -987,6 +987,38 @@ attention pass raises item overdue through `attention::due`.
   each item's label and `live` or `ended`. Watches without items omit the key.
   Keepalive envelopes do not carry it.
 
+### Agent caps and cold follow-ups (W46)
+
+Claims below follow `knowledge/research/agentic-practice-2026-11/vigil-agent-cap-spec.md`.
+Proof: `src/hold_items_tests.rs`, `tests/cli_e2e.rs`, `tests/mcp_e2e.rs` (tests prefixed `w46_`).
+
+- **Classes (W46-K1).** CLI `hold` and `hold add` accept `--cap work|review`;
+  MCP `hold` and `hold_add` accept `cap`. Each item stores its optional class.
+  Omitted classes, including old stored items without `cap`, are uncounted.
+- **Owner limits (W46-K2).** `vigil cap` prints `{work, review, until, source}`;
+  defaults are 1/1, null, `default`. `cap set --work N [--review M] --until RFC3339`
+  stores an atomic owner override in the state root. Expiry is required and must
+  be future (past: exit 2); on expiry the next read uses defaults. `cap reset`
+  restores defaults. MCP has no cap setter.
+- **Admission (W46-K3).** Under the hold lock, a classed add at its class limit
+  fails (CLI exit 1, MCP tool error), leaves the file unchanged, and names the
+  live runs, cap, and owner command to raise it. Work errors begin `agent cap
+  reached`, review errors `reviewer cap reached`. Creation counts every initial
+  item too; racing adds cannot both claim the last slot.
+- **Visibility (W46-K4).** Status items show their class. Status and keepalive
+  carry `{cap: {work, work_limit, review, review_limit}}` when the hold has any
+  classed item. With none, the key is absent and envelope bytes are unchanged.
+- **Scope and release (W46-K5).** Counts are per hold; other holds do not count.
+  An item ended by `hold done` or sensing immediately frees its class slot.
+- **Empty cold ids (W46-C5).** MCP `cold {watch_ids: []}` cancels nothing and
+  returns the instruction and pending ids; only an absent list means mine.
+- **Mixed cold ids (W46-C6).** Valid ids are cancelled even beside unknown ids;
+  unknown ids are reported with the existing CLI exit 1 / MCP tool error.
+- **Cold persistence (W46-C7).** A failed cancellation write is reported as a
+  CLI stderr warning naming its id and in MCP's `warnings` list.
+- **Populated cold hold (W46-C8).** Cold cancels a hold with live items and
+  returns the cold instruction in `next`.
+
 **Wire compatibility (H12).** `fire: "hold"` and the new `kind`s are additions.
 A new binary reads every existing watch file unchanged. An old binary does not
 understand a watch file with `fire: "hold"`: `status` and `keepalive` naming it

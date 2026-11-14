@@ -2002,3 +2002,156 @@ fn cold_with_ids_cancels_those_watches_and_leaves_the_others() {
     let ghost = sandbox.run(&["cold", "ghost"]);
     assert_eq!(ghost.status.code(), Some(1));
 }
+
+
+#[test]
+fn w46_cap_defaults_owner_settings_and_reset_survive_processes() {
+    // why: W46-K2 gives the owner a persistent, expiring shell control with separate work/review limits.
+    // catches: process-local limits, missing expiry/source, or reset leaving the override active.
+    let sandbox = Sandbox::new();
+    let defaults = serde_json::json!({"work": 1, "review": 1, "until": null, "source": "default"});
+    let initial = sandbox.run(&["cap"]);
+    assert!(initial.status.success(), "{initial:?}");
+    assert_eq!(stdout_json(&initial), defaults);
+    let until = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let set = sandbox.run(&["cap", "set", "--work", "2", "--review", "3", "--until", &until]);
+    assert!(set.status.success(), "{set:?}");
+    assert_eq!(stdout_json(&sandbox.run(&["cap"])), serde_json::json!({"work": 2, "review": 3, "until": until, "source": "owner"}));
+    assert!(sandbox.run(&["cap", "reset"]).status.success());
+    assert_eq!(stdout_json(&sandbox.run(&["cap"])), defaults);
+}
+
+#[test]
+fn w46_cap_set_requires_a_future_until_and_preserves_the_settings_on_refusal() {
+    // why: W46-K2 requires an explicit future expiry and exit 2 for past times.
+    // catches: accepting indefinite overrides, accepting past times, or overwriting settings on rejection.
+    let sandbox = Sandbox::new();
+    assert!(sandbox.run(&["cap"]).status.success());
+    let before = stdout_json(&sandbox.run(&["cap"]));
+    for arguments in [vec!["cap", "set", "--work", "2"], vec!["cap", "set", "--work", "2", "--until", "2000-01-01T00:00:00Z"]] {
+        let refused = sandbox.run(&arguments);
+        assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+        assert_eq!(stdout_json(&sandbox.run(&["cap"])), before);
+    }
+}
+
+#[test]
+fn w46_cli_cap_classes_are_stored_and_refusal_is_atomic_and_instructive() {
+    // why: W46-K1/K3/K4 expose item classes and refuse a second live classed run without touching the hold.
+    // catches: ignoring --cap, combining work/review counts, opaque errors, or saving a refused item.
+    let sandbox = Sandbox::new();
+    let created = sandbox.run(&["hold", "--id", "h", "--for", "none", "--label", "first", "--cap", "work"]);
+    assert!(created.status.success(), "{created:?}");
+    assert_eq!(sandbox.watch_file("h").unwrap()["items"][0]["cap"], "work");
+    assert!(sandbox.run(&["hold", "add", "h", "--for", "none", "--label", "reviewer", "--cap", "review"]).status.success());
+    let before = sandbox.watch_bytes("h");
+    for (class, expected) in [
+        ("work", "agent cap reached: 1 working Claude runs (cap 1): first. Wait for one to end, or the owner raises it: vigil cap set --work 2 --until <time>"),
+        ("review", "reviewer cap reached: 1 reviewing Claude runs (cap 1): reviewer. Wait for one to end, or the owner raises it: vigil cap set --review 2 --until <time>"),
+    ] {
+        let refused = sandbox.run(&["hold", "add", "h", "--for", "none", "--label", "blocked", "--cap", class]);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains(expected), "{refused:?}");
+        assert_eq!(sandbox.watch_bytes("h"), before);
+    }
+    let status = stdout_json(&sandbox.run(&["status", "h"]));
+    assert_eq!(status["items"][0]["cap"], "work");
+    assert_eq!(status["items"][1]["cap"], "review");
+    assert_eq!(status["cap"], serde_json::json!({"work": 1, "work_limit": 1, "review": 1, "review_limit": 1}));
+}
+
+#[test]
+fn w46_two_racing_work_adds_have_exactly_one_winner_at_limit_one() {
+    // why: W46-K3 requires the count check and append to share the hold lock across CLI processes.
+    // catches: checking a stale snapshot before locking, or failing to check classed adds at all.
+    let sandbox = Sandbox::new();
+    assert!(sandbox.run(&["hold", "--id", "h"]).status.success());
+    let lock = vigil::Store::new(sandbox.state_root()).lock_watch(&vigil::WatchId::parse("h").unwrap()).unwrap();
+    let spawn_add = |label: &str| piped({
+        let mut command = sandbox.command();
+        command.args(["hold", "add", "h", "--for", "none", "--label", label, "--cap", "work"]);
+        command
+    });
+    let left = spawn_add("left");
+    let right = spawn_add("right");
+    drop(lock);
+    let outcomes = [finish_within(left, Duration::from_secs(10)), finish_within(right, Duration::from_secs(10))];
+    let mut codes: Vec<_> = outcomes.iter().map(|out| out.status.code().unwrap()).collect();
+    codes.sort();
+    assert_eq!(codes, vec![0, 1], "{outcomes:?}");
+    let items = sandbox.watch_file("h").unwrap()["items"].as_array().unwrap().clone();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["cap"], "work");
+    let loser = outcomes.iter().find(|out| !out.status.success()).unwrap();
+    assert!(String::from_utf8_lossy(&loser.stderr).contains(items[0]["label"].as_str().unwrap()));
+}
+
+#[test]
+fn w46_creation_counts_all_initial_classed_items_before_writing() {
+    // why: W46-K3 applies the default limit to every initial --for item, not just subsequent adds.
+    // catches: bypassing admission at hold creation or creating a partial hold before refusing.
+    let sandbox = Sandbox::new();
+    let refused = sandbox.run(&["hold", "--id", "h", "--for", "pid:1", "--for", "until:2099-01-01T00:00:00Z", "--cap", "work"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("agent cap reached"), "{refused:?}");
+    assert!(sandbox.watch_file("h").is_none());
+}
+
+#[test]
+fn w46_ended_items_free_slots_other_holds_and_uncounted_items_do_not_consume_them() {
+    // why: W46-K1/K5 cap only live classed items of this hold; done frees a slot immediately.
+    // catches: counting globally, counting ended items, or refusing uncounted Codex/command items at the cap.
+    let sandbox = Sandbox::new();
+    for id in ["h", "other"] {
+        let made = sandbox.run(&["hold", "--id", id, "--for", "none", "--label", "first", "--cap", "work"]);
+        assert!(made.status.success(), "{made:?}");
+    }
+    for label in ["sol", "command", "qex"] {
+        assert!(sandbox.run(&["hold", "add", "h", "--for", "none", "--label", label]).status.success());
+    }
+    assert!(sandbox.run(&["hold", "done", "h", "first"]).status.success());
+    let next = sandbox.run(&["hold", "add", "h", "--for", "none", "--label", "replacement", "--cap", "work"]);
+    assert!(next.status.success(), "{next:?}");
+    assert_eq!(stdout_json(&sandbox.run(&["status", "h"]))["cap"]["work"], 1);
+}
+
+#[test]
+fn w46_cold_mixed_ids_cancel_the_valid_one_and_pin_unknown_exit_one() {
+    // why: W46-C6 cancels valid ids even when an unknown id precedes them, retaining the unknown-id exit.
+    // catches: prevalidating the whole list or stopping on the first unknown id.
+    let sandbox = Sandbox::new();
+    assert!(sandbox.run(&["hold", "--id", "valid"]).status.success());
+    let output = sandbox.run(&["cold", "ghost", "valid"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ghost"), "{output:?}");
+    assert_eq!(sandbox.watch_file("valid").unwrap()["status"], "cancelled");
+}
+
+#[test]
+fn w46_cold_warns_on_an_unsaved_cancellation_and_names_the_id() {
+    // why: W46-C7 must expose a failed cancellation write on CLI stderr instead of claiming silent success.
+    // catches: discarding cancel's persist note while assembling ColdReport.
+    let sandbox = Sandbox::new();
+    assert!(sandbox.run(&["hold", "--id", "unsaved"]).status.success());
+    let before = sandbox.watch_bytes("unsaved");
+    let output = run_with(&sandbox, Some("watch:5:all"), &["cold", "unsaved"]);
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.lines().any(|line| line.contains("warning") && line.contains("unsaved") && line.contains("Input/output error")), "{stderr}");
+    assert_eq!(stdout_json(&output)["next"], COLD_NEXT);
+    assert_eq!(sandbox.watch_bytes("unsaved"), before);
+}
+
+#[test]
+fn w46_cold_cancels_a_hold_with_live_items_and_returns_the_cold_instruction() {
+    // why: W46-C8 explicitly ends a hold even while its items remain live.
+    // catches: treating cold as hold done, or returning the ordinary cancelled-envelope next instruction.
+    let sandbox = Sandbox::new();
+    assert!(sandbox.run(&["hold", "--id", "h", "--for", "none", "--label", "still-running"]).status.success());
+    let output = sandbox.run(&["cold", "h"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(stdout_json(&output)["next"], COLD_NEXT);
+    assert_eq!(stdout_json(&output)["cancelled"], serde_json::json!(["h"]));
+    assert_eq!(sandbox.watch_file("h").unwrap()["status"], "cancelled");
+    assert!(sandbox.watch_file("h").unwrap()["items"][0].get("ended_at").is_none());
+}

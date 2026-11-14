@@ -1031,3 +1031,104 @@ async fn cold_with_ids_cancels_exactly_those_and_an_unknown_id_is_an_error() {
     assert_eq!(sandbox.watch_file("theirs").unwrap()["status"], "cancelled");
     client.cancel().await.unwrap();
 }
+
+
+#[tokio::test]
+async fn w46_mcp_cap_classes_are_declared_stored_and_refused_as_tool_errors() {
+    // why: W46-K1/K3/K4 must work through real MCP, with the same admission error and visible classes.
+    // catches: wiring --cap only in CLI, dropping cap from schemas, or returning successful refusals.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let tools = client.list_all_tools().await.unwrap();
+    for name in ["hold", "hold_add"] {
+        let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        assert!(schema["properties"].get("cap").is_some(), "{schema}");
+        assert!(schema.to_string().contains("work") && schema.to_string().contains("review"), "{schema}");
+    }
+    let peer = client.peer();
+    let created = call(peer, "hold", serde_json::json!({"id": "h", "for": ["none"], "label": "first", "cap": "work"})).await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    assert_eq!(sandbox.watch_file("h").unwrap()["items"][0]["cap"], "work");
+    let before = sandbox.watch_bytes("h");
+    let refused = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "none", "label": "second", "cap": "work"})).await;
+    assert_eq!(refused.is_error, Some(true), "{refused:?}");
+    assert_eq!(refused.content[0].as_text().unwrap().text, "agent cap reached: 1 working Claude runs (cap 1): first. Wait for one to end, or the owner raises it: vigil cap set --work 2 --until <time>");
+    assert_eq!(sandbox.watch_bytes("h"), before);
+    let review = call(peer, "hold_add", serde_json::json!({"watch_id": "h", "for": "none", "label": "reviewer", "cap": "review"})).await;
+    assert_ne!(review.is_error, Some(true), "{review:?}");
+    let status = text_json(&call(peer, "watch_status", serde_json::json!({"watch_id": "h"})).await);
+    assert_eq!(status["items"][1]["cap"], "review");
+    assert_eq!(status["cap"], serde_json::json!({"work": 1, "work_limit": 1, "review": 1, "review_limit": 1}));
+    let too_many = call(peer, "hold", serde_json::json!({"id": "too-many", "for": ["pid:1", "until:2099-01-01T00:00:00Z"], "cap": "work"})).await;
+    assert_eq!(too_many.is_error, Some(true), "{too_many:?}");
+    assert!(sandbox.watch_file("too-many").is_none());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn w46_mcp_cold_empty_ids_cancels_nothing_but_absent_ids_cancel_mine() {
+    // why: W46-C5 distinguishes an explicit empty list from an absent watch_ids argument.
+    // catches: mapping Some([]) to None and accidentally cancelling this server's live holds.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    assert_ne!(call(client.peer(), "hold", serde_json::json!({"id": "mine"})).await.is_error, Some(true));
+    let empty = text_json(&call(client.peer(), "cold", serde_json::json!({"watch_ids": []})).await);
+    assert_eq!(empty["cancelled"], serde_json::json!([]));
+    assert_eq!(empty["pending"], serde_json::json!(["mine"]));
+    assert_eq!(empty["next"], COLD_NEXT);
+    assert_eq!(sandbox.watch_file("mine").unwrap()["status"], "pending");
+    let absent = text_json(&call(client.peer(), "cold", serde_json::json!({})).await);
+    assert_eq!(absent["cancelled"], serde_json::json!(["mine"]));
+    assert_eq!(absent["pending"], serde_json::json!([]));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn w46_mcp_cold_mixed_ids_cancels_valid_and_reports_unknown_as_tool_error() {
+    // why: W46-C6 preserves unknown-id tool errors while making progress on valid ids.
+    // catches: preflight loading every id before cancelling, or silently discarding unknown ids.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    assert_ne!(call(client.peer(), "hold", serde_json::json!({"id": "valid"})).await.is_error, Some(true));
+    let result = call(client.peer(), "cold", serde_json::json!({"watch_ids": ["ghost", "valid"]})).await;
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    assert!(result.content[0].as_text().unwrap().text.contains("ghost"));
+    assert_eq!(sandbox.watch_file("valid").unwrap()["status"], "cancelled");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn w46_mcp_cold_reports_unsaved_cancellation_in_warnings() {
+    // why: W46-C7 exposes cancel persistence failure in the MCP result's warnings list.
+    // catches: dropping the failed-save envelope or emitting warnings only on CLI stderr.
+    let sandbox = Sandbox::new();
+    assert!(sandbox.run(&["hold", "--id", "unsaved"]).status.success());
+    let before = sandbox.watch_bytes("unsaved");
+    let client = connect_faulted(&sandbox, "watch:5:all").await;
+    let result = call(client.peer(), "cold", serde_json::json!({"watch_ids": ["unsaved"]})).await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let result = text_json(&result);
+    let warnings = result["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("unsaved") && warning.contains("Input/output error"), "{warning}");
+    assert_eq!(result["pending"], serde_json::json!(["unsaved"]));
+    assert_eq!(sandbox.watch_bytes("unsaved"), before);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn w46_mcp_cold_cancels_a_hold_with_live_items() {
+    // why: W46-C8 applies cold to a populated hold without requiring its work to end.
+    // catches: refusing live-item holds or returning next: watch ended instead of the cold instruction.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    assert_ne!(call(client.peer(), "hold", serde_json::json!({"id": "h", "for": ["none"], "label": "live"})).await.is_error, Some(true));
+    let result = text_json(&call(client.peer(), "cold", serde_json::json!({})).await);
+    assert_eq!(result["cancelled"], serde_json::json!(["h"]));
+    assert_eq!(result["next"], COLD_NEXT);
+    assert_eq!(sandbox.watch_file("h").unwrap()["status"], "cancelled");
+    assert!(sandbox.watch_file("h").unwrap()["items"][0].get("ended_at").is_none());
+    client.cancel().await.unwrap();
+}

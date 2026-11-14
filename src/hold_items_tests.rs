@@ -1153,3 +1153,78 @@ async fn sixteen_none_items_fill_a_hold_and_a_seventeenth_of_any_kind_is_refused
         assert_eq!(std::fs::read(env.root().join("watches/m.json")).unwrap(), full, "{refused:?}: nothing written");
     }
 }
+
+
+fn w46_request(value: Value) -> HoldRequest {
+    serde_json::from_value(value).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn w46_expired_owner_cap_falls_back_to_one_on_the_next_admission() {
+    // why: W46-K2 restores the default work limit on the next read once the owner's until expires.
+    // catches: caching the raised limit forever, using wall time, or continuing to admit under expired settings.
+    let env = rig();
+    let now = env.clock.now();
+    std::fs::create_dir_all(env.vigil.store().root()).unwrap();
+    std::fs::write(env.vigil.store().root().join("cap.json"), serde_json::to_vec(&serde_json::json!({
+        "work": 2, "review": 1, "until": now.plus_secs(10), "source": "owner"
+    })).unwrap()).unwrap();
+    env.vigil.hold(w46_request(serde_json::json!({"id": "h", "for": ["none"], "label": "first", "cap": "work"}))).await.unwrap();
+    let second: HoldItemRequest = serde_json::from_value(serde_json::json!({"for": "none", "label": "second", "cap": "work"})).unwrap();
+    assert!(env.vigil.hold_add(&wid("h"), second).await.is_ok(), "control: the unexpired raise admits two");
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let before = std::fs::read(env.vigil.store().watch_path(&wid("h"))).unwrap();
+    let third = serde_json::from_value(serde_json::json!({"for": "none", "label": "third", "cap": "work"})).unwrap();
+    let error = env.vigil.hold_add(&wid("h"), third).await.expect_err("expiry restores limit one").to_string();
+    assert!(error.contains("2 working Claude runs (cap 1): first, second"), "{error}");
+    assert_eq!(std::fs::read(env.vigil.store().watch_path(&wid("h"))).unwrap(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn w46_keepalive_cap_counts_follow_sensed_ends_and_the_slot_can_be_reused() {
+    // why: W46-K4/K5 show live class counts in real keepalive envelopes and free a slot on a sensed end.
+    // catches: counting all stored items, attaching cap only to status, or keeping ended slots occupied.
+    let env = rig();
+    env.reader.set_text("qex:a", "running");
+    env.vigil.hold(w46_request(serde_json::json!({"id": "h", "for": ["qex:a"], "label": "agent", "cap": "work"}))).await.unwrap();
+    add_ok(&env.vigil, "h", item("none", None, Some("session"))).await;
+    let live = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(live["cap"], serde_json::json!({"work": 1, "work_limit": 1, "review": 0, "review_limit": 1}));
+    env.reader.set_text("qex:a", "completed");
+    let ended = call(&env.vigil, "h", Some(30)).await;
+    assert_eq!(ended["status"], "pending");
+    assert_eq!(ended["cap"], serde_json::json!({"work": 0, "work_limit": 1, "review": 0, "review_limit": 1}));
+    let replacement = serde_json::from_value(serde_json::json!({"for": "none", "label": "replacement", "cap": "work"})).unwrap();
+    assert!(env.vigil.hold_add(&wid("h"), replacement).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn w46_old_stored_items_without_cap_load_as_uncounted() {
+    // why: W46-K1 preserves old item files as uncounted instead of retrospectively classifying their work.
+    // catches: defaulting missing cap to work, or requiring cap when reading old stored items.
+    let env = rig();
+    env.vigil.hold(first_item("none", "old", None)).await.unwrap();
+    let path = env.vigil.store().watch_path(&wid("h"));
+    let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old["items"][0].as_object_mut().unwrap().remove("cap");
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let classed = serde_json::from_value(serde_json::json!({"for": "none", "label": "classed", "cap": "work"})).unwrap();
+    assert!(env.vigil.hold_add(&wid("h"), classed).await.is_ok());
+    let status = serde_json::to_value(env.vigil.status(&wid("h")).await.unwrap()).unwrap();
+    assert!(status["items"][0].get("cap").is_none());
+    assert_eq!(status["cap"]["work"], 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn w46_unclassed_hold_envelope_remains_byte_identical() {
+    // why: W46-K4 leaves the pre-W46 envelope byte-identical when every item is uncounted.
+    // catches: serializing cap:null, cap defaults, or changing the existing envelope field order.
+    let env = rig();
+    env.vigil.hold(first_item("none", "sol", None)).await.unwrap();
+    let watch = watch_file(&env.vigil, "h");
+    let bytes = serde_json::to_string(&env.vigil.envelope_for(&watch, watch.created_at)).unwrap();
+    let expected = r#"{"watch_id":"h","status":"pending","now":"2026-10-29T14:03:11Z","tick":0,"session_ticks":0,"elapsed_s":0,"deadline_in_s":604800,"events":[],"digest":"","judge_status":"skipped","next":"call keepalive again"}"#;
+    assert_eq!(bytes, expected);
+    let quiet = call(&env.vigil, "h", Some(30)).await;
+    assert!(quiet.get("cap").is_none(), "{quiet}");
+}
