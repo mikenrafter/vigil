@@ -366,7 +366,9 @@ impl Vigil {
 
     /// `vigil cold` / MCP `cold` (W45-C1, C2). Cancels `ids`, or with `None`
     /// the watches this process created that are still pending. Naming an
-    /// unknown id is an error after valid ids are cancelled (W46-C6). `pending` is read
+    /// unknown id does not stop the others: it goes into `errors` and the call
+    /// still returns `Ok` (W46-C6; callers turn `errors` into exit 1 or a tool
+    /// error). A cancel that could not be saved goes into `warnings` (W46-C7). `pending` is read
     /// after the cancels, so it lists what is still live in the state root.
     pub async fn cold(&self, ids: Option<Vec<WatchId>>) -> Result<ColdReport, VigilError> {
         let ids = match ids {
