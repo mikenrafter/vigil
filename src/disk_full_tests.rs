@@ -1543,7 +1543,7 @@ fn a_rescue_blocked_by_a_held_store_wide_lock_gives_up_inside_the_call_budget_wi
 
         drop(guard);
         assert_eq!(envelope["status"], "fired", "{envelope}");
-        assert_eq!(envelope["waited_s"], 29, "precondition: the read really used 29.5 s of the 30 s budget: {envelope}");
+        assert_eq!(envelope["waited_s"], 30, "precondition: the read used 29.5 s of the 30 s budget (waited_s rounds): {envelope}");
         assert_failed_persist(&envelope, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), true, Some(false));
         assert!(elapsed < Duration::from_millis(1800), "the rescue waited {elapsed:?}; only ~0.5 s of the call budget was left, far below the 2 s ceiling");
         // 29.5 s read + the 0.4 s wait (0.5 s left, less the 100 ms margin).
@@ -2335,7 +2335,7 @@ fn a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_
         assert_failed_persist(&envelope, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), true, Some(false));
         assert!(elapsed >= Duration::from_millis(29_900), "precondition: the read (29 s) and the slow write (0.95 s) really ran: {elapsed:?}");
         assert!(elapsed < Duration::from_secs(30), "the rescue must not wait once its cutoff has passed; the call took {elapsed:?}");
-        assert_eq!(envelope["waited_s"], 29, "{envelope}");
+        assert_eq!(envelope["waited_s"], 30, "29.95 s, rounded: {envelope}");
         assert_eq!(plan.attempts(WriteKind::Watch) - attempts_before, 1, "no lock, no retry");
         assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "the reserve is untouched");
     });

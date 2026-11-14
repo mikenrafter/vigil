@@ -910,6 +910,31 @@ async fn credits_ending_is_reported_too_and_the_same_state_is_reported_only_once
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_call_that_starts_just_past_a_second_still_reports_the_whole_wait() {
+    // why: the credit cadence is anchored to stored whole-second instants, so a
+    //      call starting 3 ms past a second waits 599.997 s for a 600 s verdict.
+    //      `waited_s` floored that to 599 (the flake in
+    //      credits_ending_is_reported_too, which got its offset by chance).
+    // catches: waited_s truncating instead of rounding.
+    let rig = Rig::new();
+    let probe = ScriptedCreditProbe::new(credit_state(false, CreditSource::Uw));
+    probe.push(credit_state(true, CreditSource::Uw));
+    let vigil = rig.vigil(AgentEnv::default(), &probe);
+    let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 20_000, |_| {}).await;
+    let first = call(&vigil, &id, Some(3000), Some(true)).await;
+    assert_eq!(first["waited_s"], 240, "{first}");
+    let second = call(&vigil, &id, Some(3000), Some(true)).await;
+    assert_eq!(second["waited_s"], 3000, "{second}");
+    probe.push(credit_state(false, CreditSource::Uw));
+    probe.push(credit_state(false, CreditSource::Uw));
+    probe.push(credit_state(true, CreditSource::Uw));
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let third = call(&vigil, &id, Some(3000), Some(true)).await;
+    assert_eq!(third["waited_s"], 600, "{third}");
+    assert_eq!(only_event(&third)["on_credits"], true);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_first_check_a_process_makes_is_a_baseline_never_a_change() {
     // why: A9, kept by S9 for a state root that has no credit-state.json yet.
     //      Credits have been on since before vigil started: the first check

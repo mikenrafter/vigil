@@ -210,6 +210,10 @@ pub struct Envelope {
     /// W46-K4: absent unless the hold contains classed items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<crate::cap::CapStatus>,
+    /// W46 S3: why `cap` is absent from a hold with classed items (cap.json
+    /// cannot be read); names `vigil cap reset`. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_error: Option<String>,
 }
 
 /// The envelope's `clock` (AI4). `since_last_call_s` is always present on the
@@ -317,6 +321,7 @@ mod tests {
             clock: None,
             advice: None,
             cap: None,
+            cap_error: None,
         }
     }
 

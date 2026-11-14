@@ -642,11 +642,15 @@ impl Vigil {
         // S6: a pending watch's file holds only the outbox of attention events;
         // `status` neither delivers nor acknowledges them, so it shows none.
         let events = if terminal { self.replayed_events(watch) } else { Vec::new() };
-        let cap = match watch.items.as_deref() {
+        let (cap, cap_error) = match watch.items.as_deref() {
             // S1: a cap.json that cannot be read must not break a display or a cancel; the
-            // counts are left out (admission still refuses, naming `vigil cap reset`).
-            Some(items) if items.iter().any(|item| item.cap.is_some()) => self.cap_limits().ok().map(|limits| limits.status(items)),
-            _ => None,
+            // counts are left out (admission still refuses, naming `vigil cap reset`), and
+            // S3: `cap_error` says why they are missing.
+            Some(items) if items.iter().any(|item| item.cap.is_some()) => match self.cap_limits() {
+                Ok(limits) => (Some(limits.status(items)), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            _ => (None, None),
         };
         Ok(Envelope {
             watch_id: watch.spec.id.clone(),
@@ -673,6 +677,7 @@ impl Vigil {
             clock: None,
             advice: None,
             cap,
+            cap_error,
         })
     }
 }

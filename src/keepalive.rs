@@ -17,6 +17,13 @@ use crate::monitor::CreditPlan;
 use crate::tick::{digest_of, is_due, Retained, TickOutcome, TickReport};
 use crate::watch::{ChangedInput, Event, FireRule, Input, WatchFile, WatchId};
 
+/// `waited_s`: the wait rounded to the nearest second. Deadlines are anchored to
+/// stored instants, which keep whole seconds only, while a call can start a few
+/// milliseconds past a second; flooring then reported 599 for a 600 s wait.
+fn waited_secs(waited: Duration) -> u64 {
+    waited.as_secs() + u64::from(waited.subsec_millis() >= 500)
+}
+
 /// CLAIM(S4-outbox): how long a waiting call may sleep before it looks at the
 /// watches' outboxes again. Attention that another process saves (and then
 /// fails to hand over) is found at the next pass; a watch that ticks rarely
@@ -332,7 +339,7 @@ impl crate::engine::Vigil {
         let budget_end = started + Duration::from_secs(max_s);
         let finish = async {
             let call = self.sense(&covered, budget_end, progress, &plan).await?;
-            let answer = self.keepalive_envelope(&covered, &call, &plan, started.elapsed().as_secs())?;
+            let answer = self.keepalive_envelope(&covered, &call, &plan, waited_secs(started.elapsed()))?;
             // ↳ CLAIM(DF1a-hold): the one pacing for MCP and CLI keepalive [spec DF1a revised, review T1; disk_full_tests a_quiet_tick_that_cannot_save_is_held_for_one_interval_and_not_ticked_again, mcp::tests the_mcp_call_is_held_one_interval_after_a_quiet_failed_save_and_a_cancel_ends_the_hold]
             let answer = match self.hold_after_unsaved_quiet_tick(&answer.0, &call, budget_end) {
                 None => answer,
@@ -340,7 +347,7 @@ impl crate::engine::Vigil {
                     tokio::time::sleep(hold).await;
                     // The watch may have passed its deadline while the call slept: the
                     // envelope describes it as it is now (V3), still without ticking.
-                    self.keepalive_envelope(&covered, &call, &plan, started.elapsed().as_secs())?
+                    self.keepalive_envelope(&covered, &call, &plan, waited_secs(started.elapsed()))?
                 }
             };
             self.remember_last_call(&covered, &call, answer.0.now).await;

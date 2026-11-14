@@ -1001,7 +1001,8 @@ Proof: `src/hold_items_tests.rs`, `tests/cli_e2e.rs`, `tests/mcp_e2e.rs` (tests 
   be future (past: exit 2); on expiry the next read uses defaults. `cap reset`
   restores defaults. MCP has no cap setter. A `cap.json` that cannot be read
   fails admission and `vigil cap` (the error names `vigil cap reset`); keepalive,
-  status, cancel and `cap set` do not depend on it (status leaves `cap` out).
+  status, cancel and `cap set` do not depend on it (their envelopes leave `cap`
+  out and carry `cap_error`, the same error text).
 - **Admission (W46-K3).** Under the hold lock, a classed add at its class limit
   fails (CLI exit 1, MCP tool error), leaves the file unchanged, and names the
   live runs, cap, and owner command to raise it. Work errors begin `agent cap

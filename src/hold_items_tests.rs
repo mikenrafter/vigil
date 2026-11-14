@@ -1232,7 +1232,7 @@ async fn w46_unclassed_hold_envelope_remains_byte_identical() {
 #[tokio::test(start_paused = true)]
 async fn w46_bad_cap_json_does_not_break_keepalive_cancel_or_cap_set_but_admission_fails_closed() {
     // why: W46 S1: local data is untrusted, so a hand-edited cap.json must not stop an orchestrator's keepalive loop or a cancel.
-    // catches: envelope_for or cap_set propagating the cap.json parse error, or admission failing open on a bad file.
+    // catches: envelope_for or cap_set propagating the cap.json parse error, admission failing open on a bad file, or the counts silently vanishing (S2, S3).
     let env = rig();
     env.vigil.hold(w46_request(serde_json::json!({"id": "h", "for": ["none"], "label": "first", "cap": "work"}))).await.unwrap();
     env.vigil.hold(w46_request(serde_json::json!({"id": "c", "for": ["none"], "label": "first", "cap": "work"}))).await.unwrap();
@@ -1240,6 +1240,9 @@ async fn w46_bad_cap_json_does_not_break_keepalive_cancel_or_cap_set_but_admissi
     std::fs::write(&path, r#"{"work":0}"#).unwrap();
     let kept = call(&env.vigil, "h", Some(30)).await;
     assert_eq!(kept["status"], "pending", "{kept}");
+    // S2: the counts are left out rather than shown as defaults; S3: the envelope says why.
+    assert!(kept.get("cap").is_none(), "{kept}");
+    assert!(kept["cap_error"].as_str().is_some_and(|error| error.contains("cap.json") && error.contains("vigil cap reset")), "{kept}");
     assert!(env.vigil.status(&wid("h")).await.is_ok());
     let cancelled = env.vigil.cancel(&wid("c")).await.expect("cancel of a classed hold with a bad cap.json");
     assert_eq!(cancelled.status, crate::WatchStatus::Cancelled);
