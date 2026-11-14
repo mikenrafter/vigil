@@ -163,11 +163,12 @@ pub struct SecondaryFailure {
     pub path: PathBuf,
 }
 
-/// A same-session non-orchestrator call, shown only to an orchestrator.
+/// A same-session call shown as information only to an orchestrator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     pub watch_id: WatchId,
     pub kind: crate::peers::PeerKind,
+    pub mode: crate::peers::PeerMode,
     pub expect_s: Option<u64>,
     pub waited_s: u64,
     pub inputs: String,

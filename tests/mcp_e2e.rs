@@ -1139,3 +1139,45 @@ async fn w46_mcp_cold_cancels_a_hold_with_live_items() {
     assert!(sandbox.watch_file("h").unwrap()["items"][0].get("ended_at").is_none());
     client.cancel().await.unwrap();
 }
+
+
+#[tokio::test]
+async fn fix1_mcp_keepalive_accepts_confirm_and_registers_mcp_transport() {
+    // why: the daily token must cross the actual MCP boundary, with safe pid attribution.
+    // catches: dropping confirm in the tool adapter or recording the MCP server as CLI.
+    let sandbox = Sandbox::new();
+    let client = connect_with_env(&sandbox, &[("VIGIL_ORCHESTRATOR_CONFIRM", std::ffi::OsStr::new("on"))]).await;
+    let peer = client.peer();
+    assert_ne!(call(peer, "hold", serde_json::json!({"id": "confirmed", "for": ["none"], "label": "work"})).await.is_error, Some(true));
+    let challenge = call(peer, "keepalive", serde_json::json!({"watch_id": "confirmed", "orchestrator": true, "max_s": 30})).await;
+    assert_eq!(challenge.is_error, Some(true), "{challenge:?}");
+    let text = &challenge.content[0].as_text().unwrap().text;
+    let start = text.find("confirm \"").expect("challenge token") + "confirm \"".len();
+    let token = &text[start..start + 8];
+    let wait = call(peer, "keepalive", serde_json::json!({"watch_id": "confirmed", "orchestrator": true, "confirm": token, "max_s": 30}));
+    let finish = async {
+        let record = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(sandbox.state_root().join("calls")) {
+                    for entry in entries.flatten() {
+                        if entry.path().extension().is_some_and(|ext| ext == "json") {
+                            if let Ok(bytes) = std::fs::read(entry.path()) {
+                                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) { return record; }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("confirmed keepalive registers before blocking");
+        assert_eq!(record["transport"], "mcp");
+        assert_eq!(record["orchestrator"], true);
+        let marker = sandbox.state_root().join("orchestrator/watches/confirmed.json");
+        assert!(marker.is_file(), "the token confirms this live watch");
+        assert_ne!(call(peer, "watch_cancel", serde_json::json!({"watch_id": "confirmed"})).await.is_error, Some(true));
+    };
+    let (result, ()) = tokio::join!(wait, finish);
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(text_json(&result)["status"], "cancelled");
+    client.cancel().await.unwrap();
+}

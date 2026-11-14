@@ -1279,7 +1279,7 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
     // watches, so name them as own even though this credit fixture disables
     // the token challenge. Keep the credit-lock assertions independent of
     // the separate foreign-orchestrator test (CLAIM(peers-own)).
-    let confirmations = sandbox.state_root().join("orchestrator");
+    let confirmations = sandbox.state_root().join("orchestrator/watches");
     std::fs::create_dir_all(&confirmations).unwrap();
     for id in ["a", "b"] {
         let created_at = sandbox.watch_file(id).unwrap()["created_at"].clone();
@@ -1342,7 +1342,7 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
     let (env_a, env_b) = (stdout_json(&out_a), stdout_json(&out_b));
     let changes = |envelope: &serde_json::Value| envelope["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "credit_state_changed").count();
     assert_eq!((changes(&env_a), changes(&env_b)), (1, 0), "exactly one process reports the change: {env_a} / {env_b}");
-    assert_eq!(env_b["status"], "expired", "B carried on quietly until its watch ran out");
+    assert_eq!(env_b["status"], "expired", "B carried on quietly until its watch ran out: {env_b}");
     assert_eq!(lines_of(&log), 1, "the hook ran once in all");
     let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sandbox.state_root().join("credit-state.json")).unwrap()).unwrap();
     assert_eq!(recorded["on_credits"], true);

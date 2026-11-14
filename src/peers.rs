@@ -2,12 +2,13 @@
 //! blocking calls, not watches between calls. It is operator-owned state, like
 //! watch files; session identity is attribution, not an authentication boundary.
 //!
-//! CLAIM(peers-registry): a unique atomic record lives as long as the blocking
-//! future, including its error and cancellation paths [peers_tests].
+//! CLAIM(peers-registry): when registration succeeds, a unique atomic record
+//! lives as long as the blocking future, including its error and cancellation
+//! paths [peers_tests].
 //! CLAIM(peers-session): only equal, nonempty session keys see peers; the binary
 //! supplies the environment/ancestry identity, tests supply a key [peers_tests].
-//! CLAIM(peers-own): the current pid and calls whose EVERY watch has a live
-//! confirmation marker are own calls [pilot spec; peers_tests].
+//! CLAIM(peers-own): the current pid is excluded; confirmed calls on other
+//! watches remain informational [SPEC Orchestrator peers; peers_tests].
 //! CLAIM(peers-stale): dead/zombie pids are ignored and pruned [peers_tests].
 //! CLAIM(peers-once): a create-new receipt claims a foreign record once across
 //! concurrent readers and successive CLI processes [peers_tests].
@@ -34,6 +35,28 @@ pub enum PeerKind {
     Watch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerMode {
+    Plain,
+    Orchestrator,
+}
+
+/// The process behind a call's pid: a one-shot CLI or the shared MCP server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallTransport {
+    #[default]
+    Cli,
+    Mcp,
+}
+
+impl CallTransport {
+    fn as_str(self) -> &'static str {
+        match self { Self::Cli => "cli", Self::Mcp => "mcp" }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct CallWatch {
     watch_id: WatchId,
@@ -45,6 +68,8 @@ struct CallWatch {
 #[derive(Serialize, Deserialize)]
 struct CallFile {
     pid: u32,
+    #[serde(default)]
+    transport: CallTransport,
     session: Option<String>,
     orchestrator: bool,
     started_at: Timestamp,
@@ -72,8 +97,8 @@ pub(crate) struct PeerScan {
 }
 
 impl Vigil {
-    /// Registration errors are explicit store errors; no call waits invisibly
-    /// after a failed write. No await separates publication and guard ownership.
+    /// Best effort: the blocking caller ignores registration failures. No await
+    /// separates successful publication and guard ownership.
     pub(crate) fn register_call(&self, covered: &[WatchId], orchestrator: bool, max_s: u64) -> Result<CallGuard, VigilError> {
         let watches = covered.iter().map(|id| {
             let watch = self.store.load(id)?;
@@ -86,7 +111,7 @@ impl Vigil {
             })
         }).collect::<Result<Vec<_>, VigilError>>()?;
         let record = CallFile {
-            pid: std::process::id(), session: self.session_key.clone(), orchestrator,
+            pid: std::process::id(), transport: self.transport, session: self.session_key.clone(), orchestrator,
             started_at: self.clock.now(), watch_ids: covered.to_vec(), watches, max_s,
         };
         let dir = self.store.root().join("calls");
@@ -99,16 +124,16 @@ impl Vigil {
 
     /// Called only from an orchestrator sense pass. Invalid/in-flight files
     /// are skipped; only a known-dead pid permits removal. Read errors leave
-    /// another process's files alone. Receipt errors remain explicit.
-    pub(crate) fn scan_peers(&self, covered: &[WatchId]) -> Result<PeerScan, VigilError> {
+    /// another process's files alone. Registry and receipt failures are skipped.
+    pub(crate) fn scan_peers(&self, covered: &[WatchId]) -> PeerScan {
         let mut scan = PeerScan::default();
         // ↳ CLAIM(peers-session)
-        let Some(session) = self.session_key.as_deref().filter(|key| !key.is_empty()) else { return Ok(scan) };
+        let Some(session) = self.session_key.as_deref().filter(|key| !key.is_empty()) else { return scan };
         let dir = self.store.root().join("calls");
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(scan),
-            Err(error) => return Err(StoreError::io(error).into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return scan,
+            Err(_) => return scan,
         };
         let mut paths: Vec<_> = entries.filter_map(Result::ok).map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "json")).collect();
@@ -124,19 +149,17 @@ impl Vigil {
             if record.session.as_deref() != Some(session) || record.pid == std::process::id() {
                 continue;
             }
-            if !record.watch_ids.is_empty() && record.watch_ids.iter().all(|id| {
+            let confirmed = !record.watch_ids.is_empty() && record.watch_ids.iter().all(|id| {
                 self.store.load(id).ok().is_some_and(|watch| self.orchestrator_confirmed(&watch))
-            }) {
-                continue;
-            }
-            if record.orchestrator {
-                let primary = self.load_watch(&covered[0])?;
+            });
+            if record.orchestrator && !confirmed {
+                let Some(primary) = covered.first().and_then(|id| self.load_watch(id).ok()) else { continue };
                 // ↳ CLAIM(peers-once): no await between claiming and building
                 // the event. Like credit events, this is call-local attention.
                 match OpenOptions::new().write(true).create_new(true).open(path.with_extension("raised")) {
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => return Err(StoreError::io(error).into()),
+                    Err(_) => continue,
                 }
                 // A caller may have returned between our read and claim.
                 // Its guard cannot remove a receipt created AFTER it dropped.
@@ -148,18 +171,23 @@ impl Vigil {
                 scan.events.push(Event {
                     event_id: format!("{}:peer:{}", primary.spec.id, path.file_stem().unwrap_or_default().to_string_lossy()),
                     tick: primary.tick, watch_id: primary.spec.id.as_str().to_string(), input: "peers".into(),
-                    summary: format!("foreign orchestrator: {names}; pid {}; started_at {}", record.pid, record.started_at.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                    summary: format!("foreign orchestrator: {names}; transport {}; pid {}; started_at {}{}", record.transport.as_str(), record.pid, record.started_at.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        if record.transport == CallTransport::Mcp { "; this pid is the session's vigil MCP server; stop the agent, not the pid" } else { "" }),
                     judge: None, redelivered: false, detail: Some(EventDetail::ForeignOrchestrator),
                 });
             } else {
-                scan.peers.extend(record.watches.into_iter().map(|watch| Peer {
+                let mode = if record.orchestrator { PeerMode::Orchestrator } else { PeerMode::Plain };
+                scan.peers.extend(record.watches.into_iter()
+                    .filter(|watch| !confirmed || !covered.contains(&watch.watch_id))
+                    .map(|watch| Peer {
+                    mode,
                     watch_id: watch.watch_id, kind: watch.kind, expect_s: watch.expect_s,
                     waited_s: self.clock.now().secs_since(record.started_at).max(0) as u64,
                     inputs: watch.inputs,
                 }));
             }
         }
-        Ok(scan)
+        scan
     }
 }
 

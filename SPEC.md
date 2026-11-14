@@ -878,38 +878,76 @@ the envelope is `pending` with `next: "call keepalive again"` and no events
 envelope, with no release event.
 
 **Orchestrator window (H9).** A hold defaults to `orchestrator: true`: holds are
-for main sessions, so keepalive over a hold uses the 50 minute window on a 1 hour
-prompt cache (and the credit checks). `"orchestrator": false` at creation, or
+for main sessions, so after confirmation keepalive over a hold uses the 50 minute
+window on a 1 hour prompt cache (and the credit checks). `"orchestrator": false` at creation, or
 `orchestrator: false` on the call, overrides. A subagent must pass its own
 `watch_id` to `keepalive`: a no-id call covers every watch this process
 created, holds included.
 
 **Orchestrator confirmation (owner 2026-11-14, `src/orchestrator.rs`).**
 Orchestrator mode is only for the main session that speaks with the user.
-`orchestrator: true` on keepalive, hold or watch_create, for a watch that is
-not yet confirmed, needs `confirm` (CLI `--confirm`) set to the day's token;
-without it the call does not block or write anything and fails (CLI exit 1,
-MCP tool error) with a challenge that asks whether this session has spoken
-directly with the user and, only there, states the token. The right token
-confirms every watch the call covers (or the new watch) for its life; later
-calls on it need none. A stored default (a hold's `orchestrator: true`) counts
-only for a confirmed watch; unconfirmed, keepalive uses the plain window and
-asks nothing. The token is per UTC day and kept in the state root.
+`orchestrator: true` on keepalive with a named `watch_id`, hold or watch_create,
+for a watch that is not yet confirmed, needs `confirm` (CLI `--confirm`) set to
+the day's token. Without it the call does not block or write a watch and fails
+(CLI exit 1, MCP tool error) with a challenge that asks whether this session
+has spoken directly with the user and, only there, states the token. The right
+token confirms only the named watch or the new watch for its life; later calls
+on it need none. A no-id keepalive with explicit orchestrator mode requires
+EVERY covered pending watch already confirmed. It confirms nothing new, even
+with the right token; confirm each watch with a separate named call first.
+
+Without an explicit flag, keepalive can inherit orchestrator mode from stored
+flags only when EVERY covered pending watch is confirmed. A confirmed hold
+mixed with an unconfirmed plain watch gets the plain window. An unconfirmed
+hold's stored default also gets the plain window without a challenge. A caller
+that neither asks for orchestrator mode nor supplies `confirm` never reads or
+creates the token. Explicit `orchestrator: false` always selects plain mode.
+The token is per UTC day at `orchestrator/token.json` in the state root.
+Watch confirmations are separate at `orchestrator/watches/<id>.json`, tied to
+the watch's `created_at`, so a later watch with that id and a different creation
+time needs confirmation again.
 
 **Orchestrator peers (pilot, owner 2026-11-14, `src/peers.rs`).** Blocking
-calls atomically register `calls/<pid>-<n>.json` and remove it on return, error
-or cancellation. Records contain identity, effective mode, start, watch ids,
-window, and per-watch kind, expectation and short input summary. Each existing
-orchestrator sense pass flags a foreign same-session orchestrator with
-`kind: "foreign_orchestrator"` and `next: "act on events"`; ordinary peers
-appear as `peers: [{watch_id, kind, expect_s, waited_s, inputs}]`, absent when
-empty. The current pid and calls whose every watch is confirmed count as own;
-dead pids are pruned. A `.raised` receipt limits each record to one alert.
-Session identity uses `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`,
-`T3CODE_THREAD_ID`, then the nearest Claude/Codex ancestor pid; with none,
-peers are disabled. Plain calls register but never scan. Registry failures
-are explicit store errors. This operator-owned registry provides attribution,
-not authentication. Claims `peers-*` are proved in `src/peers_tests.rs`.
+calls attempt to atomically register `calls/<pid>-<n>.json` and remove it on
+return, error or cancellation. Records contain identity, transport (`mcp` or
+`cli`), effective mode, start, watch ids, window, and per-watch kind,
+expectation and short input summary. At each existing orchestrator sense pass,
+a foreign same-session orchestrator whose covered watches are not all
+confirmed raises `kind: "foreign_orchestrator"` once per record. It ends a
+pending call with `next: "act on events"`. If the primary watch has ended,
+`next` keeps its watch-ended instruction while the event is still included.
+The summary names watch ids, transport, pid and start time. For MCP it says
+"this pid is the session's vigil MCP server; stop the agent, not the pid".
+
+Calls from the current pid are excluded. An orchestrator call whose every
+watch is confirmed produces information only: its watches that the scanner
+does not cover appear in `peers` with `mode: "orchestrator"`. Ordinary calls
+appear with `mode: "plain"`. The wire shape is
+`peers: [{watch_id, kind, mode, expect_s, waited_s, inputs}]`, absent when empty;
+these entries never end the call. Dead pids are pruned. A `.raised` receipt
+limits each foreign record to one alert. Session identity uses
+`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, `T3CODE_THREAD_ID`, then the nearest
+Claude/Codex ancestor pid; with none, peers are disabled. Plain calls register
+but never scan. Registration, directory read, record read and receipt failures
+are best effort: skip the failed operation or record and continue the
+keepalive. Peer bookkeeping must never cost a caller its envelope.
+Claims `peers-*` are proved in `src/peers_tests.rs`.
+
+**Known limits (pilot).**
+
+- There is no caller identity within a session. Explicitly confirmed misuse
+  cannot be distinguished from the main session's own other calls. Calls
+  sharing the scanner's MCP pid are excluded entirely.
+- Session keys, tokens, markers and call records are operator-owned
+  attribution, not authentication. Confirmation relies on an honest answer.
+- PID reuse and restarted per-process counters can collide with stale records
+  or receipts. Cleanup runs only when an orchestrator scans.
+- Concurrent token generation can race. Recreating a watch id at the same
+  stored `created_at` can reuse its marker. Incarnation ids and serialized
+  token rotation remain deferred.
+- Registry scans are unbounded. Alerts have no durable acknowledged delivery;
+  cancellation or transport loss can consume a receipt before delivery.
+  Registry failures can hide peers while the keepalive continues.
 
 **`vigil hold --until-idle` (H10).** `idle:<dir>` with `<dir>` the creating cwd:
 live while any qex job whose cwd is that directory or below has not ended. The

@@ -391,6 +391,6 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&shown)?;
             Ok(0)
         }
-        Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil)).await.map(|()| 0),
+        Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil.with_transport(vigil::peers::CallTransport::Mcp))).await.map(|()| 0),
     }
 }

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::hold::HoldRequest;
 use crate::keepalive::KeepaliveRequest;
-use crate::testing::{Env, TokioClock, spec_instant};
+use crate::testing::{Env, TokioClock, default_config, spec_instant};
 use crate::watch::WatchId;
 
 fn env() -> Env {
@@ -118,13 +118,14 @@ async fn ordinary_peer_is_information_with_the_spec_wire_fields() {
     // why: legitimate subagent waits are visible without waking the main call.
     // catches: flagging all peers; missing fields; measuring the main's age.
     // proves: CLAIM(peers-info)
-    let env = env();
+    let env = gated_env();
     hold(&env, "main").await;
+    confirm(&env, "main");
     let peer = Peer::new();
     fixture(&env, peer.pid(), Some("pilot-session"), false, &["sub"]);
     let answer = serde_json::to_value(env.vigil.keepalive(request(Some(true))).await.unwrap()).unwrap();
     assert_eq!(answer["peers"], json!([{
-        "watch_id": "sub", "kind": "hold", "expect_s": 120, "waited_s": 37, "inputs": "process:4242"
+        "watch_id": "sub", "kind": "hold", "mode": "plain", "expect_s": 120, "waited_s": 37, "inputs": "process:4242"
     }]));
     assert_eq!(answer["waited_s"], 30);
     assert_eq!(answer["next"], "call keepalive again");
@@ -132,8 +133,9 @@ async fn ordinary_peer_is_information_with_the_spec_wire_fields() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn own_pid_and_multiple_confirmed_holds_are_not_foreign() {
-    // why: multiple main-session holds must never flag one another.
+async fn own_pid_is_excluded_and_other_confirmed_holds_are_information() {
+    // why: multiple main-session holds must never flag one another, but other
+    //      confirmed holds must remain visible as information.
     // catches: excluding only the primary id or only the calling pid; any
     //      confirmed watch wrongly exempting a mixed, foreign call.
     // proves: CLAIM(peers-own)
@@ -150,7 +152,10 @@ async fn own_pid_and_multiple_confirmed_holds_are_not_foreign() {
     fixture(&env, std::process::id(), Some("pilot-session"), true, &["same-pid"]);
     let answer = registered_call(&env, Some(true)).await;
     assert_eq!(answer["events"], json!([]));
-    assert!(answer.get("peers").is_none());
+    assert_eq!(answer["peers"], json!([
+        {"watch_id": "own-a", "kind": "hold", "mode": "orchestrator", "expect_s": 120, "waited_s": 37, "inputs": "process:4242"},
+        {"watch_id": "own-b", "kind": "hold", "mode": "orchestrator", "expect_s": 120, "waited_s": 37, "inputs": "process:4242"}
+    ]));
     assert_eq!(answer["waited_s"], 30);
     fixture(&env, peer.pid(), Some("pilot-session"), true, &["own-a", "unconfirmed"]);
     let mixed = env.vigil.keepalive(request(Some(true))).await.unwrap();
@@ -237,7 +242,7 @@ async fn call_registry_is_atomic_unique_and_removed_on_return_cancel_or_drop() {
     // catches: one file per pid; recording requested max instead of the clamp;
     //      cleanup only on success; a guard dropped before the blocking wait.
     // proves: CLAIM(peers-registry)
-    let env = env();
+    let env = gated_env();
     hold(&env, "main").await;
     let mut short = request(Some(false));
     short.max_s = Some(1); // shipped minimum is 30, not the requested 1
@@ -250,6 +255,7 @@ async fn call_registry_is_atomic_unique_and_removed_on_return_cancel_or_drop() {
     for record in active {
         assert_eq!(record["pid"], std::process::id());
         assert_eq!(record["session"], "pilot-session");
+        assert_eq!(record["transport"], "cli");
         assert_eq!(record["orchestrator"], false);
         assert_eq!(record["started_at"], json!(spec_instant()));
         assert_eq!(record["max_s"], 30);
@@ -309,4 +315,155 @@ async fn ordinary_watch_metadata_is_registered_and_an_error_unregisters_it() {
     std::fs::remove_file(env.vigil.store().watch_path(&id("main"))).unwrap();
     assert!(call.await.is_err(), "watch disappeared while waiting");
     assert!(records(&env).is_empty(), "error paths unregister too");
+}
+
+
+fn gated_env() -> Env {
+    let config = crate::config::Config { orchestrator_confirm: true, ..default_config() };
+    let mut env = Env::with_clock_and_config(Arc::new(TokioClock::new(spec_instant())), config);
+    env.vigil = env.vigil.with_session_key(Some("pilot-session".into()));
+    env
+}
+
+fn confirm(env: &Env, name: &str) {
+    let watch = env.vigil.store().load(&id(name)).unwrap();
+    env.vigil.mark_orchestrator_confirmed(&watch).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn fix1_registry_failure_never_costs_a_keepalive_its_envelope() {
+    // why: review blocker, optional peer bookkeeping cannot break any wait mode.
+    // catches: propagating either registration or directory scan errors.
+    for mode in [Some(false), None, Some(true)] {
+        let env = gated_env();
+        hold(&env, "main").await;
+        if mode == Some(true) { confirm(&env, "main"); }
+        std::fs::write(env.root().join("calls"), b"not a directory").unwrap();
+        let answer = env.vigil.keepalive(request(mode)).await.expect("registry is best effort");
+        assert_eq!(answer.status, crate::watch::WatchStatus::Pending);
+        assert_eq!(answer.next, crate::Next::CallKeepaliveAgain);
+        assert_eq!(answer.waited_s, Some(30));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fix1_receipt_failure_skips_one_peer_and_keeps_other_information() {
+    // why: failure claiming an optional event must not abort scanning or waiting.
+    // catches: propagating receipt errors or discarding the rest of the scan.
+    let env = gated_env();
+    hold(&env, "main").await;
+    confirm(&env, "main");
+    let rogue = Peer::new();
+    let ordinary = Peer::new();
+    fixture(&env, ordinary.pid(), Some("pilot-session"), false, &["ordinary"]);
+    let mut call = Box::pin(env.vigil.keepalive(request(Some(true))));
+    tokio::select! { biased; r = &mut call => panic!("unexpected return: {r:?}"), () = tokio::task::yield_now() => {} }
+    assert!(records(&env).iter().any(|record| record["pid"] == std::process::id()), "registration succeeded before the write failure");
+    let path = fixture(&env, rogue.pid(), Some("pilot-session"), true, &["rogue"]);
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path.parent().unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = call.await;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let answer = result.expect("receipt failure is best effort");
+    assert!(answer.events.is_empty());
+    assert_eq!(answer.peers.len(), 1);
+    assert_eq!(answer.peers[0].watch_id, id("ordinary"));
+    assert_eq!(answer.waited_s, Some(30));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fix1_probe_a_mixed_no_id_call_registers_plain_and_gets_plain_window() {
+    // why: a subagent shares the main's MCP server and covers its confirmed hold.
+    // catches: any confirmed watch granting orchestrator mode to a mixed call.
+    let projects = tempfile::tempdir().unwrap();
+    let config = crate::config::Config {
+        orchestrator_confirm: true,
+        claude_projects_dir: Some(projects.path().into()),
+        ..default_config()
+    };
+    crate::testing::write_transcript(projects.path(), "p", "pilot-session", &[
+        crate::testing::assistant_line(0, 500), crate::testing::assistant_line(900, 0),
+    ]);
+    let mut env = Env::with_clock_and_config(Arc::new(TokioClock::new(spec_instant())), config);
+    env.vigil = env.vigil.with_session_key(Some("pilot-session".into())).with_agent_env(crate::cache::AgentEnv {
+        claude_session_id: Some("pilot-session".into()), codex: false,
+    });
+    hold(&env, "main").await;
+    confirm(&env, "main");
+    // Positive control: this same session really can get the 3000 s window.
+    let mut main = Box::pin(env.vigil.keepalive(KeepaliveRequest {
+        watch_id: Some(id("main")), ..KeepaliveRequest::default()
+    }));
+    tokio::select! { biased; r = &mut main => panic!("unexpected return: {r:?}"), () = tokio::task::yield_now() => {} }
+    assert_eq!(records(&env)[0]["max_s"], 3000);
+    drop(main);
+    let path = env.input_path("build.log");
+    crate::testing::write_file(&path, "waiting\n");
+    env.vigil.create(crate::testing::change_request("plain", &path, 30)).await.unwrap();
+    let mut call = Box::pin(env.vigil.keepalive(KeepaliveRequest::default()));
+    tokio::select! { biased; r = &mut call => panic!("unexpected return: {r:?}"), () = tokio::task::yield_now() => {} }
+    let active = records(&env);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["orchestrator"], false);
+    let answer = call.await.unwrap();
+    assert_eq!(answer.max_s, Some(270));
+    assert_eq!(answer.waited_s, Some(270));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fix1_confirmed_other_orchestrator_is_visible_with_mode() {
+    // why: probe C, confirmation cannot make a caller on other watches invisible.
+    // catches: dropping every all-confirmed record; missing informational mode.
+    let env = gated_env();
+    for name in ["main", "other"] { hold(&env, name).await; confirm(&env, name); }
+    let peer = Peer::new();
+    fixture(&env, peer.pid(), Some("pilot-session"), true, &["main", "other"]);
+    let answer = serde_json::to_value(env.vigil.keepalive(request(Some(true))).await.unwrap()).unwrap();
+    assert_eq!(answer["events"], json!([]));
+    assert_eq!(answer["next"], "call keepalive again");
+    assert_eq!(answer["waited_s"], 30);
+    assert_eq!(answer["peers"], json!([{
+        "watch_id": "other", "kind": "hold", "mode": "orchestrator", "expect_s": 120,
+        "waited_s": 37, "inputs": "process:4242"
+    }]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fix1_foreign_summary_names_transport_and_mcp_stop_target() {
+    // why: the MCP pid is shared, so stopping it would kill the session's server.
+    // catches: a bare pid instruction or no transport distinction.
+    for transport in ["cli", "mcp"] {
+        let env = gated_env();
+        hold(&env, "main").await;
+        confirm(&env, "main");
+        let peer = Peer::new();
+        let path = fixture(&env, peer.pid(), Some("pilot-session"), true, &["rogue"]);
+        let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["transport"] = json!(transport);
+        crate::store::write_atomic(&path, &record).unwrap();
+        let answer = env.vigil.keepalive(request(Some(true))).await.unwrap();
+        assert_eq!(answer.events.len(), 1);
+        let summary = &answer.events[0].summary;
+        assert!(summary.contains(transport), "{summary}");
+        if transport == "mcp" {
+            assert!(summary.contains("this pid is the session's vigil MCP server; stop the agent, not the pid"), "{summary}");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fix1_terminal_primary_keeps_watch_ended_when_a_peer_event_arrives() {
+    // why: terminal next is the loop's stop instruction, even with extra events.
+    // catches: the unconditional peer override after envelope construction.
+    let env = gated_env();
+    hold(&env, "main").await;
+    confirm(&env, "main");
+    env.vigil.cancel(&id("main")).await.unwrap();
+    let peer = Peer::new();
+    fixture(&env, peer.pid(), Some("pilot-session"), true, &["rogue"]);
+    let answer = serde_json::to_value(env.vigil.keepalive(request(Some(true))).await.unwrap()).unwrap();
+    assert_eq!(answer["status"], "cancelled");
+    assert_eq!(answer["next"], "watch ended; create a new watch if still needed");
+    assert!(answer["events"].as_array().unwrap().iter().any(|event| event["kind"] == "foreign_orchestrator"));
 }

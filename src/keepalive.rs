@@ -63,8 +63,8 @@ pub struct KeepaliveRequest {
     pub max_s: Option<u64>,
     /// AI1' (A8): this call is the main orchestrator session's, so it gets the
     /// TTL-derived window and the credit checks. `Some(false)` overrides a flag
-    /// stored on the watch; `None` defers to the stored flag (S10: any covered
-    /// watch that stores it makes a no-id call an orchestrator call).
+    /// stored on the watch; `None` defers to stored flags only when every
+    /// covered pending watch is confirmed (SPEC Orchestrator confirmation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<bool>,
     /// The day's token, from the challenge (`orchestrator.rs`).
@@ -337,14 +337,14 @@ impl crate::engine::Vigil {
         cancel: impl std::future::Future<Output = ()>,
     ) -> Result<Option<(Envelope, Delivery)>, VigilError> {
         let covered = self.covered_ids(request.watch_id.as_ref())?;
-        let orchestrator = self.gate_orchestrator(request.orchestrator, request.confirm.as_deref(), &covered)?;
+        let orchestrator = self.gate_orchestrator(request.orchestrator, request.confirm.as_deref(), &covered, request.watch_id.as_ref())?;
         let request = KeepaliveRequest { orchestrator, ..request };
         let plan = self.plan_call(&request, &covered);
         let max_s = plan.window.interval_s;
         let started = Instant::now();
         let budget_end = started + Duration::from_secs(max_s);
         // ↳ CLAIM(peers-registry): keep the guard through return, error or cancellation.
-        let _registration = self.register_call(&covered, plan.orchestrator, plan.window.interval_s)?;
+        let _registration = self.register_call(&covered, plan.orchestrator, plan.window.interval_s).ok();
         let finish = async {
             let call = self.sense(&covered, budget_end, progress, &plan).await?;
             let answer = self.keepalive_envelope(&covered, &call, &plan, waited_secs(started.elapsed()))?;
@@ -428,7 +428,7 @@ impl crate::engine::Vigil {
             // CLAIM(peers-info): ordinary peers ride the return as information,
             // refreshed each pass, never as an early wake [pilot; peers_tests].
             if plan.orchestrator {
-                call.peer_scan = self.scan_peers(covered)?;
+                call.peer_scan = self.scan_peers(covered);
             }
             // S6, review S4: attention that was raised and saved but never
             // acknowledged (the transport died, or another process saved it
@@ -798,9 +798,6 @@ impl crate::engine::Vigil {
             if envelope.events.iter().any(Event::is_call_ending) {
                 envelope.next = Next::ActOnEvents;
             }
-        }
-        if !call.peer_scan.events.is_empty() {
-            envelope.next = Next::ActOnEvents;
         }
         // DF3a: at risk when the envelope has events or a terminal status.
         let at_risk = !envelope.events.is_empty() || envelope.status.is_finished();
