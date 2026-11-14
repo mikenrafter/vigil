@@ -614,7 +614,7 @@ These override anything above that disagrees.
   `"call keepalive again"`.
 - V21 (history): R8 applied; the `--stream` tests, and with W42-W1 every `wait` test, are removed.
 - V26 D9: the envelope has `max_s` (the clamped ceiling used) and `waited_s`
-  (time actually waited). D10: `interval_s` default 20, clamped 1..=3600.
+  (time actually waited, rounded to the nearest second). D10: `interval_s` default 20, clamped 1..=3600.
 - V27: `VIGIL_DIGEST_MAX_BYTES` bounds the whole digest including the
   `[digest cut]` marker.
 - V28: live-client checks (FINDINGS "Still unverified") are an acceptance

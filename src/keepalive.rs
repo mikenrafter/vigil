@@ -847,6 +847,17 @@ pub struct Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waited_secs_rounds_to_the_nearest_second() {
+        // why: waited_s reports a wait that may start a few ms past a second
+        //      (deadlines are whole-second anchors); floor, ceil and a late
+        //      threshold each misreport one of these.
+        // catches: floor (599.997 -> 599), ceil (1.4 -> 2), a >= 900 ms threshold (0.5 -> 0).
+        for (millis, expected) in [(499, 0), (500, 1), (599_997, 600), (1_400, 1)] {
+            assert_eq!(waited_secs(Duration::from_millis(millis)), expected, "{millis} ms");
+        }
+    }
     use crate::engine::Vigil;
     use crate::envelope::{Next, DIGEST_CUT_MARKER};
     use crate::judge::JudgeError;

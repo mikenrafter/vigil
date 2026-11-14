@@ -961,7 +961,8 @@ fn a_quiet_keepalive_on_a_full_disk_is_held_one_interval_then_returns_pending_wi
     let envelope = stdout_json(&output);
     assert_eq!(envelope["status"], "pending");
     assert_eq!(envelope["next"], "call keepalive again");
-    assert_eq!(envelope["waited_s"], 1, "{envelope}");
+    // Real time: the 1 s hold plus the tick and failed save; waited_s rounds, so 1 or 2.
+    assert!((1..=2).contains(&envelope["waited_s"].as_u64().unwrap()), "{envelope}");
     assert_eq!(envelope["events"].as_array().map(Vec::len), Some(0), "{envelope}");
     assert_failed_persist(&envelope, "disk_full", "No space left on device", &sandbox.watch_path("w"), false, Some(true));
     let lines = stderr_lines(&output);

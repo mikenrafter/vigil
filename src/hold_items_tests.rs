@@ -1243,15 +1243,30 @@ async fn w46_bad_cap_json_does_not_break_keepalive_cancel_or_cap_set_but_admissi
     // S2: the counts are left out rather than shown as defaults; S3: the envelope says why.
     assert!(kept.get("cap").is_none(), "{kept}");
     assert!(kept["cap_error"].as_str().is_some_and(|error| error.contains("cap.json") && error.contains("vigil cap reset")), "{kept}");
-    assert!(env.vigil.status(&wid("h")).await.is_ok());
+    let status = env.vigil.status(&wid("h")).await.expect("status of a classed hold with a bad cap.json");
+    assert!(status.envelope.cap.is_none() && status.envelope.cap_error.as_deref().is_some_and(|error| error.contains("vigil cap reset")), "{status:?}");
     let cancelled = env.vigil.cancel(&wid("c")).await.expect("cancel of a classed hold with a bad cap.json");
     assert_eq!(cancelled.status, crate::WatchStatus::Cancelled);
+    assert!(cancelled.cap_error.as_deref().is_some_and(|error| error.contains("vigil cap reset")), "{cancelled:?}");
     let second: HoldItemRequest = serde_json::from_value(serde_json::json!({"for": "none", "label": "second", "cap": "work"})).unwrap();
     let refused = env.vigil.hold_add(&wid("h"), second).await.expect_err("admission fails closed on a bad cap.json").to_string();
     assert!(refused.contains("vigil cap reset"), "{refused}");
     let until = env.clock.now().plus_secs(60);
     let set = env.vigil.cap_set(std::num::NonZeroUsize::new(2).unwrap(), None, until).await.expect("cap set replaces a bad cap.json");
     assert_eq!((set.work.get(), set.review.get()), (2, 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn w46_a_cap_json_that_cannot_be_read_at_all_names_the_path_and_the_reset() {
+    // why: W46 S3 review: an I/O failure (here cap.json is a directory) took the bare
+    //      io-error branch, so cap_error said "Is a directory" with no path or remedy.
+    // catches: only the parse-error branch naming the file and `vigil cap reset`.
+    let env = rig();
+    env.vigil.hold(w46_request(serde_json::json!({"id": "h", "for": ["none"], "label": "first", "cap": "work"}))).await.unwrap();
+    std::fs::create_dir(env.vigil.store().root().join("cap.json")).unwrap();
+    let kept = call(&env.vigil, "h", Some(30)).await;
+    let error = kept["cap_error"].as_str().unwrap_or_default();
+    assert!(error.contains("cap.json") && error.contains("vigil cap reset"), "{kept}");
 }
 
 #[tokio::test(start_paused = true)]

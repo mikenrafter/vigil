@@ -98,7 +98,7 @@ impl Vigil {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(CapLimits::default()),
-            Err(error) => return Err(StoreError::io(error).into()),
+            Err(error) => return Err(StoreError::Corrupt(format!("{}: {error}; the owner can replace it with `vigil cap reset`", path.display())).into()),
         };
         let limits: CapLimits = serde_json::from_slice(&bytes).map_err(|error| StoreError::Corrupt(format!("{}: {error}; the owner can replace it with `vigil cap reset`", path.display())))?;
         Ok(if limits.source == CapSource::Owner && limits.until.is_some_and(|until| until > self.clock.now()) { limits } else { CapLimits::default() })

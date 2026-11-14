@@ -2310,10 +2310,10 @@ fn a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_
     //      with ENOSPC after 0.95 s, so the rescue would begin at t = 29.95 s;
     //      the store-wide lock is held. The rescue's cutoff is the deadline less
     //      the 100 ms margin, t = 29.9 s, which has passed: no wait at all.
-    //      Expected, hand-derived: the call ends at t = 29.95 s (29 + 0.95), so
-    //      `waited_s` is 29 (before the fix the stale 0.9 s wait ran into the
-    //      30 s timeout: the call ended at exactly 30 s, `waited_s` 30, the tick
-    //      dropped), the fired envelope carries the plain failure (disk_full,
+    //      Expected, hand-derived: the call ends at t = 29.95 s (29 + 0.95),
+    //      before the 30 s timeout (before the fix the stale 0.9 s wait ran
+    //      into it: the call ended at exactly 30 s and the tick dropped;
+    //      `waited_s` rounds both to 30, so `elapsed` is the check), the fired envelope carries the plain failure (disk_full,
     //      no retry, redelivery), the reserve is the same file, ONE watch
     //      attempt in the call.
     //      Control (same world, lock FREE): a passed cutoff forbids WAITING,
@@ -2335,7 +2335,6 @@ fn a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_
         assert_failed_persist(&envelope, "disk_full", "No space left on device", &env.root().join("watches").join("q.json"), true, Some(false));
         assert!(elapsed >= Duration::from_millis(29_900), "precondition: the read (29 s) and the slow write (0.95 s) really ran: {elapsed:?}");
         assert!(elapsed < Duration::from_secs(30), "the rescue must not wait once its cutoff has passed; the call took {elapsed:?}");
-        assert_eq!(envelope["waited_s"], 30, "29.95 s, rounded: {envelope}");
         assert_eq!(plan.attempts(WriteKind::Watch) - attempts_before, 1, "no lock, no retry");
         assert_eq!(identity(&env.root().join(".reserve")), reserve_before, "the reserve is untouched");
     });
