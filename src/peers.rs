@@ -1,0 +1,215 @@
+//! Same-session calls (SPEC "Orchestrator peers"). The registry describes
+//! blocking calls, not watches between calls. It is operator-owned state, like
+//! watch files; session identity is attribution, not an authentication boundary.
+//!
+//! CLAIM(peers-registry): a unique atomic record lives as long as the blocking
+//! future, including its error and cancellation paths [peers_tests].
+//! CLAIM(peers-session): only equal, nonempty session keys see peers; the binary
+//! supplies the environment/ancestry identity, tests supply a key [peers_tests].
+//! CLAIM(peers-own): the current pid and calls whose EVERY watch has a live
+//! confirmation marker are own calls [pilot spec; peers_tests].
+//! CLAIM(peers-stale): dead/zombie pids are ignored and pruned [peers_tests].
+//! CLAIM(peers-once): a create-new receipt claims a foreign record once across
+//! concurrent readers and successive CLI processes [peers_tests].
+
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
+
+use crate::clock::Timestamp;
+use crate::engine::Vigil;
+use crate::envelope::Peer;
+use crate::error::{StoreError, VigilError};
+use crate::watch::{Event, EventDetail, FireRule, WatchId};
+
+static NEXT_CALL: AtomicU64 = AtomicU64::new(0);
+const INPUT_SUMMARY_BYTES: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerKind {
+    Hold,
+    Watch,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CallWatch {
+    watch_id: WatchId,
+    kind: PeerKind,
+    expect_s: Option<u64>,
+    inputs: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CallFile {
+    pid: u32,
+    session: Option<String>,
+    orchestrator: bool,
+    started_at: Timestamp,
+    watch_ids: Vec<WatchId>,
+    watches: Vec<CallWatch>,
+    max_s: u64,
+}
+
+pub(crate) struct CallGuard(PathBuf);
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        remove_call(&self.0);
+    }
+}
+
+fn remove_call(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("raised"));
+}
+
+#[derive(Default)]
+pub(crate) struct PeerScan {
+    pub peers: Vec<Peer>,
+    pub events: Vec<Event>,
+}
+
+impl Vigil {
+    /// Registration errors are explicit store errors; no call waits invisibly
+    /// after a failed write. No await separates publication and guard ownership.
+    pub(crate) fn register_call(&self, covered: &[WatchId], orchestrator: bool, max_s: u64) -> Result<CallGuard, VigilError> {
+        let watches = covered.iter().map(|id| {
+            let watch = self.store.load(id)?;
+            let inputs = watch.spec.inputs.iter().map(|input| input.label()).collect::<Vec<_>>().join("; ");
+            Ok(CallWatch {
+                watch_id: id.clone(),
+                kind: if matches!(watch.spec.fire, FireRule::Hold) { PeerKind::Hold } else { PeerKind::Watch },
+                expect_s: watch.spec.expect_s,
+                inputs: short_inputs(inputs),
+            })
+        }).collect::<Result<Vec<_>, VigilError>>()?;
+        let record = CallFile {
+            pid: std::process::id(), session: self.session_key.clone(), orchestrator,
+            started_at: self.clock.now(), watch_ids: covered.to_vec(), watches, max_s,
+        };
+        let dir = self.store.root().join("calls");
+        std::fs::create_dir_all(&dir).map_err(StoreError::io)?;
+        let path = dir.join(format!("{}-{}.json", record.pid, NEXT_CALL.fetch_add(1, Ordering::Relaxed)));
+        // ↳ CLAIM(peers-registry)
+        crate::store::write_atomic(&path, &record)?;
+        Ok(CallGuard(path))
+    }
+
+    /// Called only from an orchestrator sense pass. Invalid/in-flight files
+    /// are skipped; only a known-dead pid permits removal. Read errors leave
+    /// another process's files alone. Receipt errors remain explicit.
+    pub(crate) fn scan_peers(&self, covered: &[WatchId]) -> Result<PeerScan, VigilError> {
+        let mut scan = PeerScan::default();
+        // ↳ CLAIM(peers-session)
+        let Some(session) = self.session_key.as_deref().filter(|key| !key.is_empty()) else { return Ok(scan) };
+        let dir = self.store.root().join("calls");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(scan),
+            Err(error) => return Err(StoreError::io(error).into()),
+        };
+        let mut paths: Vec<_> = entries.filter_map(Result::ok).map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json")).collect();
+        paths.sort();
+        for path in paths {
+            let Some(record) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<CallFile>(&bytes).ok()) else { continue };
+            // ↳ CLAIM(peers-stale)
+            if pid_dead(record.pid) {
+                remove_call(&path);
+                continue;
+            }
+            // ↳ CLAIM(peers-own), CLAIM(peers-session)
+            if record.session.as_deref() != Some(session) || record.pid == std::process::id() {
+                continue;
+            }
+            if !record.watch_ids.is_empty() && record.watch_ids.iter().all(|id| {
+                self.store.load(id).ok().is_some_and(|watch| self.orchestrator_confirmed(&watch))
+            }) {
+                continue;
+            }
+            if record.orchestrator {
+                let primary = self.load_watch(&covered[0])?;
+                // ↳ CLAIM(peers-once): no await between claiming and building
+                // the event. Like credit events, this is call-local attention.
+                match OpenOptions::new().write(true).create_new(true).open(path.with_extension("raised")) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(StoreError::io(error).into()),
+                }
+                // A caller may have returned between our read and claim.
+                // Its guard cannot remove a receipt created AFTER it dropped.
+                if !path.exists() {
+                    let _ = std::fs::remove_file(path.with_extension("raised"));
+                    continue;
+                }
+                let names = record.watch_ids.iter().map(WatchId::as_str).collect::<Vec<_>>().join(", ");
+                scan.events.push(Event {
+                    event_id: format!("{}:peer:{}", primary.spec.id, path.file_stem().unwrap_or_default().to_string_lossy()),
+                    tick: primary.tick, watch_id: primary.spec.id.as_str().to_string(), input: "peers".into(),
+                    summary: format!("foreign orchestrator: {names}; pid {}; started_at {}", record.pid, record.started_at.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                    judge: None, redelivered: false, detail: Some(EventDetail::ForeignOrchestrator),
+                });
+            } else {
+                scan.peers.extend(record.watches.into_iter().map(|watch| Peer {
+                    watch_id: watch.watch_id, kind: watch.kind, expect_s: watch.expect_s,
+                    waited_s: self.clock.now().secs_since(record.started_at).max(0) as u64,
+                    inputs: watch.inputs,
+                }));
+            }
+        }
+        Ok(scan)
+    }
+}
+
+fn short_inputs(mut summary: String) -> String {
+    if summary.len() > INPUT_SUMMARY_BYTES {
+        let mut end = INPUT_SUMMARY_BYTES - 3;
+        while !summary.is_char_boundary(end) { end -= 1; }
+        summary.truncate(end);
+        summary.push_str("...");
+    }
+    summary
+}
+
+/// Read only names and parent pids from procfs, never another process's env.
+fn proc_stat(root: &Path, pid: u32) -> std::io::Result<(String, char, u32)> {
+    let stat = std::fs::read_to_string(root.join(pid.to_string()).join("stat"))?;
+    let (head, tail) = stat.rsplit_once(')').ok_or_else(|| std::io::Error::other("invalid proc stat"))?;
+    let name = head.split_once('(').ok_or_else(|| std::io::Error::other("invalid proc name"))?.1.to_string();
+    let mut fields = tail.split_whitespace();
+    let state = fields.next().and_then(|field| field.chars().next()).ok_or_else(|| std::io::Error::other("missing process state"))?;
+    let parent = fields.next().and_then(|field| field.parse().ok()).ok_or_else(|| std::io::Error::other("missing parent pid"))?;
+    Ok((name, state, parent))
+}
+
+fn pid_dead(pid: u32) -> bool {
+    match proc_stat(Path::new("/proc"), pid) {
+        Ok((_, state, _)) => matches!(state, 'Z' | 'X'),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn ancestor_session(root: &Path, mut pid: u32) -> Option<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    while pid != 0 && seen.insert(pid) {
+        let (name, _, parent) = proc_stat(root, pid).ok()?;
+        if matches!(name.as_str(), "claude" | ".claude-wrapped" | "codex" | ".codex-wrapped") {
+            return Some(format!("ancestor:{pid}"));
+        }
+        pid = parent;
+    }
+    None
+}
+
+/// The binary reads environment at its edge; no session env is mutated by the
+/// engine or tests. Empty values count as absent. Ancestry is the last resort.
+pub fn session_key_from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    for name in ["CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "T3CODE_THREAD_ID"] {
+        if let Some(value) = lookup(name).filter(|value| !value.trim().is_empty()) {
+            return Some(value);
+        }
+    }
+    ancestor_session(Path::new("/proc"), std::process::id())
+}

@@ -110,6 +110,7 @@ struct SaveRecord {
 #[derive(Default)]
 struct CallRecord {
     changed: Vec<ChangedInput>,
+    peer_scan: crate::peers::PeerScan,
     /// Watches whose save in this call spent the reserve or failed, by id.
     saves: BTreeMap<WatchId, SaveRecord>,
     /// S1: watches that ticked in this call right after a failed save.
@@ -158,7 +159,7 @@ impl CallRecord {
     /// not a finished watch (attention, a credit change, or an attention event
     /// that was never acknowledged)?
     fn has_events_for_the_agent(&self) -> bool {
-        self.raised_attention || !self.credit_events.is_empty() || !self.carried.is_empty()
+        self.raised_attention || !self.peer_scan.events.is_empty() || !self.credit_events.is_empty() || !self.carried.is_empty()
     }
 
     /// DF1a: a save that failed ends the call.
@@ -342,6 +343,8 @@ impl crate::engine::Vigil {
         let max_s = plan.window.interval_s;
         let started = Instant::now();
         let budget_end = started + Duration::from_secs(max_s);
+        // ↳ CLAIM(peers-registry): keep the guard through return, error or cancellation.
+        let _registration = self.register_call(&covered, plan.orchestrator, plan.window.interval_s)?;
         let finish = async {
             let call = self.sense(&covered, budget_end, progress, &plan).await?;
             let answer = self.keepalive_envelope(&covered, &call, &plan, waited_secs(started.elapsed()))?;
@@ -419,6 +422,14 @@ impl crate::engine::Vigil {
         let mut first_pass = true;
         let mut credit = plan.orchestrator.then(|| self.credit_plan(plan.window.interval_s));
         loop {
+            // CLAIM(peers-scope): plain calls never scan peers [pilot; peers_tests].
+            // CLAIM(peers-flag): every existing sense pass sees foreign
+            // orchestrators and ends the call [pilot; peers_tests].
+            // CLAIM(peers-info): ordinary peers ride the return as information,
+            // refreshed each pass, never as an early wake [pilot; peers_tests].
+            if plan.orchestrator {
+                call.peer_scan = self.scan_peers(covered)?;
+            }
             // S6, review S4: attention that was raised and saved but never
             // acknowledged (the transport died, or another process saved it
             // while this call waited) is delivered at once, ahead of any
@@ -757,6 +768,7 @@ impl crate::engine::Vigil {
             }
         }
         events.extend(call.credit_events.iter().cloned());
+        events.extend(call.peer_scan.events.iter().cloned());
         let others: Vec<OtherWatch> = finished
             .iter()
             .filter(|watch| watch.spec.id != primary.spec.id)
@@ -777,6 +789,7 @@ impl crate::engine::Vigil {
         envelope.waited_s = Some(waited_s);
         envelope.max_s = Some(plan.window.interval_s);
         envelope.events = events;
+        envelope.peers = call.peer_scan.peers.clone();
         envelope.others = others;
         if !primary.status.is_finished() {
             envelope.digest = cut_digest(&digest_of(&call.changed), self.config.digest_max_bytes);
@@ -785,6 +798,9 @@ impl crate::engine::Vigil {
             if envelope.events.iter().any(Event::is_call_ending) {
                 envelope.next = Next::ActOnEvents;
             }
+        }
+        if !call.peer_scan.events.is_empty() {
+            envelope.next = Next::ActOnEvents;
         }
         // DF3a: at risk when the envelope has events or a terminal status.
         let at_risk = !envelope.events.is_empty() || envelope.status.is_finished();

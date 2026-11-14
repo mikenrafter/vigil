@@ -2,7 +2,8 @@
 //! watches things for it. See `SPEC.md` and `FINDINGS.md` beside this crate.
 //!
 //! Module map: `watch`/`store`/`tick` (watches and their files), `keepalive`
-//! (the blocking call), `cache` (call window from the prompt-cache TTL),
+//! (the blocking call), `peers` (same-session call registry),
+//! `cache` (call window from the prompt-cache TTL),
 //! `attention` (early wake rules), `hold` + `items` (holds and their work
 //! items), `credit` + `monitor` (the orchestrator's
 //! credit check and hook), `advisory`/`advisory_store`/`advisory_eval` (rules
@@ -30,6 +31,7 @@ pub mod items;
 pub mod judge;
 pub mod meter;
 pub mod orchestrator;
+pub mod peers;
 pub(crate) mod monitor;
 pub(crate) mod process;
 pub mod keepalive;
@@ -67,3 +69,6 @@ mod disk_full_tests;
 mod hold_tests;
 #[cfg(test)]
 mod hold_items_tests;
+
+#[cfg(test)]
+mod peers_tests;

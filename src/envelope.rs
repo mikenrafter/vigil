@@ -163,6 +163,16 @@ pub struct SecondaryFailure {
     pub path: PathBuf,
 }
 
+/// A same-session non-orchestrator call, shown only to an orchestrator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
+    pub watch_id: WatchId,
+    pub kind: crate::peers::PeerKind,
+    pub expect_s: Option<u64>,
+    pub waited_s: u64,
+    pub inputs: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     /// V8: the watch every watch field below describes.
@@ -180,6 +190,8 @@ pub struct Envelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_s: Option<u64>,
     pub events: Vec<Event>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<Peer>,
     pub digest: String,
     pub judge_status: JudgeStatus,
     pub next: Next,
@@ -311,6 +323,7 @@ mod tests {
             waited_s: max_s,
             max_s,
             events: vec![],
+            peers: vec![],
             digest: String::new(),
             judge_status: JudgeStatus::Skipped,
             next: Next::CallKeepaliveAgain,

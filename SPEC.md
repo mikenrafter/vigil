@@ -896,6 +896,21 @@ calls on it need none. A stored default (a hold's `orchestrator: true`) counts
 only for a confirmed watch; unconfirmed, keepalive uses the plain window and
 asks nothing. The token is per UTC day and kept in the state root.
 
+**Orchestrator peers (pilot, owner 2026-11-14, `src/peers.rs`).** Blocking
+calls atomically register `calls/<pid>-<n>.json` and remove it on return, error
+or cancellation. Records contain identity, effective mode, start, watch ids,
+window, and per-watch kind, expectation and short input summary. Each existing
+orchestrator sense pass flags a foreign same-session orchestrator with
+`kind: "foreign_orchestrator"` and `next: "act on events"`; ordinary peers
+appear as `peers: [{watch_id, kind, expect_s, waited_s, inputs}]`, absent when
+empty. The current pid and calls whose every watch is confirmed count as own;
+dead pids are pruned. A `.raised` receipt limits each record to one alert.
+Session identity uses `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`,
+`T3CODE_THREAD_ID`, then the nearest Claude/Codex ancestor pid; with none,
+peers are disabled. Plain calls register but never scan. Registry failures
+are explicit store errors. This operator-owned registry provides attribution,
+not authentication. Claims `peers-*` are proved in `src/peers_tests.rs`.
+
 **`vigil hold --until-idle` (H10).** `idle:<dir>` with `<dir>` the creating cwd:
 live while any qex job whose cwd is that directory or below has not ended. The
 query is `qex list --under DIR --state active --json` (`active` is every state

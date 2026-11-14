@@ -156,6 +156,8 @@ pub struct Vigil {
     /// V11: relative inputs resolve against this at `create`.
     pub(crate) cwd: PathBuf,
     pub(crate) session: Mutex<Session>,
+    /// Same-session peer identity, supplied by the binary or a test.
+    pub(crate) session_key: Option<String>,
     /// A3: which agent is calling; read from the environment at the binary
     /// edge and handed over with `with_agent_env`.
     pub(crate) agent: crate::cache::AgentEnv,
@@ -177,6 +179,7 @@ impl Vigil {
             reader: Arc::new(SystemReader),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             session: Mutex::new(Session::default()),
+            session_key: None,
             agent: crate::cache::AgentEnv::default(),
             credit_probe,
             hook_runner: Arc::new(crate::credit::ProcessHookRunner),
@@ -187,6 +190,12 @@ impl Vigil {
     /// nor Codex.
     pub fn with_agent_env(mut self, agent: crate::cache::AgentEnv) -> Vigil {
         self.agent = agent;
+        self
+    }
+
+    /// Override the session identity without changing process environment.
+    pub fn with_session_key(mut self, session: Option<String>) -> Vigil {
+        self.session_key = session;
         self
     }
 
@@ -672,6 +681,7 @@ impl Vigil {
             waited_s: None,
             max_s: None,
             events,
+            peers: Vec::new(),
             digest: if terminal { cut_digest(&watch.last_digest, self.config.digest_max_bytes) } else { String::new() },
             judge_status: watch.judge_status,
             next: match watch.status {

@@ -1275,6 +1275,16 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
     vigil::testing::write_script(&fake_uw, "echo '{\"usage\":[{\"provider\":\"ClaudeCode\",\"windows\":[{\"window\":\"weekly\",\"exceeded\":true}]}]}'");
     assert!(create_with(&sandbox, "a", serde_json::json!({})).status.success());
     assert!(create_with(&sandbox, "b", serde_json::json!({"deadline_s": 12})).status.success());
+    // These are two main-session watches. The peer pilot exempts confirmed
+    // watches, so name them as own even though this credit fixture disables
+    // the token challenge. Keep the credit-lock assertions independent of
+    // the separate foreign-orchestrator test (CLAIM(peers-own)).
+    let confirmations = sandbox.state_root().join("orchestrator");
+    std::fs::create_dir_all(&confirmations).unwrap();
+    for id in ["a", "b"] {
+        let created_at = sandbox.watch_file(id).unwrap()["created_at"].clone();
+        vigil::store::write_atomic(&confirmations.join(format!("{id}.json")), &created_at).unwrap();
+    }
     std::fs::write(sandbox.state_root().join("credit-state.json"), r#"{"on_credits":false,"checked_at":"2020-01-01T00:00:00Z"}"#).unwrap();
 
     let barrier = sandbox.dir.path().join("barrier");
@@ -2197,4 +2207,55 @@ fn keepalive_orchestrator_from_the_cli_is_challenged_and_confirm_answers_it() {
     assert!(confirmed.status.success(), "{}", String::from_utf8_lossy(&confirmed.stderr));
     let again = run(&["keepalive", "h", "--max-s", "30", "--orchestrator"]);
     assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+}
+
+#[test]
+fn peer_session_keys_are_wired_through_the_cli_in_precedence_order() {
+    // why: engine tests inject identity; the real binary must supply it too.
+    // catches: omitting with_session_key at the binary edge; choosing a lower
+    //      priority variable; registering calls but never scanning real peers.
+    // proves: CLAIM(peers-session), CLAIM(peers-flag), CLAIM(peers-registry)
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let keys = ["CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "T3CODE_THREAD_ID"];
+    for first in 0..keys.len() {
+        let sandbox = Sandbox::new();
+        for id in ["main", "peer"] {
+            assert!(create_with(&sandbox, id, serde_json::json!({"deadline_s": 20})).status.success());
+        }
+        // Hold the foreign watch's lock so its call remains registered while
+        // the main call reads it. No timing guess about an input's run time.
+        let store = vigil::Store::new(sandbox.state_root());
+        let _locked = store.lock_watch(&vigil::WatchId::parse("peer").unwrap()).unwrap();
+        let command = |id: &str, lower_value: &str| {
+            let mut command = sandbox.command();
+            command.args(["keepalive", id, "--orchestrator", "--max-s", "30"]);
+            for (offset, key) in keys[first..].iter().enumerate() {
+                command.env(key, if offset == 0 { "pilot-cli-session" } else { lower_value });
+            }
+            command
+        };
+        let peer = KillOnDrop(command("peer", "peer-lower").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let peer_record = || {
+            std::fs::read_dir(sandbox.state_root().join("calls")).ok()?.filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read(entry.path()).ok())
+                .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .find(|record| record["pid"] == peer.0.id() && record["watch_ids"] == serde_json::json!(["peer"]))
+        };
+        assert!(wait_until(Duration::from_secs(8), || peer_record().is_some()), "peer must publish its call");
+        assert_eq!(peer_record().unwrap()["session"], "pilot-cli-session", "{} takes priority", keys[first]);
+        let child = command("main", "main-lower").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let output = finish_within(child, Duration::from_secs(8));
+        assert!(output.status.success(), "{}: {}", keys[first], String::from_utf8_lossy(&output.stderr));
+        let answer = stdout_json(&output);
+        assert_eq!(answer["next"], "act on events", "{}", keys[first]);
+        assert_eq!(answer["events"][0]["kind"], "foreign_orchestrator", "{}", keys[first]);
+        assert!(answer["events"][0]["summary"].as_str().unwrap().contains(&peer.0.id().to_string()));
+    }
 }

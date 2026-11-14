@@ -228,7 +228,8 @@ fn build_vigil(root: Option<PathBuf>) -> anyhow::Result<Vigil> {
         .map_err(|error| anyhow::anyhow!("invalid {}: {error}", vigil::fault::ENV_VAR))?;
     // A3, S4: who is calling is read here, once, from the whole environment.
     let agent = vigil::cache::AgentEnv::from_vars(std::env::vars());
-    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent))
+    let session = vigil::peers::session_key_from_lookup(|name| std::env::var(name).ok());
+    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent).with_session_key(session))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {

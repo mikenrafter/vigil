@@ -567,12 +567,14 @@ pub struct Event {
     pub detail: Option<EventDetail>,
 }
 
-/// The extra fields of the two events that are not about a watch's inputs
+/// The extra fields of events that are not about a watch's inputs
 /// (A17). Internally tagged, so the wire carries `kind` and the fields beside
 /// the ordinary event keys.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventDetail {
+    /// Same-session foreign call misusing orchestrator mode (pilot).
+    ForeignOrchestrator,
     /// AI5: the watch needs the agent (`overdue` or `stalled`), or W42-H3: an
     /// item of a hold ended (`ended`) or ran past its own `expect_s`
     /// (`overdue`). Saved with the watch until a delivery is committed (S6).
@@ -598,7 +600,7 @@ pub enum EventDetail {
 }
 
 impl Event {
-    /// Is this an attention or credit event (the kinds that end a pending call)?
+    /// Is this a call-ending attention, credit, or foreign-orchestrator event?
     pub fn is_call_ending(&self) -> bool {
         self.detail.is_some()
     }
