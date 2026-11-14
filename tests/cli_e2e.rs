@@ -2061,10 +2061,16 @@ fn w46_cli_cap_classes_are_stored_and_refusal_is_atomic_and_instructive() {
     assert_eq!(status["cap"], serde_json::json!({"work": 1, "work_limit": 1, "review": 1, "review_limit": 1}));
 }
 
+/// True once `pid` has a file descriptor open on a path ending in `suffix`.
+fn has_open_file(pid: u32, suffix: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return false };
+    entries.flatten().filter_map(|entry| std::fs::read_link(entry.path()).ok()).any(|target| target.ends_with(suffix))
+}
+
 #[test]
 fn w46_two_racing_work_adds_have_exactly_one_winner_at_limit_one() {
-    // why: W46-K3 requires the count check and append to share the hold lock across CLI processes.
-    // catches: checking a stale snapshot before locking, or failing to check classed adds at all.
+    // why: W46-K3 requires the count check and append to share the hold lock across CLI processes; the test holds the lock until both children are past their pre-lock load and polling for it (a child opens `locks/h.lock` only when it tries to lock).
+    // catches: checking a stale snapshot before locking (checked: a hold_add that loads before locking and appends to that snapshot fails this test), or failing to check classed adds at all.
     let sandbox = Sandbox::new();
     assert!(sandbox.run(&["hold", "--id", "h"]).status.success());
     let lock = vigil::Store::new(sandbox.state_root()).lock_watch(&vigil::WatchId::parse("h").unwrap()).unwrap();
@@ -2075,6 +2081,14 @@ fn w46_two_racing_work_adds_have_exactly_one_winner_at_limit_one() {
     });
     let left = spawn_add("left");
     let right = spawn_add("right");
+    let lock_file = std::path::Path::new("locks").join("h.lock");
+    for child in [&left, &right] {
+        // A child polls every 2 ms, opening the file for a moment each time; spin until one poll is seen.
+        let started = std::time::Instant::now();
+        while !has_open_file(child.id(), &lock_file) {
+            assert!(started.elapsed() < Duration::from_secs(10), "child {} never tried the hold lock", child.id());
+        }
+    }
     drop(lock);
     let outcomes = [finish_within(left, Duration::from_secs(10)), finish_within(right, Duration::from_secs(10))];
     let mut codes: Vec<_> = outcomes.iter().map(|out| out.status.code().unwrap()).collect();
@@ -2089,13 +2103,17 @@ fn w46_two_racing_work_adds_have_exactly_one_winner_at_limit_one() {
 
 #[test]
 fn w46_creation_counts_all_initial_classed_items_before_writing() {
-    // why: W46-K3 applies the default limit to every initial --for item, not just subsequent adds.
-    // catches: bypassing admission at hold creation or creating a partial hold before refusing.
+    // why: W46-K3 applies the default limit to every initial --for item, not just subsequent adds; a refused creation names a limit that admits the whole batch, says nothing about waiting (nothing is running), and leaves no lock file.
+    // catches: bypassing admission at hold creation, creating a partial hold before refusing, suggesting `--work 2` for three items, telling the owner to wait on creation, or leaving a stray `<id>.lock`.
     let sandbox = Sandbox::new();
-    let refused = sandbox.run(&["hold", "--id", "h", "--for", "pid:1", "--for", "until:2099-01-01T00:00:00Z", "--cap", "work"]);
+    let refused = sandbox.run(&["hold", "--id", "h", "--for", "pid:1", "--for", "until:2099-01-01T00:00:00Z", "--for", "none", "--label", "x", "--cap", "work"]);
     assert_eq!(refused.status.code(), Some(1), "{refused:?}");
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("agent cap reached"), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("agent cap reached"), "{refused:?}");
+    assert!(stderr.contains("vigil cap set --work 3 --until <time>"), "{refused:?}");
+    assert!(!stderr.contains("Wait for one"), "{refused:?}");
     assert!(sandbox.watch_file("h").is_none());
+    assert!(!sandbox.state_root().join("locks").join("h.lock").exists(), "a refused creation leaves no lock file");
 }
 
 #[test]
@@ -2131,7 +2149,7 @@ fn w46_cold_mixed_ids_cancel_the_valid_one_and_pin_unknown_exit_one() {
 #[test]
 fn w46_cold_warns_on_an_unsaved_cancellation_and_names_the_id() {
     // why: W46-C7 must expose a failed cancellation write on CLI stderr instead of claiming silent success.
-    // catches: discarding cancel's persist note while assembling ColdReport.
+    // catches: discarding cancel's persist note while assembling ColdReport, or listing an id whose cancellation was not saved as cancelled.
     let sandbox = Sandbox::new();
     assert!(sandbox.run(&["hold", "--id", "unsaved"]).status.success());
     let before = sandbox.watch_bytes("unsaved");
@@ -2140,6 +2158,8 @@ fn w46_cold_warns_on_an_unsaved_cancellation_and_names_the_id() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.lines().any(|line| line.contains("warning") && line.contains("unsaved") && line.contains("Input/output error")), "{stderr}");
     assert_eq!(stdout_json(&output)["next"], COLD_NEXT);
+    assert_eq!(stdout_json(&output)["cancelled"], serde_json::json!([]), "an unsaved cancel is not reported as cancelled");
+    assert_eq!(stdout_json(&output)["pending"], serde_json::json!(["unsaved"]));
     assert_eq!(sandbox.watch_bytes("unsaved"), before);
 }
 

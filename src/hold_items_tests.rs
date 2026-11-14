@@ -1250,3 +1250,14 @@ async fn w46_bad_cap_json_does_not_break_keepalive_cancel_or_cap_set_but_admissi
     let set = env.vigil.cap_set(std::num::NonZeroUsize::new(2).unwrap(), None, until).await.expect("cap set replaces a bad cap.json");
     assert_eq!((set.work.get(), set.review.get()), (2, 1));
 }
+
+#[tokio::test(start_paused = true)]
+async fn w46_cap_on_a_bare_hold_is_refused_like_expect_s() {
+    // why: W46 review: `--cap` classes items, so with no items it would be silently ignored.
+    // catches: accepting a cap that has nothing to apply to, or refusing a bare hold that sets no cap.
+    let env = rig();
+    let error = env.vigil.hold(w46_request(serde_json::json!({"id": "h", "cap": "work"}))).await.expect_err("cap without items").to_string();
+    assert!(error.contains("cap applies to each item") && error.contains("vigil hold add"), "{error}");
+    assert!(env.vigil.store().load(&wid("h")).is_err(), "nothing was written");
+    env.vigil.hold(w46_request(serde_json::json!({"id": "bare"}))).await.expect("control: a bare hold without a cap");
+}
