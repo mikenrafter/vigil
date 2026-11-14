@@ -73,6 +73,13 @@ async fn initialize_sends_short_instructions_that_teach_the_loop() {
     // proves: W45-C3
     // catches: the instructions line for `cold` left out.
     assert!(instructions.contains("call `cold`") && instructions.contains("BabelTele"), "missing the cold line in {instructions:?}");
+    // why: W48 (owner 2026-11-14): a foreground MCP keepalive in a main session is interrupted by
+    //      every owner message; the 3-day transcript sweep found 22 such calls, each following
+    //      these instructions. A main session that has background shells waits with the CLI.
+    // proves: W48-I1
+    // catches: instructions that still send every model to the foreground tool.
+    assert!(instructions.contains("vigil keepalive <id> --orchestrator") && instructions.contains("in the background"),
+            "missing the background CLI wait for main sessions in {instructions:?}");
     client.cancel().await.unwrap();
 }
 

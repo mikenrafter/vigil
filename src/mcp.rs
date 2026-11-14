@@ -30,10 +30,10 @@ use crate::watch::{CreateRequest, WatchId};
 /// ended text means create a new watch only if still needed).
 pub fn server_instructions() -> String {
     "vigil keeps your turn open while a cheap judge watches things. watch_create says what to watch; then call \
-     keepalive again and again. Read `next`: while it is exactly \"call keepalive again\", call it again; otherwise stop \
-     (\"act on events\": act on them; \"watch ended; create a new watch if still needed\": expired or cancelled). \
-     Results carry `advice`: operator rules to follow; advisory_set changes them. \
-     When done, call `cold` (cancels your holds), post an inline BabelTele summary, end the turn."
+     keepalive again and again. A main session with background shells runs \
+     `vigil keepalive <id> --orchestrator` in the background instead. Read `next`: while it is exactly \"call keepalive \
+     again\", call it again; otherwise stop (\"act on events\": act on them; \"watch ended; create a new watch if still \
+     needed\"). Results carry `advice`. When done, call `cold`, post an inline BabelTele summary, end the turn."
         .to_string()
 }
 
