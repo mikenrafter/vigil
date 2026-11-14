@@ -1161,8 +1161,10 @@ mod tests {
         //      second create of A's id, started while A was still reading,
         //      ends as a DuplicateId (V6: whether it waited on A's watch lock
         //      or saw the reserved id at once is the implementation's choice;
-        //      it must not create a second watch or hang).
-        // proves: CLAIM(create-lock-scope)
+        //      it must not create a second watch or hang). Guard drop must
+        //      explicitly unlock even when another test forks concurrently;
+        //      the store's inherited-descriptor regression pins that case.
+        // proves: CLAIM(create-lock-scope), CLAIM(lock-guard-release)
         let (_clock, env) = fixture();
         let gate = Gate::closed();
         env.reader.set_gate("cmd:slow-a", Some(gate.clone()));

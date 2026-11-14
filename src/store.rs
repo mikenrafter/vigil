@@ -249,6 +249,28 @@ pub struct CreditLock {
     file: File,
 }
 
+// CLAIM(lock-guard-release): drop unlocks the shared open file description
+// before closing it. A concurrent fork may retain another fd until exec;
+// close alone would keep the parent's critical section locked in that child.
+// Proven by dropping_lock_guards_unlocks_even_while_an_inherited_descriptor_is_open.
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl Drop for WatchLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl Drop for CreditLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 /// What a successful [`Store::save`] did beyond writing (specs/disk-full.md
 /// DF4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -412,7 +434,10 @@ impl Store {
         let file = self.open_lock_file_once(&self.credit_lock_path())?;
         match file.try_lock() {
             Ok(()) => Ok(Some(CreditLock { file })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                self.faults.begin(WriteKind::LockWait, &self.credit_lock_path()).at(Stage::Contended)?;
+                Ok(None)
+            },
             Err(std::fs::TryLockError::Error(error)) => Err(error),
         }
     }
@@ -748,10 +773,8 @@ impl Store {
             Err(std::fs::TryLockError::Error(error)) => Err(io_error(error)),
         }
     }
-    /// `try_lock`, retried until `patience` is over: a lock released a moment
-    /// ago can look held while a forked child that has not yet exec'd still
-    /// shares its open file description. `Ok(None)` once it is over and the
-    /// lock is still held.
+    /// `try_lock`, retried until `patience` is over. `Ok(None)` once it is
+    /// over and the lock is still held.
     async fn try_lock_until<P: Patience>(&self, patience: &P) -> Result<Option<StoreLock>, StoreError> {
         loop {
             if let Some(lock) = self.try_lock_with::<P>().await? {
@@ -792,7 +815,10 @@ impl Store {
             match file.try_lock() {
                 Ok(()) if is_same_file(&file, &path) => return Ok(Some(WatchLock { file })),
                 Ok(()) => continue, // X8: replaced under us; try the new file.
-                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    self.faults.begin(WriteKind::LockWait, &path).at(Stage::Contended).map_err(io_error)?;
+                    return Ok(None);
+                },
                 Err(std::fs::TryLockError::Error(error)) => return Err(io_error(error)),
             }
         }
@@ -1071,6 +1097,52 @@ mod tests {
         assert!(dir.path().join("lock").exists());
         drop(first);
         assert!(store.try_lock().unwrap().is_some(), "free after drop");
+    }
+
+    #[test]
+    fn lock_wait_checkpoint_runs_only_after_a_contended_try_lock() {
+        // why: CLI barriers must announce an actual refused flock, never a
+        // free attempt or a file creation. Test both checkpoint call sites.
+        // catches: moving the checkpoint before try_lock, or omitting it.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, plan) = faulted(dir.path(), vec![rule(WriteKind::LockWait, 5, When::Every)]);
+        let id = wid("h");
+        let watch = store.try_lock_watch(&id).unwrap().unwrap();
+        let credit = store.try_lock_credit().unwrap().unwrap();
+        assert_eq!(plan.attempts(WriteKind::LockWait), 0, "free acquisitions do not visit the checkpoint");
+        assert!(store.try_lock_watch(&id).is_err(), "a contended watch attempt must hit the injected error");
+        assert_eq!(store.try_lock_credit().err().unwrap().raw_os_error(), Some(5));
+        assert_eq!(plan.injected(WriteKind::LockWait, Stage::Contended), 2);
+        drop((watch, credit));
+        assert!(store.try_lock_watch(&id).unwrap().is_some());
+        assert!(store.try_lock_credit().unwrap().is_some());
+        assert_eq!(plan.attempts(WriteKind::LockWait), 2, "released locks no longer visit the checkpoint");
+    }
+
+    #[test]
+    fn dropping_lock_guards_unlocks_even_while_an_inherited_descriptor_is_open() {
+        // why: a concurrent fork inherits open file descriptions until exec.
+        // Closing the parent's fd alone leaves its flock held in the child,
+        // violating create's lock scope even after the guard was dropped.
+        // try_clone models that inheritance without a timing-dependent fork.
+        // proves: CLAIM(lock-guard-release), CLAIM(create-lock-scope)
+        // catches: relying on close, rather than LOCK_UN, to release a guard.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let id = wid("a");
+        macro_rules! check_release {
+            ($guard:expr, $probe:expr) => {{
+                let guard = $guard;
+                let inherited = guard.file.try_clone().unwrap();
+                assert!($probe.is_none(), "control: the guard excludes another owner");
+                drop(guard);
+                assert!($probe.is_some(), "drop must unlock before the inherited fd closes");
+                drop(inherited);
+            }};
+        }
+        check_release!(store.lock().unwrap(), store.try_lock().unwrap());
+        check_release!(store.lock_watch(&id).unwrap(), store.try_lock_watch(&id).unwrap());
+        check_release!(store.try_lock_credit().unwrap().unwrap(), store.try_lock_credit().unwrap());
     }
 
     #[test]

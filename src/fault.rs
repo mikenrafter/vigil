@@ -18,7 +18,8 @@
 //!
 //! # Contract of the seam
 //!
-//! One WRITE ATTEMPT is one call of [`FaultPlan::begin`]; the store then
+//! One WRITE ATTEMPT, or refused lock attempt for `lock-wait`, is one call
+//! of [`FaultPlan::begin`]; the store then
 //! passes through the stages of that attempt and asks [`Attempt::at`] at each
 //! one. Attempts are counted once, at `begin`, whatever number of stages are
 //! asked afterwards, so the retry after a disk-full failure is attempt 2 and
@@ -83,12 +84,13 @@
 //!
 //! Rules separated by `,`, each `KIND[@STAGE]:ERRNO:WHEN[:FILE]`.
 //!
-//! * `KIND`: `watch`, `lock`, `reserve`.
-//! * `STAGE`: `create`, `write`, `short`, `sync`, `rename`, `cleanup`, and
+//! * `KIND`: `watch`, `lock`, `reserve`, `credit`, `lock-wait`.
+//! * `STAGE`: `create`, `write`, `short`, `sync`, `rename`, `cleanup`,
+//!   `contended` (only `lock-wait`), and
 //!   only the combinations listed above (`watch@` all six, `lock@create`,
 //!   `reserve@create`, `reserve@short`). Omitted: the kind's default stage,
-//!   [`WriteKind::default_stage`] (`watch` -> `write`, `lock` and `reserve` ->
-//!   `create`), which is what the pre-stage syntax meant. A name outside the
+//!   [`WriteKind::default_stage`] (`watch` and `credit` -> `write`, `lock` and
+//!   `reserve` -> `create`, `lock-wait` -> `contended`), which is what the pre-stage syntax meant. A name outside the
 //!   list (also a different case, an empty one, or a stage the kind does not
 //!   have) is an `Err`, never a rule that can never fire.
 //! * `ERRNO`: a decimal errno.
@@ -110,6 +112,13 @@
 //! (for example between a hook's side effect and the commit of
 //! `credit-state.json`) and look at the world from outside. Same trust model as
 //! the failures above: test-only, trusted environment.
+//!
+//! A refused per-watch or credit-lock attempt uses the same plan, counters,
+//! file filter and barrier as writes. It begins only after try_lock reports WouldBlock. Its only
+//! stage is `contended`; the target is the lock path. For example,
+//! `lock-wait:hold=/tmp/add-ready:1:h.lock` parks the first contended attempt
+//! on h.lock and announces it with /tmp/add-ready.waiting. This records a
+//! durable synchronization point instead of sampling transient /proc fds.
 
 use std::collections::HashMap;
 use std::io;
@@ -124,7 +133,7 @@ pub const ENV_VAR: &str = "VIGIL_TEST_FAULT";
 /// releases it must not hang the process for ever).
 pub const HOLD_LIMIT: Duration = Duration::from_secs(60);
 
-/// What a store write is for; a rule selects by kind.
+/// What a store operation is for; a rule selects by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WriteKind {
     /// A watch file (`write_atomic`: `.tmp`, sync, rename).
@@ -135,6 +144,8 @@ pub enum WriteKind {
     Reserve,
     /// `<root>/credit-state.json` (specs/auto-interval.md S9).
     CreditState,
+    /// An unsuccessful lock acquisition, with the lock path as target.
+    LockWait,
 }
 
 impl WriteKind {
@@ -144,6 +155,7 @@ impl WriteKind {
         match self {
             WriteKind::Watch | WriteKind::CreditState => Stage::Write,
             WriteKind::Lock | WriteKind::Reserve => Stage::Create,
+            WriteKind::LockWait => Stage::Contended,
         }
     }
 
@@ -159,6 +171,7 @@ impl WriteKind {
             }
             WriteKind::Lock => &[Stage::Create],
             WriteKind::Reserve => &[Stage::Create, Stage::ShortWrite],
+            WriteKind::LockWait => &[Stage::Contended],
         }
     }
 
@@ -168,6 +181,7 @@ impl WriteKind {
             "lock" => Some(WriteKind::Lock),
             "reserve" => Some(WriteKind::Reserve),
             "credit" => Some(WriteKind::CreditState),
+            "lock-wait" => Some(WriteKind::LockWait),
             _ => None,
         }
     }
@@ -189,6 +203,8 @@ pub enum Stage {
     Rename,
     /// Instead of removing the `.tmp` after a failed attempt.
     Cleanup,
+    /// After try_lock refused a lock held by another owner.
+    Contended,
 }
 
 impl Stage {
@@ -200,6 +216,7 @@ impl Stage {
             "sync" => Some(Stage::Sync),
             "rename" => Some(Stage::Rename),
             "cleanup" => Some(Stage::Cleanup),
+            "contended" => Some(Stage::Contended),
             _ => None,
         }
     }
@@ -436,13 +453,13 @@ fn parse_rule(text: &str) -> Result<FaultRule, String> {
         Some((kind, stage)) => (kind, Some(stage)),
         None => (fields[0], None),
     };
-    let kind = WriteKind::from_name(kind_name).ok_or_else(|| format!("rule {text:?}: unknown kind {kind_name:?} (watch, lock, reserve or credit)"))?;
+    let kind = WriteKind::from_name(kind_name).ok_or_else(|| format!("rule {text:?}: unknown kind {kind_name:?} (watch, lock, reserve, credit or lock-wait)"))?;
     let stage = match stage_name {
         None => kind.default_stage(),
         Some(name) => {
-            let stage = Stage::from_name(name).ok_or_else(|| format!("rule {text:?}: unknown stage {name:?} (create, write, short, sync, rename or cleanup)"))?;
+            let stage = Stage::from_name(name).ok_or_else(|| format!("rule {text:?}: unknown stage {name:?} (create, write, short, sync, rename, cleanup or contended)"))?;
             if !kind.stages().contains(&stage) {
-                return Err(format!("rule {text:?}: a {kind_name} write has no stage {name:?}, so the rule could never fire"));
+                return Err(format!("rule {text:?}: a {kind_name} operation has no stage {name:?}, so the rule could never fire"));
             }
             stage
         }
@@ -512,6 +529,23 @@ mod tests {
         assert!(FaultPlan::from_env_value(Some("this is not a fault plan")).is_err(), "control: malformed is still an error");
         let plan = FaultPlan::from_env_value(Some("watch:28:all")).unwrap();
         assert_eq!(run(&plan, WriteKind::Watch, 2), [Some(28), Some(28)], "control: a real plan injects");
+    }
+
+    #[test]
+    fn lock_wait_rules_filter_the_lock_path_and_count_only_contention() {
+        // why: CLI race tests must park at real contention on the selected
+        // lock, without changing creation-fault counters or a different lock.
+        // catches: sharing the creation counter, ignoring the path filter,
+        // or accepting a stage which the lock-wait checkpoint never reaches.
+        let plan = FaultPlan::parse("lock-wait:5:2:h.lock").unwrap();
+        let target = Path::new("/state/locks/h.lock");
+        assert!(plan.begin(WriteKind::Lock, target).at(Stage::Create).is_ok());
+        assert!(plan.begin(WriteKind::LockWait, Path::new("/state/credit.lock")).at(Stage::Contended).is_ok());
+        assert!(plan.begin(WriteKind::LockWait, target).at(Stage::Contended).is_ok());
+        assert_eq!(errno_of(plan.begin(WriteKind::LockWait, target).at(Stage::Contended)), Some(5));
+        assert_eq!(plan.attempts(WriteKind::Lock), 1);
+        assert!(FaultPlan::parse("lock-wait@rename:5:1").is_err());
+        assert!(FaultPlan::parse("watch@contended:5:1").is_err());
     }
 
     const ALL_STAGES: [Stage; 6] = [Stage::Create, Stage::Write, Stage::ShortWrite, Stage::Sync, Stage::Rename, Stage::Cleanup];

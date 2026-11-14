@@ -1244,6 +1244,31 @@ fn cli_both_agent_signals_cap_both_nesting_directions_at_270() {
 
 // ---- N1: two real processes, one credit change, one hook ----
 
+/// A durable arrival marker from a fault-plan checkpoint, released even if
+/// an assertion unwinds so a failed test does not leave a child parked.
+struct ProcessBarrier(std::path::PathBuf);
+
+impl ProcessBarrier {
+    fn new(sandbox: &Sandbox, name: &str) -> Self {
+        Self(sandbox.dir.path().join(name))
+    }
+    fn wait(&self) {
+        let mut marker = self.0.as_os_str().to_owned();
+        marker.push(".waiting");
+        assert!(wait_until(Duration::from_secs(8), || std::path::Path::new(&marker).exists()),
+            "child never reached checkpoint {}", self.0.display());
+    }
+    fn release(&self) {
+        std::fs::write(&self.0, "").unwrap();
+    }
+}
+
+impl Drop for ProcessBarrier {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "");
+    }
+}
+
 /// `credit.lock` is held by someone else right now (a non-blocking flock probe
 /// from outside, independent of how vigil takes it).
 fn credit_lock_is_held(root: &std::path::Path) -> bool {
@@ -1260,7 +1285,7 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
     // why: N1 / S9 through the real binary. Both processes are orchestrators on
     //      watches of their own, credit-state.json says off, a fake `uw` says
     //      on. Process A takes `credit.lock` and runs the hook, which parks on
-    //      a barrier file (`release`); B is started while A is inside the hook.
+    //      a barrier file (`hook-release`); B starts while A is inside the hook.
     //      Then A is frozen a second time, by the test-only fault seam, AFTER
     //      the hook and BEFORE the commit of credit-state.json
     //      (`credit@rename:hold=commit`). Looked at from outside, at both
@@ -1268,13 +1293,16 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
     //      fails), the hook has run once and only once, B has not run it, and
     //      the state file still says off. A lock released after the hook but
     //      before the state update would show here as a free lock and, a moment
-    //      later, as a second hook run by B. At the end exactly one process
-    //      reports the change, the hook ran once, and the file says on.
+    //      later, as a second hook run by B. B announces actual contention
+    //      through a checkpoint and stays parked until its deadline is made
+    //      past. No sleeps or wall-clock race decide either observation.
+    //      At the end exactly one process reports the change, B expires with
+    //      no events, the hook ran once, and the file says on.
     // proves: CLAIM(N1), CLAIM(S9)
     let (sandbox, fake_uw) = auto_sandbox(false);
     vigil::testing::write_script(&fake_uw, "echo '{\"usage\":[{\"provider\":\"ClaudeCode\",\"windows\":[{\"window\":\"weekly\",\"exceeded\":true}]}]}'");
     assert!(create_with(&sandbox, "a", serde_json::json!({})).status.success());
-    assert!(create_with(&sandbox, "b", serde_json::json!({"deadline_s": 12})).status.success());
+    assert!(create_with(&sandbox, "b", serde_json::json!({})).status.success());
     // These are two main-session watches. The peer pilot exempts confirmed
     // watches, so name them as own even though this credit fixture disables
     // the token challenge. Keep the credit-lock assertions independent of
@@ -1289,17 +1317,18 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
 
     let barrier = sandbox.dir.path().join("barrier");
     std::fs::create_dir_all(&barrier).unwrap();
-    let (log, entered, release, done, commit) =
-        (barrier.join("hook.log"), barrier.join("entered"), barrier.join("release"), barrier.join("done"), barrier.join("commit"));
+    let log = barrier.join("hook.log");
+    let hook_gate = ProcessBarrier::new(&sandbox, "hook-release");
+    let commit = ProcessBarrier::new(&sandbox, "commit");
+    let contender = ProcessBarrier::new(&sandbox, "credit-contender");
     let hook = barrier.join("hook.sh");
     vigil::testing::write_script(
         &hook,
         &format!(
-            "echo \"$$\" >> '{}'\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n: > '{}'",
+            "echo \"$$\" >> '{}'\n: > '{}.waiting'\nwhile [ ! -e '{}' ]; do sleep 0.05; done",
             log.display(),
-            entered.display(),
-            release.display(),
-            done.display()
+            hook_gate.0.display(),
+            hook_gate.0.display()
         ),
     );
     let spawn = |id: &str| {
@@ -1309,40 +1338,44 @@ fn two_real_processes_race_for_one_credit_change_and_the_lock_covers_hook_and_st
             .env("CLAUDE_CODE_SESSION_ID", SESSION)
             .env("VIGIL_UW_COMMAND", &fake_uw)
             .env("VIGIL_ON_CREDIT_CHANGE", &hook)
-            .env("VIGIL_TEST_FAULT", format!("credit@rename:hold={}:all", commit.display()))
+            .env("VIGIL_TEST_FAULT", format!("credit@rename:hold={}:all{}", commit.0.display(),
+                if id == "b" { format!(",lock-wait:hold={}:1:credit.lock", contender.0.display()) } else { String::new() }))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.spawn().unwrap()
     };
 
     let mut a = spawn("a");
-    assert!(wait_until(Duration::from_secs(8), || entered.exists()), "process A should have started the credit hook");
+    hook_gate.wait();
     assert!(credit_lock_is_held(&sandbox.state_root()), "credit.lock must be held while the hook runs");
     let mut b = spawn("b");
-    std::thread::sleep(Duration::from_millis(1200));
+    contender.wait();
     assert_eq!(lines_of(&log), 1, "B must wait for the lock, not run its own hook");
     assert!(matches!(b.try_wait(), Ok(None)), "B is still waiting for the lock");
 
-    std::fs::write(&release, "").unwrap();
-    assert!(wait_until(Duration::from_secs(8), || done.exists()), "the hook should finish once released");
-    assert!(
-        wait_until(Duration::from_secs(8), || barrier.join("commit.waiting").exists()),
-        "A should reach the commit of credit-state.json after the hook"
-    );
+    hook_gate.release();
+    commit.wait();
     assert!(credit_lock_is_held(&sandbox.state_root()), "credit.lock must still be held between the hook and the state commit");
     let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sandbox.state_root().join("credit-state.json")).unwrap()).unwrap();
     assert_eq!(recorded["on_credits"], false, "the state is not committed yet");
-    std::thread::sleep(Duration::from_millis(800));
     assert_eq!(lines_of(&log), 1, "B must not run the hook while A has not recorded the change");
     assert!(matches!(a.try_wait(), Ok(None)) && matches!(b.try_wait(), Ok(None)), "both are parked, A at the commit, B at the lock");
 
-    std::fs::write(&commit, "").unwrap();
+    // B finished its first tick before attempting credit.lock and is now
+    // parked there. Set an already-past deadline while no tick can overwrite
+    // the fixture, so its quiet terminal return requires no real-time wait.
+    let mut watch_b = sandbox.watch_file("b").unwrap();
+    watch_b["deadline_at"] = serde_json::json!("2000-01-01T00:00:00Z");
+    vigil::store::write_atomic(&sandbox.state_root().join("watches/b.json"), &watch_b).unwrap();
+    commit.release();
+    contender.release();
     let (out_a, out_b) = (finish_within(a, Duration::from_secs(15)), finish_within(b, Duration::from_secs(20)));
     assert!(out_a.status.success() && out_b.status.success(), "{} / {}", String::from_utf8_lossy(&out_a.stderr), String::from_utf8_lossy(&out_b.stderr));
     let (env_a, env_b) = (stdout_json(&out_a), stdout_json(&out_b));
     let changes = |envelope: &serde_json::Value| envelope["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "credit_state_changed").count();
     assert_eq!((changes(&env_a), changes(&env_b)), (1, 0), "exactly one process reports the change: {env_a} / {env_b}");
-    assert_eq!(env_b["status"], "expired", "B carried on quietly until its watch ran out: {env_b}");
+    assert_eq!(env_b["status"], "expired", "B returns its elapsed deadline after the credit check: {env_b}");
+    assert_eq!(env_b["events"], serde_json::json!([]), "B has no credit or foreign-orchestrator attention: {env_b}");
     assert_eq!(lines_of(&log), 1, "the hook ran once in all");
     let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sandbox.state_root().join("credit-state.json")).unwrap()).unwrap();
     assert_eq!(recorded["on_credits"], true);
@@ -2072,35 +2105,32 @@ fn w46_cli_cap_classes_are_stored_and_refusal_is_atomic_and_instructive() {
     assert_eq!(status["cap"], serde_json::json!({"work": 1, "work_limit": 1, "review": 1, "review_limit": 1}));
 }
 
-/// True once `pid` has a file descriptor open on a path ending in `suffix`.
-fn has_open_file(pid: u32, suffix: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return false };
-    entries.flatten().filter_map(|entry| std::fs::read_link(entry.path()).ok()).any(|target| target.ends_with(suffix))
-}
-
 #[test]
 fn w46_two_racing_work_adds_have_exactly_one_winner_at_limit_one() {
-    // why: W46-K3 requires the count check and append to share the hold lock across CLI processes; the test holds the lock until both children are past their pre-lock load and polling for it (a child opens `locks/h.lock` only when it tries to lock).
+    // why: W46-K3 requires the count check and append to share the hold lock
+    // across CLI processes. Each child parks at an explicit checkpoint after
+    // its flock reports contention, so both have passed their pre-lock load
+    // before either can append. A durable marker cannot miss a 2 ms poll.
+    // proves: CLAIM(W46-K3)
     // catches: checking a stale snapshot before locking (checked: a hold_add that loads before locking and appends to that snapshot fails this test), or failing to check classed adds at all.
     let sandbox = Sandbox::new();
     assert!(sandbox.run(&["hold", "--id", "h"]).status.success());
     let lock = vigil::Store::new(sandbox.state_root()).lock_watch(&vigil::WatchId::parse("h").unwrap()).unwrap();
-    let spawn_add = |label: &str| piped({
+    let left_gate = ProcessBarrier::new(&sandbox, "left-lock");
+    let right_gate = ProcessBarrier::new(&sandbox, "right-lock");
+    let spawn_add = |label: &str, gate: &ProcessBarrier| piped({
         let mut command = sandbox.command();
-        command.args(["hold", "add", "h", "--for", "none", "--label", label, "--cap", "work"]);
+        command.args(["hold", "add", "h", "--for", "none", "--label", label, "--cap", "work"])
+            .env("VIGIL_TEST_FAULT", format!("lock-wait:hold={}:1:h.lock", gate.0.display()));
         command
     });
-    let left = spawn_add("left");
-    let right = spawn_add("right");
-    let lock_file = std::path::Path::new("locks").join("h.lock");
-    for child in [&left, &right] {
-        // A child polls every 2 ms, opening the file for a moment each time; spin until one poll is seen.
-        let started = std::time::Instant::now();
-        while !has_open_file(child.id(), &lock_file) {
-            assert!(started.elapsed() < Duration::from_secs(10), "child {} never tried the hold lock", child.id());
-        }
-    }
+    let left = spawn_add("left", &left_gate);
+    let right = spawn_add("right", &right_gate);
+    left_gate.wait();
+    right_gate.wait();
     drop(lock);
+    left_gate.release();
+    right_gate.release();
     let outcomes = [finish_within(left, Duration::from_secs(10)), finish_within(right, Duration::from_secs(10))];
     let mut codes: Vec<_> = outcomes.iter().map(|out| out.status.code().unwrap()).collect();
     codes.sort();
