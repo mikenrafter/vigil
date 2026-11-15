@@ -80,3 +80,6 @@ pub mod reminder_ops;
 mod reminder_tests;
 
 mod probe_cache;
+
+#[cfg(test)]
+mod quiet_hold_tests;
