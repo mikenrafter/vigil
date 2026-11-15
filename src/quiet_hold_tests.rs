@@ -259,3 +259,74 @@ async fn quiet_terminal_holds_still_require_confirmation_because_they_keep_waiti
     let implicit = guarded.keepalive(KeepaliveRequest { watch_id: Some(id("h")), max_s: Some(30), ..Default::default() }).await.unwrap();
     assert!(implicit.cache.unwrap().credit_check.is_some(), "confirmed quiet holds retain stored main-session mode");
 }
+
+/// A second process of the same session, sharing the rig's store and clock.
+fn peer_of(env: &crate::testing::Env, session: &str) -> Vigil {
+    Vigil::new(env.vigil.store().root(), env.clock.clone(), env.judge.clone(), crate::testing::default_config())
+        .with_session_key(Some(session.into())).with_reader(env.reader.clone())
+}
+fn session_request(max_s: u64) -> KeepaliveRequest {
+    KeepaliveRequest { session: true, orchestrator: Some(false), max_s: Some(max_s), ..Default::default() }
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_wait_still_discovers_new_holds_while_a_tick_waits_for_a_held_lock() {
+    // why: R1. A hold whose lock another process keeps must not stop the call
+    //      from looking for new holds; the five-second pass is a promise.
+    // catches: running the discovery pass only between rounds, so a round
+    //      stuck on one lock postpones it to the end of the window.
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { id: Some("anchor".into()), ..Default::default() }).await.unwrap();
+    let lock = env.vigil.store().try_lock_watch(&id("anchor")).unwrap().unwrap();
+    let waiter = peer_of(&env, "session-a");
+    let add_later = async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        env.vigil.hold(HoldRequest { id: Some("later".into()), work: vec!["until:2020-01-01T00:00:00Z".into()], ..Default::default() }).await.unwrap();
+    };
+    let (answer, ()) = tokio::join!(waiter.keepalive(session_request(60)), add_later);
+    drop(lock);
+    let answer = answer.unwrap();
+    assert_eq!(answer.watch_id.as_str(), "later", "{answer:?}");
+    assert!((10..=15).contains(&answer.waited_s.unwrap()), "discovery within the 5 s pass: {:?}", answer.waited_s);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ready_autonomous_item_end_returns_at_once_while_another_hold_is_locked() {
+    // why: R1. An item that ended by itself in a hold that stays live is
+    //      call-ending attention, already saved; it must not wait for a tick
+    //      that is stuck on an unrelated hold's lock.
+    // catches: a round that ignores `raised_attention` and waits out the window.
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { id: Some("locked".into()), ..Default::default() }).await.unwrap();
+    env.vigil.hold(HoldRequest { id: Some("work".into()), work: vec!["until:2020-01-01T00:00:00Z".into()], ..Default::default() }).await.unwrap();
+    env.vigil.hold_add(&id("work"), item("anchor")).await.unwrap();
+    let lock = env.vigil.store().try_lock_watch(&id("locked")).unwrap().unwrap();
+    let answer = env.vigil.keepalive(session_request(60)).await.unwrap();
+    drop(lock);
+    assert!(answer.events.iter().any(|e| e.summary.contains("item ended:") && e.is_call_ending()), "{answer:?}");
+    assert_eq!(answer.waited_s, Some(0), "ready event held behind an unrelated lock: {answer:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_transports_delivery_does_not_abort_a_session_wait() {
+    // why: R2. A named wait in another process may deliver the last quiet
+    //      terminal hold while a session wait is still holding its window.
+    // catches: treating an empty refresh of the session scope as NothingToCover.
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { work: vec!["none".into()], label: Some("manual".into()), ..request_for(&[]) }).await.unwrap();
+    env.vigil.hold_done(&id("h"), "manual").await.unwrap();
+    env.vigil.tick_due(&id("h")).await.unwrap();
+    let waiter = peer_of(&env, "session-a");
+    let other = async {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        peer_of(&env, "session-a").keepalive(KeepaliveRequest { watch_id: Some(id("h")), max_s: Some(30), orchestrator: Some(false), ..Default::default() }).await.unwrap();
+    };
+    let (answer, ()) = tokio::join!(waiter.keepalive(session_request(90)), other);
+    let answer = answer.expect("a concurrent delivery must not end the held call with an error");
+    assert_eq!(answer.waited_s, Some(90));
+    assert_eq!(answer.watch_id.as_str(), "h");
+    assert!(answer.events.iter().any(|e| e.summary == "item ended: manual: done"), "the quiet note still rides the return: {answer:?}");
+}
