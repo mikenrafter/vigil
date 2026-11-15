@@ -419,3 +419,83 @@ async fn overdue_attention_contention_keeps_discovery_running_between_ticks() {
     assert_eq!(resumed.waited_s, Some(0), "skipped attention remains due");
     assert!(resumed.events.iter().any(|e| e.watch_id == "locked" && e.summary.contains("item far overdue:")), "{resumed:?}");
 }
+
+async fn later_tick_completion(locked_companion: bool) {
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { id: Some("locked".into()), ..Default::default() }).await.unwrap();
+    let lock = if locked_companion { env.vigil.store().try_lock_watch(&id("locked")).unwrap() } else { None };
+    let until = env.clock.now().plus_secs(5).0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let input = format!("until:{until}");
+    // The production until reader uses real wall time; script only that input
+    // so this regression and its control share the engine's virtual clock.
+    env.reader.set_text(&input, "waiting");
+    env.vigil.hold(HoldRequest { id: Some("work".into()), work: vec![input.clone()], ..Default::default() }).await.unwrap();
+    let reaches_time = async {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        env.reader.set_text(&input, "reached");
+    };
+    let (answer, ()) = tokio::join!(env.vigil.keepalive(session_request(60)), reaches_time);
+    let answer = answer.unwrap();
+    // The item becomes ready at 5 s; its next normal 30 s tick senses it.
+    assert_eq!(answer.waited_s, Some(30), "later tick must run beside an unfinished tick: {answer:?}");
+    assert!(answer.events.iter().any(|e| e.watch_id == "work" && e.summary.contains("item ended:") && e.is_call_ending()), "{answer:?}");
+    let stored = watch_file(&env.vigil, "work");
+    assert_eq!(stored.tick, 2);
+    assert_eq!(stored.status, crate::watch::WatchStatus::Fired);
+    drop(lock);
+}
+
+#[tokio::test(start_paused = true)]
+async fn later_tick_without_lock_contention_is_a_control() {
+    // why: prove the timed input needs and receives a second normal tick.
+    // proves: CLAIM(R3-scheduling)
+    later_tick_completion(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn later_tick_progresses_while_an_unrelated_hold_is_locked() {
+    // why: R3-1. A quiet first tick must become eligible again independently.
+    // proves: CLAIM(R3-scheduling)
+    // catches: using retained-report membership as active-tick membership,
+    // or waiting for the slowest tick before scheduling the next tick.
+    later_tick_completion(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiry_is_saved_at_its_deadline_while_an_unrelated_hold_is_locked() {
+    // why: R3-1. Expiry needs no sensing reserve and must be durable on return.
+    // proves: CLAIM(R3-scheduling)
+    // catches: only synthesizing expiry in the envelope after a blocked round.
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { id: Some("locked".into()), ..Default::default() }).await.unwrap();
+    let lock = env.vigil.store().try_lock_watch(&id("locked")).unwrap().unwrap();
+    env.vigil.hold(HoldRequest { id: Some("short".into()), deadline_s: Some(5), ..Default::default() }).await.unwrap();
+    let answer = env.vigil.keepalive(session_request(30)).await.unwrap();
+    assert_eq!(answer.waited_s, Some(5), "expiry must wake at its own deadline: {answer:?}");
+    assert_eq!(answer.watch_id.as_str(), "short");
+    assert_eq!(answer.status, crate::watch::WatchStatus::Expired);
+    assert_eq!(watch_file(&env.vigil, "short").status, crate::watch::WatchStatus::Expired);
+    drop(lock);
+}
+
+#[tokio::test(start_paused = true)]
+async fn overdue_attention_wakes_at_its_threshold_while_an_unrelated_hold_is_locked() {
+    // why: R3-1. Attention deadlines progress between ordinary 30 s ticks.
+    // proves: CLAIM(R3-scheduling)
+    // catches: running attention only after every pending tick has completed.
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { id: Some("locked".into()), ..Default::default() }).await.unwrap();
+    let lock = env.vigil.store().try_lock_watch(&id("locked")).unwrap().unwrap();
+    env.vigil.hold(HoldRequest { id: Some("work".into()), work: vec!["none".into()], label: Some("manual".into()), expect_s: Some(3), ..Default::default() }).await.unwrap();
+    let answer = env.vigil.keepalive(session_request(30)).await.unwrap();
+    assert_eq!(answer.waited_s, Some(6), "far-overdue wakes at 2 x 3 s: {answer:?}");
+    assert!(answer.events.iter().any(|e| e.watch_id == "work" && e.summary.contains("item overdue:") && !e.is_call_ending()), "{answer:?}");
+    assert!(answer.events.iter().any(|e| e.watch_id == "work" && e.summary.contains("item far overdue:") && e.is_call_ending()), "{answer:?}");
+    let stored = watch_file(&env.vigil, "work");
+    assert!(stored.events.iter().any(|e| e.summary.contains("item far overdue:")), "attention must be saved before return");
+    assert_eq!(stored.status, crate::watch::WatchStatus::Pending);
+    drop(lock);
+}
