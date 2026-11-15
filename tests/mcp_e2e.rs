@@ -1181,3 +1181,21 @@ async fn fix1_mcp_keepalive_accepts_confirm_and_registers_mcp_transport() {
     assert_eq!(text_json(&result)["status"], "cancelled");
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn mcp_session_selection_and_brief_output_use_the_same_engine() {
+    // why: both new switches must survive the MCP schema and front door.
+    // catches: schema accepts flags but drops them before keepalive.
+    let sandbox = Sandbox::new();
+    let mut command = sandbox.tokio_command();
+    command.arg("mcp").env("CODEX_SESSION_ID", "mcp-quiet-session");
+    let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
+    let created = call(client.peer(), "hold", serde_json::json!({"id": "h", "for": ["until:2020-01-01T00:00:00Z"], "orchestrator": false})).await;
+    assert_ne!(created.is_error, Some(true));
+    let result = call(client.peer(), "keepalive", serde_json::json!({"session": true, "brief": true, "orchestrator": false})).await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let text = &result.content[0].as_text().unwrap().text;
+    assert!(text.starts_with("act: ") && text.contains("item ended:") && text.contains("advice: off"), "{text}");
+    assert_eq!(text.lines().count(), 2);
+    client.cancel().await.unwrap();
+}

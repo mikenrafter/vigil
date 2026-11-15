@@ -59,7 +59,7 @@ async fn fired_watch(env: &Env, name: &str) -> crate::WatchId {
 }
 
 fn call(id: &crate::WatchId) -> KeepaliveRequest {
-    KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30), orchestrator: None, confirm: None }
+    KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30), orchestrator: None, confirm: None, session: false }
 }
 
 fn wire(envelope: &crate::Envelope) -> Value {

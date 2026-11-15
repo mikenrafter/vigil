@@ -234,6 +234,48 @@ pub struct Envelope {
     pub cap_error: Option<String>,
 }
 
+impl Envelope {
+    /// Compact presentation of the same return. Operator instructions remain
+    /// intact; whitespace is flattened so probe text cannot create extra lines.
+    pub fn brief(&self) -> String {
+        fn line(text: &str) -> String { text.split_whitespace().collect::<Vec<_>>().join(" ") }
+        fn joined(parts: Vec<String>) -> String { if parts.is_empty() { "none".into() } else { parts.join("; ") } }
+        let mut actions = Vec::new();
+        let mut notes = Vec::new();
+        for event in &self.events {
+            let text = format!("{}: {}", event.watch_id, line(&event.summary));
+            let text = if event.redelivered { format!("{text} [redelivered]") } else { text };
+            if event.is_note() { notes.push(text); } else { actions.push(text); }
+        }
+        let next = match self.next {
+            Next::CallKeepaliveAgain => "call keepalive again",
+            Next::ActOnEvents => "act on events",
+            Next::WatchEnded => "watch ended; create a new watch if still needed",
+        };
+        let mut hud = Vec::new();
+        let advice = match &self.advice {
+            None => "off".into(),
+            Some(entries) => joined(entries.iter().map(|entry| {
+                let value = entry.value.map(|v| format!(" {v}")).unwrap_or_default();
+                format!("{}{value}: {}", line(&entry.id), line(&entry.message))
+            }).collect()),
+        };
+        hud.push(format!("advice: {advice}"));
+        for reminder in self.reminders.iter().flatten() {
+            hud.push(format!("reminder: {}", line(&serde_json::to_string(reminder).unwrap_or_default())));
+        }
+        if let Some(error) = &self.reminders_error { hud.push(format!("reminders error: {}", line(error))); }
+        if let Some(note) = &self.persist { hud.push(format!("persist: {}", serde_json::to_string(note).unwrap_or_default())); }
+        for failure in &self.persist_failures { hud.push(format!("persist: {}: {}", failure.watch_id, line(&failure.error))); }
+        if let Some(error) = &self.cap_error { hud.push(format!("cap: {}", line(error))); }
+        if let Some(cap) = &self.cap { hud.push(format!("cap: {}", serde_json::to_string(cap).unwrap_or_default())); }
+        for other in &self.others { hud.push(format!("{}: {:?}", other.watch_id, other.status)); }
+        if let Some(cache) = &self.cache { hud.push(format!("cache: {:?} {}s", cache.ttl, cache.interval_s)); }
+        format!("act: {} · notes: {} · status: {:?} · waited: {}s · next: {next}\n{}",
+            joined(actions), joined(notes), self.status, self.waited_s.unwrap_or(0), hud.join(" · "))
+    }
+}
+
 /// The envelope's `clock` (AI4). `since_last_call_s` is always present on the
 /// wire, `null` on the first call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

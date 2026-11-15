@@ -145,13 +145,13 @@ async fn judge_watch(rig: &Rig, vigil: &Vigil, id: &str, interval_s: u64, deadli
 }
 
 async fn call(vigil: &Vigil, id: &WatchId, max_s: Option<u64>, orchestrator: Option<bool>) -> Value {
-    let envelope = vigil.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator, confirm: None }).await.unwrap();
+    let envelope = vigil.keepalive(KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator, confirm: None, session: false }).await.unwrap();
     serde_json::to_value(&envelope).unwrap()
 }
 
 /// A no-id call (covers this process's pending watches, V7).
 async fn call_noid(vigil: &Vigil, max_s: Option<u64>, orchestrator: Option<bool>) -> Value {
-    let envelope = vigil.keepalive(KeepaliveRequest { watch_id: None, max_s, orchestrator, confirm: None }).await.unwrap();
+    let envelope = vigil.keepalive(KeepaliveRequest { watch_id: None, max_s, orchestrator, confirm: None, session: false }).await.unwrap();
     serde_json::to_value(&envelope).unwrap()
 }
 
@@ -977,7 +977,7 @@ async fn the_event_names_the_source_the_probe_used() {
 const REAL_CALL_LIMIT: Duration = Duration::from_secs(20);
 
 async fn real_call_with(vigil: &Vigil, id: &WatchId, max_s: Option<u64>, orchestrator: Option<bool>) -> Value {
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator, confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator, confirm: None, session: false };
     let result = tokio::time::timeout(REAL_CALL_LIMIT, vigil.keepalive(request)).await;
     assert!(result.is_ok(), "the call should have ended on the credit event, not run its full window");
     let envelope = result.unwrap().unwrap();
@@ -985,7 +985,7 @@ async fn real_call_with(vigil: &Vigil, id: &WatchId, max_s: Option<u64>, orchest
 }
 
 async fn real_call(vigil: &Vigil, id: &WatchId) -> Value {
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3000), orchestrator: Some(true), confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3000), orchestrator: Some(true), confirm: None, session: false };
     let result = tokio::time::timeout(REAL_CALL_LIMIT, vigil.keepalive(request)).await;
     assert!(result.is_ok(), "the call should have ended on the credit event, not run its full window");
     let envelope = result.unwrap().unwrap();
@@ -1036,7 +1036,7 @@ async fn the_hook_runs_once_per_change_with_the_state_on_stdin_and_its_result_in
     assert_eq!(seen["windows"], event["windows"]);
     assert_eq!(seen["at"], envelope["cache"]["credit_check"]["at"]);
 
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3000), orchestrator: Some(true), confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(3000), orchestrator: Some(true), confirm: None, session: false };
     let second = tokio::time::timeout(Duration::from_millis(900), vigil.keepalive(request)).await;
     assert!(second.is_err(), "no change, so no event and no early end: {second:?}");
     assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 1, "the hook runs once per change");
@@ -1518,7 +1518,7 @@ async fn an_attention_event_that_never_reached_the_caller_comes_again_until_it_i
         let name = if fresh_process { "fresh" } else { "same" };
         let first_process = rig.vigil(AgentEnv::default(), &probe);
         let (id, _) = quiet_watch(&rig, &first_process, name, 600, 7200, |request| request.expect_s = Some(60)).await;
-        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None };
+        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None, session: false };
         let (envelope, delivery) = first_process
             .keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>())
             .await
@@ -1654,7 +1654,7 @@ async fn cancelling_a_call_during_the_uw_probe_leaves_no_uw_descendants() {
     let rig = Rig::real_time(|config| config.uw_command = uw.clone());
     let vigil = rig.env.another_process().with_agent_env(AgentEnv::default());
     let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
-    let request = KeepaliveRequest { watch_id: Some(id), max_s: Some(600), orchestrator: Some(true), confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id), max_s: Some(600), orchestrator: Some(true), confirm: None, session: false };
     let cancelled = vigil.keepalive_cancellable(request, &crate::keepalive::NoProgress, child_pid_appears(&pid_file)).await.unwrap();
     assert!(cancelled.is_none(), "the call should have been cancelled mid-probe");
     let pid = pid_file_value(&pid_file);
@@ -1682,7 +1682,7 @@ async fn cancelling_a_call_during_the_hook_leaves_no_hook_descendants() {
     let probe = off_then_on();
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, _) = quiet_watch(&rig, &vigil, "w", 3600, 7200, |_| {}).await;
-    let request = KeepaliveRequest { watch_id: Some(id), max_s: Some(600), orchestrator: Some(true), confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id), max_s: Some(600), orchestrator: Some(true), confirm: None, session: false };
     let cancelled = vigil.keepalive_cancellable(request, &crate::keepalive::NoProgress, child_pid_appears(&pid_file)).await.unwrap();
     assert!(cancelled.is_none(), "the call should have been cancelled mid-hook");
     let pid = pid_file_value(&pid_file);
@@ -1814,7 +1814,7 @@ async fn two_processes_that_detect_the_same_change_run_the_hook_once() {
     let (id_a, _) = quiet_watch(&rig, &a, "a", 3600, 7200, |_| {}).await;
     let (id_b, _) = quiet_watch(&rig, &b, "b", 3600, 7200, |_| {}).await;
     async fn run(vigil: &Vigil, id: &WatchId) -> Result<Result<crate::Envelope, crate::VigilError>, tokio::time::error::Elapsed> {
-        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30), orchestrator: Some(true), confirm: None };
+        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: Some(30), orchestrator: Some(true), confirm: None, session: false };
         tokio::time::timeout(Duration::from_secs(3), vigil.keepalive(request)).await
     }
     let (ra, rb) = tokio::join!(run(&a, &id_a), run(&b, &id_b));
@@ -1989,7 +1989,7 @@ async fn two_attention_reasons_and_a_later_terminal_event_have_distinct_persiste
         r.stall_s = Some(60);
         r.inputs.push(Input::Process { pid: child.pid(), want: None });
     }).await;
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None, session: false };
     let (first, first_delivery) = vigil.keepalive_uncommitted(request.clone(), &crate::keepalive::NoProgress, std::future::pending()).await.unwrap().unwrap();
     let first = serde_json::to_value(first).unwrap();
     assert_attention(&first, "overdue", 30);
@@ -2024,7 +2024,7 @@ async fn attention_cancelled_before_delivery_is_replayed_until_commit_delivery()
     let rig = Rig::new();
     let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
     let (id, _) = quiet_watch(&rig, &vigil, "w", 10, 3600, |r| r.expect_s = Some(20)).await;
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None, session: false };
     let (first, delivery) = vigil.keepalive_uncommitted(request.clone(), &crate::keepalive::NoProgress, std::future::pending()).await.unwrap().unwrap();
     let first = serde_json::to_value(first).unwrap();
     assert_attention(&first, "overdue", 30);
@@ -2317,7 +2317,7 @@ async fn a_call_that_returns_carried_attention_still_makes_its_due_credit_check(
     let (rig, probe) = rig_owing_a_credit_check();
     let vigil = rig.vigil(AgentEnv::default(), &probe);
     let (id, _) = quiet_watch(&rig, &vigil, "w", 600, 7200, |request| request.expect_s = Some(60)).await;
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None, session: false };
     let (_, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().unwrap();
     drop(delivery);
     assert_eq!(probe.asked_count(), 0, "control: a plain call checks nothing");
@@ -2439,7 +2439,7 @@ async fn a_waiting_call_returns_attention_that_another_process_saved_but_could_n
         let other = Vigil::new(rig.env.root(), later_clock, rig.env.judge.clone(), rig.env.config.clone())
             .with_reader(rig.env.reader.clone())
             .with_agent_env(AgentEnv::default());
-        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None };
+        let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None, session: false };
         let (envelope, delivery) = other.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().unwrap();
         assert_attention(&serde_json::to_value(&envelope).unwrap(), "overdue", 0);
         drop(delivery);
@@ -2542,7 +2542,7 @@ async fn a_retried_attention_event_is_flagged_redelivered_even_when_nothing_else
 async fn watch_with_undelivered_attention(rig: &Rig, id: &str, deadline_s: u64) -> (Vigil, WatchId, PathBuf, String) {
     let vigil = rig.vigil(AgentEnv::default(), &quiet_probe());
     let (id, path) = quiet_watch(rig, &vigil, id, 600, deadline_s, |request| request.expect_s = Some(60)).await;
-    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(id.clone()), max_s: None, orchestrator: None, confirm: None, session: false };
     let (envelope, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().unwrap();
     let first = serde_json::to_value(&envelope).unwrap();
     assert_attention(&first, "overdue", 90);

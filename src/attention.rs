@@ -77,7 +77,7 @@ pub fn due(watch: &WatchFile, now: Timestamp, long_window: bool) -> Vec<Attentio
     if watch.status == WatchStatus::Pending {
         for (index, item) in watch.items.iter().flatten().enumerate() {
             if crate::items::overdue_at(item).is_some_and(|at| now >= at) {
-                due.push(Attention::ItemOverdue(index));
+                due.push(Attention::ItemOverdue(item.event_index(index)));
             }
         }
     }
@@ -100,7 +100,7 @@ pub fn event(watch: &WatchFile, attention: Attention, now: Timestamp) -> Option<
     match attention {
         Attention::Watch(reason) => Some(event_for(watch, reason, now)),
         Attention::ItemOverdue(index) => {
-            let item = watch.items.as_ref()?.get(index)?;
+            let item = watch.items.as_ref()?.iter().enumerate().find(|(fallback, item)| item.event_index(*fallback) == index)?.1;
             Some(crate::items::overdue_event(&watch.spec.id, watch.tick, index, item))
         }
     }
@@ -111,7 +111,7 @@ pub fn mark_raised(watch: &mut WatchFile, attention: Attention) {
     match attention {
         Attention::Watch(reason) => watch.attention_raised.push(reason),
         Attention::ItemOverdue(index) => {
-            if let Some(item) = watch.items.as_mut().and_then(|items| items.get_mut(index)) {
+            if let Some(item) = watch.items.as_mut().and_then(|items| items.iter_mut().enumerate().find(|(fallback, item)| item.event_index(*fallback) == index).map(|(_, item)| item)) {
                 item.overdue_raised = true;
             }
         }
@@ -122,7 +122,7 @@ pub fn mark_raised(watch: &mut WatchFile, attention: Attention) {
 pub fn is_raised(watch: &WatchFile, attention: Attention) -> bool {
     match attention {
         Attention::Watch(reason) => watch.attention_raised.contains(&reason),
-        Attention::ItemOverdue(index) => watch.items.as_ref().and_then(|items| items.get(index)).is_some_and(|item| item.overdue_raised),
+        Attention::ItemOverdue(index) => watch.items.as_ref().is_some_and(|items| items.iter().enumerate().any(|(fallback, item)| item.event_index(fallback) == index && item.overdue_raised)),
     }
 }
 

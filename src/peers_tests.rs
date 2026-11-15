@@ -27,7 +27,7 @@ async fn hold(env: &Env, name: &str) {
 }
 
 fn request(orchestrator: Option<bool>) -> KeepaliveRequest {
-    KeepaliveRequest { watch_id: Some(id("main")), max_s: Some(30), orchestrator, confirm: None }
+    KeepaliveRequest { watch_id: Some(id("main")), max_s: Some(30), orchestrator, confirm: None, session: false }
 }
 
 /// A real foreign pid, reaped even if an assertion panics. Its lifetime, not a

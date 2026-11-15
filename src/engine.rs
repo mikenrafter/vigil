@@ -324,6 +324,8 @@ impl Vigil {
         }
         let _watch_lock = self.lock_watch(&id).await?;
         let mut watch = WatchFile::new(spec, self.clock.now());
+        watch.owner_session = self.session_key.clone().filter(|key| !key.trim().is_empty());
+        watch.next_item_sequence = items.as_ref().map_or(0, Vec::len);
         watch.items = items.map(|items| items.into_iter().map(|item| crate::items::HoldItem { added_at: watch.created_at, ..item }).collect());
         {
             // X3: the global lock only covers the id check and the placeholder

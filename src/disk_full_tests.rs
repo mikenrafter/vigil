@@ -102,11 +102,11 @@ fn disk_has_only_the_reserve_to_give(root: &Path, errno: i32) -> Vec<FaultRule> 
 }
 
 fn by_id(id: &WatchId, max_s: Option<u64>) -> KeepaliveRequest {
-    KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator: None, confirm: None }
+    KeepaliveRequest { watch_id: Some(id.clone()), max_s, orchestrator: None, confirm: None, session: false }
 }
 
 fn no_id() -> KeepaliveRequest {
-    KeepaliveRequest { watch_id: None, max_s: None, orchestrator: None, confirm: None }
+    KeepaliveRequest { watch_id: None, max_s: None, orchestrator: None, confirm: None, session: false }
 }
 
 fn wire(envelope: &Envelope) -> Value {
@@ -159,7 +159,7 @@ fn assert_persist_failure(item: &Value, watch: &str, kind: &str, os_text: &str, 
 }
 
 fn no_id_for(max_s: u64) -> KeepaliveRequest {
-    KeepaliveRequest { watch_id: None, max_s: Some(max_s), orchestrator: None, confirm: None }
+    KeepaliveRequest { watch_id: None, max_s: Some(max_s), orchestrator: None, confirm: None, session: false }
 }
 
 /// The failed-write note, field by field against the spec (DF2, DF3a, S4). The

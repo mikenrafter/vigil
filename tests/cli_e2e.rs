@@ -1609,7 +1609,7 @@ fn the_cli_help_documents_hold_and_the_orchestrator_flag() {
     let sandbox = Sandbox::new();
     for (args, needles) in [
         (&["--help"][..], &["hold"][..]),
-        (&["keepalive", "--help"], &["--orchestrator", "main"]),
+        (&["keepalive", "--help"], &["--orchestrator", "main", "--session", "--brief"]),
         (&["hold", "--help"], &["--for", "--until-idle", "--id", "--deadline-s", "--orchestrator"]),
     ] {
         let output = sandbox.run(args);
@@ -1723,8 +1723,8 @@ fn hold_add_and_hold_done_work_across_separate_processes_through_the_binary() {
     // why: W42-H1..H5 through the real binary and watch file. `vigil hold
     //      --for QEX --label build`, then `hold add ID --for none --label t3
     //      --expect-s 600`, then `hold done ID t3` are three separate
-    //      processes; a keepalive in a fourth sees `item ended: t3: done` with
-    //      the hold still live, and the qex job ending later releases it.
+    //      processes; a keepalive in a fourth carries the explicit completion
+    //      as a note alongside the autonomous build completion.
     // proves: W42-H1, W42-H2, W42-H3, W42-H5
     // catches: a CLI whose `hold add` / `hold done` subcommands do not exist
     //      (clap exit 2) or only mutate in memory; a `done` that releases the
@@ -1739,16 +1739,17 @@ fn hold_add_and_hold_done_work_across_separate_processes_through_the_binary() {
     let done = run_with_qex(&sandbox, &qex, &["hold", "done", "h", "t3"]);
     assert!(done.status.success(), "hold done: {}", String::from_utf8_lossy(&done.stderr));
 
-    let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
-    assert_eq!((envelope["status"].as_str(), envelope["next"].as_str()), (Some("pending"), Some("act on events")), "{envelope}");
-    assert_eq!(envelope["events"][0]["summary"], "item ended: t3: done", "{envelope}");
-    assert_eq!(envelope["events"][0]["kind"], "attention", "{envelope}");
-
+    // A second unsensed item keeps the hold live after the sensed build ends.
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "add", "h", "--for", "none", "--label", "anchor"]).status.success());
     qex.set_job(J1, "completed");
-    // The next tick is due 30 s after the last (cadence across calls), so wait it out (orchestrator, W42 green: test timing fix).
-    std::thread::sleep(std::time::Duration::from_secs(31));
-    let released = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
-    assert_eq!(released["status"], "fired", "{released}");
+    let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30"]));
+    assert_eq!((envelope["status"].as_str(), envelope["next"].as_str()), (Some("pending"), Some("act on events")), "{envelope}");
+    let events = envelope["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| event["summary"] == "item ended: t3: done" && event["kind"] == "note"), "completion note rides the autonomous return: {envelope}");
+    assert!(events.iter().any(|event| event["summary"] == "item ended: build: completed" && event["kind"] == "attention"), "{envelope}");
+    // The final explicit end is quiet; it commits without releasing inline.
+    assert!(run_with_qex(&sandbox, &qex, &["hold", "done", "h", "anchor"]).status.success());
+    assert_eq!(sandbox.watch_file("h").unwrap()["status"], "pending");
 }
 
 #[test]
@@ -2288,4 +2289,17 @@ fn peer_session_keys_are_wired_through_the_cli_in_precedence_order() {
         assert_eq!(answer["events"][0]["kind"], "foreign_orchestrator", "{}", keys[first]);
         assert!(answer["events"][0]["summary"].as_str().unwrap().contains(&peer.0.id().to_string()));
     }
+}
+
+#[test]
+fn brief_delivery_to_closed_stdout_leaves_the_terminal_result_available() {
+    // why: the new presentation must commit only after a successful write.
+    // catches: a brief formatter that bypasses checked stdout delivery.
+    let sandbox = Sandbox::new();
+    assert!(sandbox.run(&["hold", "--id", "brief", "--for", "until:2020-01-01T00:00:00Z", "--orchestrator", "false"]).status.success());
+    let failed = run_with_closed_stdout(&sandbox, &["keepalive", "brief", "--brief"]);
+    assert_eq!(failed.status.code(), Some(1));
+    let returned = sandbox.run(&["keepalive", "brief", "--brief"]);
+    assert!(returned.status.success());
+    assert!(String::from_utf8_lossy(&returned.stdout).contains("item ended:"));
 }

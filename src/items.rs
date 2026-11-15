@@ -16,14 +16,11 @@
 //! front doors that change items are `Vigil::hold`, `Vigil::hold_add` and
 //! `Vigil::hold_done` (hold.rs); nothing else writes `items`.
 //!
-//! Invariants (kept by the front doors, the only writers):
-//! - labels are unique within a hold (D5);
-//! - a sensed item's `input` is an index into `spec.inputs`, and each input of
-//!   a hold with items belongs to exactly one item: an input is pushed with its
-//!   item, and neither is ever removed;
-//! - a hold has at most [`MAX_ITEMS`] items, so items never outgrow the
-//!   input cap (D5);
-//! - an item's index never changes (event ids use it, CLAIM(item-event-id));
+//! Invariants (kept under the hold lock):
+//! - labels are unique among retained items;
+//! - live items count toward MAX_ITEMS; completed inputs retire on admission;
+//! - ended history is bounded by MAX_ENDED_HISTORY; undelivered events survive;
+//! - an item's sequence is stable when history and inputs are compacted;
 //! - `last_end_event` is set only while `ended_at` is.
 //!
 //! A hold stored without `items` (by an older vigil, or made with
@@ -40,8 +37,10 @@ use crate::inputs::Reading;
 use crate::tick::cap_bytes;
 use crate::watch::{ChangedInput, Event, EventDetail, WatchId, MAX_INPUTS, MAX_SUMMARY_BYTES};
 
-/// D5: items count toward the input cap, so a hold has at most this many.
+/// Maximum live work items; ended history does not consume capacity.
 pub const MAX_ITEMS: usize = MAX_INPUTS;
+/// Keep the most recently added 64 ended items; undelivered events remain in the outbox.
+pub const MAX_ENDED_HISTORY: usize = 64;
 /// An explicit label is at most this many bytes (a label lives in event
 /// summaries of at most 200 bytes, and the release lists several).
 pub const MAX_LABEL_BYTES: usize = 64;
@@ -53,6 +52,12 @@ pub const NONE_SPEC: &str = "none";
 pub struct HoldItem {
     /// Unique in the hold. `--label`, else the `--for` spec as given (D5).
     pub label: String,
+    /// Absent on old files: their original vector index is the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<usize>,
+    /// Reading retained when a completed input is retired to free capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reading: Option<String>,
     /// W46-K1: absent means uncounted, including items stored by older vigil.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<crate::cap::CapClass>,
@@ -74,8 +79,7 @@ pub struct HoldItem {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overdue_raised: bool,
     /// D3: id of the `item ended` event that announced the current end;
-    /// absent while the item is live or its end is not announced yet (a
-    /// `hold done` is announced by the next tick).
+    /// absent while the item is live or its end is not announced yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_end_event: Option<String>,
 }
@@ -136,9 +140,11 @@ fn checked_label(label: &str) -> Result<String, ItemError> {
 }
 
 impl HoldItem {
+    pub(crate) fn event_index(&self, fallback: usize) -> usize { self.sequence.unwrap_or(fallback) }
+
     /// A live item added at `added_at`, sensed by `spec.inputs[input]` if any.
     pub fn new(label: String, input: Option<usize>, expect_s: Option<u64>, added_at: Timestamp) -> HoldItem {
-        HoldItem { label, cap: None, input, expect_s, added_at, ended_at: None, overdue_raised: false, last_end_event: None }
+        HoldItem { label, sequence: None, end_reading: None, cap: None, input, expect_s, added_at, ended_at: None, overdue_raised: false, last_end_event: None }
     }
 }
 
@@ -156,12 +162,12 @@ pub(crate) struct ItemTick {
 }
 
 /// CLAIM(item-event-id): every item event has its own id,
-/// `<watch>:<tick>:<item index>`, and the release `<watch>:<tick>:<item
-/// count>` [W1, D3; proof: an item raises at most one event per tick number:
+/// `<watch>:<tick>:<stable item sequence>`, and the release uses the next
+/// sequence [W1, D3; proof: an item raises at most one event per tick number:
 /// its end only at a tick, at most once per tick; its overdue at most once
 /// ever, at a pass after tick T (id T) and only while it is not ended, so
-/// never for an item that ended at tick T; a `hold done` is announced by the
-/// NEXT tick; a hold with items has no watch-level attention (no watch
+/// never for an item that ended at tick T; `hold done` advances the event
+/// epoch before recording its note; a hold with items has no watch-level attention (no watch
 /// `expect_s`, no `stall_s`), so no other id scheme shares its ids; tests
 /// two_items_ending_in_one_tick_give_two_events_with_distinct_event_ids and
 /// two_items_going_overdue_in_one_tick_give_two_events_with_distinct_event_ids].
@@ -172,7 +178,7 @@ fn item_event_id(watch_id: &WatchId, tick: u64, index: usize) -> String {
 /// An attention event about item `index` (`input` is its label).
 fn item_event(watch_id: &WatchId, tick: u64, index: usize, item: &HoldItem, summary: String, reason: EventReason) -> Event {
     Event {
-        event_id: item_event_id(watch_id, tick, index),
+        event_id: item_event_id(watch_id, tick, item.event_index(index)),
         tick,
         watch_id: watch_id.to_string(),
         input: item.label.clone(),
@@ -207,15 +213,18 @@ pub(crate) fn tick_items(items: &mut [HoldItem], watch_id: &WatchId, tick: u64, 
         let (is_ended, why) = match item.input {
             // A missing reading (a hand-damaged file) is not an end: a hold errs towards staying live.
             Some(input) => readings.get(input).map_or((false, String::new()), |reading| (reading.want_met == Some(true), reading.text.clone())),
-            None => (item.ended_at.is_some(), "done".to_string()),
+            None => (item.ended_at.is_some(), item.end_reading.clone().unwrap_or_else(|| "done".to_string())),
         };
         if !is_ended {
             item.ended_at = None;
             item.last_end_event = None;
+            item.end_reading = None;
             continue;
         }
         if item.last_end_event.is_none() {
-            let event = item_event(watch_id, tick, index, item, format!("item ended: {}: {why}", item.label), EventReason::Ended);
+            let mut event = item_event(watch_id, tick, index, item, format!("item ended: {}: {why}", item.label), EventReason::Ended);
+            if item.input.is_none() { event.detail = Some(EventDetail::Note { reason: Some(EventReason::Ended) }); }
+            item.end_reading = Some(why.clone());
             item.ended_at.get_or_insert(now);
             item.last_end_event = Some(event.event_id.clone());
             events.push(event);
@@ -224,6 +233,50 @@ pub(crate) fn tick_items(items: &mut [HoldItem], watch_id: &WatchId, tick: u64, 
     }
     let released = !items.is_empty() && ended.len() == items.len();
     ItemTick { events, released, ended }
+}
+
+/// Record the caller's explicit completion under the hold lock. Advance the
+/// event epoch so an overdue at the previous tick cannot share its event id.
+pub(crate) fn record_done(watch: &mut crate::watch::WatchFile, index: usize, now: Timestamp) {
+    watch.tick += 1;
+    let item = &mut watch.items.as_mut().expect("checked hold")[index];
+    item.ended_at = Some(now);
+    item.end_reading = Some("done".into());
+    let mut event = item_event(&watch.spec.id, watch.tick, index, item, format!("item ended: {}: done", item.label), EventReason::Ended);
+    event.detail = Some(EventDetail::Note { reason: Some(EventReason::Ended) });
+    item.last_end_event = Some(event.event_id.clone());
+    watch.events.push(event);
+}
+
+/// CLAIM(hold-history): admission retires completed inputs and bounds ended
+/// history without changing event identity [history_compaction_preserves_sensed_inputs_and_unique_event_ids].
+/// Until admission a sensed retry can still revive an item; afterwards the
+/// caller must add a new item for new work. All changes share the hold lock/save.
+pub(crate) fn compact_history(watch: &mut crate::watch::WatchFile, retire_inputs: bool) {
+    let Some(items) = watch.items.as_mut() else { return };
+    for (index, item) in items.iter_mut().enumerate() {
+        item.sequence.get_or_insert(index);
+        watch.next_item_sequence = watch.next_item_sequence.max(item.event_index(index) + 1);
+        if retire_inputs && item.ended_at.is_some() && item.last_end_event.is_some() { item.input = None; }
+    }
+    let mut remove = items.iter().filter(|item| item.ended_at.is_some() && item.last_end_event.is_some()).count().saturating_sub(MAX_ENDED_HISTORY);
+    items.retain(|item| {
+        if remove > 0 && item.ended_at.is_some() && item.last_end_event.is_some() { remove -= 1; false } else { true }
+    });
+    let mut inputs = Vec::new();
+    let mut states = Vec::new();
+    for item in items {
+        if let Some(old) = item.input {
+            // Invalid stored indices stay invalid; never manufacture a completion.
+            if let Some(input) = watch.spec.inputs.get(old) {
+                item.input = Some(inputs.len());
+                inputs.push(input.clone());
+                states.push(watch.input_states.get(old).cloned().unwrap_or_default());
+            } else { item.input = Some(usize::MAX); }
+        }
+    }
+    watch.spec.inputs = inputs;
+    watch.input_states = states;
 }
 
 /// D2: when `item` goes overdue, if it still can: `expect_s` set, not raised

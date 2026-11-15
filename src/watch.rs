@@ -573,6 +573,8 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventDetail {
+    /// Information delivered with the next return; never ends a wait.
+    Note { reason: Option<EventReason> },
     /// A project reminder became due inside a long call.
     ReminderDue { reminder_id: String, period: String },
     /// Same-session foreign call misusing orchestrator mode (pilot).
@@ -604,7 +606,11 @@ pub enum EventDetail {
 impl Event {
     /// Is this a call-ending attention, credit, or foreign-orchestrator event?
     pub fn is_call_ending(&self) -> bool {
-        self.detail.is_some()
+        self.detail.is_some() && !self.is_note()
+    }
+
+    pub fn is_note(&self) -> bool {
+        matches!(self.detail, Some(EventDetail::Note { .. }))
     }
 }
 
@@ -699,9 +705,25 @@ pub struct WatchFile {
     /// old behaviour (D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<crate::items::HoldItem>>,
+    /// Session attribution, never authentication. Old files remain unowned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session: Option<String>,
+    /// Terminal result reached a transport. Failed acknowledgements redeliver.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_returned: bool,
+    /// Monotonic item identity, independent of bounded history positions.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub next_item_sequence: usize,
 }
 
+fn is_zero(value: &usize) -> bool { *value == 0 }
+
 impl WatchFile {
+    /// Quiet releases ride the next timed return; expiry and cancellation wake.
+    pub(crate) fn wakes_wait(&self) -> bool {
+        self.status.is_finished() && (self.status != WatchStatus::Fired || self.events.iter().any(|event| !event.is_note()))
+    }
+
     /// A new pending watch: tick 0, `deadline_at = now + spec.deadline_s`.
     pub fn new(spec: WatchSpec, now: Timestamp) -> WatchFile {
         WatchFile {
@@ -722,6 +744,9 @@ impl WatchFile {
             activity: None,
             last_call_at: None,
             items: None,
+            owner_session: None,
+            session_returned: false,
+            next_item_sequence: 0,
         }
     }
     /// V3/V4: store the terminal result. Succeeds exactly once; afterwards the

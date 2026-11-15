@@ -40,9 +40,17 @@ enum Command {
         #[command(subcommand)]
         command: Option<CapCommand>,
     },
-    /// Block up to --max-s (30..=270) and print the envelope JSON.
+    /// Wait for a watch or all session holds. JSON by default; --brief prints text.
     Keepalive {
-        id: String,
+        #[arg(required_unless_present = "session", conflicts_with = "session")]
+        id: Option<String>,
+        /// Cover this session's holds across CLI/MCP processes, including new holds.
+        /// Each hold must be confirmed separately before --orchestrator can cover it.
+        #[arg(long)]
+        session: bool,
+        /// Two plain lines with actions, notes, next step, and every advisory message.
+        #[arg(long)]
+        brief: bool,
         #[arg(long)]
         max_s: Option<u64>,
         /// This call is the main orchestrator session's (AI1').
@@ -56,11 +64,12 @@ enum Command {
     /// of work: `qex:JOB`, `pid:N`, `file:PATH` (ends when it exists),
     /// `until:RFC3339`, `idle:DIR` (no qex job at or under DIR is running), or
     /// `none` (a T3 delegate: needs --label, ended by `vigil hold done`). Each
-    /// item that ends raises `item ended: LABEL: WHY`; the hold is released
+    /// autonomous end wakes keepalive; `hold done` queues a quiet note.
+    /// Up to 16 live items; ended history retains 64. The hold releases
     /// when every item has ended. With no work it is a bare hold, live until
     /// cancelled (7 days at most); `vigil hold add` gives it items. Then
     /// `keepalive ID` (main session: add --orchestrator, a hold stores it by
-    /// default).
+    /// default). One `keepalive --session --brief` covers all owned holds.
     #[command(args_conflicts_with_subcommands = true)]
     Hold {
         #[command(subcommand)]
@@ -170,7 +179,7 @@ enum HoldItemCommand {
         #[arg(long, value_enum)]
         cap: Option<vigil::cap::CapClass>,
     },
-    /// End the `none` item LABEL of the live hold ID (a T3 delegate finished).
+    /// End the `none` item LABEL. Queues a durable note without waking keepalive.
     Done { id: String, label: String },
 }
 
@@ -283,9 +292,14 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 /// duplicate of descriptor 1 (the duplication itself fails when it is closed),
 /// reports every error, and flushes.
 fn deliver_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    let text = serde_json::to_string(value)?;
+    deliver_text(&text)
+}
+
+fn deliver_text(text: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::fd::AsFd;
-    let mut line = serde_json::to_vec(value)?;
+    let mut line = text.as_bytes().to_vec();
     line.push(b'\n');
     let mut stdout = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned().map_err(|error| anyhow::anyhow!("cannot write the envelope to stdout: {error}"))?);
     stdout.write_all(&line).and_then(|()| stdout.flush()).map_err(|error| anyhow::anyhow!("cannot write the envelope to stdout: {error}"))
@@ -382,15 +396,15 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&limits)?;
             Ok(0)
         }
-        Command::Keepalive { id, max_s, orchestrator, confirm } => {
-            let request = KeepaliveRequest { watch_id: Some(WatchId::parse(&id)?), max_s, orchestrator: orchestrator.then_some(true), confirm };
+        Command::Keepalive { id, session, brief, max_s, orchestrator, confirm } => {
+            let request = KeepaliveRequest { watch_id: id.as_deref().map(WatchId::parse).transpose()?, max_s, orchestrator: orchestrator.then_some(true), confirm, session };
             let (envelope, delivery) = vigil
                 .keepalive_uncommitted(request, &vigil::keepalive::NoProgress, std::future::pending::<()>())
                 .await?
                 .expect("a call that cannot be cancelled always finishes");
             // N3: print, THEN commit. A failed write leaves the delivery
             // uncommitted (the error ends the process), so the next call replays it.
-            deliver_json(&envelope)?;
+            if brief { deliver_text(&envelope.brief())?; } else { deliver_json(&envelope)?; }
             vigil.commit_delivery(delivery);
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(0)

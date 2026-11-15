@@ -229,6 +229,7 @@ fn request(id: crate::WatchId, long: bool) -> KeepaliveRequest {
     KeepaliveRequest {
         watch_id: Some(id),
         max_s: Some(if long { 3000 } else { 30 }),
+        session: false,
         orchestrator: Some(long),
         confirm: None,
     }

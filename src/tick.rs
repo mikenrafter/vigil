@@ -192,11 +192,12 @@ impl Vigil {
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
 
-        let raised_attention = watch.events.len() > outbox_before;
+        let raised_attention = watch.events[outbox_before..].iter().any(Event::is_call_ending);
         watch.tick = tick;
         watch.last_tick_at = Some(now);
         watch.activity = Some(activity_after(&watch, &readings, now));
         watch.input_states = readings.into_iter().map(|reading| reading.state).collect();
+        if watch.items.is_some() { crate::items::compact_history(&mut watch, false); }
         if !fired_events.is_empty() {
             let terminal = Terminal {
                 status: TerminalStatus::Fired,
@@ -453,15 +454,16 @@ fn hold_events(watch: &mut WatchFile, tick: u64, readings: &[Reading], now: Time
             return Vec::new();
         }
         watch.last_digest = digest_of(&decided.ended);
+        let quiet_release = decided.events.iter().all(Event::is_note);
         let release = Event {
-            event_id: Event::make_id(watch.spec.id.as_str(), tick, items.len()),
+            event_id: Event::make_id(watch.spec.id.as_str(), tick, watch.next_item_sequence.max(items.len())),
             tick,
             watch_id: watch.spec.id.to_string(),
             input: "hold".to_string(),
             summary: crate::items::release_summary(items),
             judge: None,
             redelivered: false,
-            detail: None,
+            detail: quiet_release.then_some(crate::watch::EventDetail::Note { reason: None }),
         };
         return decided.events.into_iter().chain([release]).collect();
     }

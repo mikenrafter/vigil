@@ -127,7 +127,7 @@ mod tests {
     }
 
     async fn keepalive(env: &Env, name: &str, orchestrator: Option<bool>, confirm: Option<&str>) -> Result<serde_json::Value, VigilError> {
-        let request = KeepaliveRequest { watch_id: Some(id(name)), max_s: Some(30), orchestrator, confirm: confirm.map(String::from) };
+        let request = KeepaliveRequest { watch_id: Some(id(name)), max_s: Some(30), orchestrator, confirm: confirm.map(String::from), session: false };
         env.vigil.keepalive(request).await.map(|envelope| serde_json::to_value(envelope).unwrap())
     }
 
@@ -210,12 +210,11 @@ mod tests {
         let token = token_in(&keepalive(&env, "main", Some(true), None).await.unwrap_err());
         keepalive(&env, "main", Some(true), Some(&token)).await.unwrap();
         let result = env.vigil.keepalive(KeepaliveRequest {
-            watch_id: None, max_s: Some(30), orchestrator: Some(true), confirm: Some(token.clone()),
-        }).await;
+            watch_id: None, max_s: Some(30), orchestrator: Some(true), confirm: Some(token.clone()), session: false }).await;
         assert!(matches!(result, Err(VigilError::OrchestratorUnconfirmed(_))), "{result:?}");
         assert!(!env.vigil.orchestrator_confirmed(&env.vigil.store().load(&id("sub")).unwrap()));
         keepalive(&env, "sub", Some(true), Some(&token)).await.unwrap();
-        env.vigil.keepalive(KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: Some(true), confirm: None }).await.unwrap();
+        env.vigil.keepalive(KeepaliveRequest { watch_id: None, max_s: Some(30), orchestrator: Some(true), confirm: None, session: false }).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

@@ -227,7 +227,7 @@ pub enum ItemError {
     #[error("hold {0} has no items (made by watch_create or an older vigil); make a new hold with `vigil hold`")]
     NoItems(String),
     /// D5: items count toward the input cap.
-    #[error("a hold has at most {max} items (ended ones count), and this one would have {wanted}; make a new hold")]
+    #[error("a hold has at most {max} live items, and this one would have {wanted}; wait for work to end or make a new hold")]
     TooManyItems { max: usize, wanted: usize },
     /// D5: labels are unique per hold (an unlabelled item is labelled by its spec).
     #[error("this hold already has an item labelled {0:?}; labels are unique per hold, give --label")]
@@ -271,6 +271,8 @@ pub enum VigilError {
     /// `keepalive` with no id and no pending watch created by this process.
     #[error("no watches to cover")]
     NothingToCover,
+    #[error("{0}")]
+    WaitScope(String),
     #[error(transparent)]
     Advisory(#[from] crate::advisory::AdvisoryError),
     /// Orchestrator mode asked for without the day's token: the challenge.

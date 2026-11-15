@@ -419,7 +419,7 @@ impl Vigil {
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
         check_editable(&watch, now)?;
-        let items = watch.items.as_ref().map_or(0, Vec::len);
+        let items = watch.items.iter().flatten().filter(|item| item.ended_at.is_none()).count();
         if items >= MAX_ITEMS {
             return Err(ItemError::TooManyItems { max: MAX_ITEMS, wanted: items + 1 }.into());
         }
@@ -430,6 +430,7 @@ impl Vigil {
         if let Some(class) = request.cap {
             self.cap_limits()?.admit(class, watch.items.as_deref().unwrap_or_default(), &[&draft.label])?;
         }
+        crate::items::compact_history(&mut watch, true);
         let input = match draft.work {
             ItemWork::Sensed(work) => {
                 let input = self.sensing_input(work).await?;
@@ -443,6 +444,8 @@ impl Vigil {
         };
         let mut item = HoldItem::new(draft.label, input, draft.expect_s, now);
         item.cap = request.cap;
+        item.sequence = Some(watch.next_item_sequence);
+        watch.next_item_sequence += 1;
         watch.items.get_or_insert_with(Vec::new).push(item.clone());
         self.store.save_async(&watch).await?;
         Ok(ItemReport::of(&watch, &item))
@@ -452,9 +455,10 @@ impl Vigil {
     ///
     /// Under the watch's lock (`lock_and_load`): the hold must be live and
     /// have items; the item must exist, be a `none` item (a sensed one ends by
-    /// itself) and not have ended. Its `ended_at` is set now; the next tick
-    /// announces `item ended: <label>: done` (and releases the hold if it was
-    /// the last live item). Refusals write nothing.
+    /// itself) and not have ended. Completion and its quiet note commit in
+    /// one save. The next tick releases the hold if this was the last live
+    /// item; neither completion nor that release interrupts a wait.
+    /// Refusals write nothing.
     pub async fn hold_done(&self, id: &WatchId, label: &str) -> Result<ItemReport, VigilError> {
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
@@ -471,8 +475,10 @@ impl Vigil {
         if item.ended_at.is_some() {
             return Err(ItemError::AlreadyEnded(item.label.clone()).into());
         }
-        item.ended_at = Some(now);
-        let item = item.clone();
+        let index = watch.items.as_ref().unwrap().iter().position(|item| item.label == label).unwrap();
+        crate::items::record_done(&mut watch, index, now);
+        let item = watch.items.as_ref().unwrap()[index].clone();
+        crate::items::compact_history(&mut watch, false);
         self.store.save_async(&watch).await?;
         Ok(ItemReport::of(&watch, &item))
     }

@@ -284,7 +284,7 @@ async fn one_keepalive_on_the_hold_id_covers_every_item_even_from_another_proces
 
     env.reader.set_text("qex:c", "completed");
     let other = env.another_process();
-    let request = KeepaliveRequest { watch_id: Some(wid("h")), max_s: Some(30), orchestrator: Some(true), confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(wid("h")), max_s: Some(30), orchestrator: Some(true), confirm: None, session: false };
     let envelope = serde_json::to_value(other.keepalive(request).await.unwrap()).unwrap();
     assert_eq!(summaries(&envelope), vec!["item ended: c: completed"], "{envelope}");
 }
@@ -359,9 +359,9 @@ async fn status_lists_a_holds_items_live_or_ended_and_a_watch_without_items_has_
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_seventeenth_item_is_refused_with_make_a_new_hold() {
-    // why: ended items count toward the cap of 16, so the refusal must say
-    //      what to do: make a new hold. Item 1 ended; 15 more fill the hold.
+async fn the_seventeenth_live_item_is_refused_with_make_a_new_hold() {
+    // why: 16 live items fill the hold. The refusal must tell the caller
+    //      to wait for completion or make another hold.
     // proves: D5
     // catches: a refusal that does not tell the agent the way out.
     let env = rig();
@@ -400,7 +400,9 @@ async fn a_none_item_is_ended_by_hold_done_and_a_wrong_label_is_refused() {
     let done = env.vigil.hold_done(&wid("h"), "t3").await;
     assert!(done.is_ok(), "{done:?}");
     let ended = call(&env.vigil, "h", Some(30)).await;
-    assert_eq!((ended["status"].as_str(), ended["next"].as_str()), (Some("pending"), Some("act on events")), "{ended}");
+    assert_eq!((ended["status"].as_str(), ended["next"].as_str()), (Some("pending"), Some("call keepalive again")), "explicit completion is a note: {ended}");
+    assert_eq!(ended["waited_s"], 30);
+    assert_eq!(ended["events"][0]["kind"], "note");
     assert_eq!(summaries(&ended), vec!["item ended: t3: done"], "{ended}");
 
     env.reader.set_text("qex:a", "completed");
@@ -487,7 +489,7 @@ fn distinct(ids: &[String]) -> bool {
 /// One keepalive whose delivery the caller never commits (the client went
 /// away before the envelope arrived), as in `auto_interval_tests` S6.
 async fn call_uncommitted(vigil: &Vigil, id: &str, max_s: u64) -> Value {
-    let request = KeepaliveRequest { watch_id: Some(wid(id)), max_s: Some(max_s), orchestrator: None, confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(wid(id)), max_s: Some(max_s), orchestrator: None, confirm: None, session: false };
     let (envelope, delivery) = vigil.keepalive_uncommitted(request, &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().expect("not cancelled");
     drop(delivery);
     serde_json::to_value(&envelope).unwrap()
@@ -1045,7 +1047,7 @@ async fn a_hold_done_waiting_on_the_lock_keeps_an_item_that_was_added_meanwhile(
     let ended = call(&env.vigil, "h", Some(30)).await;
     assert_eq!((ended["status"].as_str(), summaries(&ended)), (Some("pending"), vec!["item ended: t3: done".to_string()]), "{ended}");
     env.reader.set_text("qex:a", "completed");
-    // 60 s: the call above returned at once on its item event, so the next tick is 30 s away.
+    // The explicit completion used the whole quiet window; allow the next tick.
     let still = call(&env.vigil, "h", Some(60)).await;
     assert_eq!((still["status"].as_str(), summaries(&still)), (Some("pending"), vec!["item ended: build: completed".to_string()]), "late (added while done waited) still holds the session: {still}");
     env.vigil.hold_done(&wid("h"), "late").await.expect("the item added meanwhile is still there");
@@ -1076,7 +1078,7 @@ async fn a_hold_add_waiting_on_the_lock_keeps_a_done_made_meanwhile() {
     let ended = call(&env.vigil, "h", Some(30)).await;
     assert_eq!((ended["status"].as_str(), summaries(&ended)), (Some("pending"), vec!["item ended: t3: done".to_string()]), "the done made while the add waited survived: {ended}");
     env.reader.set_text("qex:a", "completed");
-    // 60 s: the call above returned at once on its item event, so the next tick is 30 s away.
+    // The explicit completion used the whole quiet window; allow the next tick.
     let still = call(&env.vigil, "h", Some(60)).await;
     assert_eq!((still["status"].as_str(), summaries(&still)), (Some("pending"), vec!["item ended: build: completed".to_string()]), "b holds the session: {still}");
     env.reader.set_text("qex:b", "completed");

@@ -47,7 +47,7 @@ fn hold_request(id: &str, inputs: Vec<Input>) -> CreateRequest {
 }
 
 pub(crate) async fn call(vigil: &Vigil, id: &str, max_s: Option<u64>) -> Value {
-    let request = KeepaliveRequest { watch_id: Some(WatchId::parse(id).unwrap()), max_s, orchestrator: None, confirm: None };
+    let request = KeepaliveRequest { watch_id: Some(WatchId::parse(id).unwrap()), max_s, orchestrator: None, confirm: None, session: false };
     serde_json::to_value(vigil.keepalive(request).await.unwrap()).unwrap()
 }
 
@@ -261,7 +261,7 @@ async fn a_hold_call_with_no_flag_gets_the_orchestrator_window_on_a_one_hour_cac
     let vigil = claude_vigil(&env, projects.path());
     env.reader.set_text("qex:a", "running");
     vigil.create(hold_request("h", vec![qex("a")])).await.unwrap();
-    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: None, max_s: None, orchestrator: None, confirm: None }).await.unwrap()).unwrap();
+    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: None, max_s: None, orchestrator: None, confirm: None, session: false }).await.unwrap()).unwrap();
     assert_eq!((envelope["status"].as_str(), envelope["max_s"].as_u64()), (Some("pending"), Some(3000)), "{envelope}");
     assert_eq!((envelope["cache"]["ttl"].as_str(), envelope["cache"]["interval_s"].as_u64()), (Some("1h"), Some(3000)));
     assert_eq!(envelope["next"], "call keepalive again");
@@ -271,7 +271,7 @@ async fn a_hold_call_with_no_flag_gets_the_orchestrator_window_on_a_one_hour_cac
     let path = other.input_path("c.log");
     write_file(&path, "x\n");
     plain.create(change_request("c", &path, 60)).await.unwrap();
-    let envelope = serde_json::to_value(plain.keepalive(KeepaliveRequest { watch_id: None, max_s: None, orchestrator: None, confirm: None }).await.unwrap()).unwrap();
+    let envelope = serde_json::to_value(plain.keepalive(KeepaliveRequest { watch_id: None, max_s: None, orchestrator: None, confirm: None, session: false }).await.unwrap()).unwrap();
     assert_eq!(envelope["max_s"], 270, "control: {envelope}");
 }
 
@@ -290,7 +290,7 @@ async fn a_hold_on_a_running_process_never_raises_the_default_stall() {
     let sleeper = Sleeper::start();
     let pid = sleeper.0.id();
     vigil.create(hold_request("h", vec![Input::Process { pid, want: Some(ProcessWant::Exited) }])).await.unwrap();
-    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(3000), orchestrator: Some(true), confirm: None }).await.unwrap()).unwrap();
+    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(3000), orchestrator: Some(true), confirm: None, session: false }).await.unwrap()).unwrap();
     assert_eq!((envelope["status"].as_str(), envelope["waited_s"].as_u64()), (Some("pending"), Some(3000)), "{envelope}");
     assert_eq!(envelope["events"], json!([]));
     assert!(envelope["cache"].get("interval_s").is_some());
@@ -301,7 +301,7 @@ async fn a_hold_on_a_running_process_never_raises_the_default_stall() {
     control.fire = FireKind::Condition;
     control.inputs.push(Input::Process { pid, want: Some(ProcessWant::Exited) });
     vigil.create(control).await.unwrap();
-    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("control").unwrap()), max_s: Some(3000), orchestrator: Some(true), confirm: None }).await.unwrap()).unwrap();
+    let envelope = serde_json::to_value(vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("control").unwrap()), max_s: Some(3000), orchestrator: Some(true), confirm: None, session: false }).await.unwrap()).unwrap();
     assert_eq!(envelope["events"][0]["reason"], "stalled", "control: {envelope}");
 }
 
@@ -435,10 +435,10 @@ async fn until_a_time_and_a_marker_file_end_a_hold_on_their_own() {
     request.interval_s = Some(1);
     env.vigil.create(request).await.unwrap();
     // Not scripted -> the production reader runs.
-    let first = tokio::time::timeout(Duration::from_millis(1500), env.vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(30), orchestrator: None, confirm: None })).await;
+    let first = tokio::time::timeout(Duration::from_millis(1500), env.vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(30), orchestrator: None, confirm: None, session: false })).await;
     assert!(first.is_err(), "the marker does not exist yet: the hold is still live");
     write_file(&marker, "done\n");
-    let released = serde_json::to_value(env.vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(30), orchestrator: None, confirm: None }).await.unwrap()).unwrap();
+    let released = serde_json::to_value(env.vigil.keepalive(KeepaliveRequest { watch_id: Some(WatchId::parse("h").unwrap()), max_s: Some(30), orchestrator: None, confirm: None, session: false }).await.unwrap()).unwrap();
     assert_eq!(released["status"], "fired", "{released}");
     let summary = released["events"][0]["summary"].as_str().unwrap();
     assert!(summary.starts_with("hold released: exists:") && summary.contains("present") && summary.contains("reached"), "{summary}");
