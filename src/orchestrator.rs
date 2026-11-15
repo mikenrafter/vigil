@@ -71,13 +71,14 @@ impl Vigil {
     }
 
     /// Only a named watch can gain confirmation. A no-id call requires every
-    /// covered pending watch already confirmed, even when it supplies a token.
-    /// Implicit mode requires all pending watches confirmed and a stored flag.
+    /// covered watch that can keep waiting already confirmed, even with a token.
+    /// This includes quiet terminal holds; other terminal results return at once.
+    /// Implicit mode also requires confirmation and a stored flag.
     pub(crate) fn gate_orchestrator(&self, requested: Option<bool>, confirm: Option<&str>, covered: &[WatchId], named_watch: Option<&WatchId>) -> Result<Option<bool>, VigilError> {
         if !self.config.orchestrator_confirm || requested == Some(false) {
             return Ok(requested);
         }
-        let pending: Vec<WatchFile> = covered.iter().filter_map(|id| self.store.load(id).ok()).filter(|watch| !watch.status.is_finished()).collect();
+        let pending: Vec<WatchFile> = covered.iter().filter_map(|id| self.store.load(id).ok()).filter(|watch| !watch.wakes_wait()).collect();
         let all_confirmed = pending.iter().all(|watch| self.orchestrator_confirmed(watch));
         // CLAIM(confirmation-scope): plain callers never touch the token, and
         // mixed no-id calls stay plain [SPEC Orchestrator confirmation;
@@ -91,7 +92,7 @@ impl Vigil {
         }
         let Some(named_watch) = named_watch else {
             return Err(VigilError::OrchestratorUnconfirmed(
-                "orchestrator keepalive without watch_id requires every covered pending watch already confirmed. Confirm each watch by naming its watch_id; a no-id call confirms nothing.".into()
+                "orchestrator keepalive without watch_id requires every covered waiting watch already confirmed. Confirm each watch by naming its watch_id; a no-id call confirms nothing.".into()
             ));
         };
         self.check_orchestrator_token(confirm)?;

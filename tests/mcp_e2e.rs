@@ -947,7 +947,7 @@ async fn expect_s_given_through_the_mcp_tools_raises_overdue_for_the_initial_and
     let envelope = text_json(&call(peer, "keepalive", serde_json::json!({"watch_id": "h", "max_s": 30})).await);
     let mut summaries: Vec<&str> = envelope["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap()).collect();
     summaries.sort();
-    assert_eq!(summaries, vec!["item overdue: build", "item overdue: t3"], "{envelope}");
+    assert_eq!(summaries, vec!["item far overdue: build", "item far overdue: t3", "item overdue: build", "item overdue: t3"], "{envelope}");
     assert_eq!(envelope["status"], "pending", "{envelope}");
     client.cancel().await.unwrap();
 }

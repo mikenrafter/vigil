@@ -117,6 +117,7 @@ async fn session_wait_discovers_new_holds_while_waiting() {
 #[tokio::test(start_paused = true)]
 async fn history_compaction_preserves_sensed_inputs_and_unique_event_ids() {
     // why: freeing slots must not read the wrong input or recycle an event id.
+    // proves: CLAIM(hold-history)
     // catches: pruning items without remapping inputs or retaining a sequence.
     let env = rig();
     env.reader.set_text("qex:anchor", "running");
@@ -238,4 +239,23 @@ async fn session_wait_cannot_confirm_unconfirmed_holds_even_with_a_token() {
     guarded.mark_orchestrator_confirmed(&watch_file(&env.vigil, "h")).unwrap();
     let answer = guarded.keepalive(KeepaliveRequest { confirm: None, ..request }).await.unwrap();
     assert_eq!(answer.waited_s, Some(30));
+}
+
+#[tokio::test(start_paused = true)]
+async fn quiet_terminal_holds_still_require_confirmation_because_they_keep_waiting() {
+    // why: terminal results used to return immediately; quiet releases now wait.
+    // catches: bypassing the guard by first ending an unconfirmed hold in plain mode.
+    let env = rig();
+    env.vigil.hold(HoldRequest { work: vec!["none".into()], label: Some("x".into()), ..request_for(&[]) }).await.unwrap();
+    env.vigil.hold_done(&id("h"), "x").await.unwrap();
+    env.vigil.tick_due(&id("h")).await.unwrap();
+    assert_eq!(watch_file(&env.vigil, "h").status, crate::watch::WatchStatus::Fired);
+    let guarded = Vigil::new(env.vigil.store().root(), env.clock.clone(), env.judge.clone(), crate::Config {
+        orchestrator_confirm: true, ..crate::testing::default_config()
+    });
+    let result = guarded.keepalive(KeepaliveRequest { watch_id: Some(id("h")), orchestrator: Some(true), max_s: Some(30), ..Default::default() }).await;
+    assert!(matches!(result, Err(crate::VigilError::OrchestratorUnconfirmed(_))), "{result:?}");
+    guarded.mark_orchestrator_confirmed(&watch_file(&env.vigil, "h")).unwrap();
+    let implicit = guarded.keepalive(KeepaliveRequest { watch_id: Some(id("h")), max_s: Some(30), ..Default::default() }).await.unwrap();
+    assert!(implicit.cache.unwrap().credit_check.is_some(), "confirmed quiet holds retain stored main-session mode");
 }

@@ -147,8 +147,8 @@ struct HoldArgs {
     /// Seconds until the hold expires, 1..=604800 (default 604800).
     #[arg(long)]
     deadline_s: Option<u64>,
-    /// Seconds each item should take; one `item overdue` attention event
-    /// after 1.5x (or 9 minutes over, whichever comes first).
+    /// Seconds each item should take. Quiet overdue note after 1.5x (or
+    /// 9 minutes over, whichever comes first); interrupt once at 2x.
     #[arg(long)]
     expect_s: Option<u64>,
     /// Store whether keepalive calls are the main session's (default true).
@@ -172,7 +172,7 @@ enum HoldItemCommand {
         /// Name of the item (default: its spec). Unique per hold.
         #[arg(long)]
         label: Option<String>,
-        /// Seconds this item should take; one `item overdue` event after 1.5x.
+        /// Expected seconds: overdue note after 1.5x (capped at +9m), interrupt at 2x.
         #[arg(long)]
         expect_s: Option<u64>,
         /// Count this item as a Claude work or review run; omit for uncounted work.

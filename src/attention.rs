@@ -68,6 +68,8 @@ pub enum Attention {
     Watch(AttentionReason),
     /// Item `index` of a hold ran past its own `expect_s` (W42-H3, D2).
     ItemOverdue(usize),
+    /// An item reached twice expect_s and needs action.
+    ItemFarOverdue(usize),
 }
 
 /// Every attention due for `watch` at `now`: the watch-level reasons (as
@@ -78,6 +80,12 @@ pub fn due(watch: &WatchFile, now: Timestamp, long_window: bool) -> Vec<Attentio
         for (index, item) in watch.items.iter().flatten().enumerate() {
             if crate::items::overdue_at(item).is_some_and(|at| now >= at) {
                 due.push(Attention::ItemOverdue(item.event_index(index)));
+            }
+        }
+        // Ordinary notes precede escalation so each kind has its own event epoch.
+        for (index, item) in watch.items.iter().flatten().enumerate() {
+            if crate::items::far_overdue_at(item).is_some_and(|at| now >= at) {
+                due.push(Attention::ItemFarOverdue(item.event_index(index)));
             }
         }
     }
@@ -91,7 +99,8 @@ pub fn next_due_at(watch: &WatchFile) -> Option<Timestamp> {
         return None;
     }
     let items = watch.items.iter().flatten().filter_map(crate::items::overdue_at);
-    overdue_at(watch).into_iter().chain(items).min()
+    let far = watch.items.iter().flatten().filter_map(crate::items::far_overdue_at);
+    overdue_at(watch).into_iter().chain(items).chain(far).min()
 }
 
 /// The event for `attention` (watch-level: [`event_for`]; an item: its
@@ -99,9 +108,12 @@ pub fn next_due_at(watch: &WatchFile) -> Option<Timestamp> {
 pub fn event(watch: &WatchFile, attention: Attention, now: Timestamp) -> Option<Event> {
     match attention {
         Attention::Watch(reason) => Some(event_for(watch, reason, now)),
-        Attention::ItemOverdue(index) => {
+        Attention::ItemOverdue(index) | Attention::ItemFarOverdue(index) => {
             let item = watch.items.as_ref()?.iter().enumerate().find(|(fallback, item)| item.event_index(*fallback) == index)?.1;
-            Some(crate::items::overdue_event(&watch.spec.id, watch.tick, index, item))
+            Some(match attention {
+                Attention::ItemFarOverdue(_) => crate::items::far_overdue_event(&watch.spec.id, watch.tick, index, item),
+                _ => crate::items::overdue_event(&watch.spec.id, watch.tick, index, item),
+            })
         }
     }
 }
@@ -110,9 +122,12 @@ pub fn event(watch: &WatchFile, attention: Attention, now: Timestamp) -> Option<
 pub fn mark_raised(watch: &mut WatchFile, attention: Attention) {
     match attention {
         Attention::Watch(reason) => watch.attention_raised.push(reason),
-        Attention::ItemOverdue(index) => {
+        Attention::ItemOverdue(index) | Attention::ItemFarOverdue(index) => {
             if let Some(item) = watch.items.as_mut().and_then(|items| items.iter_mut().enumerate().find(|(fallback, item)| item.event_index(*fallback) == index).map(|(_, item)| item)) {
-                item.overdue_raised = true;
+                match attention {
+                    Attention::ItemFarOverdue(_) => item.far_overdue_raised = true,
+                    _ => item.overdue_raised = true,
+                }
             }
         }
     }
@@ -122,7 +137,10 @@ pub fn mark_raised(watch: &mut WatchFile, attention: Attention) {
 pub fn is_raised(watch: &WatchFile, attention: Attention) -> bool {
     match attention {
         Attention::Watch(reason) => watch.attention_raised.contains(&reason),
-        Attention::ItemOverdue(index) => watch.items.as_ref().is_some_and(|items| items.iter().enumerate().any(|(fallback, item)| item.event_index(fallback) == index && item.overdue_raised)),
+        Attention::ItemOverdue(index) | Attention::ItemFarOverdue(index) => watch.items.as_ref().is_some_and(|items| items.iter().enumerate().any(|(fallback, item)| item.event_index(fallback) == index && match attention {
+            Attention::ItemFarOverdue(_) => item.far_overdue_raised,
+            _ => item.overdue_raised,
+        })),
     }
 }
 

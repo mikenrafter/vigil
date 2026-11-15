@@ -78,6 +78,9 @@ pub struct HoldItem {
     /// D3: the overdue event was raised (once per item; survives restarts).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overdue_raised: bool,
+    /// Escalation at twice the estimate was raised, once per item.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub far_overdue_raised: bool,
     /// D3: id of the `item ended` event that announced the current end;
     /// absent while the item is live or its end is not announced yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,7 +147,7 @@ impl HoldItem {
 
     /// A live item added at `added_at`, sensed by `spec.inputs[input]` if any.
     pub fn new(label: String, input: Option<usize>, expect_s: Option<u64>, added_at: Timestamp) -> HoldItem {
-        HoldItem { label, sequence: None, end_reading: None, cap: None, input, expect_s, added_at, ended_at: None, overdue_raised: false, last_end_event: None }
+        HoldItem { label, sequence: None, end_reading: None, cap: None, input, expect_s, added_at, ended_at: None, overdue_raised: false, far_overdue_raised: false, last_end_event: None }
     }
 }
 
@@ -167,7 +170,8 @@ pub(crate) struct ItemTick {
 /// its end only at a tick, at most once per tick; its overdue at most once
 /// ever, at a pass after tick T (id T) and only while it is not ended, so
 /// never for an item that ended at tick T; `hold done` advances the event
-/// epoch before recording its note; a hold with items has no watch-level attention (no watch
+/// epoch before recording its note; escalation uses another epoch after normal
+/// overdue notes (CLAIM(overdue-event-epoch)); a hold has no watch-level attention (no watch
 /// `expect_s`, no `stall_s`), so no other id scheme shares its ids; tests
 /// two_items_ending_in_one_tick_give_two_events_with_distinct_event_ids and
 /// two_items_going_overdue_in_one_tick_give_two_events_with_distinct_event_ids].
@@ -290,7 +294,20 @@ pub fn overdue_at(item: &HoldItem) -> Option<Timestamp> {
 /// D3: the overdue event of item `index`, `item overdue: <label>`, raised
 /// after tick `tick` (CLAIM(item-event-id)).
 pub fn overdue_event(watch_id: &WatchId, tick: u64, index: usize, item: &HoldItem) -> Event {
-    item_event(watch_id, tick, index, item, format!("item overdue: {}", item.label), EventReason::Overdue)
+    let mut event = item_event(watch_id, tick, index, item, format!("item overdue: {}", item.label), EventReason::Overdue);
+    event.detail = Some(EventDetail::Note { reason: Some(EventReason::Overdue) });
+    event
+}
+
+/// A stuck item's next interrupt. Normal overdue remains a note; the separate
+/// flag ensures a delivered escalation never repeats after a restart.
+pub fn far_overdue_at(item: &HoldItem) -> Option<Timestamp> {
+    let expect_s = item.expect_s?;
+    (!item.far_overdue_raised && item.ended_at.is_none()).then(|| item.added_at.plus_secs(expect_s.saturating_mul(2)))
+}
+
+pub fn far_overdue_event(watch_id: &WatchId, tick: u64, index: usize, item: &HoldItem) -> Event {
+    item_event(watch_id, tick, index, item, format!("item far overdue: {}", item.label), EventReason::Overdue)
 }
 
 /// D6, D9: `hold released: <N> items ended (<labels>)`, the labels in item

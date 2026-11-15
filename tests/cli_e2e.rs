@@ -1931,7 +1931,7 @@ fn expect_s_through_the_cli_raises_overdue_for_the_initial_item_and_every_item_o
     //      given to `vigil hold --for A --for B` applies to EACH item, and to
     //      an item added with `hold add --expect-s 2`. Real time (separate
     //      processes): one 4 s sleep, then the first keepalive tick sees all
-    //      three.
+    //      three normal notes and all three 2x escalations.
     // proves: W42-D8, W42-D5, W42-H3
     // catches: --expect-s dropped by the CLI layer; applied to the first
     //      item only; applied to the hold but not to added items.
@@ -1946,7 +1946,7 @@ fn expect_s_through_the_cli_raises_overdue_for_the_initial_item_and_every_item_o
     let envelope = stdout_json(&run_with_qex(&sandbox, &qex, &["keepalive", "h", "--max-s", "30", "--orchestrator"]));
     let mut summaries: Vec<String> = envelope["events"].as_array().unwrap().iter().map(|event| event["summary"].as_str().unwrap().to_string()).collect();
     summaries.sort();
-    assert_eq!(summaries, vec!["item overdue: pid:1".to_string(), format!("item overdue: {J1_SPEC}"), "item overdue: t3".to_string()], "{envelope}");
+    assert_eq!(summaries, vec!["item far overdue: pid:1".to_string(), format!("item far overdue: {J1_SPEC}"), "item far overdue: t3".to_string(), "item overdue: pid:1".to_string(), format!("item overdue: {J1_SPEC}"), "item overdue: t3".to_string()], "{envelope}");
     assert_eq!(envelope["status"], "pending", "{envelope}");
 }
 

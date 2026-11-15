@@ -118,7 +118,7 @@ pub struct HoldArgs {
     pub until_idle: bool,
     /// Seconds until the hold expires, 1..=604800 (default 604800).
     pub deadline_s: Option<u64>,
-    /// Seconds each item should take; one `item overdue` attention event after 1.5x.
+    /// Expected seconds: quiet overdue note after 1.5x (capped at +9m), interrupt at 2x.
     pub expect_s: Option<u64>,
     /// Whether keepalive calls for this hold are the main session's (default true).
     pub orchestrator: Option<bool>,
@@ -138,7 +138,7 @@ pub struct HoldAddArgs {
     #[serde(rename = "for")]
     #[schemars(rename = "for")]
     pub work: String,
-    /// Seconds this item should take; one `item overdue` attention event after 1.5x.
+    /// Expected seconds: quiet overdue note after 1.5x (capped at +9m), interrupt at 2x.
     pub expect_s: Option<u64>,
     /// Name of the item (default: its spec). Unique per hold.
     pub label: Option<String>,

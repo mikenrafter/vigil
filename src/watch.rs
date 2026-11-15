@@ -666,6 +666,8 @@ pub struct WatchFile {
     pub deadline_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<Timestamp>,
+    /// Event epoch: advances on sensing, explicit completion, and escalation.
+    /// Sensing cadence is tracked separately by last_tick_at.
     pub tick: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tick_at: Option<Timestamp>,

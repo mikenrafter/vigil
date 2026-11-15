@@ -32,6 +32,7 @@ async fn ordinary_overdue_is_a_note_and_twice_expected_time_wakes_once() {
 #[tokio::test(start_paused = true)]
 async fn note_escalation_and_later_completion_have_distinct_ids_even_between_ticks() {
     // why: 1 s estimates put normal and far overdue between the same 30 s ticks.
+    // proves: CLAIM(overdue-event-epoch)
     // catches: reusing the normal event id for escalation or later manual done.
     let env = rig();
     env.vigil.hold(HoldRequest { work: vec!["none".into()], label: Some("a".into()), expect_s: Some(1), ..request_for(&[]) }).await.unwrap();
@@ -61,4 +62,44 @@ async fn a_gone_pid_still_wakes_before_its_estimate() {
     let (answer, ()) = tokio::join!(wait(&env.vigil, 90), finish);
     assert_eq!(answer.waited_s, Some(60));
     assert!(answer.events.iter().any(|event| event.is_call_ending() && event.summary.contains("exited")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_escalation_save_keeps_its_identity_and_event_epoch_on_retry() {
+    // why: a retry must not reuse a far-overdue id for later completion.
+    // catches: restored attention without restoring its event epoch.
+    use crate::fault::{FaultPlan, FaultRule, When, WriteKind};
+    let env = rig();
+    env.vigil.hold(HoldRequest { work: vec!["none".into()], label: Some("a".into()), expect_s: Some(100), ..request_for(&[]) }).await.unwrap();
+    let normal = wait(&env.vigil, 180).await;
+    assert_eq!(normal.events.len(), 1);
+    let mut stored = env.vigil.store().load(&id()).unwrap();
+    stored.spec.interval_s = 3600;
+    stored.last_tick_at = Some(normal.now);
+    env.vigil.store().save(&stored).unwrap();
+    let failing = env.another_process().with_write_faults(FaultPlan::from_rules(vec![FaultRule::new(WriteKind::Watch, 5, When::Nth(1))]));
+    let first = wait(&failing, 60).await;
+    assert!(matches!(first.persist, Some(crate::PersistNote::NotSaved { .. })));
+    assert_eq!(first.events[0].summary, "item far overdue: a");
+    let second = wait(&failing, 60).await;
+    assert_eq!(second.events[0].event_id, first.events[0].event_id);
+    assert!(second.events[0].redelivered);
+    env.vigil.hold_done(&id(), "a").await.unwrap();
+    let completed = wait(&env.vigil, 30).await;
+    assert_ne!(completed.events[0].event_id, second.events[0].event_id);
+}
+
+#[test]
+fn far_clock_reads_older_items_and_saturates_damaged_limits() {
+    // why: additive state must load old files, including oversized hand edits.
+    // catches: required escalation flags or multiplication wrapping before timestamp saturation.
+    let mut item: crate::items::HoldItem = serde_json::from_value(serde_json::json!({
+        "label": "old", "added_at": "2026-11-13T10:00:00Z", "expect_s": 100
+    })).unwrap();
+    assert!(!item.far_overdue_raised);
+    assert_eq!(crate::items::far_overdue_at(&item), Some(crate::testing::at("2026-11-13T10:03:20Z")));
+    item.expect_s = Some(u64::MAX);
+    assert_eq!(crate::items::far_overdue_at(&item), Some(crate::Timestamp(chrono::DateTime::<chrono::Utc>::MAX_UTC)));
+    item.far_overdue_raised = true;
+    assert_eq!(crate::items::far_overdue_at(&item), None);
 }

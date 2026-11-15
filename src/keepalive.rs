@@ -383,7 +383,7 @@ impl crate::engine::Vigil {
         // A8: the caller's flag wins, `Some(false)` included; else any covered
         // pending watch that stores the flag makes this an orchestrator call.
         let orchestrator = request.orchestrator.unwrap_or_else(|| {
-            covered.iter().filter_map(|id| self.store.load(id).ok()).any(|watch| !watch.status.is_finished() && watch.spec.orchestrator)
+            covered.iter().filter_map(|id| self.store.load(id).ok()).any(|watch| !watch.wakes_wait() && watch.spec.orchestrator)
         });
         let window = choose_window(&WindowRequest {
             explicit_s: request.max_s,
@@ -700,10 +700,18 @@ impl crate::engine::Vigil {
         }
         let any_retried = !raised.is_empty();
         for (attention, event) in &raised {
+            watch.tick = watch.tick.max(event.tick);
             watch.events.push(event.clone());
             crate::attention::mark_raised(&mut watch, *attention);
         }
+        let mut escalation_epoch = false;
         for attention in fresh {
+            // CLAIM(overdue-event-epoch): normal overdue, escalation and a later
+            // end cannot share an id, even between ticks [note_escalation_and_later_completion_have_distinct_ids_even_between_ticks].
+            if matches!(attention, Attention::ItemFarOverdue(_)) && !escalation_epoch {
+                watch.tick += 1;
+                escalation_epoch = true;
+            }
             // Built before it is marked: a watch-level id counts the reasons raised before it.
             let Some(event) = crate::attention::event(&watch, attention, now) else { continue };
             watch.events.push(event.clone());
@@ -715,7 +723,7 @@ impl crate::engine::Vigil {
         if repeating || any_retried {
             call.redelivered.insert(id.clone());
         }
-        call.raised_attention = true;
+        call.raised_attention |= raised.iter().any(|(_, event)| event.is_call_ending());
         call.note_save(id, watch, persisted);
         Ok(())
     }

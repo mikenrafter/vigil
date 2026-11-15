@@ -204,15 +204,15 @@ async fn each_item_has_its_own_overdue_clock_that_names_the_label_and_fires_once
     env.vigil.hold(first_item("qex:a", "slow", Some(100))).await.unwrap();
     add_ok(&env.vigil, "h", item("qex:b", Some(1000), Some("fast"))).await;
 
-    let first = call(&env.vigil, "h", Some(200)).await;
-    assert_eq!((first["status"].as_str(), first["next"].as_str(), first["waited_s"].as_u64()), (Some("pending"), Some("act on events"), Some(150)), "{first}");
+    let first = call(&env.vigil, "h", Some(180)).await;
+    assert_eq!((first["status"].as_str(), first["next"].as_str(), first["waited_s"].as_u64()), (Some("pending"), Some("call keepalive again"), Some(180)), "{first}");
     assert_eq!(first["events"].as_array().unwrap().len(), 1, "{first}");
-    assert_eq!((first["events"][0]["kind"].as_str(), first["events"][0]["reason"].as_str()), (Some("attention"), Some("overdue")), "{first}");
+    assert_eq!((first["events"][0]["kind"].as_str(), first["events"][0]["reason"].as_str()), (Some("note"), Some("overdue")), "{first}");
     let summary = first["events"][0]["summary"].as_str().unwrap();
     assert!(summary.contains("slow") && !summary.contains("fast"), "names the overdue item only: {summary}");
 
     let again = call(&env.vigil, "h", Some(200)).await;
-    assert_eq!((again["status"].as_str(), summaries(&again).len()), (Some("pending"), 0), "overdue is raised once, and fast is not due at 350 s: {again}");
+    assert_eq!(summaries(&again), vec!["item far overdue: slow"], "one escalation, and fast is not due at 200 s: {again}");
 
     tokio::time::advance(Duration::from_secs(1400)).await;
     let later = call(&env.vigil, "h", Some(30)).await;
@@ -329,10 +329,11 @@ async fn an_item_that_only_ever_reads_errors_still_goes_overdue_once() {
     let env = rig();
     env.reader.set_text("qex:a", "error: timeout after 10s");
     env.vigil.hold(first_item("qex:a", "a", Some(100))).await.unwrap();
-    let due = call(&env.vigil, "h", Some(200)).await;
+    let due = call(&env.vigil, "h", Some(180)).await;
     assert_eq!(summaries(&due), vec!["item overdue: a"], "{due}");
     let after = call(&env.vigil, "h", Some(30)).await;
-    assert_eq!(summaries(&after), Vec::<String>::new(), "{after}");
+    assert_eq!(summaries(&after), vec!["item far overdue: a"], "{after}");
+    assert_eq!(summaries(&call(&env.vigil, "h", Some(30)).await), Vec::<String>::new());
 }
 
 #[tokio::test(start_paused = true)]
@@ -421,8 +422,8 @@ async fn a_none_item_with_expect_s_goes_overdue_naming_its_label() {
     env.reader.set_text("qex:a", "running");
     env.vigil.hold(first_item("qex:a", "build", None)).await.unwrap();
     add_ok(&env.vigil, "h", item("none", Some(100), Some("t3"))).await;
-    let envelope = call(&env.vigil, "h", Some(200)).await;
-    assert_eq!((envelope["status"].as_str(), envelope["waited_s"].as_u64()), (Some("pending"), Some(150)), "{envelope}");
+    let envelope = call(&env.vigil, "h", Some(180)).await;
+    assert_eq!((envelope["status"].as_str(), envelope["waited_s"].as_u64()), (Some("pending"), Some(180)), "{envelope}");
     assert_eq!(envelope["events"].as_array().unwrap().len(), 1, "{envelope}");
     assert_eq!(envelope["events"][0]["reason"], "overdue", "{envelope}");
     assert!(envelope["events"][0]["summary"].as_str().unwrap().contains("t3"), "{envelope}");
@@ -561,13 +562,11 @@ async fn an_items_overdue_uses_the_capped_formula_so_expect_s_2000_is_overdue_at
     let before = call(&env.vigil, "h", Some(2500)).await;
     assert_eq!((before["status"].as_str(), summaries(&before).len()), (Some("pending"), 0), "2500 s is before 2540 s: {before}");
     let after = call(&env.vigil, "h", Some(100)).await;
-    assert_eq!((after["events"][0]["kind"].as_str(), after["events"][0]["reason"].as_str()), (Some("attention"), Some("overdue")), "2600 s is past 2540 s: {after}");
+    assert_eq!((after["events"][0]["kind"].as_str(), after["events"][0]["reason"].as_str()), (Some("note"), Some("overdue")), "2600 s is past 2540 s: {after}");
     assert!(after["events"][0]["summary"].as_str().unwrap().contains("big"), "{after}");
-    // S13: exactly at 2540 s of the hold's life, not merely inside the second
-    //      window: the second call starts at 2500 s, so it waits 40 s.
-    // catches: an overdue moment that is not a wake of its own (found only at
-    //      the next 30 s tick, 2550 s), or a formula off by a few seconds.
-    assert_eq!((after["elapsed_s"].as_u64(), after["waited_s"].as_u64()), (Some(2540), Some(40)), "{after}");
+    // Normal overdue is a note delivered at the quiet window's end. The pure
+    // item clock test pins 2540 exactly; this proves it is present by 2600.
+    assert_eq!((after["elapsed_s"].as_u64(), after["waited_s"].as_u64()), (Some(2600), Some(100)), "{after}");
 }
 
 // -- D3 ----------------------------------------------------------------------
@@ -614,11 +613,11 @@ async fn two_items_going_overdue_in_one_tick_give_two_events_with_distinct_event
     env.reader.set_text("qex:b", "running");
     env.vigil.hold(first_item("qex:a", "one", Some(100))).await.unwrap();
     add_ok(&env.vigil, "h", item("qex:b", Some(100), Some("two"))).await;
-    let envelope = call(&env.vigil, "h", Some(200)).await;
+    let envelope = call(&env.vigil, "h", Some(180)).await;
     let mut events = summaries(&envelope);
     events.sort();
     assert_eq!(events, vec!["item overdue: one", "item overdue: two"], "{envelope}");
-    assert!(envelope["events"].as_array().unwrap().iter().all(|event| event["reason"] == "overdue" && event["kind"] == "attention"), "{envelope}");
+    assert!(envelope["events"].as_array().unwrap().iter().all(|event| event["reason"] == "overdue" && event["kind"] == "note"), "{envelope}");
     assert!(distinct(&event_ids(&envelope)), "distinct event ids: {envelope}");
 }
 
@@ -639,7 +638,7 @@ async fn a_restart_before_and_after_acknowledgement_never_repeats_an_overdue_eve
     env.vigil.hold(first_item("qex:a", "slow", Some(100))).await.unwrap();
     add_ok(&env.vigil, "h", item("qex:b", None, Some("b"))).await;
 
-    let first = call_uncommitted(&env.vigil, "h", 200).await;
+    let first = call_uncommitted(&env.vigil, "h", 160).await;
     assert_eq!(summaries(&first), vec!["item overdue: slow"], "{first}");
     let first_id = event_ids(&first).remove(0);
 
@@ -647,7 +646,9 @@ async fn a_restart_before_and_after_acknowledgement_never_repeats_an_overdue_eve
     assert_eq!((event_ids(&second), second["events"][0]["redelivered"].as_bool()), (vec![first_id], Some(true)), "before acknowledgement: the same event again: {second}");
 
     let third = call(&env.another_process(), "h", Some(200)).await;
-    assert_eq!((third["status"].as_str(), summaries(&third).len()), (Some("pending"), 0), "after acknowledgement: not raised again: {third}");
+    assert_eq!(summaries(&third), vec!["item far overdue: slow"], "normal note was acknowledged; escalation is distinct: {third}");
+    let fourth = call(&env.another_process(), "h", Some(200)).await;
+    assert_eq!(summaries(&fourth), Vec::<String>::new(), "both kinds are delivered once: {fourth}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -689,7 +690,7 @@ async fn an_items_overdue_clock_survives_a_restart() {
     let early = call(&env.vigil, "h", Some(100)).await;
     assert_eq!((early["status"].as_str(), summaries(&early).len()), (Some("pending"), 0), "{early}");
     let later = call(&env.another_process(), "h", Some(100)).await;
-    assert_eq!(summaries(&later), vec!["item overdue: slow"], "{later}");
+    assert_eq!(summaries(&later), vec!["item overdue: slow", "item far overdue: slow"], "{later}");
 }
 
 // -- D4 ----------------------------------------------------------------------
@@ -733,9 +734,9 @@ async fn a_running_keepalive_picks_up_an_item_added_by_another_process_at_the_ne
         add_ok(&adder, "h", item("qex:b", Some(40), Some("b"))).await;
     };
     let (envelope, ()) = tokio::join!(call(&env.vigil, "h", Some(300)), add);
-    assert_eq!(summaries(&envelope), vec!["item overdue: b"], "{envelope}");
+    assert_eq!(summaries(&envelope), vec!["item overdue: b", "item far overdue: b"], "{envelope}");
     let waited = envelope["waited_s"].as_u64().unwrap();
-    assert!((105..=140).contains(&waited), "overdue 60 s after the add at 45 s, at the next tick: waited {waited}: {envelope}");
+    assert!((125..=140).contains(&waited), "escalation 80 s after the add at 45 s: waited {waited}: {envelope}");
 }
 
 // -- D5 ----------------------------------------------------------------------
@@ -787,7 +788,7 @@ async fn several_for_make_several_items_expect_s_applies_to_each_and_a_label_wit
     assert!(!env.vigil.store().watch_path(&wid("h")).exists(), "nothing written");
 
     env.vigil.hold(HoldRequest { expect_s: Some(100), ..request_for(&["qex:a", "qex:b"]) }).await.unwrap();
-    let envelope = call(&env.vigil, "h", Some(200)).await;
+    let envelope = call(&env.vigil, "h", Some(180)).await;
     let mut events = summaries(&envelope);
     events.sort();
     assert_eq!(events, vec!["item overdue: qex:a", "item overdue: qex:b"], "{envelope}");
