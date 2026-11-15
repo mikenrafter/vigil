@@ -237,9 +237,11 @@ Red-report defaults R2-A1..A8 accepted (A7 offsets: 60, 300, 540 s). Remaining:
 Decisions taken while fixing S1-S8 of that review (none changes an earlier claim;
 each makes one precise):
 
-- **S1.** Every wait inside a call ends at the call's budget, the attention lock
-  wait included; nothing is saved after the budget. An attention that missed it
-  is still due and the next call raises it at once.
+- **S1.** Every wait inside a call ends at the call's budget; nothing is saved
+  after the budget. Attention tries each watch lock once and skips a busy
+  watch, leaving its attention due for a later pass. A past-due threshold is
+  retried at the five-second scan cadence. Writable watches keep their own
+  tick, expiry and attention deadlines while other ticks are still pending.
 - **S2.** The credit probe has one deadline (5 s). `uw` may use four fifths of
   it; the transcript fallback runs in the rest.
 - **S3.** The due entry credit check runs on every return path of an

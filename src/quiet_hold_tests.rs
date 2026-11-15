@@ -490,12 +490,13 @@ async fn overdue_attention_wakes_at_its_threshold_while_an_unrelated_hold_is_loc
     env.vigil.hold(HoldRequest { id: Some("locked".into()), ..Default::default() }).await.unwrap();
     let lock = env.vigil.store().try_lock_watch(&id("locked")).unwrap().unwrap();
     env.vigil.hold(HoldRequest { id: Some("work".into()), work: vec!["none".into()], label: Some("manual".into()), expect_s: Some(3), ..Default::default() }).await.unwrap();
-    let answer = env.vigil.keepalive(session_request(30)).await.unwrap();
+    let (answer, delivery) = env.vigil.keepalive_uncommitted(session_request(30), &crate::keepalive::NoProgress, std::future::pending::<()>()).await.unwrap().unwrap();
     assert_eq!(answer.waited_s, Some(6), "far-overdue wakes at 2 x 3 s: {answer:?}");
     assert!(answer.events.iter().any(|e| e.watch_id == "work" && e.summary.contains("item overdue:") && !e.is_call_ending()), "{answer:?}");
     assert!(answer.events.iter().any(|e| e.watch_id == "work" && e.summary.contains("item far overdue:") && e.is_call_ending()), "{answer:?}");
     let stored = watch_file(&env.vigil, "work");
     assert!(stored.events.iter().any(|e| e.summary.contains("item far overdue:")), "attention must be saved before return");
     assert_eq!(stored.status, crate::watch::WatchStatus::Pending);
+    drop(delivery);
     drop(lock);
 }

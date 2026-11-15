@@ -216,34 +216,25 @@ impl CallRecord {
     }
 }
 
-/// What `for_each_completed` hands its callback.
-enum Round<T> {
-    /// One future finished with this output.
-    Done(T),
-    /// `idle_every` passed with the round still waiting.
-    Idle,
-}
-
-/// Poll `futures` together and hand each output to `on` as soon as it is
-/// ready (completion order, ties by position), and `Round::Idle` each time
-/// `idle_every` passes while some are still pending, so the caller can look
-/// around instead of waiting blind on a slow future. The callback may append
-/// futures to the pending set without restarting existing work. `Ok(true)`
-/// stops: the completions that are already ready are still collected, then
-/// what is unfinished is dropped (C12). Stops at the first `Err`, dropping
-/// what is still pending. Used so that one slow tick never holds back
-/// another's result or its commit (C1).
+/// Wait for a completion or the next scheduling deadline. Drain every ready
+/// completion, including those another completion readied (C12). Pending
+/// futures belong to the caller and survive this pass, so a slow read or
+/// lock wait cannot prevent another watch's next tick [CLAIM(R3-scheduling)].
+/// The first callback error ends the pass and propagates to the caller.
 async fn for_each_completed<F, E>(
-    futures: impl IntoIterator<Item = F>,
-    idle_every: Duration,
-    mut on: impl FnMut(Round<F::Output>, &mut Vec<std::pin::Pin<Box<F>>>) -> Result<bool, E>,
+    pending: &mut Vec<std::pin::Pin<Box<F>>>,
+    wake_at: Instant,
+    mut on: impl FnMut(F::Output) -> Result<(), E>,
 ) -> Result<(), E>
 where
     F: std::future::Future,
 {
-    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
-    let mut idle = Box::pin(tokio::time::sleep(idle_every));
-    let mut stopping = false;
+    let mut wake = Box::pin(tokio::time::sleep_until(wake_at));
+    // Input reads run in JoinSet tasks. Give those already runnable tasks a
+    // turn before deciding which results can ride the same return (S10).
+    let mut settle = Box::pin(tokio::task::yield_now());
+    let mut settled = false;
+    let mut completed = false;
     std::future::poll_fn(|cx| {
         loop {
             let mut index = 0;
@@ -253,29 +244,28 @@ where
                     std::task::Poll::Ready(output) => {
                         drop(pending.remove(index));
                         completed_any = true;
-                        match on(Round::Done(output), &mut pending) {
-                            Err(error) => return std::task::Poll::Ready(Err(error)),
-                            Ok(stop) => stopping |= stop,
+                        if let Err(error) = on(output) {
+                            return std::task::Poll::Ready(Err(error));
                         }
                     }
                     std::task::Poll::Pending => index += 1,
                 }
             }
-            if pending.is_empty() || (stopping && !completed_any) {
+            if completed_any {
+                completed = true;
+                continue;
+            }
+            if completed || wake.as_mut().poll(cx).is_ready() {
+                if !settled {
+                    if settle.as_mut().poll(cx).is_pending() {
+                        return std::task::Poll::Pending;
+                    }
+                    settled = true;
+                    continue;
+                }
                 return std::task::Poll::Ready(Ok(()));
             }
-            if !stopping {
-                if idle.as_mut().poll(cx).is_pending() {
-                    return std::task::Poll::Pending;
-                }
-                idle.as_mut().reset(tokio::time::Instant::now() + idle_every);
-                match on(Round::Idle, &mut pending) {
-                    Err(error) => return std::task::Poll::Ready(Err(error)),
-                    Ok(stop) => stopping |= stop,
-                }
-            }
-            // Stopping, or just looked: one more pass to pick up what the last
-            // completion readied, and to register the fresh idle timer.
+            return std::task::Poll::Pending;
         }
     })
     .await
@@ -283,8 +273,6 @@ where
 
 /// What `look_around` found.
 struct Looked {
-    /// A session hold the call did not cover before.
-    discovered: bool,
     /// A covered watch has a terminal result that wakes the wait.
     any_terminal: bool,
 }
@@ -456,207 +444,189 @@ impl crate::engine::Vigil {
     /// interval by the caller), or the budget ends. Returns what the
     /// call learned (V14, DF1).
     ///
-    /// Each round ticks every due covered watch CONCURRENTLY inside the shared
-    /// budget, each under its own watch lock (C1), so a slow watch cannot
-    /// starve another. A tick runs only if the budget left covers its reserve
-    /// (X4), except the one due when the call starts. Expiry never needs a
-    /// reserve and its deadline wake is kept when sensing is skipped (C7).
+    /// CLAIM(R3-scheduling): unfinished ticks survive scheduling passes, while
+    /// each writable watch keeps its own tick, expiry and attention deadlines
+    /// [review R3-1; quiet_hold_tests::later_tick_progresses_while_an_unrelated_hold_is_locked,
+    /// expiry_is_saved_at_its_deadline_while_an_unrelated_hold_is_locked,
+    /// overdue_attention_wakes_at_its_threshold_while_an_unrelated_hold_is_locked].
+    /// At most one tick per watch runs at a time, starting only with its
+    /// reserve (X4), except the first due tick of the call. Expiry needs no
+    /// sensing reserve (C7).
     async fn sense(&self, covered: &mut Vec<WatchId>, session_scope: bool, registration: &mut Option<crate::peers::CallGuard>, budget_end: Instant, progress: &dyn ProgressSink, plan: &CallPlan) -> Result<CallRecord, VigilError> {
         let mut call = CallRecord::default();
         let mut ticks_in_call = 0u64;
         let mut first_pass = true;
         let mut credit = plan.orchestrator.then(|| self.credit_plan(plan.window.interval_s));
         let mut reminder_check = Instant::now();
-        loop {
-            let looked = self.look_around(covered, session_scope, registration, plan, &mut call)?;
-            // ↳ CLAIM(S4-outbox) ↳ CLAIM(S3-credit): both returns still owe the orchestrator's due check
-            if looked.any_terminal || call.has_events_for_the_agent() {
-                self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
-                return Ok(call);
+        let mut attention_retries: BTreeMap<WatchId, Instant> = BTreeMap::new();
+        // Active membership ends on completion. Retained slots protect reports
+        // during cancelled saves; they must never forbid a later due tick.
+        let mut active = BTreeSet::new();
+        let mut retained: BTreeMap<WatchId, std::sync::Arc<Retained>> = BTreeMap::new();
+        let mut pending = Vec::new();
+        let tick = |id: WatchId, slot: std::sync::Arc<Retained>| async move {
+            let outcome = tokio::time::timeout_at(budget_end, self.tick_report_retaining(&id, Some(budget_end), &slot)).await;
+            (id, outcome)
+        };
+        let take_in = |call: &mut CallRecord, ticks_in_call: &mut u64, id: &WatchId, report: TickReport| -> Result<(), VigilError> {
+            let outcome = report.outcome;
+            let after_tick = report.after.as_ref().map(|watch| watch.tick);
+            call.absorb(id, report);
+            if outcome == TickOutcome::Ticked {
+                *ticks_in_call += 1;
+                let tick = match after_tick {
+                    Some(tick) => tick,
+                    None => self.load_watch(id)?.tick,
+                };
+                progress.progress(&ProgressUpdate { progress: *ticks_in_call, watch_id: id.clone(), tick });
             }
-            // ↳ CLAIM(reminder-latency): terminal watches and the outbox get
-            // their pass before cache-only reminder delivery. Probes run in a
-            // background task; a later pass picks up its cached result.
-            if plan.orchestrator && plan.is_long() && Instant::now() >= reminder_check {
-                call.reminder_events.extend(self.reminder_events(&covered[0]).await);
-                reminder_check = Instant::now() + crate::reminder_ops::REMINDER_CHECK_INTERVAL;
-                if call.has_events_for_the_agent() {
+            Ok(())
+        };
+        let take_finished = |
+            (id, outcome): (WatchId, Result<Result<TickReport, VigilError>, tokio::time::error::Elapsed>),
+            active: &mut BTreeSet<WatchId>,
+            retained: &mut BTreeMap<WatchId, std::sync::Arc<Retained>>,
+            call: &mut CallRecord,
+            ticks_in_call: &mut u64,
+        | -> Result<(), VigilError> {
+            active.remove(&id);
+            let slot = retained.remove(&id).expect("every active tick owns a retained slot");
+            match outcome {
+                Ok(report) => take_in(call, ticks_in_call, &id, report?),
+                Err(_) => {
+                    // ↳ CLAIM(S4-retained): timeout dropped the tick inside
+                    // its save. Recover its answer before further scheduling.
+                    if let Some(report) = slot.take() {
+                        if let Some(after) = &report.after { self.remember_save(after, &report.persisted); }
+                        take_in(call, ticks_in_call, &id, report)?;
+                    }
+                    Ok(())
+                }
+            }
+        };
+        let sensing: Result<(), VigilError> = async {
+            loop {
+                // ↳ CLAIM(DF1a): failed saves stop sensing immediately.
+                if call.any_unsaved() { break; }
+                let looked = self.look_around(covered, session_scope, registration, plan, &mut call)?;
+                let ready = looked.any_terminal || call.has_events_for_the_agent();
+                // ↳ CLAIM(S4-outbox) ↳ CLAIM(S3-credit): an answer already
+                // available at admission needs no new sensing.
+                if first_pass && ready {
                     self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
-                    return Ok(call);
+                    break;
                 }
-            }
-            let now = self.clock.now();
-            // Owned ids: a look made while the round waits may grow `covered`.
-            let mut round: Vec<WatchId> = Vec::new();
-            for id in covered.iter() {
-                let watch = self.load_watch(id)?;
-                if watch.status.is_finished() {
-                    continue;
+                // ↳ CLAIM(reminder-latency): probes run in a background task;
+                // this pass only delivers cached results after the outbox.
+                if !ready && plan.orchestrator && plan.is_long() && Instant::now() >= reminder_check {
+                    call.reminder_events.extend(self.reminder_events(&covered[0]).await);
+                    reminder_check = Instant::now() + crate::reminder_ops::REMINDER_CHECK_INTERVAL;
                 }
-                if watch.is_overdue(now) || (is_due(&watch, now) && (first_pass || !self.reserve_blocks(&watch, budget_end))) {
-                    round.push(id.clone());
-                }
-            }
-            // V2: a tick that cannot finish in the budget is dropped before it
-            // writes anything (it also checks the deadline itself, C5).
-            // Review S4: each tick leaves what it has sensed in its own slot
-            // before its save can wait, so a tick dropped inside that wait
-            // (the budget, or the round ending below) still has an answer.
-            let mut retained: BTreeMap<WatchId, std::sync::Arc<Retained>> = round.into_iter()
-                .map(|id| (id, std::sync::Arc::new(Retained::default()))).collect();
-            let tick = |id: WatchId, slot: std::sync::Arc<Retained>| async move {
-                let outcome = tokio::time::timeout_at(budget_end, self.tick_report_retaining(&id, Some(budget_end), &slot)).await;
-                (id, outcome)
-            };
-            let ticks: Vec<_> = retained.iter().map(|(id, slot)| tick(id.clone(), slot.clone())).collect();
-            // Take in one finished or retained tick report; `Ok(true)` ends the round.
-            // ↳ CLAIM(R1-attention): so does a report that raised call-ending
-            // attention (an item ended by itself while its hold stays live): it
-            // is saved and ready, and must not wait for another tick's lock
-            // [review R1; quiet_hold_tests::a_ready_autonomous_item_end_returns_at_once_while_another_hold_is_locked].
-            let take_in = |call: &mut CallRecord, ticks_in_call: &mut u64, id: &WatchId, report: TickReport| -> Result<bool, VigilError> {
-                let outcome = report.outcome;
-                // The watch as the tick left it: saved or not, this is the truth.
-                let after = report.after.as_ref().map(|watch| (watch.tick, watch.wakes_wait()));
-                call.absorb(id, report);
-                let unsaved = call.any_unsaved();
-                let attention = call.raised_attention;
-                if outcome == TickOutcome::Ticked {
-                    *ticks_in_call += 1;
-                    let (tick, finished) = match after {
-                        Some(after) => after,
-                        None => {
-                            let watch = self.load_watch(id)?;
-                            (watch.tick, watch.wakes_wait())
+                if !ready && !call.has_events_for_the_agent() {
+                    let now = self.clock.now();
+                    for id in covered.iter() {
+                        if active.contains(id) { continue; }
+                        let watch = self.load_watch(id)?;
+                        if !watch.status.is_finished() && (watch.is_overdue(now) || (is_due(&watch, now) && (first_pass || !self.reserve_blocks(&watch, budget_end)))) {
+                            let slot = std::sync::Arc::new(Retained::default());
+                            pending.push(Box::pin(tick(id.clone(), slot.clone())));
+                            retained.insert(id.clone(), slot);
+                            active.insert(id.clone());
                         }
-                    };
-                    progress.progress(&ProgressUpdate { progress: *ticks_in_call, watch_id: id.clone(), tick });
-                    return Ok(finished || unsaved || attention);
-                }
-                Ok((matches!(outcome, TickOutcome::Finished(_)) && self.load_watch(id)?.wakes_wait()) || unsaved || attention)
-            };
-            // C12: once a covered watch has a terminal result the round stops
-            // waiting for unfinished ticks (they write nothing, C5).
-            // ↳ CLAIM(DF1a): so does a tick whose save failed, the moment it is absorbed: the other ticks of the round may be waiting on a lock held elsewhere, and the call must not wait for them [spec DF1a, review S1; disk_full_tests a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held]
-            // ↳ CLAIM(R1-look): while the round waits, the call looks around every
-            // `OUTBOX_POLL`; a terminal result or attention in an outbox ends
-            // the round and the loop goes straight back to the top.
-            // CLAIM(R2-discovery): new holds join the active round; unfinished
-            // reads and judges keep their futures [review R2-2;
-            // quiet_hold_tests::repeated_discovery_preserves_a_slow_session_tick].
-            let mut interrupted = false;
-            for_each_completed(ticks, OUTBOX_POLL, |step, pending| -> Result<bool, VigilError> {
-                match step {
-                    Round::Done((id, outcome)) => {
-                        let Ok(report) = outcome else { return Ok(false) };
-                        take_in(&mut call, &mut ticks_in_call, &id, report?)
-                    }
-                    Round::Idle => {
-                        let looked = self.look_around(covered, session_scope, registration, plan, &mut call)?;
-                        interrupted |= looked.any_terminal || call.has_events_for_the_agent();
-                        if looked.discovered && !interrupted {
-                            let now = self.clock.now();
-                            for id in covered.iter() {
-                                if retained.contains_key(id) { continue; }
-                                let watch = self.load_watch(id)?;
-                                if !watch.status.is_finished() && (watch.is_overdue(now) || (is_due(&watch, now) && !self.reserve_blocks(&watch, budget_end))) {
-                                    let slot = std::sync::Arc::new(Retained::default());
-                                    pending.push(Box::pin(tick(id.clone(), slot.clone())));
-                                    retained.insert(id.clone(), slot);
-                                }
-                            }
-                        }
-                        Ok(interrupted)
                     }
                 }
-            })
-            .await?;
-            // ↳ CLAIM(S4-retained): a tick dropped inside its save (the round ended, or the budget did) is not lost: its slot still holds what it had sensed and how the write stood [review S4; disk_full_tests a_rescue_still_waiting_when_another_rescue_gives_up_keeps_its_answer]
-            for (id, slot) in &retained {
-                if let Some(report) = slot.take() {
-                    if let Some(after) = &report.after {
-                        self.remember_save(after, &report.persisted);
+                first_pass = false;
+                // Give newly due ticks their pass BEFORE attention. A watch
+                // finishing exactly at its attention threshold emits only its
+                // terminal event [auto_interval_tests::a_watch_finishing_at_its_attention_threshold_emits_only_its_terminal_event].
+                for_each_completed(&mut pending, Instant::now(), |output| {
+                    take_finished(output, &mut active, &mut retained, &mut call, &mut ticks_in_call)
+                }).await?;
+                if call.any_unsaved() { break; }
+                // Visit every writable secondary watch before returning (S10).
+                // Busy locks stay due and never delay this pass (R2-attention).
+                for id in covered.iter() {
+                    if attention_retries.get(id).is_some_and(|retry| *retry > Instant::now()) { continue; }
+                    match self.raise_attention(id, plan.is_long(), budget_end, &mut call).await? {
+                        Some(retry) => { attention_retries.insert(id.clone(), retry); }
+                        None => { attention_retries.remove(id); }
                     }
-                    take_in(&mut call, &mut ticks_in_call, id, report)?;
                 }
-            }
-            first_pass = false;
-            // ↳ CLAIM(DF1a): a tick whose save failed ends the call; no in-memory re-ticking, no spin [spec DF1a; disk_full_tests a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again]
-            if call.any_unsaved() {
-                return Ok(call);
-            }
-            if interrupted {
-                continue;
-            }
-
-            // AI5: a covered watch that has run too long, or gone quiet while its
-            // process runs, raises its attention event (after the round, so a
-            // watch that just finished raises nothing, A15, and one that fired
-            // in the same round still gets the secondary event, S10).
-            for id in covered.iter() {
-                self.raise_attention(id, plan.is_long(), budget_end, &mut call).await?;
-            }
-            if call.any_unsaved() {
-                return Ok(call);
-            }
-
-            let now = self.clock.now();
-            let mut any_finished = false;
-            let mut next_wake: Option<Timestamp> = None;
-            for id in covered.iter() {
-                let watch = self.load_watch(id)?;
-                if watch.status.is_finished() {
-                    any_finished |= watch.wakes_wait();
-                    continue;
+                if call.any_unsaved() { break; }
+                let mut any_finished = false;
+                for id in covered.iter() {
+                    any_finished |= self.load_watch(id)?.wakes_wait();
                 }
-                let due_at = watch.last_tick_at.map_or(now, |last| last.plus_secs(watch.spec.interval_s));
-                // A due tick the reserve forbids is not waited for; its deadline still is.
-                let wake = if is_due(&watch, now) && self.reserve_blocks(&watch, budget_end) { watch.deadline_at } else { due_at.min(watch.deadline_at) };
-                // AI5, W42-D2: an overdue moment (the watch's or an item's) is a wake of its own, however rarely the watch ticks.
-                let wake = crate::attention::next_due_at(&watch).map_or(wake, |overdue| {
-                    // A still-due attention pass could not take its lock. Retry
-                    // on the next scan instead of spinning on a past threshold.
-                    let retry = if overdue <= now { now.plus_secs(OUTBOX_POLL.as_secs()) } else { overdue };
-                    wake.min(retry)
-                });
-                next_wake = Some(next_wake.map_or(wake, |current| current.min(wake)));
+                // ↳ CLAIM(S3-credit): every normal return still owes its due
+                // credit check, including an immediate completion or attention.
+                let credit_changed = self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
+                if any_finished || call.has_events_for_the_agent() || credit_changed || Instant::now() >= budget_end {
+                    break;
+                }
+                // ↳ CLAIM(R3-scheduling): pending work does not own the next
+                // wake. Other watches' due ticks and deadlines still do.
+                let now = self.clock.now();
+                let mut wake_at = (Instant::now() + OUTBOX_POLL).min(budget_end);
+                for id in covered.iter() {
+                    let watch = self.load_watch(id)?;
+                    if watch.status.is_finished() { continue; }
+                    if !active.contains(id) && !self.reserve_blocks(&watch, budget_end) {
+                        let due = watch.last_tick_at.map_or(now, |last| last.plus_secs(watch.spec.interval_s));
+                        wake_at = wake_at.min(Instant::now() + due.duration_since(now));
+                    }
+                    // An active tick already owns an elapsed deadline and will
+                    // expire under its lock. A past deadline must not spin.
+                    if watch.deadline_at > now {
+                        wake_at = wake_at.min(Instant::now() + watch.deadline_at.duration_since(now));
+                    }
+                    if let Some(overdue) = crate::attention::next_due_at(&watch) {
+                        // ↳ CLAIM(R2-attention): attention already had its pass;
+                        // retry a still-due threshold at scan pace. Future
+                        // thresholds retain their exact wake between ticks.
+                        let due = if overdue <= now {
+                            attention_retries.get(id).copied().unwrap_or(Instant::now() + OUTBOX_POLL)
+                        } else { Instant::now() + overdue.duration_since(now) };
+                        wake_at = wake_at.min(due);
+                    }
+                }
+                if let Some(due) = credit.as_ref().and_then(CreditPlan::next_due_at) {
+                    wake_at = wake_at.min(Instant::now() + due.duration_since(now));
+                }
+                // CLAIM(R2-discovery): discovery and deadline wakes preserve
+                // unfinished reads and judges [quiet_hold_tests::repeated_discovery_preserves_a_slow_session_tick].
+                for_each_completed(&mut pending, wake_at, |output| {
+                    take_finished(output, &mut active, &mut retained, &mut call, &mut ticks_in_call)
+                }).await?;
             }
-            // AI2' / S2 / S3: the orchestrator's credit check, after the watches
-            // had their pass, on every way out of the call (a quiet pass, a
-            // finished watch, new attention): a call that always returns early
-            // would otherwise never monitor.
-            // ↳ CLAIM(S3-credit)
-            if any_finished || call.raised_attention {
-                self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
-                return Ok(call);
+            Ok(())
+        }.await;
+        // ↳ CLAIM(S4-retained): drop futures before collecting their slots,
+        // whether a ready result or the original call budget ended sensing.
+        drop(pending);
+        for (id, slot) in &retained {
+            if let Some(report) = slot.take() {
+                if let Some(after) = &report.after { self.remember_save(after, &report.persisted); }
+                take_in(&mut call, &mut ticks_in_call, id, report)?;
             }
-            if self.due_credit_check(&mut credit, covered, budget_end, &mut call).await? {
-                return Ok(call);
-            }
-            if let Some(due) = credit.as_ref().and_then(CreditPlan::next_due_at) {
-                next_wake = Some(next_wake.map_or(due, |current| current.min(due)));
-            }
-            let left = budget_end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(call);
-            }
-            // Sleep to the next tick or deadline, or to the end of the budget.
-            let until_wake = next_wake
-                .map(|wake| (wake.0 - self.clock.now().0).to_std().unwrap_or(Duration::ZERO))
-                .unwrap_or(left);
-            // ↳ CLAIM(S4-outbox): never sleep past the next look at the outboxes
-            tokio::time::sleep(until_wake.min(left).min(OUTBOX_POLL)).await;
         }
+        sensing?;
+        // ↳ CLAIM(peers-info): refresh ages on the final pass too, including
+        // when the budget ended while the scheduler waited for its next wake.
+        if plan.orchestrator {
+            let latest = self.scan_peers(covered);
+            call.peer_scan.peers = latest.peers;
+            call.peer_scan.events.extend(latest.events);
+        }
+        Ok(call)
     }
 
     /// One look at everything a call must see between ticks: new session
     /// holds, foreign orchestrators, and the covered watches' outboxes and
-    /// terminal state. Made before every round and, while a round waits, every
-    /// `OUTBOX_POLL`, so a tick stuck on a lock held elsewhere cannot postpone
+    /// terminal state. Made each scheduling pass, at most `OUTBOX_POLL` apart
+    /// while ticks wait, so a tick stuck on a lock held elsewhere cannot postpone
     /// any of it for the rest of the window [review R1;
     /// quiet_hold_tests::session_wait_still_discovers_new_holds_while_a_tick_waits_for_a_held_lock].
     fn look_around(&self, covered: &mut Vec<WatchId>, session_scope: bool, registration: &mut Option<crate::peers::CallGuard>, plan: &CallPlan, call: &mut CallRecord) -> Result<Looked, VigilError> {
-        let mut discovered = false;
         if session_scope {
             let before = covered.len();
             for id in self.session_hold_ids()? {
@@ -665,7 +635,6 @@ impl crate::engine::Vigil {
             // New holds obey the same per-watch confirmation rule as a no-id call.
             self.gate_orchestrator(Some(plan.orchestrator), None, covered, None)?;
             if covered.len() != before {
-                discovered = true;
                 let updated = self.register_call(covered, plan.orchestrator, plan.window.interval_s).ok();
                 *registration = updated;
             }
@@ -698,7 +667,7 @@ impl crate::engine::Vigil {
                 call.carried_attention |= watch.events.iter().any(Event::is_call_ending);
             }
         }
-        Ok(Looked { discovered, any_terminal })
+        Ok(Looked { any_terminal })
     }
 
     /// AI2' / S2 / S3: make the orchestrator's credit check if the plan says one
@@ -760,25 +729,27 @@ impl crate::engine::Vigil {
     /// auto_interval_tests::attention_due_at_the_end_of_the_budget_does_not_wait_for_a_watch_lock_held_elsewhere].
     /// An attention that could not be raised in time is still due, so the next
     /// call raises it at once.
-    async fn raise_attention(&self, id: &WatchId, long_window: bool, budget_end: Instant, call: &mut CallRecord) -> Result<(), VigilError> {
+    /// Returns the next permitted lock retry when the watch is busy. The
+    /// caller keeps that deadline across quiet completions and discoveries.
+    async fn raise_attention(&self, id: &WatchId, long_window: bool, budget_end: Instant, call: &mut CallRecord) -> Result<Option<Instant>, VigilError> {
         if crate::attention::due(&self.load_watch(id)?, self.clock.now(), long_window).is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // ↳ CLAIM(R2-attention): still visit every writable secondary watch.
-        let Ok(lock) = tokio::time::timeout_at(budget_end, self.store.try_lock_watch_async(id)).await else { return Ok(()) };
-        let Some(_lock) = lock? else { return Ok(()) };
+        let Ok(lock) = tokio::time::timeout_at(budget_end, self.store.try_lock_watch_async(id)).await else { return Ok(None) };
+        let Some(_lock) = lock? else { return Ok(Some(Instant::now() + OUTBOX_POLL)) };
         let mut watch = self.load_watch(id)?;
         // ↳ CLAIM(V2-attention)
         // The wait may have used the last of the budget: the same strict test a
         // tick makes before it persists (C5).
         if Instant::now() > budget_end {
-            return Ok(());
+            return Ok(None);
         }
         let now = self.clock.now();
         self.forget_unsaved_attention(&watch);
         let due = crate::attention::due(&watch, now, long_window);
         if due.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // S1, decided before this save changes the answer.
         let repeating = self.may_repeat(id);
@@ -823,7 +794,7 @@ impl crate::engine::Vigil {
         }
         call.raised_attention |= raised.iter().any(|(_, event)| event.is_call_ending());
         call.note_save(id, watch, persisted);
-        Ok(())
+        Ok(None)
     }
 
     /// X4: true when the budget left is below the watch's tick reserve.
