@@ -1218,3 +1218,108 @@ what a caller can make vigil store or run.
 **Hook.** agent-integration's Claude/Codex PreToolUse hook runs `vigil advice`
 before heavy Bash commands (flutter test, edge-test, cargo build/test, gradle,
 nix build, qex submit) and injects the lines as additional context; it fails open.
+
+## Reminders (pilot)
+
+A reminder is a per-project instruction delivered inside calls sessions already
+make. It never starts a process between calls or wakes a session. Configuration
+is `$XDG_CONFIG_HOME/vigil/reminders.toml`, falling back to
+`~/.config/vigil/reminders.toml`; `VIGIL_REMINDERS_FILE` overrides it, and `off`
+disables reminders. Missing files mean no reminders; nothing is seeded. Reads
+happen on every delivery and every long-wait check. Commands preserve unrelated
+TOML and comments, validate before writing, and lock around atomic updates.
+
+```toml
+[reminders.release]
+scope = ["/repos/edge", "/repos/edge.research", "/repos/edge.worktrees"]
+days = ["wed", "thu", "fri"]
+window = "09:00-18:00"
+tz = "America/Denver"
+probe = ["/path/to/release-check"]
+message = "Fork release due: {output}"
+period = "week"
+cache_s = 600
+timeout_s = 10
+```
+
+Scope uses directory components, including the directory itself. `/repos/edge`
+never includes `/repos/edge-heavy` or `/repos/edge.research`; list sibling scopes
+explicitly. Absolute scopes are required. Paths are normalized, and existing
+paths canonicalized, so an existing symlink uses its target. Nonexistent paths
+use lexical normalization. The CLI uses its process cwd; MCP uses its server's
+startup cwd. MCP roots and client navigation are not consulted. Restart an MCP
+server in the correct directory when switching projects, or use the CLI.
+
+Weekdays use `mon` through `sun`. An omitted window allows the entire selected
+day. A window includes its start and excludes its end; start must precede end,
+so overnight windows are rejected in this pilot. `tz` accepts an IANA timezone;
+omitting it uses the host's local zone. Calendar membership comes from each
+instant in that zone, including DST changes. `period` defaults to `week`, an
+ISO Monday-based local week including its ISO year; `day` uses the local date.
+
+Probes are optional argv arrays, run from the first scope directory through the
+advisory input reader and shared 20-second outer deadline. `timeout_s` is 1..19,
+default 10. Exit 0 means due, exit 1 means not due, and other exits, signals,
+timeouts and unreadable output mean `unavailable`. With `condition`, a successful
+probe must also satisfy an advisory-style numeric comparison, for example
+`value >= 100`. `extract` and `params` reuse advisory extraction and comparison;
+omitted extraction reads a single decimal number. `{output}` interpolates the
+trimmed probe output, and `{value}` the numeric value. Probes are trusted local
+operator commands, just like advisories. Only add commands you would run yourself.
+
+Raw probe results are cached under `<state root>/reminder-cache` for `cache_s`
+seconds, default 600, range 0..86400. Command failures are cached for at most 30
+seconds. Probe argv, timeout and resolved cwd must match; future timestamps are
+not reused. Schedule, condition and message edits apply to cached output at
+once. Schedule and suppression are checked again after a probe returns, so a
+slow command cannot deliver outside its window or after a concurrent `done`. Cache writes are best effort. Invalid extraction is unavailable and uses
+the raw-output cache lifetime. Suppression state read/write failures are errors,
+never interpreted as a fresh empty state. There are at most 32 reminders, 16
+scopes per reminder, and 2048 bytes of message template per reminder.
+
+CLI operations:
+
+```sh
+vigil remind add ID --scope DIR... --days wed,thu,fri \
+  --window 09:00-18:00 --tz America/Denver \
+  --probe '["release-check"]' --message 'Release due: {output}' --period week
+vigil remind list
+vigil remind show ID
+vigil remind done ID
+vigil remind snooze ID 2h
+vigil remind rm ID
+```
+
+`add` also accepts `--condition`, `--extract` as JSON, `--cache-s` and
+`--timeout-s`. Existing ids must be removed before adding them again. MCP tools
+are `remind_list`, `remind_show {id}`, `remind_add {id,spec}`, `remind_done {id}`,
+`remind_snooze {id,duration}`, and `remind_rm {id}`. `show` reports the current
+state, including `out_of_scope`, `outside_schedule`, `not_due`, `due`, `done`,
+`snoozed` and `unavailable`, without claiming a delivery event.
+
+Every keepalive/wait return and the CLI/MCP `advice` report carries
+`reminders: [{id,kind,message,checked_at,period,value?}]` only when at least one
+configured scope includes the caller. Within scope it is `[]` if nothing is due;
+due and unavailable entries appear in the list. A malformed entry is unavailable
+only within its declared scope. A file-wide read/parse failure produces
+`reminders_error: "reminders unavailable: ..."` and no reminder list, because
+scope cannot be recovered. Status and cancel do not
+run reminder probes. `advice` works when advisories are disabled if reminder
+scope matches. Plain `advice` prints both lists as `id: message` lines.
+
+Long orchestrator keepalives check reminders at entry and every 30 seconds,
+using the probe cache. On a due reminder they return early with one
+`kind: "reminder_due"` event, `reminder_id`, and `period`; a pending watch says
+`next: "act on events"`. Multiple distinct reminders may each contribute an
+event. This does not finish or cancel a watch. Ordinary short calls receive the
+list at return. No daemon, scheduler or session wake is added.
+
+`done` suppresses delivery for the rest of the reminder's local period across
+all sessions. Snooze is an absolute duration, 1s..7d with `s/m/h/d` suffixes,
+independent of period boundaries. Both live in `<state root>/reminders`. The
+long-wait event is claimed atomically once per reminder per period across
+sessions; lists continue showing it until done/snoozed. A crash or transport
+cancellation after the claim can lose that early-return event. Later lists
+still carry the due reminder. Removing and re-adding an id resets suppression
+and event state; hand edits keep state. Config and state writers use immediate
+try-locks, reporting contention instead of blocking a call.

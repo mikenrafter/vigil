@@ -269,7 +269,7 @@ fn entry_of(id: &str, item: &Item) -> Entry {
 
 // ---- TOML <-> JSON --------------------------------------------------------
 
-fn item_to_json(item: &Item) -> Value {
+pub(crate) fn item_to_json(item: &Item) -> Value {
     match item {
         Item::None => Value::Null,
         Item::Value(value) => value_to_json(value),
@@ -293,7 +293,7 @@ fn value_to_json(value: &toml_edit::Value) -> Value {
     }
 }
 
-fn json_to_value(value: &Value) -> Option<toml_edit::Value> {
+pub(crate) fn json_to_value(value: &Value) -> Option<toml_edit::Value> {
     Some(match value {
         Value::Null => return None,
         Value::Bool(flag) => (*flag).into(),

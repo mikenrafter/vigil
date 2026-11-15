@@ -41,6 +41,7 @@ pub fn default_config() -> Config {
         credit_check_every: Duration::from_secs(240),
         credit_hook_timeout: Duration::from_secs(10),
         advisories_file: None,
+        reminders_file: None,
         orchestrator_confirm: false,
         home: None,
     }

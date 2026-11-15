@@ -703,6 +703,8 @@ impl Vigil {
             cache: None,
             clock: None,
             advice: None,
+            reminders: None,
+            reminders_error: None,
             cap,
             cap_error,
         })

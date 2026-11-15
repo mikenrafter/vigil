@@ -199,6 +199,17 @@ pub struct AdvisoryAddArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemindAddArgs {
+    pub id: String,
+    /// {scope: absolute directory prefixes, days: [wed,thu,fri], window?, tz?,
+    /// probe?: argv array, condition?, extract?, message, period?: week|day, cache_s?, timeout_s?}.
+    #[schemars(with = "serde_json::Map<String, Value>")]
+    pub spec: Value,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemindSnoozeArgs { pub id: String, pub duration: String }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ColdArgs {
     /// Watches or holds to cancel; without it, the watches this server created.
     pub watch_ids: Option<Vec<String>>,
@@ -464,6 +475,31 @@ impl VigilServer {
         Ok(advisory_reply(self.vigil.advice_report().await))
     }
 
+    #[tool(description = "List configured project reminders; only deliver inside vigil calls, never wake a session.")]
+    async fn remind_list(&self) -> Result<CallToolResult, ErrorData> {
+        Ok(reminder_reply(self.vigil.remind_list()))
+    }
+    #[tool(description = "Add a project reminder with absolute scope prefixes, weekdays, optional local window and IANA tz, optional cached command probe, message and day/week period. Probe exits 0 due, 1 not due, others unavailable.")]
+    async fn remind_add(&self, Parameters(args): Parameters<RemindAddArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(reminder_reply(self.vigil.remind_add(&args.id, args.spec)))
+    }
+    #[tool(description = "Show a reminder's spec and current evaluation from the MCP server startup cwd.")]
+    async fn remind_show(&self, Parameters(args): Parameters<AdvisoryIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(reminder_reply(self.vigil.remind_show(&args.id).await))
+    }
+    #[tool(description = "Suppress a reminder for the rest of its local day or Monday-based week, across sessions.")]
+    async fn remind_done(&self, Parameters(args): Parameters<AdvisoryIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(reminder_reply(self.vigil.remind_done(&args.id)))
+    }
+    #[tool(description = "Snooze a reminder for a duration such as 30m, 2h or 1d, at most 7d.")]
+    async fn remind_snooze(&self, Parameters(args): Parameters<RemindSnoozeArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(reminder_reply(self.vigil.remind_snooze(&args.id, &args.duration)))
+    }
+    #[tool(description = "Remove a project reminder.")]
+    async fn remind_rm(&self, Parameters(args): Parameters<AdvisoryIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(reminder_reply(self.vigil.remind_rm(&args.id)))
+    }
+
     #[tool(description = "List advisories: id, status, parameters (e.g. threshold), condition and cache time.")]
     async fn advisory_list(&self) -> Result<CallToolResult, ErrorData> {
         Ok(advisory_reply(self.vigil.advisory_list()))
@@ -639,4 +675,8 @@ mod tests {
         assert!(cancelled.is_none(), "the cancel ended the hold");
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
     }
+}
+
+fn reminder_reply(result: crate::reminder::Result<Value>) -> CallToolResult {
+    match result { Ok(value) => text_result(false, value.to_string()), Err(error) => text_result(true, error.to_string()) }
 }

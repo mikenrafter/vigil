@@ -123,6 +123,7 @@ struct CallRecord {
     raised_attention: bool,
     /// AI8: the call's credit event, if the check saw a change (not saved, A18).
     credit_events: Vec<Event>,
+    reminder_events: Vec<Event>,
     /// AI2': the newest credit check of this call.
     credit_check: Option<CreditCheck>,
 }
@@ -159,7 +160,7 @@ impl CallRecord {
     /// not a finished watch (attention, a credit change, or an attention event
     /// that was never acknowledged)?
     fn has_events_for_the_agent(&self) -> bool {
-        self.raised_attention || !self.peer_scan.events.is_empty() || !self.credit_events.is_empty() || !self.carried.is_empty()
+        self.raised_attention || !self.reminder_events.is_empty() || !self.peer_scan.events.is_empty() || !self.credit_events.is_empty() || !self.carried.is_empty()
     }
 
     /// DF1a: a save that failed ends the call.
@@ -324,6 +325,8 @@ impl crate::engine::Vigil {
         if let Some((envelope, _)) = outcome.as_mut() {
             // CLAIM(advisory-delivery) ↳ every blocking return of keepalive carries `advice`
             envelope.advice = self.envelope_advice().await;
+            envelope.reminders = self.envelope_reminders().await;
+            envelope.reminders_error = self.reminders_error();
         }
         Ok(outcome)
     }
@@ -421,7 +424,17 @@ impl crate::engine::Vigil {
         let mut ticks_in_call = 0u64;
         let mut first_pass = true;
         let mut credit = plan.orchestrator.then(|| self.credit_plan(plan.window.interval_s));
+        let mut reminder_check = Instant::now();
         loop {
+            // CLAIM(reminder-event): one claim per reminder/period, only during
+            // long orchestrator calls [SPEC Reminders; reminder_tests mid_wait].
+            if plan.orchestrator && plan.is_long() && Instant::now() >= reminder_check {
+                let anchor = self.load_watch(&covered[0])?;
+                if let Ok(events) = tokio::time::timeout_at(budget_end, self.reminder_events(&anchor)).await {
+                    call.reminder_events.extend(events);
+                }
+                reminder_check = Instant::now() + Duration::from_secs(30);
+            }
             // CLAIM(peers-scope): plain calls never scan peers [pilot; peers_tests].
             // CLAIM(peers-flag): every existing sense pass sees foreign
             // orchestrators and ends the call [pilot; peers_tests].
@@ -768,6 +781,7 @@ impl crate::engine::Vigil {
             }
         }
         events.extend(call.credit_events.iter().cloned());
+        events.extend(call.reminder_events.iter().cloned());
         events.extend(call.peer_scan.events.iter().cloned());
         let others: Vec<OtherWatch> = finished
             .iter()

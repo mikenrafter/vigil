@@ -36,10 +36,19 @@ fn detail(advisory: &Advisory) -> Value {
 
 impl Vigil {
     /// `{"advice": [...]}`, the shape of `vigil advice --json` and the MCP
-    /// `advice` tool. `Err(Disabled)` when advisories are off.
+    /// `advice` tool. `Err(Disabled)` when advisories are off and no scoped
+    /// reminder or config diagnostic can be delivered.
     pub async fn advice_report(&self) -> Result<Value, AdvisoryError> {
-        let advice: Vec<Advice> = self.envelope_advice().await.ok_or(AdvisoryError::Disabled)?;
-        Ok(json!({"advice": advice}))
+        let advice: Option<Vec<Advice>> = self.envelope_advice().await;
+        let reminders = self.envelope_reminders().await;
+        let reminders_error = self.reminders_error();
+        // Advice remains usable for project reminders when advisories are off.
+        if advice.is_none() && reminders.is_none() && reminders_error.is_none() { return Err(AdvisoryError::Disabled); }
+        let mut report = json!({});
+        if let Some(advice) = advice { report["advice"] = json!(advice); }
+        if let Some(reminders) = reminders { report["reminders"] = json!(reminders); }
+        if let Some(error) = reminders_error { report["reminders_error"] = json!(error); }
+        Ok(report)
     }
 
     pub fn advisory_list(&self) -> Result<Value, AdvisoryError> {

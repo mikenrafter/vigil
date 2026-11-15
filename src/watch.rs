@@ -573,6 +573,8 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventDetail {
+    /// A project reminder became due inside a long call.
+    ReminderDue { reminder_id: String, period: String },
     /// Same-session foreign call misusing orchestrator mode (pilot).
     ForeignOrchestrator,
     /// AI5: the watch needs the agent (`overdue` or `stalled`), or W42-H3: an

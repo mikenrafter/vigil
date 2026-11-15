@@ -220,6 +220,11 @@ pub struct Envelope {
     /// list means "on, nothing configured".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice: Option<Vec<crate::advisory_eval::Advice>>,
+    /// Present only when the caller is in a configured reminder scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminders: Option<Vec<crate::reminder::ReminderNotice>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminders_error: Option<String>,
     /// W46-K4: absent unless the hold contains classed items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<crate::cap::CapStatus>,
@@ -334,6 +339,8 @@ mod tests {
             cache: None,
             clock: None,
             advice: None,
+            reminders: None,
+            reminders_error: None,
             cap: None,
             cap_error: None,
         }

@@ -21,6 +21,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Project reminders, delivered only inside vigil calls.
+    Remind { #[command(subcommand)] command: RemindCommand },
     /// Run the stdio MCP server.
     Mcp,
     /// Create a watch from one JSON object (argument, or stdin if absent).
@@ -77,6 +79,43 @@ enum Command {
         #[command(subcommand)]
         command: AdvisoryCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RemindCommand {
+    List,
+    Show { id: String },
+    Add {
+        id: String,
+        #[arg(long, required = true, num_args = 1..)]
+        scope: Vec<PathBuf>,
+        #[arg(long, value_delimiter = ',', required = true)]
+        days: Vec<String>,
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long)]
+        tz: Option<String>,
+        /// JSON argv array; exits 0 due, 1 not due, others unavailable.
+        #[arg(long)]
+        probe: Option<String>,
+        /// Numeric comparison, e.g. value >= 10 (default extraction: number).
+        #[arg(long)]
+        condition: Option<String>,
+        /// Advisory extraction object as JSON; requires --condition.
+        #[arg(long)]
+        extract: Option<String>,
+        #[arg(long)]
+        message: String,
+        #[arg(long, default_value = "week", value_parser = ["day", "week"])]
+        period: String,
+        #[arg(long, default_value_t = 600)]
+        cache_s: u64,
+        #[arg(long, default_value_t = 10)]
+        timeout_s: u64,
+    },
+    Done { id: String },
+    Snooze { id: String, duration: String },
+    Rm { id: String },
 }
 
 #[derive(Debug, clap::Args)]
@@ -356,12 +395,33 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             warn_about_unsaved(vigil.store().root(), &envelope);
             Ok(0)
         }
+        Command::Remind { command } => {
+            let result = match command {
+                RemindCommand::List => vigil.remind_list()?,
+                RemindCommand::Show { id } => vigil.remind_show(&id).await?,
+                RemindCommand::Done { id } => vigil.remind_done(&id)?,
+                RemindCommand::Snooze { id, duration } => vigil.remind_snooze(&id, &duration)?,
+                RemindCommand::Rm { id } => vigil.remind_rm(&id)?,
+                RemindCommand::Add { id, scope, days, window, tz, probe, condition, extract, message, period, cache_s, timeout_s } => {
+                    let probe = probe.map(|raw| serde_json::from_str::<Vec<String>>(&raw)).transpose()?;
+                    let extract = extract.map(|raw| serde_json::from_str::<serde_json::Value>(&raw)).transpose()?;
+                    vigil.remind_add(&id, serde_json::json!({
+                        "scope": scope, "days": days, "window": window, "tz": tz,
+                        "probe": probe, "condition": condition, "extract": extract,
+                        "message": message, "period": period, "cache_s": cache_s, "timeout_s": timeout_s,
+                    }))?
+                },
+            };
+            print_json(&result)?;
+            Ok(0)
+        }
         Command::Advice { json } => {
             let report = vigil.advice_report().await?;
             if json {
                 print_json(&report)?;
             } else {
-                for entry in report["advice"].as_array().into_iter().flatten() {
+                if let Some(error) = report["reminders_error"].as_str() { println!("{error}"); }
+                for entry in ["advice", "reminders"].iter().flat_map(|key| report[key].as_array().into_iter().flatten()) {
                     println!("{}: {}", entry["id"].as_str().unwrap_or("?"), entry["message"].as_str().unwrap_or(""));
                 }
             }

@@ -52,6 +52,8 @@ pub struct Config {
     pub advisories_file: Option<PathBuf>,
     /// `$HOME`, for the default advisory's absolute `boat` path.
     pub home: Option<String>,
+    /// Reminder config, re-read at delivery; off disables reminders.
+    pub reminders_file: Option<PathBuf>,
     /// Orchestrator mode asks for the day's token (owner 2026-11-14,
     /// `orchestrator.rs`). Off only in this crate's own test sandboxes.
     pub orchestrator_confirm: bool,
@@ -91,6 +93,13 @@ impl Config {
                 None => non_empty("XDG_CONFIG_HOME")
                     .map(|dir| PathBuf::from(dir).join("vigil/advisories.toml"))
                     .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".config/vigil/advisories.toml"))),
+            },
+            reminders_file: match non_empty("VIGIL_REMINDERS_FILE") {
+                Some(setting) if setting == "off" => None,
+                Some(path) => Some(PathBuf::from(path)),
+                None => non_empty("XDG_CONFIG_HOME")
+                    .map(|dir| PathBuf::from(dir).join("vigil/reminders.toml"))
+                    .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".config/vigil/reminders.toml"))),
             },
             home: non_empty("HOME"),
             orchestrator_confirm: lookup("VIGIL_ORCHESTRATOR_CONFIRM").as_deref() != Some("off"),

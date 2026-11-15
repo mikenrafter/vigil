@@ -101,11 +101,17 @@ fn write_cache(cache_dir: &Path, advisory: &Advisory, record: &CacheRecord) {
     }
 }
 
+/// Shared bounded reader for advisory and reminder probes.
+pub(crate) async fn read_probe(input: &crate::watch::Input, reader: &dyn InputReader) -> Result<crate::inputs::Reading, String> {
+    tokio::time::timeout(PROBE_DEADLINE, reader.read(input, &InputState::default()))
+        .await.map_err(|_| format!("probe did not answer within {}s", PROBE_DEADLINE.as_secs()))
+}
+
 async fn probe(advisory: &Advisory, reader: &dyn InputReader) -> Outcome {
     let failed = |reason: String| Outcome::Failed { reason };
-    let reading = match tokio::time::timeout(PROBE_DEADLINE, reader.read(advisory.probe(), &InputState::default())).await {
+    let reading = match read_probe(advisory.probe(), reader).await {
         Ok(reading) => reading,
-        Err(_) => return failed(format!("probe did not answer within {}s", PROBE_DEADLINE.as_secs())),
+        Err(reason) => return failed(reason),
     };
     match probe_body(advisory.probe(), &reading).and_then(|body| advisory.extract_value(&body)) {
         Ok(value) => Outcome::Value { value },
