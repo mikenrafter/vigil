@@ -330,3 +330,60 @@ async fn another_transports_delivery_does_not_abort_a_session_wait() {
     assert_eq!(answer.watch_id.as_str(), "h");
     assert!(answer.events.iter().any(|e| e.summary == "item ended: manual: done"), "the quiet note still rides the return: {answer:?}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn ready_completion_does_not_wait_for_an_overdue_attention_lock() {
+    // why: R2-1. The post-tick attention pass must not delay a saved result.
+    // proves: CLAIM(R2-attention)
+    // catches: serial attention lock waits after a ready tick ends its round.
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { id: Some("locked".into()), work: vec!["none".into()], label: Some("late".into()), expect_s: Some(1), ..Default::default() }).await.unwrap();
+    let lock = env.vigil.store().try_lock_watch(&id("locked")).unwrap().unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    env.vigil.hold(HoldRequest { id: Some("work".into()), work: vec!["until:2020-01-01T00:00:00Z".into()], ..Default::default() }).await.unwrap();
+    env.vigil.hold_add(&id("work"), item("anchor")).await.unwrap();
+    let answer = env.vigil.keepalive(session_request(30)).await.unwrap();
+    drop(lock);
+    assert!(answer.events.iter().any(|e| e.summary.contains("item ended:") && e.is_call_ending()), "{answer:?}");
+    assert_eq!(answer.waited_s, Some(0), "ready completion blocked by an overdue attention lock: {answer:?}");
+}
+
+async fn slow_session_completion(discover: bool) {
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.reader.set_text("qex:slow", "completed");
+    env.vigil.hold(HoldRequest { id: Some("slow".into()), work: vec!["qex:slow".into()], ..Default::default() }).await.unwrap();
+    env.reader.set_sleep("qex:slow", std::time::Duration::from_secs(8));
+    let reads_before = env.reader.started_count("qex:slow");
+    let add_later = async {
+        if discover {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            for n in 0..6 {
+                env.vigil.hold(HoldRequest { id: Some(format!("later-{n}")), ..Default::default() }).await.unwrap();
+                if n < 5 { tokio::time::sleep(std::time::Duration::from_secs(5)).await; }
+            }
+        }
+    };
+    let (answer, ()) = tokio::join!(env.vigil.keepalive(session_request(30)), add_later);
+    let answer = answer.unwrap();
+    assert_eq!(answer.waited_s, Some(8), "discovery must preserve the original eight-second read: {answer:?}");
+    assert!(answer.events.iter().any(|e| e.summary == "item ended: qex:slow: completed"), "{answer:?}");
+    assert_eq!(env.reader.started_count("qex:slow") - reads_before, 1, "an unfinished read must not restart");
+    assert_eq!(watch_file(&env.vigil, "slow").tick, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_session_reader_completes_without_discovery() {
+    // why: positive control for the slow reader used by the starvation regression.
+    // proves: CLAIM(R2-discovery)
+    slow_session_completion(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_discovery_preserves_a_slow_session_tick() {
+    // why: R2-2. New holds must join sensing without starving active reads.
+    // proves: CLAIM(R2-discovery)
+    // catches: ending the round and restarting all unfinished ticks on discovery.
+    slow_session_completion(true).await;
+}
