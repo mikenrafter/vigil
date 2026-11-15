@@ -216,20 +216,32 @@ impl CallRecord {
     }
 }
 
-/// Poll `futures` together and hand each output to `on_done` as soon as it is
-/// ready (completion order, ties by position). `on_done` returns `Ok(true)`
+/// What `for_each_completed` hands its callback.
+enum Round<T> {
+    /// One future finished with this output.
+    Done(T),
+    /// `idle_every` passed with the round still waiting.
+    Idle,
+}
+
+/// Poll `futures` together and hand each output to `on` as soon as it is
+/// ready (completion order, ties by position), and `Round::Idle` each time
+/// `idle_every` passes while some are still pending, so the caller can look
+/// around instead of waiting blind on a slow future. `on` returns `Ok(true)`
 /// to stop: the completions that are already ready are still collected, then
 /// what is unfinished is dropped (C12). Stops at the first `Err`, dropping
 /// what is still pending. Used so that one slow tick never holds back
 /// another's result or its commit (C1).
 async fn for_each_completed<F, E>(
     futures: impl IntoIterator<Item = F>,
-    mut on_done: impl FnMut(F::Output) -> Result<bool, E>,
+    idle_every: Duration,
+    mut on: impl FnMut(Round<F::Output>) -> Result<bool, E>,
 ) -> Result<(), E>
 where
     F: std::future::Future,
 {
     let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut idle = Box::pin(tokio::time::sleep(idle_every));
     let mut stopping = false;
     std::future::poll_fn(|cx| {
         loop {
@@ -240,7 +252,7 @@ where
                     std::task::Poll::Ready(output) => {
                         drop(pending.remove(index));
                         completed_any = true;
-                        match on_done(output) {
+                        match on(Round::Done(output)) {
                             Err(error) => return std::task::Poll::Ready(Err(error)),
                             Ok(stop) => stopping |= stop,
                         }
@@ -252,12 +264,28 @@ where
                 return std::task::Poll::Ready(Ok(()));
             }
             if !stopping {
-                return std::task::Poll::Pending;
+                if idle.as_mut().poll(cx).is_pending() {
+                    return std::task::Poll::Pending;
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_every);
+                match on(Round::Idle) {
+                    Err(error) => return std::task::Poll::Ready(Err(error)),
+                    Ok(stop) => stopping |= stop,
+                }
             }
-            // Stopping: one more pass to pick up what the last completion readied.
+            // Stopping, or just looked: one more pass to pick up what the last
+            // completion readied, and to register the fresh idle timer.
         }
     })
     .await
+}
+
+/// What `look_around` found.
+struct Looked {
+    /// A session hold the call did not cover before.
+    discovered: bool,
+    /// A covered watch has a terminal result that wakes the wait.
+    any_terminal: bool,
 }
 
 /// What one call is, decided before it starts: the window and the note that
@@ -345,7 +373,14 @@ impl crate::engine::Vigil {
         if request.session && request.watch_id.is_some() {
             return Err(VigilError::WaitScope("session and watch_id are mutually exclusive".into()));
         }
-        let mut covered = if request.session { self.session_hold_ids()? } else { self.covered_ids(request.watch_id.as_ref())? };
+        let mut covered = if request.session {
+            let ids = self.session_hold_ids()?;
+            // Admission only: later refreshes of a running call may find nothing new.
+            if ids.is_empty() { return Err(VigilError::NothingToCover); }
+            ids
+        } else {
+            self.covered_ids(request.watch_id.as_ref())?
+        };
         let orchestrator = self.gate_orchestrator(request.orchestrator, request.confirm.as_deref(), &covered, request.watch_id.as_ref())?;
         let request = KeepaliveRequest { orchestrator, ..request };
         let plan = self.plan_call(&request, &covered);
@@ -432,48 +467,9 @@ impl crate::engine::Vigil {
         let mut credit = plan.orchestrator.then(|| self.credit_plan(plan.window.interval_s));
         let mut reminder_check = Instant::now();
         loop {
-            if session_scope {
-                let before = covered.len();
-                for id in self.session_hold_ids()? {
-                    if !covered.contains(&id) { covered.push(id); }
-                }
-                // New holds obey the same per-watch confirmation rule as a no-id call.
-                self.gate_orchestrator(Some(plan.orchestrator), None, covered, None)?;
-                if covered.len() != before {
-                    let updated = self.register_call(covered, plan.orchestrator, plan.window.interval_s).ok();
-                    *registration = updated;
-                }
-            }
-            // CLAIM(peers-scope): plain calls never scan peers [pilot; peers_tests].
-            // CLAIM(peers-flag): every existing sense pass sees foreign
-            // orchestrators and ends the call [pilot; peers_tests].
-            // CLAIM(peers-info): ordinary peers ride the return as information,
-            // refreshed each pass, never as an early wake [pilot; peers_tests].
-            if plan.orchestrator {
-                call.peer_scan = self.scan_peers(covered);
-            }
-            // S6, review S4: attention that was raised and saved but never
-            // acknowledged (the transport died, or another process saved it
-            // while this call waited) is delivered at once, ahead of any
-            // sensing. Looked at on EVERY pass, not only at the start of the
-            // call. Quiet notes remain in the outbox without interrupting;
-            // only call-ending attention is treated as carried work here.
-            // C12: a covered watch that is already terminal (finished before
-            // this call, or by another process) is returned before any round
-            // is awaited, so a held lock elsewhere cannot hold it back.
-            // ↳ CLAIM(S4-outbox)
-            // ↳ CLAIM(S3-credit): both returns still owe the orchestrator's due check
-            let mut any_terminal = false;
-            for id in covered.iter() {
-                let watch = self.load_watch(id)?;
-                if watch.wakes_wait() {
-                    any_terminal = true;
-                } else {
-                    call.carried.extend(watch.events.iter().map(|event| event.event_id.clone()));
-                    call.carried_attention |= watch.events.iter().any(Event::is_call_ending);
-                }
-            }
-            if any_terminal || call.has_events_for_the_agent() {
+            let looked = self.look_around(covered, session_scope, registration, plan, &mut call)?;
+            // ↳ CLAIM(S4-outbox) ↳ CLAIM(S3-credit): both returns still owe the orchestrator's due check
+            if looked.any_terminal || call.has_events_for_the_agent() {
                 self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
                 return Ok(call);
             }
@@ -489,14 +485,15 @@ impl crate::engine::Vigil {
                 }
             }
             let now = self.clock.now();
-            let mut round: Vec<&WatchId> = Vec::new();
+            // Owned ids: a look made while the round waits may grow `covered`.
+            let mut round: Vec<WatchId> = Vec::new();
             for id in covered.iter() {
                 let watch = self.load_watch(id)?;
                 if watch.status.is_finished() {
                     continue;
                 }
                 if watch.is_overdue(now) || (is_due(&watch, now) && (first_pass || !self.reserve_blocks(&watch, budget_end))) {
-                    round.push(id);
+                    round.push(id.clone());
                 }
             }
             // V2: a tick that cannot finish in the budget is dropped before it
@@ -505,18 +502,23 @@ impl crate::engine::Vigil {
             // before its save can wait, so a tick dropped inside that wait
             // (the budget, or the round ending below) still has an answer.
             let retained: Vec<Retained> = round.iter().map(|_| Retained::default()).collect();
-            let ticks = round.iter().zip(&retained).map(|(&id, slot)| async move {
+            let ticks = round.iter().zip(&retained).map(|(id, slot)| async move {
                 (id, tokio::time::timeout_at(budget_end, self.tick_report_retaining(id, Some(budget_end), slot)).await)
             });
             // Take in one finished or retained tick report; `Ok(true)` ends the round.
-            let mut take_in = |id: &WatchId, report: TickReport| -> Result<bool, VigilError> {
+            // ↳ CLAIM(R1-attention): so does a report that raised call-ending
+            // attention (an item ended by itself while its hold stays live): it
+            // is saved and ready, and must not wait for another tick's lock
+            // [review R1; quiet_hold_tests::a_ready_autonomous_item_end_returns_at_once_while_another_hold_is_locked].
+            let take_in = |call: &mut CallRecord, ticks_in_call: &mut u64, id: &WatchId, report: TickReport| -> Result<bool, VigilError> {
                 let outcome = report.outcome;
                 // The watch as the tick left it: saved or not, this is the truth.
                 let after = report.after.as_ref().map(|watch| (watch.tick, watch.wakes_wait()));
                 call.absorb(id, report);
                 let unsaved = call.any_unsaved();
+                let attention = call.raised_attention;
                 if outcome == TickOutcome::Ticked {
-                    ticks_in_call += 1;
+                    *ticks_in_call += 1;
                     let (tick, finished) = match after {
                         Some(after) => after,
                         None => {
@@ -524,32 +526,48 @@ impl crate::engine::Vigil {
                             (watch.tick, watch.wakes_wait())
                         }
                     };
-                    progress.progress(&ProgressUpdate { progress: ticks_in_call, watch_id: id.clone(), tick });
-                    return Ok(finished || unsaved);
+                    progress.progress(&ProgressUpdate { progress: *ticks_in_call, watch_id: id.clone(), tick });
+                    return Ok(finished || unsaved || attention);
                 }
-                Ok((matches!(outcome, TickOutcome::Finished(_)) && self.load_watch(id)?.wakes_wait()) || unsaved)
+                Ok((matches!(outcome, TickOutcome::Finished(_)) && self.load_watch(id)?.wakes_wait()) || unsaved || attention)
             };
             // C12: once a covered watch has a terminal result the round stops
             // waiting for unfinished ticks (they write nothing, C5).
             // ↳ CLAIM(DF1a): so does a tick whose save failed, the moment it is absorbed: the other ticks of the round may be waiting on a lock held elsewhere, and the call must not wait for them [spec DF1a, review S1; disk_full_tests a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held]
-            for_each_completed(ticks, |(id, outcome)| -> Result<bool, VigilError> {
-                let Ok(report) = outcome else { return Ok(false) };
-                take_in(id, report?)
+            // ↳ CLAIM(R1-look): while the round waits, the call looks around every
+            // `OUTBOX_POLL`; a new hold, a terminal result or attention in an
+            // outbox ends the round and the loop goes straight back to the top.
+            let mut interrupted = false;
+            for_each_completed(ticks, OUTBOX_POLL, |step| -> Result<bool, VigilError> {
+                match step {
+                    Round::Done((id, outcome)) => {
+                        let Ok(report) = outcome else { return Ok(false) };
+                        take_in(&mut call, &mut ticks_in_call, id, report?)
+                    }
+                    Round::Idle => {
+                        let looked = self.look_around(covered, session_scope, registration, plan, &mut call)?;
+                        interrupted |= looked.discovered || looked.any_terminal || call.has_events_for_the_agent();
+                        Ok(interrupted)
+                    }
+                }
             })
             .await?;
             // ↳ CLAIM(S4-retained): a tick dropped inside its save (the round ended, or the budget did) is not lost: its slot still holds what it had sensed and how the write stood [review S4; disk_full_tests a_rescue_still_waiting_when_another_rescue_gives_up_keeps_its_answer]
-            for (&id, slot) in round.iter().zip(&retained) {
+            for (id, slot) in round.iter().zip(&retained) {
                 if let Some(report) = slot.take() {
                     if let Some(after) = &report.after {
                         self.remember_save(after, &report.persisted);
                     }
-                    take_in(id, report)?;
+                    take_in(&mut call, &mut ticks_in_call, id, report)?;
                 }
             }
             first_pass = false;
             // ↳ CLAIM(DF1a): a tick whose save failed ends the call; no in-memory re-ticking, no spin [spec DF1a; disk_full_tests a_quiet_tick_that_cannot_save_ends_the_call_at_once_and_is_not_ticked_again]
             if call.any_unsaved() {
                 return Ok(call);
+            }
+            if interrupted {
+                continue;
             }
 
             // AI5: a covered watch that has run too long, or gone quiet while its
@@ -605,6 +623,58 @@ impl crate::engine::Vigil {
             // ↳ CLAIM(S4-outbox): never sleep past the next look at the outboxes
             tokio::time::sleep(until_wake.min(left).min(OUTBOX_POLL)).await;
         }
+    }
+
+    /// One look at everything a call must see between ticks: new session
+    /// holds, foreign orchestrators, and the covered watches' outboxes and
+    /// terminal state. Made before every round and, while a round waits, every
+    /// `OUTBOX_POLL`, so a tick stuck on a lock held elsewhere cannot postpone
+    /// any of it for the rest of the window [review R1;
+    /// quiet_hold_tests::session_wait_still_discovers_new_holds_while_a_tick_waits_for_a_held_lock].
+    fn look_around(&self, covered: &mut Vec<WatchId>, session_scope: bool, registration: &mut Option<crate::peers::CallGuard>, plan: &CallPlan, call: &mut CallRecord) -> Result<Looked, VigilError> {
+        let mut discovered = false;
+        if session_scope {
+            let before = covered.len();
+            for id in self.session_hold_ids()? {
+                if !covered.contains(&id) { covered.push(id); }
+            }
+            // New holds obey the same per-watch confirmation rule as a no-id call.
+            self.gate_orchestrator(Some(plan.orchestrator), None, covered, None)?;
+            if covered.len() != before {
+                discovered = true;
+                let updated = self.register_call(covered, plan.orchestrator, plan.window.interval_s).ok();
+                *registration = updated;
+            }
+        }
+        // CLAIM(peers-scope): plain calls never scan peers [pilot; peers_tests].
+        // CLAIM(peers-flag): every existing sense pass sees foreign
+        // orchestrators and ends the call [pilot; peers_tests].
+        // CLAIM(peers-info): ordinary peers ride the return as information,
+        // refreshed each pass, never as an early wake [pilot; peers_tests].
+        if plan.orchestrator {
+            call.peer_scan = self.scan_peers(covered);
+        }
+        // S6, review S4: attention that was raised and saved but never
+        // acknowledged (the transport died, or another process saved it
+        // while this call waited) is delivered at once, ahead of any
+        // sensing. Looked at on EVERY pass, not only at the start of the
+        // call. Quiet notes remain in the outbox without interrupting;
+        // only call-ending attention is treated as carried work here.
+        // C12: a covered watch that is already terminal (finished before
+        // this call, or by another process) is returned before any round
+        // is awaited, so a held lock elsewhere cannot hold it back.
+        // ↳ CLAIM(S4-outbox)
+        let mut any_terminal = false;
+        for id in covered.iter() {
+            let watch = self.load_watch(id)?;
+            if watch.wakes_wait() {
+                any_terminal = true;
+            } else {
+                call.carried.extend(watch.events.iter().map(|event| event.event_id.clone()));
+                call.carried_attention |= watch.events.iter().any(Event::is_call_ending);
+            }
+        }
+        Ok(Looked { discovered, any_terminal })
     }
 
     /// AI2' / S2 / S3: make the orchestrator's credit check if the plan says one
@@ -736,6 +806,9 @@ impl crate::engine::Vigil {
 
     /// Session attribution is explicit and persisted at create time. Missing
     /// identity never falls back to all watches; old unowned holds need an id.
+    /// May be empty: a call that has begun keeps covering what it already
+    /// covers when another transport delivers the last owned hold, so only
+    /// admission rejects an empty selection [R2; quiet_hold_tests::another_transports_delivery_does_not_abort_a_session_wait].
     fn session_hold_ids(&self) -> Result<Vec<WatchId>, VigilError> {
         let session = self.session_key.as_deref().filter(|key| !key.trim().is_empty())
             .ok_or_else(|| VigilError::WaitScope("session wait needs a session identity (CLAUDE_CODE_SESSION_ID, CODEX_SESSION_ID or T3CODE_THREAD_ID); otherwise pass a hold id".into()))?;
@@ -743,7 +816,6 @@ impl crate::engine::Vigil {
             .filter(|watch| matches!(watch.spec.fire, FireRule::Hold) && watch.owner_session.as_deref() == Some(session))
             .filter(|watch| !watch.status.is_finished() || !watch.session_returned)
             .map(|watch| watch.spec.id).collect();
-        if ids.is_empty() { return Err(VigilError::NothingToCover); }
         Ok(ids)
     }
 
