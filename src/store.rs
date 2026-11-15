@@ -230,7 +230,7 @@ fn is_same_file(file: &File, path: &Path) -> bool {
 /// and never this one.
 #[must_use = "the lock is released when this is dropped"]
 pub struct StoreLock {
-    file: File,
+    pub(crate) file: File,
 }
 
 /// A per-watch exclusive `flock` on `<root>/locks/<id>.lock`, held across a

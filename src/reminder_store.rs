@@ -47,7 +47,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn lock(path: &Path) -> Result<std::fs::File> {
+fn lock(path: &Path) -> Result<crate::store::StoreLock> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -59,7 +59,8 @@ fn lock(path: &Path) -> Result<std::fs::File> {
     // A reminder must not hold a wait hostage to another editor.
     lock.try_lock()
         .map_err(|e| invalid(format!("{}: {e}", path.display())))?;
-    Ok(lock)
+    // ↳ CLAIM(lock-guard-release): StoreLock explicitly unlocks before close.
+    Ok(crate::store::StoreLock { file: lock })
 }
 
 impl ReminderStore {
@@ -196,5 +197,24 @@ impl ReminderStore {
             state.event_period = Some(period.into());
             Ok(true)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_reminder_lock_unlocks_while_a_duplicate_descriptor_is_open() {
+        // WHY: CLAIM(lock-guard-release): a fork/dup must not extend a completed
+        // reminder edit's flock. Close-only guards leave the next edit refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reminders.lock");
+        let guard = lock(&path).unwrap();
+        let inherited = guard.file.try_clone().unwrap();
+        drop(guard);
+        let next = lock(&path);
+        assert!(next.is_ok(), "dropped reminder guard still locked: {:?}", next.err());
+        drop(inherited);
     }
 }
