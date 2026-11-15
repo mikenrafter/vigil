@@ -340,11 +340,13 @@ async fn ready_completion_does_not_wait_for_an_overdue_attention_lock() {
     env.vigil.session_key = Some("session-a".into());
     env.vigil.hold(HoldRequest { id: Some("locked".into()), work: vec!["none".into()], label: Some("late".into()), expect_s: Some(1), ..Default::default() }).await.unwrap();
     let lock = env.vigil.store().try_lock_watch(&id("locked")).unwrap().unwrap();
+    env.vigil.hold(HoldRequest { id: Some("writable".into()), work: vec!["none".into()], label: Some("also-late".into()), expect_s: Some(1), ..Default::default() }).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     env.vigil.hold(HoldRequest { id: Some("work".into()), work: vec!["until:2020-01-01T00:00:00Z".into()], ..Default::default() }).await.unwrap();
     env.vigil.hold_add(&id("work"), item("anchor")).await.unwrap();
     let answer = env.vigil.keepalive(session_request(30)).await.unwrap();
     drop(lock);
+    assert!(answer.events.iter().any(|e| e.watch_id == "writable" && e.summary.contains("item far overdue:")), "writable secondary attention must ride this return: {answer:?}");
     assert!(answer.events.iter().any(|e| e.summary.contains("item ended:") && e.is_call_ending()), "{answer:?}");
     assert_eq!(answer.waited_s, Some(0), "ready completion blocked by an overdue attention lock: {answer:?}");
 }
@@ -386,4 +388,34 @@ async fn repeated_discovery_preserves_a_slow_session_tick() {
     // proves: CLAIM(R2-discovery)
     // catches: ending the round and restarting all unfinished ticks on discovery.
     slow_session_completion(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn overdue_attention_contention_keeps_discovery_running_between_ticks() {
+    // why: R2-1. A non-due tick must not move the lock wait into attention.
+    // proves: CLAIM(R2-attention)
+    // catches: waiting for the attention lock or spinning on its past threshold.
+    let mut env = rig();
+    env.vigil.session_key = Some("session-a".into());
+    env.vigil.hold(HoldRequest { id: Some("locked".into()), work: vec!["none".into()], label: Some("late".into()), expect_s: Some(1), ..Default::default() }).await.unwrap();
+    env.vigil.tick_due(&id("locked")).await.unwrap();
+    let lock = env.vigil.store().try_lock_watch(&id("locked")).unwrap().unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let attempts = crate::fault::FaultPlan::none();
+    let waiter = peer_of(&env, "session-a").with_write_faults(attempts.clone());
+    let add_later = async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        env.vigil.hold(HoldRequest { id: Some("later".into()), work: vec!["until:2020-01-01T00:00:00Z".into()], ..Default::default() }).await.unwrap();
+    };
+    let (answer, ()) = tokio::join!(waiter.keepalive(session_request(30)), add_later);
+    // Scans at 0, 5, 10 and possibly 15 s, plus last-call bookkeeping.
+    let retries = attempts.attempts(crate::fault::WriteKind::LockWait);
+    assert!((3..=5).contains(&retries), "attention must retry at scan pace, not spin: {retries}");
+    drop(lock);
+    let answer = answer.unwrap();
+    assert_eq!(answer.watch_id.as_str(), "later", "{answer:?}");
+    assert!((10..=15).contains(&answer.waited_s.unwrap()), "attention contention must retain the five-second scan: {answer:?}");
+    let resumed = env.vigil.keepalive(session_request(30)).await.unwrap();
+    assert_eq!(resumed.waited_s, Some(0), "skipped attention remains due");
+    assert!(resumed.events.iter().any(|e| e.watch_id == "locked" && e.summary.contains("item far overdue:")), "{resumed:?}");
 }
