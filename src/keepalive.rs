@@ -325,8 +325,7 @@ impl crate::engine::Vigil {
         if let Some((envelope, _)) = outcome.as_mut() {
             // CLAIM(advisory-delivery) ↳ every blocking return of keepalive carries `advice`
             envelope.advice = self.envelope_advice().await;
-            envelope.reminders = self.envelope_reminders().await;
-            envelope.reminders_error = self.reminders_error();
+            (envelope.reminders, envelope.reminders_error) = self.reminder_report().await;
         }
         Ok(outcome)
     }
@@ -426,15 +425,6 @@ impl crate::engine::Vigil {
         let mut credit = plan.orchestrator.then(|| self.credit_plan(plan.window.interval_s));
         let mut reminder_check = Instant::now();
         loop {
-            // CLAIM(reminder-event): one claim per reminder/period, only during
-            // long orchestrator calls [SPEC Reminders; reminder_tests mid_wait].
-            if plan.orchestrator && plan.is_long() && Instant::now() >= reminder_check {
-                let anchor = self.load_watch(&covered[0])?;
-                if let Ok(events) = tokio::time::timeout_at(budget_end, self.reminder_events(&anchor)).await {
-                    call.reminder_events.extend(events);
-                }
-                reminder_check = Instant::now() + Duration::from_secs(30);
-            }
             // CLAIM(peers-scope): plain calls never scan peers [pilot; peers_tests].
             // CLAIM(peers-flag): every existing sense pass sees foreign
             // orchestrators and ends the call [pilot; peers_tests].
@@ -467,6 +457,17 @@ impl crate::engine::Vigil {
             if any_terminal || call.has_events_for_the_agent() {
                 self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
                 return Ok(call);
+            }
+            // ↳ CLAIM(reminder-latency): terminal watches and the outbox get
+            // their pass before cache-only reminder delivery. Probes run in a
+            // background task; a later pass picks up its cached result.
+            if plan.orchestrator && plan.is_long() && Instant::now() >= reminder_check {
+                call.reminder_events.extend(self.reminder_events(&covered[0]).await);
+                reminder_check = Instant::now() + crate::reminder_ops::REMINDER_CHECK_INTERVAL;
+                if call.has_events_for_the_agent() {
+                    self.due_credit_check(&mut credit, covered, budget_end, &mut call).await?;
+                    return Ok(call);
+                }
             }
             let now = self.clock.now();
             let mut round: Vec<&WatchId> = Vec::new();

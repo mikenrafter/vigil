@@ -20,6 +20,7 @@ use crate::advisory_store::{AdvisorySet, Entry};
 use crate::clock::{Clock, Timestamp};
 use crate::inputs::InputReader;
 use crate::watch::InputState;
+use crate::probe_cache::ProbeCache;
 
 /// A probe that has not answered after this long is a failure (the cmd's own
 /// timeout is at most 19 s; this also bounds `url` and a stuck reader).
@@ -59,48 +60,6 @@ enum Outcome {
     Failed { reason: String },
 }
 
-/// `<cache dir>/<id>.json`: one probe result and when and for what it was taken.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct CacheRecord {
-    fingerprint: String,
-    fetched_at: Timestamp,
-    outcome: Outcome,
-}
-
-impl CacheRecord {
-    /// CLAIM(advisory-cache) ↳ younger than the time to live, and not from the future
-    fn is_current(&self, advisory: &Advisory, now: Timestamp) -> bool {
-        let time_to_live = match self.outcome {
-            Outcome::Value { .. } => advisory.cache_s(),
-            Outcome::Failed { .. } => advisory.cache_s().min(FAILURE_CACHE_S),
-        };
-        let age = now.secs_since(self.fetched_at);
-        self.fingerprint == advisory.fingerprint() && age >= 0 && (age as u64) < time_to_live
-    }
-}
-
-fn cache_file(cache_dir: &Path, advisory: &Advisory) -> std::path::PathBuf {
-    cache_dir.join(format!("{}.json", advisory.id()))
-}
-
-fn read_cache(cache_dir: &Path, advisory: &Advisory) -> Option<CacheRecord> {
-    serde_json::from_slice(&std::fs::read(cache_file(cache_dir, advisory)).ok()?).ok()
-}
-
-/// Best effort: a cache that cannot be written costs the next call a probe.
-fn write_cache(cache_dir: &Path, advisory: &Advisory, record: &CacheRecord) {
-    let target = cache_file(cache_dir, advisory);
-    let tmp = target.with_extension(format!("json.{}.tmp", std::process::id()));
-    let written = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(cache_dir)?;
-        std::fs::write(&tmp, serde_json::to_vec(record)?)?;
-        std::fs::rename(&tmp, &target)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
 /// Shared bounded reader for advisory and reminder probes.
 pub(crate) async fn read_probe(input: &crate::watch::Input, reader: &dyn InputReader) -> Result<crate::inputs::Reading, String> {
     tokio::time::timeout(PROBE_DEADLINE, reader.read(input, &InputState::default()))
@@ -121,14 +80,17 @@ async fn probe(advisory: &Advisory, reader: &dyn InputReader) -> Outcome {
 
 async fn advise_one(advisory: &Advisory, reader: &dyn InputReader, clock: &dyn Clock, cache_dir: &Path) -> Advice {
     let now = clock.now();
-    let record = match read_cache(cache_dir, advisory).filter(|record| record.is_current(advisory, now)) {
+    let cache = ProbeCache {
+        path: cache_dir.join(format!("{}.json", advisory.id())),
+        fingerprint: advisory.fingerprint(),
+        ttl_s: advisory.cache_s(),
+        failure_ttl_s: advisory.cache_s().min(FAILURE_CACHE_S),
+    };
+    let record = match cache.read(now, |outcome| matches!(outcome, Outcome::Failed { .. })) {
         Some(record) => record,
         None => {
-            // The probe's own time is taken after it ran: `checked_at` is when the answer was true.
             let outcome = probe(advisory, reader).await;
-            let record = CacheRecord { fingerprint: advisory.fingerprint(), fetched_at: clock.now(), outcome };
-            write_cache(cache_dir, advisory, &record);
-            record
+            cache.write(outcome, clock.now())
         }
     };
     let id = advisory.id().as_str();

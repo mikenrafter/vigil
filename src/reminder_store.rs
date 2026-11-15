@@ -28,7 +28,6 @@ pub struct Entry {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReminderState {
     pub done_period: Option<String>,
     pub snooze_until: Option<Timestamp>,
@@ -137,10 +136,10 @@ impl ReminderStore {
         }
         // Remove/re-add starts a fresh lifecycle; a failed config write leaves
         // only an inactive state reset, never a partially written config.
-        self.update_state(id, |state| {
-            *state = ReminderState::default();
-            Ok(())
-        })?;
+        let state_path = self.root.join("reminders").join(format!("{id}.json"));
+        let _state_lock = lock(&state_path.with_extension("lock"))?;
+        atomic_write(&state_path, &serde_json::to_vec(&ReminderState::default()).map_err(|e| invalid(e.to_string()))?)?;
+        self.remove_cache(id)?;
         table.insert(id, Item::Table(spec));
         atomic_write(&self.path, doc.to_string().as_bytes())?;
         Ok(json!({"id": id, "spec": raw}))
@@ -156,8 +155,16 @@ impl ReminderStore {
         if table.remove(id).is_none() {
             return Err(invalid(format!("no reminder named {id:?}")));
         }
+        let state_path = self.root.join("reminders").join(format!("{id}.json"));
+        let _state_lock = lock(&state_path.with_extension("lock"))?;
         atomic_write(&self.path, doc.to_string().as_bytes())?;
+        remove_if_present(&state_path)?;
+        self.remove_cache(id)?;
         Ok(json!({"removed": id}))
+    }
+    fn remove_cache(&self, id: &str) -> Result<()> {
+        remove_if_present(&self.root.join("reminder-cache").join(format!("{id}.json")))?;
+        Ok(())
     }
     pub fn state(&self, id: &str) -> Result<ReminderState> {
         check_id(id)?;
@@ -178,10 +185,13 @@ impl ReminderStore {
         let path = self.root.join("reminders").join(format!("{id}.json"));
         let _lock = lock(&path.with_extension("lock"))?;
         let mut state = self.state(id)?;
+        let before = serde_json::to_vec(&state).map_err(|e| invalid(e.to_string()))?;
         let answer = update(&mut state)?;
+        let after = serde_json::to_vec(&state).map_err(|e| invalid(e.to_string()))?;
+        if before == after { return Ok(answer); }
         atomic_write(
             &path,
-            &serde_json::to_vec(&state).map_err(|e| invalid(e.to_string()))?,
+            &after,
         )?;
         Ok(answer)
     }
@@ -216,5 +226,12 @@ mod tests {
         let next = lock(&path);
         assert!(next.is_ok(), "dropped reminder guard still locked: {:?}", next.err());
         drop(inherited);
+    }
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }

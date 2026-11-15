@@ -86,6 +86,7 @@ fn cli_scope_uses_callers_cwd_even_for_a_foreign_watch() {
     // WHY: scope follows the calling process, not the cwd that made the watch.
     let sandbox = Sandbox::new();
     add(&sandbox);
+    run(&sandbox, &["remind", "show", "release"]);
     let input = sandbox.input("trigger");
     std::fs::write(&input, "old").unwrap();
     let watch = run(
@@ -222,60 +223,35 @@ async fn mcp_lifecycle_and_delivery_use_server_startup_cwd() {
 }
 
 #[test]
-fn example_edge_probe_checks_lib_diff_and_abstains_on_git_failure() {
-    // WHY: the example is an executable operator policy, not a placeholder.
-    // Fake external programs provide known facts; the real example evaluates them.
+fn example_edge_probe_uses_real_local_git_repositories() {
+    // WHY: C1/C2: the owner policy must work against real refs, tags and
+    // missing blobs, not fake git output that mirrors the implementation.
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-m", "unittest", "discover", "-s"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"))
+        .args(["-p", "test_edge_release_probe.py"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn real_sleeping_probe_does_not_delay_advice_or_a_fired_watch() {
+    // WHY: R2: exercise subprocess/runtime shutdown as well as virtual readers.
+    // A cold `sleep 15` must not hold CLI stdout or a fired watch past 2 seconds.
     let sandbox = Sandbox::new();
-    let bin = sandbox.dir.path().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    vigil::testing::write_script(&bin.join("gh"), "printf '[]'");
-    let git = bin.join("git");
-    vigil::testing::write_script(
-        &git,
-        "case \"$1\" in merge-base) echo abcdef123456;; diff) printf '70\\t40\\tlib/a.dart\\n';; *) exit 2;; esac",
-    );
-    let probe =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/edge-release-probe.py");
-    let run_probe = |threshold: &str| {
-        std::process::Command::new("python3")
-            .arg(&probe)
-            .args([
-                "--dir",
-                sandbox.cwd().to_str().unwrap(),
-                "--tz",
-                "UTC",
-                "--min-lines",
-                threshold,
-            ])
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .output()
-            .unwrap()
-    };
-    let due = run_probe("100");
-    assert_eq!(
-        due.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&due.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(due.stdout).unwrap(),
-        "110 changed lib/ lines across 1 files since abcdef123456 on integrate/next; threshold 100\n"
-    );
-    assert_eq!(run_probe("111").status.code(), Some(1));
-    vigil::testing::write_script(&git, "exit 7");
-    let failed = run_probe("100");
-    assert_eq!(failed.status.code(), Some(2));
-    assert!(
-        String::from_utf8(failed.stderr)
-            .unwrap()
-            .starts_with("Release check unavailable:")
-    );
+    run(&sandbox, &["remind", "add", "slow", "--scope", sandbox.cwd().to_str().unwrap(),
+        "--days", "mon,tue,wed,thu,fri,sat,sun", "--tz", "UTC", "--probe", r#"["sleep","15"]"#,
+        "--timeout-s", "19", "--message", "Ready"]);
+    let started = std::time::Instant::now();
+    let report = run(&sandbox, &["advice", "--json"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "advice waited for sleep 15");
+    assert_eq!(report["reminders"][0]["kind"], "unavailable");
+    let input = sandbox.input("slow-watch");
+    std::fs::write(&input, "old").unwrap();
+    run(&sandbox, &["create", &json!({"id":"watch","inputs":[{"kind":"file","path":input}],"fire":"change"}).to_string()]);
+    std::fs::write(&input, "new").unwrap();
+    let started = std::time::Instant::now();
+    let result = run(&sandbox, &["keepalive", "watch"]);
+    assert_eq!(result["status"], "fired");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "fired watch waited for sleep 15");
 }

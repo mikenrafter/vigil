@@ -102,13 +102,8 @@ struct Rig {
 }
 impl Rig {
     fn new(now: &str) -> Self {
-        let config_dir = tempfile::tempdir().unwrap();
-        let config = crate::Config {
-            reminders_file: Some(config_dir.path().join("reminders.toml")),
-            ..default_config()
-        };
-        // Keep the config under Env's tempdir instead of leaking a real user file.
-        let mut env = Env::with_clock_and_config(Arc::new(TokioClock::new(at(now))), config);
+        let mut env = Env::with_clock_and_config(Arc::new(TokioClock::new(at(now))), default_config());
+        // Keep the config under Env's tempdir instead of a real user file.
         env.config.reminders_file = Some(env.dir.path().join("reminders.toml"));
         let cwd = env.dir.path().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -200,7 +195,7 @@ async fn probes_due_not_due_failure_and_cache_boundaries() {
         "reminder release unavailable: probe exited with 7: network gone"
     );
     rig.env.reader.set_text("cmd:release-probe", "exit=1\n");
-    tokio::time::advance(Duration::from_secs(29)).await;
+    tokio::time::advance(Duration::from_secs(59)).await;
     assert_eq!(rig.kind().await, "unavailable");
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(rig.kind().await, "not_due");
@@ -227,7 +222,7 @@ async fn probe_timeout_and_exit_only_predicate() {
         .set_sleep("cmd:release-probe", Duration::from_secs(3600));
     let start = tokio::time::Instant::now();
     assert_eq!(rig.kind().await, "unavailable");
-    assert_eq!(start.elapsed(), Duration::from_secs(20));
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
 }
 
 fn request(id: crate::WatchId, long: bool) -> KeepaliveRequest {
@@ -464,14 +459,14 @@ async fn numeric_json_extraction_and_missing_input_do_not_invent_a_value() {
 async fn slow_probe_cannot_deliver_after_window_end_or_concurrent_done() {
     // WHY: schedule and suppression must still hold when the answer arrives,
     // not merely when a command starts (CLAIM(reminder-time/state)).
-    let rig = Rig::new("2026-11-12T00:59:50Z"); // Wed 17:59:50 Denver
+    let rig = Rig::new("2026-11-12T00:59:58Z"); // Wed 17:59:58 Denver
     rig.add(json!({"window":"09:00-18:00", "probe":["release-probe"], "cache_s":0}));
     rig.env
         .reader
         .set_text("cmd:release-probe", "exit=0\nready");
     rig.env
         .reader
-        .set_sleep("cmd:release-probe", Duration::from_secs(15));
+        .set_sleep("cmd:release-probe", Duration::from_secs(3));
     assert_eq!(rig.kind().await, "outside_schedule");
     let rig = Rig::new("2026-11-11T16:00:00Z");
     rig.add(json!({"probe":["release-probe"], "cache_s":0}));
@@ -486,4 +481,177 @@ async fn slow_probe_cannot_deliver_after_window_end_or_concurrent_done() {
         rig.env.vigil.remind_done("release").unwrap();
     });
     assert_eq!(kind, "done");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_reminder_probes_never_delay_returns_or_advice() {
+    // WHY: R2 / CLAIM(reminder-latency): a 15s reminder cannot delay a terminal
+    // watch, a budget return or advice, or consume the advice hook's 20s limit.
+    for route in ["terminal", "return", "advice"] {
+        let rig = Rig::new("2026-11-11T16:00:00Z");
+        rig.add(json!({"probe":["release-probe"], "timeout_s":19}));
+        rig.env.reader.set_text("cmd:release-probe", "exit=0\nready");
+        rig.env.reader.set_sleep("cmd:release-probe", Duration::from_secs(15));
+        let id = rig.quiet(route).await;
+        if route == "terminal" {
+            append_file(&rig.env.input_path(route), "changed");
+            rig.env.vigil.tick_due(&id).await.unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        if route == "advice" {
+            rig.env.vigil.advice_report().await.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1), "advice waited for reminder");
+        } else {
+            let result = rig.env.vigil.keepalive(request(id, route == "terminal")).await.unwrap();
+            if route == "terminal" {
+                assert_eq!(result.status, crate::WatchStatus::Fired);
+                assert!(started.elapsed() < Duration::from_secs(1), "terminal waited for reminder");
+            } else {
+                assert!(started.elapsed() <= Duration::from_secs(30), "return exceeded max_s for reminder");
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn all_cold_probes_start_concurrently_and_cache_the_total_deadline() {
+    // WHY: R2: no serial N*timeout cost, no probe starvation behind a hung
+    // neighbor, and failures last beyond the next 30s check, even cache_s=0.
+    let rig = Rig::new("2026-11-11T16:00:00Z");
+    rig.add(json!({"probe":["release-probe"], "cache_s":0}));
+    let mut other = spec(json!({"scope":[rig.cwd], "window":null, "probe":["other-probe"], "cache_s":0}));
+    other["days"] = json!(["wed"]);
+    rig.env.vigil.remind_add("other", other).unwrap();
+    for label in ["cmd:release-probe", "cmd:other-probe"] {
+        rig.env.reader.set_text(label, "exit=0\nready");
+        rig.env.reader.set_sleep(label, Duration::from_secs(15));
+    }
+    let started = tokio::time::Instant::now();
+    rig.env.vigil.envelope_reminders().await;
+    assert!(started.elapsed() < Duration::from_secs(1), "cache delivery awaited a probe");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    for label in ["cmd:release-probe", "cmd:other-probe"] {
+        assert_eq!(rig.env.reader.started_count(label), 1, "every probe starts in the same batch");
+    }
+    let notices = rig.env.vigil.envelope_reminders().await.unwrap();
+    assert_eq!(notices.len(), 2);
+    assert!(notices.iter().all(|n| n.kind == ReminderKind::Unavailable && n.message.contains("5s")), "{notices:?}");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    rig.env.vigil.envelope_reminders().await;
+    tokio::task::yield_now().await;
+    for label in ["cmd:release-probe", "cmd:other-probe"] {
+        assert_eq!(rig.env.reader.started_count(label), 1, "failure was retried before the check interval");
+    }
+}
+
+#[test]
+fn output_interpolation_has_a_utf8_byte_bound() {
+    // WHY: C3: a verbose probe must not inject 64KiB into every envelope.
+    let rule = reminder(json!({"message":"Check: {output}"}));
+    let (_, message, _) = rule.judge(&"é".repeat(1000)).unwrap();
+    assert!(message.len() <= "Check: ".len() + 400);
+    assert!(message.ends_with("..."));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_background_probe_cannot_hold_a_watch_fired_by_another_process() {
+    // WHY: R2 / CLAIM(S4-outbox): while probes sleep, external terminal state
+    // must still be observed on the next <=5s outbox pass.
+    let rig = Rig::new("2026-11-11T16:00:00Z");
+    rig.add(json!({"probe":["release-probe"], "timeout_s":19}));
+    rig.env.reader.set_text("cmd:release-probe", "exit=0\nready");
+    rig.env.reader.set_sleep("cmd:release-probe", Duration::from_secs(15));
+    let id = rig.quiet("external").await;
+    let other = rig.env.another_process_in(&rig.cwd);
+    let started = tokio::time::Instant::now();
+    let (result, ()) = tokio::join!(rig.env.vigil.keepalive(request(id.clone(), true)), async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        append_file(&rig.env.input_path("external"), "changed");
+        let mut watch = other.load_watch(&id).unwrap();
+        watch.last_tick_at = None; // Simulate an independent due tick.
+        other.store().save(&watch).unwrap();
+        other.tick_due(&id).await.unwrap();
+    });
+    assert_eq!(result.unwrap().status, crate::WatchStatus::Fired);
+    assert!(started.elapsed() <= Duration::from_secs(5), "watch waited for background probe");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_completed_background_probe_is_delivered_on_a_later_pass() {
+    // WHY: R2: spawning alone is insufficient; a later sense pass must pick
+    // up the cached due result and claim one early event without ending the watch.
+    let rig = Rig::new("2026-11-11T16:00:00Z");
+    rig.add(json!({"probe":["release-probe"], "cache_s":0}));
+    rig.env.reader.set_text("cmd:release-probe", "exit=0\nready");
+    rig.env.reader.set_sleep("cmd:release-probe", Duration::from_secs(3));
+    let id = rig.quiet("later").await;
+    let result = rig.env.vigil.keepalive(request(id, true)).await.unwrap();
+    assert_eq!(result.waited_s, Some(30));
+    assert_eq!(result.status, crate::WatchStatus::Pending);
+    assert_eq!(result.events.len(), 1);
+    assert_eq!(result.events[0].input, "reminder:release");
+    assert_eq!(rig.env.reader.started_count("cmd:release-probe"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_reminder_keeps_the_existing_advice_within_the_hook_timeout() {
+    // WHY: R2: a cold 15s boat-budget probe still reaches timeout-20's stdout
+    // when there is also a cold 15s reminder. Reminders add zero probe wait.
+    let mut rig = Rig::new("2026-11-11T16:00:00Z");
+    rig.env.config.advisories_file = Some(rig.env.dir.path().join("advisories.toml"));
+    std::fs::write(rig.env.config.advisories_file.as_ref().unwrap(), "[advisories]\n").unwrap();
+    rig.env.vigil = rig.env.another_process_in(&rig.cwd);
+    rig.env.vigil.advisory_add("budget", json!({
+        "probe":{"kind":"cmd","argv":["budget-probe"],"timeout_s":19},
+        "extract":{"name":"free","json":"free"}, "condition":"free > 0",
+        "message_when_true":"Use Boat", "message_when_false":"Use qex"
+    }), false).unwrap();
+    rig.add(json!({"probe":["release-probe"], "timeout_s":19}));
+    rig.env.reader.set_text("cmd:budget-probe", "exit=0\n{\"free\":15}");
+    for label in ["cmd:release-probe", "cmd:budget-probe"] {
+        rig.env.reader.set_sleep(label, Duration::from_secs(15));
+    }
+    let started = tokio::time::Instant::now();
+    let report = tokio::time::timeout(Duration::from_secs(20), rig.env.vigil.advice_report()).await.unwrap().unwrap();
+    assert_eq!(report["advice"][0]["message"], "Use Boat");
+    assert_eq!(started.elapsed(), Duration::from_secs(15));
+}
+
+#[test]
+fn removing_and_readding_recovers_corrupt_suppression_and_cache() {
+    // WHY: R4: the documented rm/add recovery must work without parsing the
+    // corrupt state it is supposed to replace, and must discard old cache.
+    let rig = Rig::new("2026-11-11T16:00:00Z");
+    rig.add(json!({}));
+    let state = rig.env.root().join("reminders/release.json");
+    let cache = rig.env.root().join("reminder-cache/release.json");
+    std::fs::write(&state, "broken").unwrap();
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, "old").unwrap();
+    rig.env.vigil.remind_rm("release").unwrap();
+    assert!(!state.exists());
+    assert!(!cache.exists());
+    // Even an orphaned corrupt state before add must be reset directly.
+    std::fs::write(&state, "broken again").unwrap();
+    rig.add(json!({}));
+    let state = rig.env.vigil.reminder_store().unwrap().state("release").unwrap();
+    assert_eq!(state.done_period, None);
+    assert_eq!(state.event_period, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unchanged_event_claim_does_not_replace_the_state_file() {
+    // WHY: R3: repeated checks of an already claimed period must not rewrite
+    // and fsync the same state every 30s. Replacement changes the inode.
+    use std::os::unix::fs::MetadataExt;
+    let rig = Rig::new("2026-11-11T16:00:00Z");
+    rig.add(json!({}));
+    let store = rig.env.vigil.reminder_store().unwrap();
+    let now = at("2026-11-11T16:00:00Z");
+    assert!(store.claim_event("release", "2026-W46", now).unwrap());
+    let path = rig.env.root().join("reminders/release.json");
+    let inode = std::fs::metadata(&path).unwrap().ino();
+    assert!(!store.claim_event("release", "2026-W46", now).unwrap());
+    assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
 }

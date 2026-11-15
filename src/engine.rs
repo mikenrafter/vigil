@@ -147,6 +147,8 @@ impl Persisted {
 }
 
 pub struct Vigil {
+    // Owns the one in-flight reminder refresh for this engine.
+    pub(crate) reminder_refresh: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) store: Store,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) judge: Arc<dyn Judge>,
@@ -173,6 +175,7 @@ impl Vigil {
     pub fn new(root: impl Into<PathBuf>, clock: Arc<dyn Clock>, judge: Arc<dyn Judge>, config: Config) -> Vigil {
         let credit_probe = Arc::new(crate::credit::SystemCreditProbe::from_config(&config));
         Vigil {
+            reminder_refresh: Mutex::new(None),
             store: Store::new(root),
             clock,
             judge,

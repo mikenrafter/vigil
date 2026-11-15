@@ -265,7 +265,7 @@ impl Reminder {
         let message = self
             .spec
             .message
-            .replace("{output}", output.trim())
+            .replace("{output}", &bounded_output(output.trim()))
             .replace("{value}", &rendered);
         Ok((due, message, value))
     }
@@ -313,4 +313,13 @@ impl ReminderNotice {
             period: String::new(),
         }
     }
+}
+
+// CLAIM(reminder-output): interpolation is at most 400 UTF-8 bytes including
+// the ellipsis [reminder_tests::output_interpolation_has_a_utf8_byte_bound].
+fn bounded_output(output: &str) -> String {
+    if output.len() <= 400 { return output.to_owned(); }
+    let mut end = 397;
+    while !output.is_char_boundary(end) { end -= 1; }
+    format!("{}...", &output[..end])
 }

@@ -40,8 +40,7 @@ impl Vigil {
     /// reminder or config diagnostic can be delivered.
     pub async fn advice_report(&self) -> Result<Value, AdvisoryError> {
         let advice: Option<Vec<Advice>> = self.envelope_advice().await;
-        let reminders = self.envelope_reminders().await;
-        let reminders_error = self.reminders_error();
+        let (reminders, reminders_error) = self.reminder_report().await;
         // Advice remains usable for project reminders when advisories are off.
         if advice.is_none() && reminders.is_none() && reminders_error.is_none() { return Err(AdvisoryError::Disabled); }
         let mut report = json!({});

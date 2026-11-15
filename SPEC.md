@@ -1258,24 +1258,48 @@ instant in that zone, including DST changes. `period` defaults to `week`, an
 ISO Monday-based local week including its ISO year; `day` uses the local date.
 
 Probes are optional argv arrays, run from the first scope directory through the
-advisory input reader and shared 20-second outer deadline. `timeout_s` is 1..19,
-default 10. Exit 0 means due, exit 1 means not due, and other exits, signals,
-timeouts and unreadable output mean `unavailable`. With `condition`, a successful
-probe must also satisfy an advisory-style numeric comparison, for example
-`value >= 100`. `extract` and `params` reuse advisory extraction and comparison;
-omitted extraction reads a single decimal number. `{output}` interpolates the
-trimmed probe output, and `{value}` the numeric value. Probes are trusted local
+advisory input reader. All eligible reminders refresh concurrently under one
+**5-second total deadline**, including `show`. `timeout_s` remains 1..19,
+default 10, but the shared deadline can end a command sooner. Exit 0 means due,
+exit 1 means not due, and other exits, signals, timeouts and unreadable output
+mean `unavailable`. Reserve exit 1 for a successfully evaluated false predicate;
+do not use an arbitrary command whose errors also exit 1. The example probe
+catches unexpected exceptions and exits 2.
+
+With `condition`, a successful probe must also satisfy an advisory-style numeric
+comparison, for example `value >= 100`. `extract` and `params` reuse advisory
+extraction and comparison; omitted extraction reads a single decimal number.
+`{output}` interpolates trimmed stdout plus stderr, capped at **400 UTF-8 bytes**
+including a `...` suffix when truncated. Numeric extraction uses the full captured
+output. `{value}` interpolates the numeric value. Probes are trusted local
 operator commands, just like advisories. Only add commands you would run yourself.
 
-Raw probe results are cached under `<state root>/reminder-cache` for `cache_s`
-seconds, default 600, range 0..86400. Command failures are cached for at most 30
-seconds. Probe argv, timeout and resolved cwd must match; future timestamps are
-not reused. Schedule, condition and message edits apply to cached output at
-once. Schedule and suppression are checked again after a probe returns, so a
-slow command cannot deliver outside its window or after a concurrent `done`. Cache writes are best effort. Invalid extraction is unavailable and uses
-the raw-output cache lifetime. Suppression state read/write failures are errors,
-never interpreted as a fresh empty state. There are at most 32 reminders, 16
-scopes per reminder, and 2048 bytes of message template per reminder.
+Advisories and reminders use one shared probe-cache implementation for
+fingerprints, timestamp validation, failure TTLs and atomic writes. Reminder
+results live under `<state root>/reminder-cache`; advisory results keep their
+existing namespace. `cache_s` defaults to 600, range 0..86400. Explicit `show`
+uses that TTL, so zero requests a new probe. Cache-only delivery retains a
+successful snapshot for at least 60 seconds so even a zero-TTL refresh can be
+picked up on a later check. Failures are cached for **60 seconds**, longer than
+the 30-second check interval, regardless of `cache_s`. Probe argv, timeout and
+resolved cwd must match; future timestamps are not reused. Schedule, condition
+and message edits apply to cached output at once. Schedule and suppression are
+checked again after a probe returns. Invalid numeric extraction is unavailable;
+its raw output is retained with the failure TTL while it remains invalid.
+
+Every return path and `advice` reads reminders **only from the cache**, adding
+**zero time waiting for reminder probes**. A cold or expired cache reports
+`unavailable: ... refresh pending` and starts one background refresh per engine.
+A later call/pass reads the result. Existing advisory evaluation keeps its own
+bounds; adding reminders cannot consume the advisory hook's remaining 20-second
+timeout. A short CLI process may exit before its refresh completes; use
+`vigil remind show ID` to warm a cache explicitly, or let an active MCP/long call
+refresh it. Refresh tasks do not create a daemon or wake a session.
+
+Cache writes are best effort. Suppression state read/write failures are errors,
+never interpreted as fresh empty state. Unchanged event claims do not rewrite
+or fsync state. There are at most 32 reminders, 16 scopes per reminder, and
+2048 bytes of message template per reminder.
 
 CLI operations:
 
@@ -1305,10 +1329,14 @@ only within its declared scope. A file-wide read/parse failure produces
 `reminders_error: "reminders unavailable: ..."` and no reminder list, because
 scope cannot be recovered. Status and cancel do not
 run reminder probes. `advice` works when advisories are disabled if reminder
-scope matches. Plain `advice` prints both lists as `id: message` lines.
+scope matches. Plain `advice` prints both lists as `id: message` lines. The
+PreToolUse advice hook carries both lists, with a separate project-reminders
+header so a release reminder is not framed as an operator rule for a heavy job.
 
 Long orchestrator keepalives check reminders at entry and every 30 seconds,
-using the probe cache. On a due reminder they return early with one
+after checking terminal watches and outboxes. They spawn refreshes without
+awaiting probes and pick up cached results on later passes. The existing
+5-second outbox polling bound is unchanged. On a due reminder they return early with one
 `kind: "reminder_due"` event, `reminder_id`, and `period`; a pending watch says
 `next: "act on events"`. Multiple distinct reminders may each contribute an
 event. This does not finish or cancel a watch. Ordinary short calls receive the
@@ -1321,5 +1349,6 @@ long-wait event is claimed atomically once per reminder per period across
 sessions; lists continue showing it until done/snoozed. A crash or transport
 cancellation after the claim can lose that early-return event. Later lists
 still carry the due reminder. Removing and re-adding an id resets suppression
-and event state; hand edits keep state. Config and state writers use immediate
+and event state and deletes its probe cache, even if the old state is corrupt;
+hand edits keep state. Config and state writers use immediate
 try-locks, reporting contention instead of blocking a call.
