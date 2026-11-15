@@ -267,7 +267,7 @@ impl ScriptedReader {
 fn script_key(input: &Input) -> Option<String> {
     match input {
         Input::Cmd { argv, .. } => Some(format!("cmd:{}", argv.join(" "))),
-        Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } => Some(input.label()),
+        Input::Qex { .. } | Input::QexIdle { .. } | Input::PathExists { .. } | Input::Until { .. } | Input::Process { .. } => Some(input.label()),
         _ => None,
     }
 }
