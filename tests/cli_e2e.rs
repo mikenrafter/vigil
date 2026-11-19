@@ -1626,7 +1626,7 @@ fn an_idle_hold_reads_only_active_jobs_so_a_long_history_cannot_blind_it() {
     // why: S1. On a busy host `qex list --under $HOME --all --json` was 2.5 MB
     //      of terminal jobs, over the 64 KiB command capture, and the old query
     //      made an idle queue read "error: qex answered no job list" for ever.
-    //      The fake answers the history query with 200 real-shaped records
+    //      The fake answers the history query with 250 real-shaped records
     //      (>400 KB) and the active query with `[]`: the hold releases on its
     //      first tick. Control: a busy queue of 40 real-shaped records, itself
     //      over the capture, keeps the hold pending.
@@ -1634,7 +1634,7 @@ fn an_idle_hold_reads_only_active_jobs_so_a_long_history_cannot_blind_it() {
     let sandbox = Sandbox::new();
     let qex = FakeQex::new(&sandbox);
     let cwd = sandbox.cwd();
-    let history = FakeQex::list_of(200, "completed");
+    let history = FakeQex::list_of(250, "completed");
     assert!(history.len() > 400_000, "the history must dwarf the capture: {}", history.len());
     qex.set_list(&format!("--under {} --all --json", cwd.display()), &history);
     qex.set_list(&format!("--under {} --state active --json", cwd.display()), "[]\n");
