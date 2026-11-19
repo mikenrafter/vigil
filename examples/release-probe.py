@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
-"""Offline edge release policy: 0 due, 1 not due, 2 unavailable.
+"""Example reminder probe: is a weekly release of a fork due?
+
+Exit 0 when due, 1 when not due, 2 when the answer is unavailable (the exit
+codes `vigil remind add --probe` expects). The release is due when, since the
+newest `next-*` tag (or the merge base with refs/remotes/upstream/main when
+there is no tag), the branch changed at least --min-lines lines or added at
+least --min-new-files files under lib/, and no `next-*` tag was created this
+local week. Generated and test files do not count.
 
 Only local objects and refs are read. Missing objects never trigger a fetch.
-The caller supplies the same IANA timezone as the reminder.
+The caller supplies the same IANA timezone as the reminder. Run it from the
+repository, or pass --dir.
+
+    vigil remind add release --scope /repos/app --days wed,thu,fri \
+      --tz Europe/Berlin --message 'Release due: {output}' \
+      --probe '["python3", "/path/to/release-probe.py", "--dir", "/repos/app", "--tz", "Europe/Berlin"]'
 """
 import argparse
 import datetime as dt
@@ -15,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 def git(directory, *args):
     # CLAIM(release-offline): both lazy fetch and all transport protocols are
-    # disabled [test_edge_release_probe missing_blob regression]. External diff
+    # disabled [test_release_probe missing_blob regression]. External diff
     # and textconv are disabled at the diff call sites as well.
     return subprocess.run(
         ["git", "-c", "protocol.allow=never", "-c", "core.fsmonitor=false", *args],
@@ -34,7 +46,7 @@ def eligible(path):
 
 def main(argv=None, now=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dir", default="/home/user/Documents/repos/edge")
+    parser.add_argument("--dir", default=".", help="the git repository (default: the current directory)")
     parser.add_argument("--branch", default="refs/remotes/origin/integrate/next")
     parser.add_argument("--tz", required=True)
     parser.add_argument("--min-lines", type=int, default=300)

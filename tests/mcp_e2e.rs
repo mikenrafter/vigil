@@ -113,7 +113,7 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
 #[tokio::test]
 async fn watch_create_declares_its_inputs_and_judge_fields_as_objects() {
     // why: with an untyped `items` schema, Codex (gpt-6-luna) sent each input
-    //      as a JSON-encoded string and the call failed (host-b smoke run).
+    //      as a JSON-encoded string and the call failed (a smoke run on a real host).
     // proves: CLAIM(create-schema-objects)
     let sandbox = Sandbox::new();
     let (client, _) = connect(&sandbox).await;
@@ -295,7 +295,7 @@ async fn a_blocked_keepalive_emits_a_strictly_increasing_counter_with_the_watch_
     //      and the watch id and its tick count ride in `message`. The watch
     //      has no change at first, so the call spans several ticks; after the
     //      first notification arrives ONE line is appended and the call fires.
-    //      The rmcp client attaches a progressToken itself (FINDINGS).
+    //      The rmcp client attaches a progressToken itself (docs/findings.md).
     //      T3: the round-2 test blocked the test's own (single-thread) runtime
     //      in `wait_until` right after spawning the request, so the task that
     //      sends the request and the handler that receives the notification
@@ -458,7 +458,7 @@ async fn sigterm_to_the_mcp_server_exits_it_and_kills_the_commands_it_was_runnin
     assert!(wait_until_async(Duration::from_secs(2), || proc_is_dead(cmd_pid)).await, "the command outlived the server");
 }
 
-// ---- surviving a full disk (specs/disk-full.md DF1-DF5) ------------------
+// ---- surviving a full disk (docs/specs/disk-full.md DF1-DF5) ------------------
 //
 // The server process is started with `VIGIL_TEST_FAULT` (src/fault.rs), so
 // its store writes fail while the test's other processes (the CLI used to
@@ -625,7 +625,7 @@ async fn keepalive_over_mcp_lists_a_secondary_watchs_failed_save_in_persist_fail
 }
 
 
-// ---- auto-interval (specs/auto-interval.md) --------------------------------
+// ---- auto-interval (docs/specs/auto-interval.md) --------------------------------
 //
 // As in cli_e2e.rs: the sandbox HOME holds the transcript, `VIGIL_UW_COMMAND`
 // is a fake `uw`, and every watch fires on its first tick so no call waits out

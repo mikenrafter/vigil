@@ -1,4 +1,4 @@
-//! Write fault injection for the store (specs/disk-full.md, "Test seam", and
+//! Write fault injection for the store (docs/specs/disk-full.md, "Test seam", and
 //! "Amendments after spec review round 1", S4).
 //!
 //! TEST-ONLY. The plan is read from `VIGIL_TEST_FAULT`, which assumes a trusted
@@ -49,7 +49,7 @@
 //!   existing one needs no disk space and is not an attempt). Stage
 //!   [`Stage::Create`] only. `begin`'s target is the lock file.
 //! * [`WriteKind::CreditState`]: one `write_atomic` of `<root>/credit-state.json`
-//!   (specs/auto-interval.md S9, N4). The same six stages as a watch file.
+//!   (docs/specs/auto-interval.md S9, N4). The same six stages as a watch file.
 //!   `begin`'s target is `credit-state.json`.
 //! * [`WriteKind::Reserve`]: the best-effort creation of `<root>/.reserve`.
 //!   Stages [`Stage::Create`] (before the file is created) and
@@ -102,7 +102,7 @@
 //!
 //! Paths in `while=` and file names must not contain `:` or `,`.
 //!
-//! # Holding a stage (specs/auto-interval.md N1)
+//! # Holding a stage (docs/specs/auto-interval.md N1)
 //!
 //! A rule may HOLD a stage instead of failing it: in the `ERRNO` position write
 //! `hold=PATH`. When an attempt the rule selects reaches the stage, it creates
@@ -142,7 +142,7 @@ pub enum WriteKind {
     Lock,
     /// Creation of `<root>/.reserve`.
     Reserve,
-    /// `<root>/credit-state.json` (specs/auto-interval.md S9).
+    /// `<root>/credit-state.json` (docs/specs/auto-interval.md S9).
     CreditState,
     /// An unsuccessful lock acquisition, with the lock path as target.
     LockWait,
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn the_credit_kind_has_the_six_watch_stages_and_a_hold_rule_parses() {
-        // why: specs/auto-interval.md N1/N4 inject at the `credit-state.json`
+        // why: docs/specs/auto-interval.md N1/N4 inject at the `credit-state.json`
         //      write. Every one of the six stages of `write_atomic` must be
         //      addressable (`credit@STAGE`), the bare kind targets the default
         //      `write` stage like a watch file, and `hold=PATH` takes the

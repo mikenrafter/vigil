@@ -1,4 +1,4 @@
-//! Cache-aware call window (specs/auto-interval.md AI1', AI3, S4, S8).
+//! Cache-aware call window (docs/specs/auto-interval.md AI1', AI3, S4, S8).
 //!
 //! The agent should not decide how long a keepalive call blocks. A call made
 //! by the main orchestrator session gets a window derived from the session's

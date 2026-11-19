@@ -1,4 +1,4 @@
-"""Owner policy regression tests; real local git repositories, no network."""
+"""Regression tests for the example release probe; real local git repositories, no network."""
 import contextlib
 import datetime as dt
 import importlib.util
@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("release_probe", Path(__file__).with_name("edge-release-probe.py"))
+spec = importlib.util.spec_from_file_location("release_probe", Path(__file__).with_name("release-probe.py"))
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 NOW = dt.datetime(2026, 11, 18, 18, tzinfo=dt.timezone.utc)
@@ -159,6 +159,20 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertEqual(code, 2, (out, err))
         self.assertTrue(err.startswith("Release check unavailable:"), err)
         self.assertFalse(marker.exists(), "probe tried a lazy network fetch")
+
+    def test_dir_defaults_to_the_current_directory(self):
+        # WHY: the example carries no machine-specific default; run from the repo.
+        self.write("lib/one.dart", "one\n")
+        self.write("lib/two.dart", "two\n")
+        self.commit("two files")
+        out, err = io.StringIO(), io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, cwd)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = probe.run(["--tz", "America/Denver"], now=NOW)
+        self.assertEqual((code, err.getvalue()), (0, ""))
+        self.assertIn("2 new files", out.getvalue())
 
     def test_unexpected_exceptions_are_unavailable(self):
         # WHY: C2: bugs such as TypeError must not silently mean not due.

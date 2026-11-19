@@ -799,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn condition_already_true_at_the_first_tick_fires_without_a_change() {
-        // why: R1 (kept by Sol): "fire = condition is evaluated on every tick,
+        // why: R1 (kept by the reviewer): "fire = condition is evaluated on every tick,
         //      including the first, changed or not". A state test, not a change
         //      test: "wait until the process has exited" returns at once if it
         //      already has - even though the baseline taken at create (V1)
@@ -1680,7 +1680,7 @@ mod tests {
             }
             assert!(file.starts_with(&state), "stray file outside the state root: {}", file.display());
             let relative = file.strip_prefix(&state).unwrap().to_string_lossy().to_string();
-            // DF4 (specs/disk-full.md): the one extra file is the reserve,
+            // DF4 (docs/specs/disk-full.md): the one extra file is the reserve,
             // and only at exactly 256 KiB. Optional here (its presence is
             // pinned by the disk-full tests); anything else stays forbidden.
             let allowed = relative == "lock"

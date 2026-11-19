@@ -2,7 +2,7 @@
 
 ## Why
 
-On 2026-11-10 host-b's root filesystem hit 100%. `vigil keepalive` then exited
+On 2026-11-10 a host's root filesystem hit 100%. `vigil keepalive` then exited
 1 with `io error: No space left on device (os error 28)` and printed no
 envelope. The agent lost the tick's result (events, digest, `next`) and had to
 guess whether its watch still existed. Sensing worked; only the state write
@@ -61,7 +61,7 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
 - D3: state root unchanged (`~/.local/state/vigil`); moving it to
   `$XDG_RUNTIME_DIR` was considered (cheaper, survives `/` filling) and
   rejected for now because it loses watches on reboot and tmpfs can fill too.
-- D4: skill doc (`agent-integration/skills/vigil/SKILL.md`) is updated in the
+- D4: the vigil agent skill doc is updated in the
   same change: glob inputs take `pattern`; a `change` watch ends after it
   fires; what `persist` means and what to do (free space, keep calling).
 
@@ -92,7 +92,7 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
   documented as test-only, a malformed value is a hard error, unset changes
   nothing.
 
-## Amendments after spec review round 1 (Sol 6/10, bar 9; orchestrator, 2026-11-10)
+## Amendments after spec review round 1 (reviewer 6/10, bar 9; orchestrator, 2026-11-10)
 
 - **S1 → DF3 narrowed.** Guaranteed: this call's answer (DF1). Best effort
   after a failed save: the next tick re-senses from the last saved baseline.
@@ -114,7 +114,7 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
   inode exhaustion, quotas, compression or a different filesystem can still
   fail, and then DF1/DF2 apply.
 - **S3 → DF4c.** Reserve create, delete and the retry run under the
-  store-wide lock (taken after any watch lock, matching SPEC.md's lock order),
+  store-wide lock (taken after any watch lock, matching docs/spec.md's lock order),
   so two processes cannot both spend or re-create it mid-rescue. vigil never
   keeps the reserve open. One threaded test races two rescues on one root:
   exactly one consumes the reserve, the other reports `disk_full`.
@@ -151,7 +151,7 @@ store level and end to end (`tests/cli_e2e.rs`, `tests/mcp_e2e.rs`).
 - `.tmp` cleanup after a successful write covers only that watch's own file;
   never sweep other `*.tmp` files (another process may be mid-write).
 
-## Defaults after spec review round 2 (final round; Sol 6/10; orchestrator, 2026-11-10)
+## Defaults after spec review round 2 (final round; reviewer 6/10; orchestrator, 2026-11-10)
 
 - **S1 qualified.** Redelivery covers `file` appends only, within the existing
   64 KiB pending-change cap (SPEC W7); `glob` reports current matches, like

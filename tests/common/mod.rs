@@ -275,7 +275,7 @@ pub fn send_signal(signal: &str, pid: u32) {
     assert!(Command::new("kill").args([signal, &pid.to_string()]).status().unwrap().success());
 }
 
-// ---- disk full (specs/disk-full.md) ------------------------------------
+// ---- disk full (docs/specs/disk-full.md) ------------------------------------
 
 /// The seam a spawned `vigil` reads its write-fault plan from (src/fault.rs
 /// documents the syntax). Set on one command at a time, so a test chooses

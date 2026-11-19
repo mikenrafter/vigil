@@ -13,7 +13,7 @@
   ],
   "cpu": 1,
   "cpu_source": "explicit",
-  "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+  "cwd": "/tmp/agent-1000/scratchpad/cap/w",
   "dedupe_key": null,
   "disk": null,
   "disk_path": null,
@@ -44,7 +44,7 @@
   "submitted_at": 1794489833,
   "submitter": [
     {
-      "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+      "cwd": "/tmp/agent-1000/scratchpad/cap/w",
       "name": "bash",
       "pid": 3080082,
       "ppid": 3075642,
@@ -52,7 +52,7 @@
       "terminal": false
     },
     {
-      "cwd": "/home/user/Documents/repos/host-config",
+      "cwd": "/home/user/repos/project",
       "name": ".claude-wrapped",
       "pid": 3075642,
       "ppid": 2766008,

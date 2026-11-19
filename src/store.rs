@@ -2,7 +2,7 @@
 //! under `<root>/locks/`, the short store-wide namespace lock, the reserve that
 //! lets a write survive a full disk, pruning (X3).
 //!
-//! # Surviving a full disk (specs/disk-full.md DF4-DF6)
+//! # Surviving a full disk (docs/specs/disk-full.md DF4-DF6)
 //!
 //! Every write the store makes (a watch file, a lock file, the reserve itself)
 //! goes through one path. A write that fails with ENOSPC or EDQUOT while a
@@ -271,7 +271,7 @@ impl Drop for CreditLock {
     }
 }
 
-/// What a successful [`Store::save`] did beyond writing (specs/disk-full.md
+/// What a successful [`Store::save`] did beyond writing (docs/specs/disk-full.md
 /// DF4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WriteOutcome {
@@ -1293,7 +1293,7 @@ mod tests {
         let store = Store::new(dir.path());
         let names = |sub: &str| -> Vec<String> {
             let mut out: Vec<String> = match std::fs::read_dir(dir.path().join(sub)) {
-                // DF4 (specs/disk-full.md): after a save the root also holds
+                // DF4 (docs/specs/disk-full.md): after a save the root also holds
                 // `.reserve`. It is not a lock file; its own tests are the
                 // "reserve" ones below. Changed from an unfiltered listing.
                 Ok(entries) => entries.map(|e| e.unwrap().file_name().to_string_lossy().into()).filter(|name: &String| name != ".reserve").collect(),
@@ -1491,7 +1491,7 @@ mod tests {
         assert!(!store.watch_path(&wid("old")).exists(), "control: prunable once the lock is free");
     }
 
-    // ---- disk full (specs/disk-full.md DF2, DF4, DF5, DF6) ----
+    // ---- disk full (docs/specs/disk-full.md DF2, DF4, DF5, DF6) ----
 
     use crate::fault::{FaultPlan, FaultRule, When, WriteKind};
 

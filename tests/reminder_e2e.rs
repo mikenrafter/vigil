@@ -223,13 +223,13 @@ async fn mcp_lifecycle_and_delivery_use_server_startup_cwd() {
 }
 
 #[test]
-fn example_edge_probe_uses_real_local_git_repositories() {
-    // WHY: C1/C2: the owner policy must work against real refs, tags and
+fn example_release_probe_uses_real_local_git_repositories() {
+    // WHY: C1/C2: the example policy must work against real refs, tags and
     // missing blobs, not fake git output that mirrors the implementation.
     let output = std::process::Command::new("python3")
         .args(["-I", "-m", "unittest", "discover", "-s"])
         .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"))
-        .args(["-p", "test_edge_release_probe.py"])
+        .args(["-p", "test_release_probe.py"])
         .output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }

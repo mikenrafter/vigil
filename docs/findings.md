@@ -1,17 +1,22 @@
-# vigil — phase 0 findings (2026-10-29)
+# vigil: phase 0 findings (2026-10-29)
 
-Toolchain: rustc/cargo 1.95.0 (nixos-26.05). Clients installed on host-a:
-Claude Code 2.1.301, codex-cli 0.163.0. Spike files: `/tmp/vigil-spike/`
-(probe source `rmcp-probe/src/main.rs`, binary `bin/rmcp-probe`; not kept in
-the repo).
+Notes from the spike that came before the first line of production code. They
+record what the judge API, the MCP clients and the crates looked like then;
+later sections of `docs/spec.md` cite them by section number.
+
+Toolchain: rustc/cargo 1.95.0 (nixos-26.05). Clients tested: Claude Code
+2.1.301, codex-cli 0.163.0. The spike was a throwaway `rmcp-probe` binary,
+not kept in the repo.
 
 A minimal rmcp stdio server compiled and completed a real round trip: the
 rmcp test client spawned it as a child process, read `instructions`, and got a
 tool's text result. The rmcp client attaches a `progressToken` by itself.
 
-## 1. Laya request and response schema
+## 1. Judge request and response schema
 
-Read from the laya 0.3.6 wheel (`agent.py`, `common.py`).
+The judge is any HTTP endpoint that speaks the Jev-style typed-decision API
+below. The schema was read from one implementation, the laya 0.3.6 wheel
+(`agent.py`, `common.py`).
 
 `questions` is an object keyed by question id, not a list. Three types; there
 is no bool, number or text type.
@@ -35,10 +40,11 @@ Errors: HTTP 400 or 500 with `{"error": "..."}`.
 
 - Laya truncates `state` from the end: it keeps the first tokens (about 768
   on typed-decisions). vigil must send about 2-3 KB, newest lines first.
-- Laya runs only on host-c, bound to 127.0.0.1 unless `exposeOnTailscale` is
-  set. Unreachable from host-a and host-b (port 4010 refused / timed out).
-- Laya's README uses "TypeSafe Jev" for a competing model, so the spec now
-  calls the judge "judge" (Laya).
+- The default URL is `http://127.0.0.1:4010` (`VIGIL_JUDGE_URL` overrides
+  it). A judge bound to loopback on one machine is unreachable from the
+  others, so the spec makes `fire = "judge"` fail at `watch_create` there.
+- vigil calls whatever serves this API "the judge"; Laya is one
+  implementation.
 
 ## 2. Claude Code channels: not building
 
@@ -122,9 +128,10 @@ rmcp = { version = "=3.8.0", features = ["client", "transport-child-process"] }
 
 ## Still unverified (needs a live session)
 
-- Claude: `claude mcp add -s local probe -e PROBE_SLEEP_S=270 -- /tmp/vigil-spike/bin/rmcp-probe server`,
+- Claude: `claude mcp add -s local probe -e PROBE_SLEEP_S=270 -- rmcp-probe server`,
   then have it call `mcp__probe__keepalive` once. Repeat with
   `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`, and with `-e PROBE_PROGRESS=0`.
-- Codex: `codex mcp add probe --env PROBE_SLEEP_S=270 -- /tmp/vigil-spike/bin/rmcp-probe server`,
+- Codex: `codex mcp add probe --env PROBE_SLEEP_S=270 -- rmcp-probe server`,
   call the tool; then `PROBE_SLEEP_S=320` to confirm the 300 s cutoff.
-- Laya: on host-c, POST the example request to `localhost:4010/v1/predict`.
+- Judge: on a host that runs one, POST the example request to
+  `localhost:4010/v1/predict`.

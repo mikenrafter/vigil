@@ -1,4 +1,4 @@
-//! Early attention (specs/auto-interval.md AI5, S6): when a watch has run
+//! Early attention (docs/specs/auto-interval.md AI5, S6): when a watch has run
 //! longer than its owner expected, or its inputs have gone quiet while its
 //! process still runs, the call ends early with one `attention` event.
 //!

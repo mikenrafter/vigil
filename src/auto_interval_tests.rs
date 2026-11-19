@@ -1,4 +1,4 @@
-//! Engine-level tests for specs/auto-interval.md (AI1'-AI6, AI8; AI7 is
+//! Engine-level tests for docs/specs/auto-interval.md (AI1'-AI6, AI8; AI7 is
 //! removed). Cross-cutting, like `disk_full_tests.rs`: each test drives
 //! `Vigil::keepalive` and reads the envelope as the agent sees it (JSON), so
 //! the wire format is what is pinned, not the Rust types behind it.
@@ -536,7 +536,7 @@ fn every_write_fails() -> FaultPlan {
 
 #[tokio::test(start_paused = true)]
 async fn cache_and_clock_ride_along_with_a_disk_full_persist_note() {
-    // why: specs/disk-full.md DF1/DF2 must coexist with AI3/AI4. Every write
+    // why: docs/specs/disk-full.md DF1/DF2 must coexist with AI3/AI4. Every write
     //      fails; the quiet tick cannot be saved, so DF1a holds the call one
     //      watch interval (20 s) and answers pending with `persist.ok = false`.
     //      The same envelope must still carry `cache` (270 s default) and
@@ -2206,7 +2206,7 @@ async fn a_hook_whose_state_write_failed_runs_again_at_the_next_check() {
 
 
 // ============================================================================
-// Review round 1 (Sol 6/10, bar 9): S1-S8. One red test per finding, each
+// Review round 1 (reviewer 6/10, bar 9): S1-S8. One red test per finding, each
 // beside the others because they drive `Vigil::keepalive` end to end.
 // ============================================================================
 

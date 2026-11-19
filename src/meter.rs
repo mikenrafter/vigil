@@ -1,4 +1,4 @@
-//! The read meter (specs/auto-interval.md N2): counts what the PRODUCTION read
+//! The read meter (docs/specs/auto-interval.md N2): counts what the PRODUCTION read
 //! paths really consume, so a test can assert "at most 512 KiB of a 5 MiB
 //! transcript" about the code that ships, not about a copy of it.
 //!

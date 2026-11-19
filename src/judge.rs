@@ -1,5 +1,7 @@
-//! The judge: a POST to Laya's `/v1/predict` (FINDINGS section 1), the rule
-//! that turns its answers into fire/no-fire, and the `state` trimming.
+//! The judge: a POST to a Jev-style typed-decision endpoint's `/v1/predict`
+//! (docs/findings.md section 1; Laya is one implementation), the rule that
+//! turns its answers into fire/no-fire, and the `state` trimming. Only
+//! watches with `fire = "judge"` reach it.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -13,7 +15,7 @@ use crate::watch::ChangedInput;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// One typed answer (FINDINGS section 1). Extra Laya fields (`action`,
+/// One typed answer (docs/findings.md section 1). Extra fields (Laya's `action`,
 /// `probabilities`, `legend`) are ignored on read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -339,7 +341,7 @@ mod tests {
 
     #[test]
     fn answers_parse_from_the_findings_literals_ignoring_extra_fields() {
-        // why: parity with FINDINGS section 1 (Laya 0.3.6 wheel): noul has
+        // why: parity with docs/findings.md section 1 (Laya 0.3.6 wheel): noul has
         //      noul/confidence/action, choice has choice/probabilities, score
         //      has score/legend/probabilities. Extras must be ignored.
         let noul: Answer = serde_json::from_value(
@@ -384,7 +386,7 @@ mod tests {
 
     #[test]
     fn state_lists_the_newest_lines_first() {
-        // why: SPEC step 4 + FINDINGS: Laya keeps only the START of state, so
+        // why: SPEC step 4 + docs/findings.md: Laya keeps only the START of state, so
         //      the newest (last) lines must come first. Each line appears once.
         // proves: CLAIM(newest-first)
         let state = build_state("P", &[changed("file:/x", "a\nb\nc\n")], 2560);
@@ -529,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn predict_posts_state_and_questions_unchanged_and_parses_the_answer() {
-        // why: SPEC step 4 + FINDINGS section 1: POST $URL/v1/predict with
+        // why: SPEC step 4 + docs/findings.md section 1: POST $URL/v1/predict with
         //      exactly {state, questions}; questions pass through unchanged
         //      (including unknown nested fields); the literal Laya response
         //      parses to typed answers. Positive control: the server counter moved.
@@ -560,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn non_2xx_responses_map_to_status_errors() {
         // why: SPEC "Failure rules": non-2xx is a judge failure. Laya returns
-        //      400/500 with {"error": ...} (FINDINGS section 1).
+        //      400/500 with {"error": ...} (docs/findings.md section 1).
         let server = FakeHttpServer::start(Behavior::Respond { status: 500, body: r#"{"error":"boom"}"#.into() });
         assert_eq!(client(&server).predict(&request()).await, Err(JudgeError::Status(500)));
         server.set_behavior(Behavior::Respond { status: 400, body: r#"{"error":"bad"}"#.into() });

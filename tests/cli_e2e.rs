@@ -157,7 +157,7 @@ fn nothing_is_written_outside_the_state_root() {
     assert!(root.join("watches").join("w.json").is_file(), "control: the watch file exists");
     let mut under_root: Vec<String> = list_files(&root).into_iter().map(|(p, _)| p.strip_prefix(&root).unwrap().to_string_lossy().to_string()).collect();
     under_root.sort();
-    // DF4 (specs/disk-full.md): the reserve is the one extra file, exactly
+    // DF4 (docs/specs/disk-full.md): the reserve is the one extra file, exactly
     // 256 KiB when present (its presence is pinned by the disk-full tests).
     if let Some(position) = under_root.iter().position(|name| name == ".reserve") {
         under_root.remove(position);
@@ -718,7 +718,7 @@ fn sigterm_to_vigil_create_waiting_on_stdin_exits_143() {
     assert_eq!(output.status.code(), Some(143), "{:?}", output.status);
 }
 
-// ---- surviving a full disk (specs/disk-full.md DF1-DF6) -----------------
+// ---- surviving a full disk (docs/specs/disk-full.md DF1-DF6) -----------------
 //
 // The disk cannot really be filled from a test, so the spawned binary is told
 // to fail its own store writes through `VIGIL_TEST_FAULT` (src/fault.rs;
@@ -928,7 +928,7 @@ fn an_empty_fault_variable_is_treated_as_unset() {
     assert!(sandbox.watch_file("e").is_some(), "the write went through");
 }
 
-// ---- round 2: amendments DF1a, DF3a, DF5a, DF7 (specs/disk-full.md) ------
+// ---- round 2: amendments DF1a, DF3a, DF5a, DF7 (docs/specs/disk-full.md) ------
 
 #[test]
 fn a_quiet_keepalive_on_a_full_disk_is_held_one_interval_then_returns_pending_without_a_redelivery_flag() {
@@ -1029,7 +1029,7 @@ fn a_create_whose_baseline_cannot_be_saved_leaves_no_placeholder_so_the_same_id_
     assert_eq!(sandbox.watch_file("w").unwrap()["status"], "pending");
 }
 
-// ---- round 3: seam stages (specs/disk-full.md S4) --------------------------
+// ---- round 3: seam stages (docs/specs/disk-full.md S4) --------------------------
 
 #[test]
 fn a_malformed_stage_in_a_fault_plan_is_refused_loudly_and_a_well_formed_one_is_not() {
@@ -1076,7 +1076,7 @@ fn a_failure_at_the_rename_stage_through_the_binary_keeps_the_old_file_and_still
 }
 
 
-// ---- auto-interval (specs/auto-interval.md) --------------------------------
+// ---- auto-interval (docs/specs/auto-interval.md) --------------------------------
 //
 // The sandbox HOME is the only place vigil looks for `~/.claude/projects`, and
 // `VIGIL_UW_COMMAND` points at a fake `uw`, so none of these touches the real
@@ -1623,7 +1623,7 @@ fn the_cli_help_documents_hold_and_the_orchestrator_flag() {
 
 #[test]
 fn an_idle_hold_reads_only_active_jobs_so_a_long_history_cannot_blind_it() {
-    // why: S1. On this host `qex list --under /home/user --all --json` is 2.5 MB
+    // why: S1. On a busy host `qex list --under $HOME --all --json` was 2.5 MB
     //      of terminal jobs, over the 64 KiB command capture, and the old query
     //      made an idle queue read "error: qex answered no job list" for ever.
     //      The fake answers the history query with 200 real-shaped records
@@ -1715,8 +1715,8 @@ fn a_hold_made_on_a_name_stores_the_job_id_and_survives_the_name_being_reused() 
 
 // ---- hold items (W42) and the removal of `vigil wait` ------------------------
 //
-// Claim ids W42-H1..W42-H5 / W42-W1 are the hold-items spec's own
-// (knowledge/research/agentic-practice-2026-11/vigil-hold-items-spec.md).
+// Claim ids W42-H1..W42-H5 / W42-W1 are the hold-items spec's own (see
+// `src/items.rs` and docs/spec.md "Hold items").
 
 #[test]
 fn hold_add_and_hold_done_work_across_separate_processes_through_the_binary() {

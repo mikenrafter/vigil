@@ -1,4 +1,4 @@
-# vigil — spec
+# vigil: design spec
 
 An MCP server that keeps an agent's turn open while a cheap model watches
 things for it. The agent says what to watch and for how long. After that it
@@ -6,12 +6,14 @@ calls one tool, `keepalive`, over and over. Each call returns the tick count,
 elapsed time, what changed, and what the watcher decided. The big model
 spends almost no inference while it waits, and its prompt cache stays warm.
 
-Written in Rust. Status: spec reviewed (round 1); phase 0 research in
-`FINDINGS.md`, its live-client checks still open (V28); not built.
+Written in Rust. This is the design record: it started as the spec and
+gathered each later feature's decisions, so later sections override earlier
+ones where they say so. Phase 0 research is in `docs/findings.md`; optional
+tools and harness settings are in `docs/integrations.md`.
 
 ## Why this exists
 
-Research (see an earlier design discussion) found parts but no whole:
+Research in an earlier design discussion found parts but no whole:
 
 - wait-style MCP servers (mcp-await, herdr-mcp, mcp-timer) block until a
   fixed condition or timeout, with no judgement about relevance;
@@ -21,8 +23,8 @@ Research (see an earlier design discussion) found parts but no whole:
   wake is a full-model turn and is tied to one harness.
 
 vigil joins them: wait primitives, a tick/elapsed counter, a cheap judge
-(Laya, a typed-decision service), and a delivery path that does not
-need the agent to re-arm anything.
+(a Jev-style typed-decision endpoint; Laya is one implementation), and a
+delivery path that does not need the agent to re-arm anything.
 
 The manual `manual-keepalive` skill does about half of this. vigil replaces
 the `sleep 270 && echo keepalive` command with a tool whose result carries the
@@ -34,7 +36,8 @@ context the agent expects on wake.
   A long watch is just many short `keepalive` calls; vigil never resumes a
   session.
 - Targets Claude Code and Codex only.
-- No new model. The judge is the existing `laya` flakelet on `127.0.0.1:4010`.
+- No new model. The judge is an existing HTTP endpoint, by default
+  `http://127.0.0.1:4010` (`VIGIL_JUDGE_URL`). Only `fire = "judge"` uses it.
 - No config UI. A watch is one JSON object.
 - No daemon, no database, no background sensing. Inputs are read only while
   a `keepalive` call is running. Between calls nothing watches; that is
@@ -51,13 +54,14 @@ context the agent expects on wake.
 - **tick**: one evaluation round of a watch (read inputs, maybe ask the judge).
 - **keepalive**: the agent-facing blocking tool call. One call can span many
   ticks. It is the thing the agent repeats.
-- **judge**: the cheap model. A POST to Laya's `/v1/predict`. (Not "Jev":
-  Laya's README uses that name for a competing model.)
+- **judge**: the cheap model: a Jev-style typed-decision endpoint, reached
+  with `POST /v1/predict` (`docs/findings.md` §1). Laya is one
+  implementation. Watches that do not use `fire = "judge"` never call it.
 
 ## Architecture
 
 ```
-agent harness ──stdio MCP──▶ vigil mcp ──▶ judge (laya :4010)
+agent harness ──stdio MCP──▶ vigil mcp ──▶ judge (:4010, optional)
                                │
                                ├─ watch files ($XDG_STATE_HOME/vigil/watches/<id>.json)
                                └─ input readers (file, glob, cmd, url, port, process)
@@ -85,7 +89,7 @@ spike (phase 0).
 Path 1 is required. Channel push (an MCP server starting a turn on its
 own) is out of scope: Claude Code loads custom channel servers only behind
 `--dangerously-load-development-channels`, drops refused events silently,
-and Codex has no equivalent (`FINDINGS.md` §2).
+and Codex has no equivalent (`docs/findings.md` §2).
 
 1. **Blocking `keepalive` result (required).** The call ticks in-process
    up to `max_s` or until the watch fires, then returns the envelope below.
@@ -103,8 +107,8 @@ and Codex has no equivalent (`FINDINGS.md` §2).
    no ceiling until the watch finished and printed one final envelope (exit
    0 fired, 3 expired, 4 cancelled, 5 attention), for long waits where a cold
    prompt cache was acceptable. Removed because there is always a session to
-   keep warm (owner, 2026-11-13); a session whose work is done posts its
-   summary and ends its turn instead (vigil skill, "Going cold"). Its
+   keep warm; a session whose work is done calls `cold`, posts its summary
+   and ends its turn instead. Its
    decisions D11, R8, V21 and W6 below are history notes.
 
 ### Interval and long deadlines
@@ -113,7 +117,7 @@ The agent stays "in cache" only if the gap between its requests is under the
 prompt-cache TTL, so every `keepalive` call has a fixed window:
 
 - The window is chosen by vigil, not by the agent: **270 s** by default, and
-  up to **3000 s** (50 minutes; owner 2026-11-13: at most 50 minutes, was 3300 s)
+  up to **3000 s** (50 minutes; it was 3300 s until 2026-11-13)
   for the orchestrator on a 1-hour prompt cache (see
   "Cache-aware window, time and early attention"). An explicit `max_s` still
   wins, clamped to 30..=3000 (30..=270 for Codex and for an ambiguous
@@ -164,8 +168,8 @@ All tools return a JSON text block (the envelope or a subset) and set
   `"change"` (fire on any input change, no model call), `"condition"`
   (fire when every input that has a `want` meets it, no model call), or
   `"hold"` (fire when every input, all of them work, has ended; see "Holds").
-- `judge_questions` is passed to Laya unchanged, in Laya's own schema
-  (`FINDINGS.md` §1): an object keyed by question id, types `noul`, `choice`,
+- `judge_questions` is passed to the judge unchanged, in the typed-decision
+  schema (`docs/findings.md` §1): an object keyed by question id, types `noul`, `choice`,
   `score`. vigil checks only that it is a non-empty object and that the
   rule's `question` is a key in it.
 - `judge_rule` is exactly one of `{"question", "noul_gte": p}` (p in 0..1),
@@ -275,8 +279,8 @@ For each covered watch, each time a tick comes due:
    `POST $VIGIL_JUDGE_URL/v1/predict` (default `http://127.0.0.1:4010`).
    `state` is the prompt, then the changed inputs' new content with the
    newest lines first, cut to `VIGIL_JUDGE_STATE_BYTES` (default 2560) on a
-   UTF-8 boundary. Laya keeps only the start of `state`, so newest-first puts
-   the lines that matter where it reads. Record the answers.
+   UTF-8 boundary. A judge such as Laya keeps only the start of `state`, so
+   newest-first puts the lines that matter where it reads. Record the answers.
 5. Fire if the rule matches: append an event, set `status: "fired"`, and
    return from `keepalive`.
 6. Rewrite the watch file (hashes, tick count, `last_tick_at`, file
@@ -337,7 +341,7 @@ Nothing is written to the working tree or any repository, and nothing to
 
 ### Surviving a full disk
 
-Full contract and decisions: `specs/disk-full.md` (claims DF1-DF7 and the
+Full contract and decisions: `docs/specs/disk-full.md` (claims DF1-DF7 and the
 amendments S1-S6, N1-N3); proof: `src/disk_full_tests.rs`, the `store.rs` and
 `fault.rs` tests, `tests/cli_e2e.rs`, `tests/mcp_e2e.rs`. The intent: a state
 write that fails must never cost the agent the tick's answer, and a full disk
@@ -433,9 +437,10 @@ must be named as such.
 
 ## Open questions (resolve in phase 0)
 
-1. **Laya request schema.** The flakelet shows `POST /v1/predict` with
-   `{state, questions}` but not the question types or result shape. Read the
-   Laya SDK and fix `judge_questions` to match before phase 2 (done: `FINDINGS.md` §1).
+1. **Judge request schema.** The endpoint is `POST /v1/predict` with
+   `{state, questions}`, but the question types and result shape were not
+   written down. Read an implementation's SDK and fix `judge_questions` to
+   match before phase 2 (done: `docs/findings.md` §1).
 2. **Channels.** Out of scope since the stateless design; findings kept for
    reference only.
 3. **Blocking limit.** Confirm a 270 s blocking call completes in both Claude
@@ -448,18 +453,16 @@ must be named as such.
 
 ## Packaging
 
-Scout module at ``, following `modules/apk-builder/`:
-
-- `scout` facet: the `vigil` binary and an agent skill (`skills/vigil/SKILL.md`)
-  to every host.
-- No `flakelet` and no service: `vigil mcp` is started by the harness. The
-  `laya` flakelet is an optional runtime dependency (default
-  `127.0.0.1:4010`, override with `VIGIL_JUDGE_URL`); where it is unreachable,
-  `fire = "judge"` returns an error at `watch_create` instead of failing later.
-- Wire the MCP server into the agent configs through `agent-integration`:
+- One binary, `vigil`, built with cargo or the flake in this repository
+  (`nix build`). No service: `vigil mcp` is started by the agent harness.
+- The judge is an optional runtime dependency (default
+  `http://127.0.0.1:4010`, override with `VIGIL_JUDGE_URL`); where it is
+  unreachable, `fire = "judge"` returns an error at `watch_create` that names
+  `VIGIL_JUDGE_URL`, instead of failing later. Other fire rules never need it.
+- Wire the MCP server into the agent configs (`docs/integrations.md`):
   - Codex: `[mcp_servers.vigil]` with `tool_timeout_sec = 330`. Codex's
     docs say the default is 60 s, its source says 300 s, and it is a hard
-    limit that progress does not reset (`FINDINGS.md` §3).
+    limit that progress does not reset (`docs/findings.md` §3).
   - Claude Code: set `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=280000` in the
     settings `env`. Otherwise any call over 2 minutes is moved to a
     background task and a 270 s `keepalive` costs two model round trips.
@@ -467,10 +470,22 @@ Scout module at ``, following `modules/apk-builder/`:
   them (Codex reads the first 512, Claude Code cuts at 4,096). They must say:
   create a watch, then call `keepalive` repeatedly until `next` says
   "act on events".
-- Per `AGENTS.md`: build and evaluate only the host you are on. On host-a,
-  use `nix eval .#nixosConfigurations.host-a.config.system.build.toplevel.drvPath`,
-  not `nix flake check`. Cargo builds on host-a or host-b (8 GB RAM) need
-  `low-ram-hosts`; use `-j2`.
+- Cargo builds on a machine with 8 GB of RAM need `-j2`.
+
+**Environment variables.** All optional. `VIGIL_JUDGE_URL` (the judge, D5);
+`VIGIL_JUDGE_STATE_BYTES`, `VIGIL_DIGEST_MAX_BYTES` (W2, W3);
+`VIGIL_CLAUDE_PROJECTS_DIR`, `CLAUDE_CONFIG_DIR`, `VIGIL_UW_COMMAND`,
+`VIGIL_ON_CREDIT_CHANGE` (credit check, AI1'-AI8); `VIGIL_ADVISORIES_FILE`,
+`VIGIL_REMINDERS_FILE` (`off` turns each off); `VIGIL_ORCHESTRATOR_CONFIRM`
+(`off` turns the orchestrator challenge off); `VIGIL_TEST_FAULT` (test-only);
+`XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME` (where files live); `PATH` (where
+`boat`, `qex` and `uw` are looked for). `VIGIL_COLD_SUMMARY` replaces the
+phrase `cold` uses to say what to post before the turn ends; the default is
+"post a short summary of this session (task, progress, in-flight ids, tools,
+the user's standing rules)", so `cold`'s `next` reads "Going cold: <phrase>,
+then end your turn. Nothing will wake you." The MCP server instructions use the
+same phrase (the default appears there as "post a short summary"). Example:
+`VIGIL_COLD_SUMMARY="post an inline BabelTele summary"`.
 
 ## Build plan (for build-loop)
 
@@ -478,7 +493,7 @@ Each phase ends with passing tests. Tests that need the judge use a fake HTTP
 server that returns canned answers.
 
 0. **Spike (no production code).** Answer the four open questions above.
-   Output: a short `FINDINGS.md` and pinned crate versions.
+   Output: a short `docs/findings.md` and pinned crate versions.
 1. **Core.** Watch files, input readers, tick logic, deterministic fire
    rules, locking, pruning. CLI: `create`, `status`, `list`, `cancel`,
    `keepalive`. Tests: file/glob/cmd/url/port/process readers; unchanged
@@ -494,9 +509,8 @@ server that returns canned answers.
    in the test drives create, then repeated keepalive; blocked call returns
    early on fire; `max_s` of 5 and 9999 are clamped to 30 and 3000 (270 for Codex; originally 270, see "Cache-aware window"); a deadline hours away returns `pending` at 270 s (the default window); pending returns carry `tick` and `now`; quiet envelope is
    small.
-4. **Nix packaging and skill.** Scout module, flakelet, agent skill, MCP
-   wiring. Verify per `AGENTS.md`: the affected output evaluates, then
-   `nix flake check --no-build` (or the host-a-safe eval).
+4. **Nix packaging and skill.** Flake package, agent skill, MCP wiring.
+   Verify: the package evaluates, then `nix flake check --no-build`.
 
 ## Acceptance
 
@@ -509,10 +523,11 @@ server that returns canned answers.
   from a new process does not reset elapsed time or the tick count.
 - With the judge stopped, a change still reaches the agent within three ticks and
   is labelled as unjudged.
-- Live run on host-b: a cheap Codex agent (GPT Luna, low effort) watches a
-  few long-running commands for about an hour using only `keepalive`. host-b
-  has no Laya, so this run uses `change` and `condition`; the judge path is
-  covered by the fake-judge tests and a separate live check on host-c.
+- Live run on a host without the judge: a cheap Codex agent (low effort)
+  watches a few long-running commands for about an hour using only
+  `keepalive`. With no judge this run uses `change` and `condition`; the judge
+  path is covered by the fake-judge tests and a separate live check on a
+  second machine that runs one.
 
 ## Defaults taken (raise at next check-in)
 
@@ -521,11 +536,11 @@ server that returns canned answers.
 - D3: ticks keep the watch's cadence across calls (`last_tick_at + interval_s`).
 - D4: finished watch files are deleted 7 days after they finish.
 - D5: judge URL from `VIGIL_JUDGE_URL`, default `http://127.0.0.1:4010`.
-- D6: Claude Code gets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=280000` through
-  agent-integration, so `keepalive` stays one round trip.
-- D7: URL inputs are http only (no TLS stack, to avoid aws-lc-rs on 8 GB hosts).
+- D6: Claude Code gets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=280000` in its
+  settings, so `keepalive` stays one round trip.
+- D7: URL inputs are http only (no TLS stack, to avoid building aws-lc-rs on small machines).
 - D11 (history): `vigil wait` was added as delivery path 3 so Claude Code agents could wait with no re-trigger; removed 2026-11-13 (W42-W1).
-- D8: the live hour-long test uses `change`/`condition`; Laya stays on host-c.
+- D8: the live hour-long test uses `change`/`condition`; the judge runs on a second machine.
 
 ## Resolved details (from the red phase, 2026-10-29)
 
@@ -553,7 +568,7 @@ server that returns canned answers.
 - R8 (history): `vigil wait` had no `--stream` (under D1 a watch fires once);
   the whole command was removed 2026-11-13 (W42-W1).
 
-## Spec review round 1 (Sol, 2026-10-29)
+## Spec review round 1 (reviewer model, 2026-10-29)
 
 These override anything above that disagrees.
 
@@ -617,8 +632,8 @@ These override anything above that disagrees.
   (time actually waited, rounded to the nearest second). D10: `interval_s` default 20, clamped 1..=3600.
 - V27: `VIGIL_DIGEST_MAX_BYTES` bounds the whole digest including the
   `[digest cut]` marker.
-- V28: live-client checks (FINDINGS "Still unverified") are an acceptance
-  gate, run on host-b before calling the clients compatible.
+- V28: live-client checks (docs/findings.md "Still unverified") are an acceptance
+  gate, run on a real machine before calling the clients compatible.
 
 ## Red-phase follow-ups (after round 1)
 
@@ -638,7 +653,7 @@ These override anything above that disagrees.
 - W7 the persisted pending change is capped at 64 KiB per input, newest
   kept, with `[truncated]` when cut.
 
-## Spec review round 2 (Sol) — final decisions
+## Spec review round 2 (reviewer model): final decisions
 
 Round 2 was the last spec round; these are decisions, not open questions.
 
@@ -683,11 +698,11 @@ Round 2 was the last spec round; these are decisions, not open questions.
 
 ## Cache-aware window, time and early attention
 
-Full claims and decisions: `specs/auto-interval.md` (AI1-AI8, S1-S10, N1-N4).
+Full claims and decisions: `docs/specs/auto-interval.md` (AI1-AI8, S1-S10, N1-N4).
 This section is the behaviour as built.
 
 **Why.** An agent should not pick a tick length. A Claude main session with a
-1-hour prompt cache needs a call only every ~50 minutes (owner 2026-11-13: at most 50 minutes; was 55); a 270 s tick costs
+1-hour prompt cache needs a call only every ~50 minutes (at most 50 minutes since 2026-11-13; it was 55); a 270 s tick costs
 about 11 times as many model calls. A long wait hides time, so a long window
 needs a clock in the envelope and an early wake when a job looks stuck.
 
@@ -781,13 +796,15 @@ ENOSPC) exits 1 and leaves the events to be replayed by the next call.
 
 **Environment.** `CLAUDE_CODE_SESSION_ID`, `AGENT`, `CODEX_*` (identity);
 `VIGIL_CLAUDE_PROJECTS_DIR`, `CLAUDE_CONFIG_DIR`, `HOME` (transcripts);
-`VIGIL_UW_COMMAND`; `VIGIL_ON_CREDIT_CHANGE`. `VIGIL_TEST_FAULT` gains the write
+`VIGIL_UW_COMMAND` (default `uw`; a `uw` that is missing, fails or is slow is
+treated exactly as "not available", silently, and the transcripts decide);
+`VIGIL_ON_CREDIT_CHANGE`. `VIGIL_TEST_FAULT` gains the write
 kind `credit` and `hold=PATH` rules (test-only, trusted environment).
 
 
 ## Holds: keep an orchestrator in cache by watching its own work
 
-Claims `H1`-`H12`. Built 2026-11-12 at the owner's request (PLAN W36). Proof:
+Claims `H1`-`H12`. Built 2026-11-12 (W36). Proof:
 `src/hold.rs` and `src/watch.rs` (unit), `src/tick.rs` and `src/keepalive.rs`
 (engine, virtual time), `tests/cli_e2e.rs` and `tests/mcp_e2e.rs` (binary).
 
@@ -842,11 +859,16 @@ watches (`judge`, `change`, `condition`) read and behave exactly as before
   skipped`. `queued starting running` are live, and so is any other state word
   (a newer qex's): only the eight end a hold. A job that fails and is queued for
   a retry reads live again; the hold is evaluated afresh at every tick.
-- Not senseable from here, said plainly: a **T3 task / delegate** (its state is
-  in the T3 server, not on this host) and a **`boat exec` run** as a Boat job.
-  Hold on the local `boat` process with `pid:<pid>`, or have the work write a
-  marker and hold on `file:<path>`. vigil does not guess.
-- `qex` is found on `PATH`.
+- Not senseable from here, said plainly: a **delegated run with no pid or
+  file to watch** (for example a T3 Code delegate task, whose state lives in
+  the T3 Code server) and a **`boat exec` run** as a Boat job. Hold on the
+  local `boat` process with `pid:<pid>`, or have the work write a marker and
+  hold on `file:<path>`, or use a `none` item. vigil does not guess.
+- `qex` is found on `PATH`. qex is optional
+  (https://github.com/stephenc/qex): without it, creating a hold (or
+  `hold add`, or `watch_create`) with `qex:` or `idle:` work fails at once
+  with an error naming qex and where to get it, and writes nothing. Other
+  work kinds do not need it.
 
 **Hold rules (H4).** Validation at create, errors not clamps:
 - every input is a work input (the five above; a `process` input must say
@@ -884,7 +906,7 @@ window on a 1 hour prompt cache (and the credit checks). `"orchestrator": false`
 `watch_id` to `keepalive`: a no-id call covers every watch this process
 created, holds included.
 
-**Orchestrator confirmation (owner 2026-11-14, `src/orchestrator.rs`).**
+**Orchestrator confirmation (2026-11-14, `src/orchestrator.rs`).**
 Orchestrator mode is only for the main session that speaks with the user.
 `orchestrator: true` on keepalive with a named `watch_id`, hold or watch_create,
 for a watch that is not yet confirmed, needs `confirm` (CLI `--confirm`) set to
@@ -907,7 +929,7 @@ Watch confirmations are separate at `orchestrator/watches/<id>.json`, tied to
 the watch's `created_at`, so a later watch with that id and a different creation
 time needs confirmation again.
 
-**Orchestrator peers (pilot, owner 2026-11-14, `src/peers.rs`).** Blocking
+**Orchestrator peers (pilot, 2026-11-14, `src/peers.rs`).** Blocking
 calls attempt to atomically register `calls/<pid>-<n>.json` and remove it on
 return, error or cancellation. Records contain identity, transport (`mcp` or
 `cli`), effective mode, start, watch ids, window, and per-watch kind,
@@ -977,9 +999,9 @@ done` and what changed in the release (H6).
 
 ### Hold items: one hold, many units of work (W42)
 
-Claims `W42-H1`..`W42-H5`, decisions `W42-D1`..`W42-D9` (full text:
-`knowledge/research/agentic-practice-2026-11/vigil-hold-items-spec.md`). Built
-2026-11-13 (owner: "there is always a session/cache to keep warm"). Proof:
+Claims `W42-H1`..`W42-H5`, decisions `W42-D1`..`W42-D9` (the full text is a
+design note kept outside this repository). Built 2026-11-13, because there
+is always a session or cache to keep warm. Proof:
 `src/items.rs` (unit), `src/hold_items_tests.rs` (engine, virtual time),
 `tests/cli_e2e.rs` and `tests/mcp_e2e.rs` (binary). Code: the model and the
 one place that decides item events is `src/items.rs`; the front doors are in
@@ -1032,7 +1054,8 @@ attention pass raises item overdue through `attention::due`.
   together get two ids.
 - **One keepalive covers every item (W42-H4)**: all items live in the one
   hold watch.
-- **`none` items (W42-H5).** A T3 delegate cannot be sensed: `--for none
+- **`none` items (W42-H5).** A delegated run with no pid or file to watch
+  (such as a T3 Code delegate task) cannot be sensed: `--for none
   --label L` (label required) with an optional `--expect-s`. `vigil hold done
   ID LABEL` / MCP `hold_done {watch_id, label}` ends it under the lock: an
   unknown label, a sensed item ("ends by itself"), an item that already ended
@@ -1043,7 +1066,7 @@ attention pass raises item overdue through `attention::due`.
   one made with `watch_create`) keeps the old rule: no item events, the
   release names each input and its reading. `hold add` and `hold done` refuse
   it (make a new hold).
-- **Error readings are no news (Fable S3, 2026-11-13).** An item whose input
+- **Error readings are no news (review S3, 2026-11-13).** An item whose input
   reads `error:` (a qex status timeout, an unreadable file) is neither ended nor
   un-ended at that tick: `ended_at` and its end event stay as they were, and it
   does not count as ended for the release. A never-ended item that only reads
@@ -1054,7 +1077,7 @@ attention pass raises item overdue through `attention::due`.
 
 ### Agent caps and cold follow-ups (W46)
 
-Claims below follow `knowledge/research/agentic-practice-2026-11/vigil-agent-cap-spec.md`.
+Claims below follow a design note kept outside this repository.
 Proof: `src/hold_items_tests.rs`, `tests/cli_e2e.rs`, `tests/mcp_e2e.rs` (tests prefixed `w46_`).
 
 - **Classes (W46-K1).** CLI `hold` and `hold add` accept `--cap work|review`;
@@ -1097,15 +1120,16 @@ it alone. Run the new binary on every host that shares a state root.
 ## Advisories
 
 Rules the operator programs at runtime that tell agents what to do, delivered
-wherever vigil talks to an agent. Built 2026-11-12 at the owner's request. Proof:
+wherever vigil talks to an agent. Built 2026-11-12. Proof:
 `src/advisory*.rs` (unit), `src/advisory_tests.rs` (engine), `tests/advisory_e2e.rs`
 (binary, CLI and MCP). Claim ids below are the `CLAIM(...)` ids in code and tests.
 
-**Why.** An agent cannot see Boat's remaining hours or the host's memory; the
-operator can write down once what to do about them, and every agent reads it
-where it already looks: the keepalive result. The first rule: prefer Boat
-(cloud sandboxes) for all heavy work; when Boat's remaining hours are at or below
-a threshold (default 10%), use `qex` on the local host.
+**Why.** An agent cannot see a cloud sandbox plan's remaining hours or the
+host's memory; the operator can write down once what to do about them, and
+every agent reads it where it already looks: the keepalive result. The
+example rule, seeded when `boat` is installed: prefer Boat (cloud sandboxes)
+for heavy work; when Boat's remaining hours are at or below a threshold
+(default 10%), run heavy work on the local host.
 
 **An advisory** is `{probe, extract, params, condition, message_when_true,
 message_when_false, cache_s}` under an id `[A-Za-z0-9_-]{1,64}`:
@@ -1142,11 +1166,11 @@ advisory:
 
 ```toml
 [advisories.boat-budget]
-probe = { kind = "cmd", argv = ["env", "BOAT_NO_UPDATE=1", "/home/user/.local/bin/boat", "limits", "--json"], timeout_s = 15 }
+probe = { kind = "cmd", argv = ["env", "BOAT_NO_UPDATE=1", "/usr/local/bin/boat", "limits", "--json"], timeout_s = 15 }
 extract = { name = "pct", json = "planIncluded.vmHoursRemaining", of = "planIncluded.vmHours", scale = 100 }
 condition = "pct <= threshold"
 message_when_true = "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): ..."
-message_when_false = "Boat has {pct}% ... prefer Boat ... via edge.research/bin/boat-run; ..."
+message_when_false = "Boat has {pct}% of its hours left (above the {threshold}% threshold): prefer Boat ..."
 cache_s = 600
 [advisories.boat-budget.params]
 threshold = 10
@@ -1156,8 +1180,11 @@ The file is read on every call, so a hand edit takes effect with no restart.
 `vigil advisory ...` edits it in place under `<file>.lock` (an `flock` held across
 read, check and rename), keeping the operator's comments, and writes
 tmp + fsync + rename; a refused edit leaves the bytes untouched. A file that does
-not exist is created with the default `boat-budget`; a file that exists is never
-given defaults back (so `rm boat-budget` sticks). A table that no longer
+not exist is created once: with the default `boat-budget` when `boat` is on
+`PATH` at that moment, else with no advisory (a header saying why, and the
+same advisory as a commented example). A file that exists is never given
+defaults back (so `rm boat-budget` sticks, and installing `boat` later adds
+nothing by itself). A table that no longer
 validates is reported as its own `unavailable` entry and does not hide the others;
 a file that is not TOML is an error naming it and is never rewritten.
 
@@ -1197,16 +1224,17 @@ change values, not add parameters: use `add --replace` for that.
 `advisory_rm {id}`: the same operations as the CLI (`src/advisory_ops.rs`), errors
 as `isError` with the CLI's message.
 
-**Default advisory `boat-budget` (CLAIM(advisory-boat-budget)).** Probe `env
-BOAT_NO_UPDATE=1 <home>/.local/bin/boat limits --json` (read-only; `env` keeps the
-CLI from self-updating, and the absolute path survives a PATH without
-`~/.local/bin`; `boat` alone when HOME is unknown). `pct =
+**Default advisory `boat-budget` (CLAIM(advisory-boat-budget)).** Seeded only
+when `boat` is on `PATH` when the file is created. Probe `env BOAT_NO_UPDATE=1
+<boat> limits --json`, where `<boat>` is the path found on `PATH` then
+(read-only; `env` keeps the CLI from self-updating, and the absolute path
+survives a hook whose `PATH` lacks that directory). `pct =
 planIncluded.vmHoursRemaining / planIncluded.vmHours * 100`, `threshold = 10`,
-true when `pct <= threshold` (exactly 10% counts): use `qex` on this host for
-heavy jobs; false: prefer Boat via `edge.research/bin/boat-run` for builds and
-test runs, `qex` locally only for one or two quick runs. To change the threshold:
-`vigil advisory set boat-budget threshold=15` (or the MCP tool `advisory_set`, or
-edit the file).
+true when `pct <= threshold` (exactly 10% counts): run heavy jobs on this host,
+through a queue such as qex; false: prefer Boat for builds and test runs, and
+run only one or two quick jobs locally. To change the threshold: `vigil
+advisory set boat-budget threshold=15` (or the MCP tool `advisory_set`, or edit
+the file).
 
 **Trust.** The model is an untrusted caller of `advisory_add` and `advisory_set`,
 but `watch_create` already lets it run any `cmd` input, so an advisory probe adds
@@ -1215,9 +1243,10 @@ until removed). Text read from a probe never reaches an agent: only the extracte
 number, formatted, is placed in the operator-written message. Bounds above cap
 what a caller can make vigil store or run.
 
-**Hook.** agent-integration's Claude/Codex PreToolUse hook runs `vigil advice`
-before heavy Bash commands (flutter test, edge-test, cargo build/test, gradle,
-nix build, qex submit) and injects the lines as additional context; it fails open.
+**Hook.** A Claude Code or Codex PreToolUse hook can run `vigil advice` before
+heavy Bash commands (cargo build/test, gradle, nix build, a test runner) and
+inject the lines as additional context; such a hook should fail open
+(`docs/integrations.md`).
 
 ## Reminders (pilot)
 
@@ -1231,10 +1260,10 @@ TOML and comments, validate before writing, and lock around atomic updates.
 
 ```toml
 [reminders.release]
-scope = ["/repos/edge", "/repos/edge.research", "/repos/edge.worktrees"]
+scope = ["/repos/app", "/repos/app.worktrees"]
 days = ["wed", "thu", "fri"]
 window = "09:00-18:00"
-tz = "America/Denver"
+tz = "Europe/Berlin"
 probe = ["/path/to/release-check"]
 message = "Fork release due: {output}"
 period = "week"
@@ -1242,8 +1271,8 @@ cache_s = 600
 timeout_s = 10
 ```
 
-Scope uses directory components, including the directory itself. `/repos/edge`
-never includes `/repos/edge-heavy` or `/repos/edge.research`; list sibling scopes
+Scope uses directory components, including the directory itself. `/repos/app`
+never includes `/repos/app-heavy` or `/repos/app.worktrees`; list sibling scopes
 explicitly. Absolute scopes are required. Paths are normalized, and existing
 paths canonicalized, so an existing symlink uses its target. Nonexistent paths
 use lexical normalization. The CLI uses its process cwd; MCP uses its server's
@@ -1305,7 +1334,7 @@ CLI operations:
 
 ```sh
 vigil remind add ID --scope DIR... --days wed,thu,fri \
-  --window 09:00-18:00 --tz America/Denver \
+  --window 09:00-18:00 --tz Europe/Berlin \
   --probe '["release-check"]' --message 'Release due: {output}' --period week
 vigil remind list
 vigil remind show ID

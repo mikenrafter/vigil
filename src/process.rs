@@ -1,6 +1,6 @@
 //! Child processes that own a process group, so that stopping one stops its
 //! descendants too (the C9 lesson for `cmd` inputs, reused by the credit probe
-//! and the credit hook, specs/auto-interval.md S7).
+//! and the credit hook, docs/specs/auto-interval.md S7).
 //!
 //! Invariants: a [`GroupGuard`] that is armed SIGKILLs the whole group when it
 //! drops, so dropping the future that owns a child never leaves a descendant

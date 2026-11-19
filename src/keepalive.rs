@@ -2016,7 +2016,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_15_s_cmd_with_timeout_20_completes_and_fires_across_repeated_30_s_calls() {
-        // why: X4 / T5 exactly: Sol's counterexample was a command that takes
+        // why: X4 / T5 exactly: the reviewer's counterexample was a command that takes
         //      longer than the budget allows being restarted and discarded on
         //      every max_s = 30 call, so even a durable change never fires. A
         //      cmd that takes 15 s (virtual: scripted, no real waits) with

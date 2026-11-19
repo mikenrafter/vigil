@@ -1,5 +1,5 @@
 //! vigil: an MCP server that keeps an agent's turn open while a cheap judge
-//! watches things for it. See `SPEC.md` and `FINDINGS.md` beside this crate.
+//! watches things for it. See `docs/spec.md` and `docs/findings.md` in this repository.
 //!
 //! Module map: `watch`/`store`/`tick` (watches and their files), `keepalive`
 //! (the blocking call), `peers` (same-session call registry),

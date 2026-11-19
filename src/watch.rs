@@ -236,7 +236,8 @@ pub enum FireKind {
     Hold,
 }
 
-/// Judge questions in Laya's own schema, passed through unchanged.
+/// Judge questions in the typed-decision schema (docs/findings.md section 1),
+/// passed through to the judge unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JudgeQuestions(pub Map<String, Value>);

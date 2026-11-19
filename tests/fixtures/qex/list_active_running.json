@@ -6,7 +6,7 @@
       "sleep",
       "5"
     ],
-    "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+    "cwd": "/tmp/agent-1000/scratchpad/cap/w",
     "state": "starting",
     "pid": null,
     "pid_start_token": null,
@@ -18,7 +18,7 @@
         "ppid": 3075642,
         "start": 116142752,
         "name": "bash",
-        "cwd": "/tmp/claude-1001/-home-mini-Documents-repos-host-config/4ef1bd29-9934-4d10-affc-abc803804e77/scratchpad/cap/w",
+        "cwd": "/tmp/agent-1000/scratchpad/cap/w",
         "terminal": false
       },
       {
@@ -26,7 +26,7 @@
         "ppid": 2766008,
         "start": 116129534,
         "name": ".claude-wrapped",
-        "cwd": "/home/user/Documents/repos/host-config",
+        "cwd": "/home/user/repos/project",
         "terminal": false
       },
       {

@@ -96,12 +96,12 @@ must, to pass `--max-s 270`). Recorded in the vigil skill.
 - **AI7 — going cold.** When `since_last_call_s` exceeds the TTL in force (the
   cache has certainly expired), or AI2' just fired, the envelope carries
   `"cold": true` and `next` tells the agent, before anything else, to post an
-  inline BabelTele summary of the session to the user, collapsed as
-  `<details><summary>Session state (BabelTele)</summary> … </details>`,
+  inline summary of the session to the user, collapsed as
+  `<details><summary>Session state</summary> … </details>`,
   covering: the task and its progress, work in flight (ids, paths), the tools
   in use (MCP servers, CLIs such as vigil and qex, watch ids), the user's
   standing rules for this session, and the skills loaded. The same instruction
-  is also delivered by a hook (agent-integration W4: UserPromptSubmit when the
+  is also delivered by a hook (a UserPromptSubmit hook in the agent configuration, when the
   gap since the last assistant turn exceeds the TTL), so it works without vigil.
 
 Interplay to note: setting `promptCacheTtl: "1h"` in Claude settings would
@@ -113,8 +113,8 @@ dropped) unless the owner prefers that trade.
 
 - **AI7 removed.** vigil never wakes or re-activates a session to summarize
   it. "Going cold" is the agent's own step when it is told to end the session
-  (or its keepalive duty ends): it posts the collapsed BabelTele summary
-  (`<details><summary>Session state (BabelTele)</summary> … </details>`: task
+  (or its keepalive duty ends): it posts the collapsed summary
+  (`<details><summary>Session state</summary> … </details>`: task
   and progress, work in flight, tools in use, standing rules, skills loaded),
   then stops calling vigil. This lives in the manual-keepalive and vigil
   skills (PLAN W3), not in vigil's code. `watch_cancel` needs no change.
@@ -153,7 +153,7 @@ to a settings file switched the session's next cache write from
 after one more request. `~/.claude/settings.json` is a plain writable file
 (Nix activation copies it), so the hook can manage the TTL live.
 
-Default hook (agent-integration, PLAN W5): `claude-cache-ttl-policy` reads
+Example hook (from the agent configuration vigil was first used with): `claude-cache-ttl-policy` reads
 the JSON state on stdin and sets `promptCacheTtl` in `~/.claude/settings.json`
 with an atomic jq merge that touches only that key: `"5m"` while on usage
 credits (writes cost 1.25x input instead of 2x), `"1h"` otherwise (the pinned
@@ -163,13 +163,13 @@ pinned 1 h, which is the correct state off credits.
 
 ## Defaults after red (orchestrator, 2026-11-11)
 
-The red report's A1–A22 (`host-config.research/vigil-auto-interval/red-report.md`)
+The red report's A1-A22 (kept outside this repository)
 are accepted as written, except:
 - **A12 amended.** `vigil wait` (removed 2026-11-13, W42-W1)'s final envelope also carries `clock` (and
   `cache`), since a background `vigil wait` is the main way Claude sessions
   use vigil; status and cancel envelopes do not.
 
-## Amendments after spec review round 1 (Sol 6/10, bar 9; orchestrator, 2026-11-11)
+## Amendments after spec review round 1 (reviewer 6/10, bar 9; orchestrator, 2026-11-11)
 
 - **S1.** `wait`'s final envelope carries `cache` (from its last internal call)
   and `clock` measuring the whole `wait` (`waited_s` = total). Fix the tests
@@ -214,7 +214,7 @@ are accepted as written, except:
   secondary watch, attention vs terminal result in the same call (terminal is
   primary; attention still delivered, as a secondary event).
 
-## Defaults after spec review round 2 (final round; Sol 6/10; orchestrator, 2026-11-11)
+## Defaults after spec review round 2 (final round; reviewer 6/10; orchestrator, 2026-11-11)
 
 Red-report defaults R2-A1..A8 accepted (A7 offsets: 60, 300, 540 s). Remaining:
 - **N1.** A cross-process test races two real vigil processes (barrier via a
@@ -232,7 +232,7 @@ Red-report defaults R2-A1..A8 accepted (A7 offsets: 60, 300, 540 s). Remaining:
   fails or the process dies after the hook, the next check re-runs it. Test
   with an injected failure after the hook's side effect.
 
-## Review round 1 of the green phase (Sol 6/10, bar 9; implementer, 2026-11-11)
+## Review round 1 of the green phase (reviewer 6/10, bar 9; implementer, 2026-11-11)
 
 Decisions taken while fixing S1-S8 of that review (none changes an earlier claim;
 each makes one precise):

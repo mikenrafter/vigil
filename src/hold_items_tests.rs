@@ -291,7 +291,7 @@ async fn one_keepalive_on_the_hold_id_covers_every_item_even_from_another_proces
 
 #[tokio::test(start_paused = true)]
 async fn an_error_reading_never_ends_or_un_ends_an_item() {
-    // why: Fable S3. `a` (expect 100 s) ends; a later read fails
+    // why: review S3. `a` (expect 100 s) ends; a later read fails
     //      (`error: timeout after 10s`, a flaky qex) and then reads
     //      `completed` again. A failed read says nothing about the work: `a`
     //      stays ended through it, so there is no `item overdue: a` (its
@@ -320,7 +320,7 @@ async fn an_error_reading_never_ends_or_un_ends_an_item() {
 
 #[tokio::test(start_paused = true)]
 async fn an_item_that_only_ever_reads_errors_still_goes_overdue_once() {
-    // why: Fable S3, control for the test above: an error reading must not
+    // why: review S3, control for the test above: an error reading must not
     //      hide a stuck item. `a` (expect 100 s, overdue at 150 s) never
     //      reads anything but an error, and is raised overdue once.
     // proves: S3

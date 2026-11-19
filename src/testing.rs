@@ -554,7 +554,7 @@ fn serve_one(mut stream: TcpStream, shared: &ServerShared) -> Option<TcpStream> 
     }
 }
 
-/// Laya's response for one `noul` question (FINDINGS section 1, literal).
+/// Laya's response for one `noul` question (docs/findings.md section 1, literal).
 pub fn laya_noul_body(question: &str, noul: f64, confidence: f64) -> String {
     format!(
         r#"{{"model":"laya-rl-agent","answers":{{"{question}":{{"type":"noul","noul":{noul},"confidence":{confidence},"action":{{"act_probability":0.71}}}}}},"usage":{{"input_tokens":120,"output_tokens":0}}}}"#
@@ -711,7 +711,7 @@ pub fn judge_request(id: &str, path: &Path, interval_s: u64) -> CreateRequest {
     }
 }
 
-// ---- auto-interval fixtures (specs/auto-interval.md) ----------------------
+// ---- auto-interval fixtures (docs/specs/auto-interval.md) ----------------------
 
 /// One assistant record in the shape Claude Code 2.1.301 writes to
 /// `~/.claude/projects/*/<session>.jsonl` (captured 2026-11-11 from a live

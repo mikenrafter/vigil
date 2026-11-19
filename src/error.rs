@@ -91,7 +91,7 @@ pub enum CreateError {
     Store(#[from] StoreError),
 }
 
-/// What a person can do about a failed write (specs/disk-full.md DF2): free
+/// What a person can do about a failed write (docs/specs/disk-full.md DF2): free
 /// space (`DiskFull`: ENOSPC or EDQUOT) or look at the disk (`Io`: anything
 /// else). The wire names are `disk_full` and `io`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,7 +164,7 @@ pub enum StoreError {
     NotFound(String),
     #[error("{}", .0.describe(FailureKind::Io.label()))]
     Io(IoFailure),
-    /// ENOSPC or EDQUOT (specs/disk-full.md DF2, DF5).
+    /// ENOSPC or EDQUOT (docs/specs/disk-full.md DF2, DF5).
     #[error("{}", .0.describe(FailureKind::DiskFull.label()))]
     DiskFull(IoFailure),
     #[error("serialization error: {0}")]

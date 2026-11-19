@@ -39,7 +39,7 @@ pub struct OtherWatch {
     pub event_ids: Vec<String>,
 }
 
-/// A write that did not happen (specs/disk-full.md DF2): what this call's
+/// A write that did not happen (docs/specs/disk-full.md DF2): what this call's
 /// answer could not persist. The envelope itself is still complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistFailure {

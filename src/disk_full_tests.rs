@@ -1,4 +1,4 @@
-//! Engine-level tests for surviving a full disk (specs/disk-full.md, claims
+//! Engine-level tests for surviving a full disk (docs/specs/disk-full.md, claims
 //! DF1-DF7, with the amendments DF1a, DF3a, DF3b, DF4a, DF5a, DF5b of
 //! "Amendments after red" and S1, S4, S5 of "Amendments after spec review
 //! round 1"). Cross-cutting on purpose: one scenario drives the store, the tick,
@@ -1720,7 +1720,7 @@ fn a_file_redelivers_every_append_since_the_saved_baseline_up_to_the_64_kib_capt
     }
 }
 
-// ---- review round 1 (Sol 6/10): S1 failed-save early return ----------------
+// ---- review round 1 (reviewer 6/10): S1 failed-save early return ----------------
 
 /// One quiet `cmd` watch `id` (interval 20 s, deadline 3600 s) whose probe
 /// `probe-<id>` answers `ok`, created by `vigil`.
@@ -1738,7 +1738,7 @@ async fn probe_watch_every(env: &Env, vigil: &Vigil, id: &str, interval_s: u64) 
 
 #[test]
 fn a_quiet_failed_save_ends_the_call_without_waiting_for_a_watch_whose_lock_is_held() {
-    // why: review S1 (Sol round 1): DF1a says "A tick whose save failed ends
+    // why: review S1 (reviewer, round 1): DF1a says "A tick whose save failed ends
     //      the call and returns its envelope". `sense` only checked
     //      `any_unsaved()` AFTER every tick of the round had finished, so a
     //      quiet failed save on watch "a" waited for watch "b", whose watch
@@ -1820,7 +1820,7 @@ fn a_failed_save_ends_the_round_but_keeps_the_saves_that_were_ready_with_it() {
     });
 }
 
-// ---- review round 1 (Sol 6/10): S2 redelivery provenance -------------------
+// ---- review round 1 (reviewer 6/10): S2 redelivery provenance -------------------
 
 #[test]
 fn a_changed_event_another_process_saved_under_a_lost_event_id_comes_back_flagged_redelivered() {
@@ -1900,7 +1900,7 @@ fn a_retry_that_saved_keeps_its_redelivered_flag_until_the_envelope_is_really_de
     });
 }
 
-// ---- review round 1 (Sol 6/10): S3 the rescue wait blocked the executor ----
+// ---- review round 1 (reviewer 6/10): S3 the rescue wait blocked the executor ----
 
 /// Like [`scenario`] but on REAL time: the contended-lock wait of a rescue is
 /// measured against the wall clock and against a task that must keep running
@@ -2105,7 +2105,7 @@ fn the_redelivery_memory_is_released_when_its_envelope_is_delivered() {
     });
 }
 
-// ---- review round 2 (Sol 4/10): S4 a dropped wait must not drop the answer --
+// ---- review round 2 (reviewer 4/10): S4 a dropped wait must not drop the answer --
 
 /// The `events` array a single quiet probe watch `id` fires when its probe
 /// turns `bad`, in a world where nothing fails: the oracle for what a damaged
@@ -2150,7 +2150,7 @@ async fn two_fired_watches_whose_saves_fail(env: &Env, a_errno: i32, b_errno: i3
 
 #[test]
 fn a_rescue_waiting_for_the_store_lock_keeps_its_answer_when_another_watch_ends_the_round() {
-    // why: review S4 (Sol round 2), DF1/DF2: "A senses an event, gets ENOSPC,
+    // why: review S4 (reviewer, round 2), DF1/DF2: "A senses an event, gets ENOSPC,
     //      awaits the held global lock; B returns EIO immediately; round
     //      termination drops A before CallRecord receives A's event or
     //      failure." The rescue wait is async since review S3, and the round
@@ -2281,7 +2281,7 @@ fn a_tick_that_saved_keeps_its_report_when_the_reserve_upkeep_after_its_save_is_
     });
 }
 
-// ---- review round 2 (Sol 4/10): S5 the rescue deadline was captured too early -
+// ---- review round 2 (reviewer 4/10): S5 the rescue deadline was captured too early -
 
 /// A quiet watch "q" whose probe takes `read_takes` of virtual time and then
 /// reads `bad` (so its tick fires), and a process whose FIRST watch write of
@@ -2300,7 +2300,7 @@ async fn tick_with_a_slow_failing_write(env: &Env, read_takes: Duration, write_t
 
 #[test]
 fn a_slow_failing_write_near_the_deadline_gets_no_rescue_wait_and_the_call_ends_inside_its_budget() {
-    // why: review S5 (Sol round 2): "the remaining budget is captured before
+    // why: review S5 (reviewer, round 2): "the remaining budget is captured before
     //      the synchronous write; a slow failing write then starts a full
     //      rescue wait and the outer timeout drops the tick." `persist` turned
     //      the call's deadline into a DURATION when the save began, and the

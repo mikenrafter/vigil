@@ -1,4 +1,4 @@
-//! The orchestrator's credit check (specs/auto-interval.md AI2', AI8, S2, S5,
+//! The orchestrator's credit check (docs/specs/auto-interval.md AI2', AI8, S2, S5,
 //! S7, S9, N1, N4): when it runs, how it is serialized across processes, and
 //! what it records.
 //!

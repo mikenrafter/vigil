@@ -1,4 +1,4 @@
-//! Account-wide credit state (specs/auto-interval.md AI2', AI8).
+//! Account-wide credit state (docs/specs/auto-interval.md AI2', AI8).
 //!
 //! Usage credits can start because of any session on the account, so a long
 //! call re-checks every 240 s, independent of its own transcript. Two
@@ -11,7 +11,7 @@
 //! hook, event) and the `testing` doubles `ScriptedCreditProbe` and
 //! `ScriptedHookRunner`.
 //!
-//! Round 2 (specs/auto-interval.md S1-S10): the verdict is tri-state (S5);
+//! Round 2 (docs/specs/auto-interval.md S1-S10): the verdict is tri-state (S5);
 //! the last applied state and check time live in `<root>/credit-state.json`,
 //! serialized across processes by `<root>/credit.lock` (S9); probes and the
 //! hook are bounded and killed with their descendants (S7); every read is
