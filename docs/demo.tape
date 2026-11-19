@@ -5,8 +5,8 @@ Require bash
 Require tee
 
 Set Framerate 12
-Set PlaybackSpeed 2
-Set LoopOffset 30%
+Set PlaybackSpeed 1.5
+Set LoopOffset 0%
 Set FontSize 22
 Set Width 1500
 Set Height 620
@@ -26,9 +26,9 @@ Type `export PATH="$DEMO_BIN:/usr/bin:/bin"; demo_dir=$(mktemp -d); cd "$demo_di
 Enter
 Type `! command -v boat && ! command -v qex`
 Enter
-# The demo build takes eight seconds. tee writes both the log and progress
+# The demo build takes seven seconds. tee writes both the log and progress
 # in the terminal, so viewers can see work happening during the blocking call.
-Type `printf '%s\n' '#!/bin/bash' '{ sleep 6; echo "build: compiling..."; sleep 1; echo "build: linking..."; sleep 1; echo "build: finished"; } | tee build.log' > build; chmod +x build`
+Type `printf '%s\n' '#!/bin/bash' '{ sleep 5; echo "build: compiling..."; sleep 1; echo "build: linking..."; sleep 1; echo "build: finished"; } | tee build.log' > build; chmod +x build`
 Enter
 Type `clear`
 Enter
@@ -37,7 +37,9 @@ Show
 # Establish what the tool does before starting the work.
 Type `# vigil keeps the agent here until the build ends.`
 Enter
-Type `# Playback at 2x speed; hold checks every 30s.`
+Type `# keepalive blocks; vigil checks the build every 30s.`
+Enter
+Type `# --orchestrator false skips main-agent checks in this shell demo.`
 Enter
 Sleep 2s
 Type `./build &`
@@ -54,8 +56,9 @@ Enter
 
 # This is the actual blocking call, not staged output. Its next process
 # check observes the completed build and prints the release and next action.
-Sleep 32s
-Sleep 8s
+Sleep 30s
+# At 1.5x playback, six more seconds leave about 4s to read the result.
+Sleep 6s
 
 Hide
 Type `cd /; rm -rf "$demo_dir"; exit`
