@@ -92,8 +92,9 @@ Boat is a cloud sandbox service. Its CLI is `boat`.
 (`~/.config/vigil/advisories.toml`, or `VIGIL_ADVISORIES_FILE`) and finds none,
 it creates one. If `boat` is on `PATH` at that moment, the new file holds a
 `boat-budget` advisory. That advisory runs `env BOAT_NO_UPDATE=1 <path to boat>
-limits --json`, works out the percentage of plan hours left, and tells agents
-to prefer Boat for heavy work until 10% or less is left. vigil stores the full
+limits --json`, adds the plan's remaining hours to the prepaid credit hours,
+and tells agents to prefer Boat for heavy work until 10 hours or fewer are
+left. vigil stores the full
 path it found, so a hook started with a shorter `PATH` still runs the same
 `boat`.
 
