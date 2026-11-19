@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "MCP server that keeps an agent's turn open while a cheap judge watches things"
+license = "MIT"
+repository = "https://github.com/mikenrafter/vigil"
+readme = "README.md"
+keywords = ["mcp", "agent", "llm", "monitoring", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "vigil"
