@@ -139,7 +139,7 @@ fn without_boat_on_path_nothing_is_seeded_and_advice_is_empty() {
 
 #[test]
 fn set_threshold_changes_the_advice_immediately_with_no_new_probe() {
-    // why: `vigil advisory set boat-budget threshold=15` takes effect at
+    // why: `vigil advisory set boat-budget threshold=500` takes effect at
     //      once. 479 hours left: prefer Boat. Threshold 500: 479 <= 500, so run heavy
     //      work locally. The probe ran once for both answers.
     // proves: CLAIM(advisory-immediate), CLAIM(advisory-set)
@@ -191,7 +191,7 @@ fn advisory_commands_validate_and_explain_their_errors() {
         (vec!["advisory", "set", "nope", "threshold=1"], vec!["no advisory named", "boat-budget"]),
         (vec!["advisory", "set", "boat-budget", "treshold=1"], vec!["no parameter", "threshold"]),
         (vec!["advisory", "set", "boat-budget", "threshold=abc"], vec!["threshold", "number"]),
-        (vec!["advisory", "set", "boat-budget", "condition=pct <= gone"], vec!["gone"]),
+        (vec!["advisory", "set", "boat-budget", "condition=hours <= gone"], vec!["gone"]),
         (vec!["advisory", "set", "boat-budget"], vec![]),
         (vec!["advisory", "show", "nope"], vec!["no advisory named"]),
         (vec!["advisory", "rm", "nope"], vec!["no advisory named"]),
@@ -333,7 +333,7 @@ async fn the_mcp_tools_list_show_set_add_remove_and_advise() {
     for (tool, arguments, needle) in [
         ("advisory_set", json!({"id": "nope", "settings": {"threshold": 1}}), "no advisory named"),
         ("advisory_set", json!({"id": "boat-budget", "settings": {"treshold": 1}}), "no parameter"),
-        ("advisory_set", json!({"id": "boat-budget", "settings": {"condition": "pct <= gone"}}), "gone"),
+        ("advisory_set", json!({"id": "boat-budget", "settings": {"condition": "hours <= gone"}}), "gone"),
         ("advisory_show", json!({"id": "nope"}), "no advisory named"),
         ("advisory_rm", json!({"id": "nope"}), "no advisory named"),
         ("advisory_add", json!({"id": "bad id", "spec": {}}), "bad advisory id"),
@@ -378,7 +378,7 @@ async fn an_mcp_keepalive_result_carries_the_advice() {
     let envelope = json_of(&call(&client, "keepalive", json!({})).await);
     assert_eq!(envelope["status"], "fired");
     let message = envelope["advice"][0]["message"].as_str().unwrap();
-    assert!(message.contains("qex") && message.contains("0.7"), "4 of 555.56 hours is 0.7%: {message}");
+    assert!(message.contains("qex") && message.contains("4 hours"), "4 plan hours + 0 credit hours is below the 10-hour threshold: {message}");
     rig.set_remaining(500.0);
     client.cancel().await.unwrap();
 }

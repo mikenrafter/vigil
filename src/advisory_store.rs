@@ -553,7 +553,7 @@ mod tests {
         let unknown_id = store.set("nope", &["threshold=1".to_string()]).unwrap_err();
         assert!(matches!(&unknown_id, AdvisoryError::Unknown { id, known } if id == "nope" && known.contains("boat-budget")), "{unknown_id}");
         assert!(matches!(store.set("boat-budget", &["threshold=15".into(), "treshold=1".into()]), Err(AdvisoryError::UnknownParam { .. })));
-        assert!(store.set("boat-budget", &["threshold=15".into(), "condition=pct <= gone".into()]).is_err());
+        assert!(store.set("boat-budget", &["threshold=15".into(), "condition=hours <= gone".into()]).is_err());
         assert!(store.set("boat-budget", &["threshold=abc".into()]).is_err());
         assert!(store.add("bad id", spec(json!({})), false).is_err());
         assert!(store.add("worse", spec(json!({"condition": "free < nothing"})), false).is_err());
