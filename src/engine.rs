@@ -38,8 +38,12 @@ pub struct Created {
     pub deadline_at: Timestamp,
 }
 
-/// The instruction `cold` returns (W45-C1).
-pub const COLD_NEXT: &str = "Going cold: post an inline BabelTele summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
+/// The instruction `cold` returns (W45-C1): `summary` is the phrase saying
+/// what to post (`Config::cold_summary`: `VIGIL_COLD_SUMMARY`, else
+/// `config::DEFAULT_COLD_SUMMARY`).
+pub fn cold_next(summary: &str) -> String {
+    format!("Going cold: {summary}, then end your turn. Nothing will wake you.")
+}
 
 /// What `cold` did: the watches it cancelled, the ids still pending, and the
 /// instruction to follow.
@@ -47,7 +51,7 @@ pub const COLD_NEXT: &str = "Going cold: post an inline BabelTele summary of thi
 pub struct ColdReport {
     pub cancelled: Vec<WatchId>,
     pub pending: Vec<WatchId>,
-    pub next: &'static str,
+    pub next: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -252,7 +256,7 @@ impl Vigil {
     /// The advisories file, or `Disabled` when advisories are off.
     pub fn advisory_store(&self) -> Result<crate::advisory_store::AdvisoryStore, crate::advisory::AdvisoryError> {
         match &self.config.advisories_file {
-            Some(path) => Ok(crate::advisory_store::AdvisoryStore::new(path.clone(), self.config.home.clone())),
+            Some(path) => Ok(crate::advisory_store::AdvisoryStore::new(path.clone(), self.config.path.clone())),
             None => Err(crate::advisory::AdvisoryError::Disabled),
         }
     }
@@ -307,8 +311,9 @@ impl Vigil {
             self.check_orchestrator_token(request.confirm.as_deref())?;
         }
         let spec = WatchSpec::parse(request)?.absolutize(&self.cwd);
+        self.require_qex(spec.inputs.iter())?;
         if matches!(spec.fire, FireRule::Judge { .. }) && !self.judge.healthy().await {
-            return Err(CreateError::JudgeUnreachable.into());
+            return Err(CreateError::JudgeUnreachable { url: self.config.judge_url.clone() }.into());
         }
         let id = spec.id.clone();
         // W46-K3: check every initial classed item before the hold's lock file or id
@@ -433,7 +438,7 @@ impl Vigil {
             }
         }
         let pending = self.list().await?.into_iter().filter(|w| w.status == WatchStatus::Pending).map(|w| w.id).collect();
-        Ok(ColdReport { cancelled, pending, next: COLD_NEXT, warnings, errors })
+        Ok(ColdReport { cancelled, pending, next: cold_next(&self.config.cold_summary), warnings, errors })
     }
 
     /// `watch_cancel`. Cancel on an already finished watch returns the stored
@@ -898,18 +903,19 @@ mod tests {
 
     #[tokio::test]
     async fn judge_watches_require_a_reachable_judge_at_create_time() {
-        // why: SPEC "Packaging": "where [laya] is unreachable, fire = judge
-        //      returns an error at watch_create instead of failing later".
-        //      change/condition watches do not need the judge. Control: the
-        //      same request succeeds once the judge is healthy.
+        // why: SPEC "Packaging": "where the judge is unreachable, fire =
+        //      judge returns an error at watch_create instead of failing
+        //      later", naming the URL and VIGIL_JUDGE_URL. change/condition
+        //      watches do not need the judge. Control: the same request
+        //      succeeds once the judge is healthy.
         // proves: CLAIM(judge-reachable-at-create)
         let (_clock, env) = fixture();
         let path = env.input_path("a.log");
         env.judge.set_healthy(false);
-        assert_eq!(
-            env.vigil.create(judge_request("j", &path, 20)).await,
-            Err(VigilError::Create(CreateError::JudgeUnreachable))
-        );
+        let refused = env.vigil.create(judge_request("j", &path, 20)).await;
+        assert_eq!(refused, Err(VigilError::Create(CreateError::JudgeUnreachable { url: "http://127.0.0.1:4010".to_string() })));
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("VIGIL_JUDGE_URL") && message.contains("http://127.0.0.1:4010"), "{message}");
         assert!(json_files(&env).is_empty(), "no file for a refused watch");
         env.vigil.create(change_request("c", &path, 20)).await.unwrap();
         env.judge.set_healthy(true);

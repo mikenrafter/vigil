@@ -18,12 +18,28 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
-/// A sandbox whose `$HOME/.local/bin/boat` prints a captured `boat limits
-/// --json` (trimmed to the fields vigil reads) and counts its runs.
+/// A sandbox whose `bin/boat` prints a captured `boat limits --json`
+/// (trimmed to the fields vigil reads) and counts its runs. vigil runs with
+/// `PATH` = that `bin` plus a `tools` directory holding only `env`, `sh` and
+/// `cat`, so whether `boat` is "on PATH" never depends on the host.
 struct Rig {
     sandbox: Sandbox,
     advisories: PathBuf,
     runs: PathBuf,
+    path: String,
+}
+
+/// `tools/` with links to the host's `env`, `sh` and `cat`: what the probes
+/// and the fake `boat` need, and nothing else.
+fn tools_dir(sandbox: &Sandbox) -> PathBuf {
+    let tools = sandbox.dir.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let host = std::env::var("PATH").unwrap_or_default();
+    for name in ["env", "sh", "cat"] {
+        let found = std::env::split_paths(&host).map(|dir| dir.join(name)).find(|p| p.is_file()).unwrap_or_else(|| panic!("{name} is not on PATH"));
+        std::os::unix::fs::symlink(found, tools.join(name)).unwrap();
+    }
+    tools
 }
 
 fn boat_json(remaining: f64) -> String {
@@ -33,15 +49,19 @@ fn boat_json(remaining: f64) -> String {
 impl Rig {
     fn new(remaining: f64) -> Rig {
         let sandbox = Sandbox::new();
-        let bin = sandbox.home().join(".local/bin");
+        let bin = sandbox.dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        let path = format!("{}:{}", bin.display(), tools_dir(&sandbox).display());
         let runs = sandbox.dir.path().join("boat-runs");
         let data = sandbox.dir.path().join("boat.json");
         std::fs::write(&data, boat_json(remaining)).unwrap();
-        // The shipped probe is `env BOAT_NO_UPDATE=1 <home>/.local/bin/boat limits --json`.
+        // The shipped probe is `env BOAT_NO_UPDATE=1 <boat found on PATH> limits --json`.
         vigil::testing::write_script(&bin.join("boat"), &format!("[ \"$BOAT_NO_UPDATE\" = 1 ] || exit 9\n[ \"$1 $2\" = 'limits --json' ] || exit 8\necho run >> '{}'\ncat '{}'", runs.display(), data.display()));
         let advisories = sandbox.dir.path().join("config/vigil/advisories.toml");
-        Rig { sandbox, advisories, runs }
+        Rig { sandbox, advisories, runs, path }
+    }
+    fn boat(&self) -> PathBuf {
+        self.sandbox.dir.path().join("bin/boat")
     }
     fn set_remaining(&self, remaining: f64) {
         std::fs::write(self.sandbox.dir.path().join("boat.json"), boat_json(remaining)).unwrap();
@@ -51,7 +71,7 @@ impl Rig {
     }
     fn command(&self) -> std::process::Command {
         let mut command = self.sandbox.command();
-        command.env("VIGIL_ADVISORIES_FILE", &self.advisories);
+        command.env("VIGIL_ADVISORIES_FILE", &self.advisories).env("PATH", &self.path);
         command
     }
     fn run(&self, args: &[&str]) -> std::process::Output {
@@ -78,10 +98,10 @@ fn only(advice: &Value) -> &Value {
 
 #[test]
 fn advice_runs_the_shipped_boat_budget_advisory_and_seeds_the_file() {
-    // why: owner request 2026-11-12, items 4 and 5: `vigil advice [--json]` is
-    //      what hooks call; the default boat-budget is seeded when the file is
-    //      absent and, with 479.01 of 555.56 hours left (86%), says to prefer
-    //      Boat via boat-run. The plain form prints `id: message`, one line.
+    // why: `vigil advice [--json]` is what hooks call; with `boat` on PATH
+    //      the default boat-budget is seeded when the file is absent and,
+    //      with 479.01 of 555.56 hours left (86%), says to prefer Boat. The
+    //      plain form prints `id: message`, one line.
     // proves: CLAIM(advisory-boat-budget), CLAIM(advisory-seed), CLAIM(advisory-delivery)
     let rig = Rig::new(479.01);
     assert!(!rig.advisories.exists());
@@ -90,8 +110,9 @@ fn advice_runs_the_shipped_boat_budget_advisory_and_seeds_the_file() {
     assert_eq!(entry["id"], "boat-budget");
     assert_eq!(entry["kind"], "advice");
     let message = entry["message"].as_str().unwrap();
-    assert!(message.contains("86.2") && message.contains("boat-run"), "{message}");
-    assert!(std::fs::read_to_string(&rig.advisories).unwrap().contains("[advisories.boat-budget]"));
+    assert!(message.contains("86.2") && message.contains("prefer Boat"), "{message}");
+    let seeded = std::fs::read_to_string(&rig.advisories).unwrap();
+    assert!(seeded.contains("[advisories.boat-budget]") && seeded.contains(&format!("{:?}", rig.boat().display().to_string())), "the probe runs the boat found on PATH: {seeded}");
 
     let plain = rig.run(&["advice"]);
     assert!(plain.status.success());
@@ -100,13 +121,30 @@ fn advice_runs_the_shipped_boat_budget_advisory_and_seeds_the_file() {
 }
 
 #[test]
+fn without_boat_on_path_nothing_is_seeded_and_advice_is_empty() {
+    // why: `boat` is optional. With no `boat` on PATH the first use writes a
+    //      file with no active advisory (a header and a commented example),
+    //      `vigil advice` prints nothing and exits 0, and no probe runs.
+    // proves: CLAIM(advisory-seed), CLAIM(tool-presence)
+    let rig = Rig::new(479.01);
+    std::fs::remove_file(rig.boat()).unwrap();
+    assert_eq!(rig.advice_json()["advice"], json!([]));
+    let plain = rig.run(&["advice"]);
+    assert!(plain.status.success(), "{}", stderr_of(&plain));
+    assert!(plain.stdout.is_empty(), "{}", String::from_utf8_lossy(&plain.stdout));
+    let seeded = std::fs::read_to_string(&rig.advisories).unwrap();
+    assert!(seeded.contains("`boat` was not on PATH") && seeded.contains("# [advisories.boat-budget]"), "{seeded}");
+    assert_eq!(rig.probe_runs(), 0);
+}
+
+#[test]
 fn set_threshold_changes_the_advice_immediately_with_no_new_probe() {
-    // why: owner item 3: `vigil advisory set boat-budget threshold=15` takes
-    //      effect at once. 86% left: prefer Boat. Threshold 90: 86 <= 90, so
-    //      use qex locally. The probe ran once for both answers.
+    // why: `vigil advisory set boat-budget threshold=15` takes effect at
+    //      once. 86% left: prefer Boat. Threshold 90: 86 <= 90, so run heavy
+    //      work locally. The probe ran once for both answers.
     // proves: CLAIM(advisory-immediate), CLAIM(advisory-set)
     let rig = Rig::new(479.01);
-    assert!(only(&rig.advice_json())["message"].as_str().unwrap().contains("boat-run"));
+    assert!(only(&rig.advice_json())["message"].as_str().unwrap().contains("prefer Boat"));
     let set = rig.run(&["advisory", "set", "boat-budget", "threshold=90"]);
     assert!(set.status.success(), "{}", stderr_of(&set));
     assert_eq!(stdout_json(&set)["spec"]["params"]["threshold"], 90.0);
@@ -116,18 +154,21 @@ fn set_threshold_changes_the_advice_immediately_with_no_new_probe() {
     // And a hand edit is the same thing.
     let text = std::fs::read_to_string(&rig.advisories).unwrap();
     std::fs::write(&rig.advisories, text.replace("threshold = 90", "threshold = 5")).unwrap();
-    assert!(only(&rig.advice_json())["message"].as_str().unwrap().contains("boat-run"));
+    assert!(only(&rig.advice_json())["message"].as_str().unwrap().contains("prefer Boat"));
 }
 
 #[test]
 fn a_probe_that_fails_gives_an_unavailable_entry_not_silence() {
-    // why: owner item 4: "advisory <id> unavailable: <reason>". The fake boat
+    // why: "advisory <id> unavailable: <reason>". The file is seeded while
+    //      `boat` is there (`advisory list` runs no probe); then the fake boat
     //      is removed, so the probe (run through `env`) exits 127 with env's
     //      message; `vigil advice` still exits 0 (hooks must not break) and
     //      says why.
     // proves: CLAIM(advisory-unavailable)
     let rig = Rig::new(479.01);
-    std::fs::remove_file(rig.sandbox.home().join(".local/bin/boat")).unwrap();
+    assert!(rig.run(&["advisory", "list"]).status.success());
+    assert_eq!(rig.probe_runs(), 0, "listing does not probe");
+    std::fs::remove_file(rig.boat()).unwrap();
     let output = rig.run(&["advice"]);
     assert!(output.status.success(), "{}", stderr_of(&output));
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -232,7 +273,7 @@ fn keepalive_envelopes_carry_the_advice() {
         assert_eq!(envelope["status"], "fired");
         let entry = &envelope["advice"][0];
         assert_eq!(entry["id"], "boat-budget", "{subcommand}: {envelope}");
-        assert!(entry["message"].as_str().unwrap().contains("boat-run"));
+        assert!(entry["message"].as_str().unwrap().contains("prefer Boat"));
     }
     let status = stdout_json(&rig.run(&["status", "k"]));
     assert!(status.get("advice").is_none(), "status does not carry advice");
@@ -244,7 +285,7 @@ type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 async fn connect(rig: &Rig) -> Client {
     let transport = TokioChildProcess::new(rig.sandbox.tokio_command().configure(|c| {
-        c.arg("mcp").env("VIGIL_ADVISORIES_FILE", &rig.advisories);
+        c.arg("mcp").env("VIGIL_ADVISORIES_FILE", &rig.advisories).env("PATH", &rig.path);
     }))
     .unwrap();
     ().serve(transport).await.expect("initialize handshake")
@@ -280,7 +321,7 @@ async fn the_mcp_tools_list_show_set_add_remove_and_advise() {
     let listed = json_of(&call(&client, "advisory_list", json!({})).await);
     assert_eq!(listed[0]["id"], "boat-budget");
     let advice = json_of(&call(&client, "advice", json!({})).await);
-    assert!(advice["advice"][0]["message"].as_str().unwrap().contains("boat-run"), "{advice}");
+    assert!(advice["advice"][0]["message"].as_str().unwrap().contains("prefer Boat"), "{advice}");
     let set = json_of(&call(&client, "advisory_set", json!({"id": "boat-budget", "settings": {"threshold": 90}})).await);
     assert_eq!(set["spec"]["params"]["threshold"], 90.0);
     let advice = json_of(&call(&client, "advice", json!({})).await);

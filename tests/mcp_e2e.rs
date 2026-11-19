@@ -72,7 +72,7 @@ async fn initialize_sends_short_instructions_that_teach_the_loop() {
     // why: W45-C3: an agent that is done must find `cold` without a skill.
     // proves: W45-C3
     // catches: the instructions line for `cold` left out.
-    assert!(instructions.contains("call `cold`") && instructions.contains("BabelTele"), "missing the cold line in {instructions:?}");
+    assert!(instructions.contains("call `cold`, post a short summary, end the turn"), "missing the cold line in {instructions:?}");
     // why: W48 (owner 2026-11-14): a foreground MCP keepalive in a main session is interrupted by
     //      every owner message; the 3-day transcript sweep found 22 such calls, each following
     //      these instructions. A main session that has background shells waits with the CLI.
@@ -986,7 +986,7 @@ async fn hold_add_over_the_wire_resolves_qex_names_refuses_ambiguous_ones_and_du
     client.cancel().await.unwrap();
 }
 
-const COLD_NEXT: &str = "Going cold: post an inline BabelTele summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
+const COLD_NEXT: &str = "Going cold: post a short summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
 
 #[tokio::test]
 async fn cold_without_ids_cancels_only_the_watches_this_server_created() {

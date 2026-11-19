@@ -43,7 +43,8 @@ pub fn default_config() -> Config {
         advisories_file: None,
         reminders_file: None,
         orchestrator_confirm: false,
-        home: None,
+        path: None,
+        cold_summary: crate::config::DEFAULT_COLD_SUMMARY.to_string(),
     }
 }
 
@@ -201,6 +202,8 @@ struct ReaderState {
     scripts: std::collections::HashMap<String, ReaderScript>,
     resolutions: std::collections::HashMap<String, Result<String, crate::error::CreateError>>,
     reads: Vec<ReadRecord>,
+    /// Programs `has_program` says are absent (every other one is present).
+    missing_programs: std::collections::HashSet<String>,
 }
 
 /// An `InputReader` for tests (X3, X4). A label with a script (`set_text`,
@@ -239,6 +242,10 @@ impl ScriptedReader {
     pub fn set_qex_resolution(&self, job: &str, resolution: Result<String, crate::error::CreateError>) {
         self.state.lock().unwrap().resolutions.insert(job.to_string(), resolution);
     }
+    /// Make `has_program(name)` answer false, as on a host without that tool.
+    pub fn set_program_missing(&self, name: &str) {
+        self.state.lock().unwrap().missing_programs.insert(name.to_string());
+    }
     /// Every scripted read so far, in start order.
     pub fn reads(&self) -> Vec<ReadRecord> {
         self.state.lock().unwrap().reads.clone()
@@ -273,6 +280,10 @@ fn script_key(input: &Input) -> Option<String> {
 }
 
 impl InputReader for ScriptedReader {
+    /// Every program is present unless `set_program_missing` named it.
+    fn has_program(&self, name: &str, _path: Option<&str>) -> bool {
+        !self.state.lock().unwrap().missing_programs.contains(name)
+    }
     /// A job with a `set_qex_resolution` answers with it. A job whose status is
     /// scripted (`set_text("qex:JOB", ...)`) is already an id (or `gone`, which
     /// qex does not know); anything else asks the real `qex`.

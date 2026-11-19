@@ -1,5 +1,5 @@
-//! Engine-level tests for hold items (W42; spec:
-//! knowledge/research/agentic-practice-2026-11/vigil-hold-items-spec.md).
+//! Engine-level tests for hold items (W42; claims W42-H1..H5, see
+//! `items.rs`).
 //! Cross-cutting, like `hold_tests.rs` whose helpers they reuse: each test
 //! drives `Vigil::hold` / `hold_add` / `hold_done` / `keepalive` on paused
 //! tokio time and reads the envelope as the agent sees it.
@@ -1223,7 +1223,7 @@ async fn w46_unclassed_hold_envelope_remains_byte_identical() {
     // why: W46-K4 leaves the pre-W46 envelope byte-identical when every item is uncounted.
     // catches: serializing cap:null, cap defaults, or changing the existing envelope field order.
     let env = rig();
-    env.vigil.hold(first_item("none", "sol", None)).await.unwrap();
+    env.vigil.hold(first_item("none", "reviewer", None)).await.unwrap();
     let watch = watch_file(&env.vigil, "h");
     let bytes = serde_json::to_string(&env.vigil.envelope_for(&watch, watch.created_at).unwrap()).unwrap();
     let expected = r#"{"watch_id":"h","status":"pending","now":"2026-10-29T14:03:11Z","tick":0,"session_ticks":0,"elapsed_s":0,"deadline_in_s":604800,"events":[],"digest":"","judge_status":"skipped","next":"call keepalive again"}"#;

@@ -328,6 +328,16 @@ fn check_editable(watch: &WatchFile, now: Timestamp) -> Result<(), ItemError> {
 }
 
 impl Vigil {
+    /// Refuse, before anything is read or written, any of `inputs` that only
+    /// `qex` can sense when `qex` is not on PATH (a `qex:` or `idle:` item
+    /// would otherwise fail at every tick and never end).
+    pub(crate) fn require_qex<'a>(&self, inputs: impl IntoIterator<Item = &'a Input>) -> Result<(), CreateError> {
+        match inputs.into_iter().find(|input| matches!(input, Input::Qex { .. } | Input::QexIdle { .. })) {
+            Some(input) if !self.reader.has_program("qex", self.config.path.as_deref()) => Err(CreateError::QexMissing(input.label())),
+            _ => Ok(()),
+        }
+    }
+
     /// The input that senses `work`, ready to store: paths absolute (V11),
     /// a qex job resolved to its full id (H3, D8).
     async fn sensing_input(&self, work: Work) -> Result<Input, VigilError> {
@@ -373,6 +383,7 @@ impl Vigil {
                 return Err(ItemError::DuplicateLabel(draft.label.clone()).into());
             }
         }
+        self.require_qex(&drafts.iter().filter_map(ItemDraft::sensed_input).collect::<Vec<_>>())?;
         let mut inputs = Vec::new();
         let mut items = Vec::new();
         for draft in drafts {
@@ -416,6 +427,7 @@ impl Vigil {
     /// tick (it reloads the hold at every tick). Refusals write nothing.
     pub async fn hold_add(&self, id: &WatchId, request: HoldItemRequest) -> Result<ItemReport, VigilError> {
         let draft = ItemDraft::parse(&request.work, request.label.as_deref(), request.expect_s)?;
+        self.require_qex(draft.sensed_input().as_ref())?;
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
         check_editable(&watch, now)?;

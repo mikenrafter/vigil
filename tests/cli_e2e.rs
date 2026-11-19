@@ -1997,7 +1997,7 @@ fn hold_add_resolves_a_qex_name_to_the_full_id_and_refuses_an_ambiguous_name_thr
     assert_eq!(sandbox.watch_file("h").unwrap(), stored, "nothing written");
 }
 
-const COLD_NEXT: &str = "Going cold: post an inline BabelTele summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
+const COLD_NEXT: &str = "Going cold: post a short summary of this session (task, progress, in-flight ids, tools, the user's standing rules), then end your turn. Nothing will wake you.";
 
 #[test]
 fn cold_with_no_ids_cancels_nothing_and_lists_what_is_pending() {
@@ -2047,6 +2047,17 @@ fn cold_with_ids_cancels_those_watches_and_leaves_the_others() {
 
     let ghost = sandbox.run(&["cold", "ghost"]);
     assert_eq!(ghost.status.code(), Some(1));
+}
+
+#[test]
+fn vigil_cold_summary_replaces_what_cold_says_to_post() {
+    // why: the summary format is the operator's choice: VIGIL_COLD_SUMMARY
+    //      replaces the phrase in `next`; the rest of the instruction stays.
+    // proves: CLAIM(cold-summary)
+    let sandbox = Sandbox::new();
+    let output = sandbox.command().arg("cold").env("VIGIL_COLD_SUMMARY", "post an inline BabelTele summary").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(stdout_json(&output)["next"], "Going cold: post an inline BabelTele summary, then end your turn. Nothing will wake you.");
 }
 
 
@@ -2167,7 +2178,7 @@ fn w46_ended_items_free_slots_other_holds_and_uncounted_items_do_not_consume_the
         let made = sandbox.run(&["hold", "--id", id, "--for", "none", "--label", "first", "--cap", "work"]);
         assert!(made.status.success(), "{made:?}");
     }
-    for label in ["sol", "command", "qex"] {
+    for label in ["codex", "command", "qex"] {
         assert!(sandbox.run(&["hold", "add", "h", "--for", "none", "--label", label]).status.success());
     }
     assert!(sandbox.run(&["hold", "done", "h", "first"]).status.success());
@@ -2302,4 +2313,46 @@ fn brief_delivery_to_closed_stdout_leaves_the_terminal_result_available() {
     let returned = sandbox.run(&["keepalive", "brief", "--brief"]);
     assert!(returned.status.success());
     assert!(String::from_utf8_lossy(&returned.stdout).contains("item ended:"));
+}
+
+#[test]
+fn a_qex_hold_on_a_host_without_qex_fails_at_create_and_names_where_to_get_it() {
+    // why: qex is optional. `vigil hold --for qex:JOB` (or `idle:DIR`) with
+    //      no `qex` on PATH must exit 1 at once with a message naming qex and
+    //      its home, and write no watch; a pid hold still works there.
+    // proves: CLAIM(tool-presence)
+    let sandbox = Sandbox::new();
+    let empty = sandbox.dir.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    for spec in ["qex:abc123", "idle:/tmp"] {
+        let output = sandbox.command().args(["hold", "--id", "q", "--for", spec]).env("PATH", &empty).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{spec}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("needs qex") && stderr.contains("https://github.com/stephenc/qex"), "{spec}: {stderr}");
+        assert!(sandbox.watch_file("q").is_none(), "{spec}: nothing written");
+    }
+    let output = sandbox.command().args(["hold", "--id", "p", "--for", "pid:1"]).env("PATH", &empty).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn a_judge_watch_with_no_judge_names_vigil_judge_url_and_other_watches_need_none() {
+    // why: only fire = judge needs the judge. With none listening, creating a
+    //      judge watch fails with a message naming VIGIL_JUDGE_URL and the URL
+    //      tried; change and condition watches are created as usual.
+    // proves: CLAIM(judge-optional)
+    let sandbox = Sandbox::new();
+    let input = sandbox.input("a.log");
+    std::fs::write(&input, "boot\n").unwrap();
+    let judge = serde_json::json!({
+        "id": "j", "prompt": "did it fail?", "inputs": [{"kind": "file", "path": input}], "fire": "judge",
+        "judge_questions": {"failed": {"type": "noul", "instructions": "Did the build fail?"}},
+        "judge_rule": {"question": "failed", "noul_gte": 0.8}
+    });
+    let output = sandbox.run(&["create", &judge.to_string()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("VIGIL_JUDGE_URL") && stderr.contains("http://127.0.0.1:9"), "{stderr}");
+    assert!(sandbox.watch_file("j").is_none());
+    assert!(sandbox.run(&["create", &change_watch_json("c", &input, 1)]).status.success());
 }

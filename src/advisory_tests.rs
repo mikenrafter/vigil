@@ -40,7 +40,6 @@ fn rig_with(content: Option<&str>) -> Rig {
     }
     let mut config = default_config();
     config.advisories_file = Some(file.clone());
-    config.home = Some("/home/u".to_string());
     let env = Env::with_clock_and_config(Arc::new(TokioClock::new(spec_instant())), config);
     env.reader.set_text(PROBE, "exit=0\n{\"free\": 15}");
     Rig { _config_dir: config_dir, file, env }

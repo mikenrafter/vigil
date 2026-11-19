@@ -1,12 +1,12 @@
-//! Hold items (W42; spec
-//! `knowledge/research/agentic-practice-2026-11/vigil-hold-items-spec.md`,
-//! claims W42-H1..H5 and the round decisions W42-D1..D9): one hold, many
-//! units of work, each ending on its own.
+//! Hold items (W42; claims W42-H1..H5 and the round decisions W42-D1..D9,
+//! from a design note kept outside this repository): one hold, many units of
+//! work, each ending on its own.
 //!
 //! A hold made by `vigil hold` stores `items` beside its inputs. An item is
 //! one unit of work: sensed through one input of the hold (`qex:`, `pid:`,
-//! `file:`, `until:`, `idle:`), or `none` (a T3 delegate nothing on this host
-//! can sense, ended by `vigil hold done`). Each has a label unique in its
+//! `file:`, `until:`, `idle:`), or `none` (a delegated run with no pid or
+//! file to watch, such as a T3 Code delegate task, ended by `vigil hold
+//! done`). Each has a label unique in its
 //! hold, an optional `expect_s`, and its own clocks and flags (D3).
 //!
 //! Why a module: this is the item model and the ONE place that decides item
@@ -107,6 +107,15 @@ pub struct ItemDraft {
 }
 
 impl ItemDraft {
+    /// The input that would sense this item, before paths are made absolute
+    /// or a qex job is resolved; `None` for a `none` item.
+    pub fn sensed_input(&self) -> Option<crate::watch::Input> {
+        match &self.work {
+            ItemWork::Sensed(work) => Some(work.clone().into_input()),
+            ItemWork::Unsensed => None,
+        }
+    }
+
     /// Check one item request. `spec` is a `--for` spec or `none`; `label`
     /// defaults to `spec` as given; a `none` item needs a label (it could
     /// never be ended otherwise); `expect_s` follows the watch rule (1 s up

@@ -526,3 +526,34 @@ async fn a_hold_on_an_ambiguous_or_unresolvable_name_is_refused_with_the_cause_a
     assert!(!env.vigil.store().watch_path(&WatchId::parse("h").unwrap()).exists());
     env.vigil.hold(request_for(&[&format!("qex:{JOB_ID}")])).await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn without_qex_on_path_qex_and_idle_work_is_refused_at_create_and_other_work_is_not() {
+    // why: `qex:` and `idle:` items are sensed by running `qex`. On a host
+    //      without it such a hold could never end, so creating one must fail
+    //      at once, naming qex and where to get it, and write nothing. The
+    //      same for `hold add` and for `watch_create` with a qex input. Holds
+    //      on other work (pid, until, none) do not need qex.
+    // proves: CLAIM(tool-presence)
+    // catches: a check that runs only at the first tick; a check that also
+    //      refuses pid/until/none items.
+    let env = rig();
+    env.reader.set_program_missing("qex");
+    for spec in ["qex:abc123", "idle:/work/repo"] {
+        let error = env.vigil.hold(HoldRequest { id: Some("q".into()), work: vec![spec.into()], ..HoldRequest::default() }).await.expect_err(spec).to_string();
+        assert!(error.contains(spec) && error.contains("qex") && error.contains("https://github.com/stephenc/qex"), "{error}");
+        assert!(!env.vigil.store().watch_path(&WatchId::parse("q").unwrap()).exists(), "{spec}: nothing written");
+    }
+    let error = env.vigil.hold(HoldRequest { id: Some("i".into()), until_idle: true, ..HoldRequest::default() }).await.expect_err("until_idle").to_string();
+    assert!(error.contains("needs qex"), "{error}");
+    let error = env.vigil.create(hold_request("w", vec![qex("abc123")])).await.expect_err("watch_create").to_string();
+    assert!(error.contains("needs qex"), "{error}");
+
+    env.vigil.hold(HoldRequest { id: Some("h".into()), work: vec!["pid:1".into(), "until:2099-01-01T00:00:00Z".into()], ..HoldRequest::default() }).await.expect("pid and until need no qex");
+    let item = crate::hold::HoldItemRequest { work: "none".into(), label: Some("delegate".into()), ..Default::default() };
+    env.vigil.hold_add(&WatchId::parse("h").unwrap(), item).await.expect("none needs no qex");
+    let item = crate::hold::HoldItemRequest { work: "qex:abc123".into(), ..Default::default() };
+    let error = env.vigil.hold_add(&WatchId::parse("h").unwrap(), item).await.expect_err("hold add qex").to_string();
+    assert!(error.contains("needs qex"), "{error}");
+    assert_eq!(watch_file(&env.vigil, "h").items.unwrap().len(), 3, "pid, until and the none item; the refused add wrote nothing");
+}

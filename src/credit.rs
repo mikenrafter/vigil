@@ -591,9 +591,10 @@ mod tests {
 
     #[tokio::test]
     async fn when_uw_is_missing_fails_prints_junk_or_hangs_the_transcripts_decide() {
-        // why: AI2' step 2 "when uw is missing or fails". Four failure modes,
-        //      each over the same fresh shifted transcript: no such binary,
-        //      exit 1, exit 0 with junk, and a hang (uw_timeout 500 ms). All
+        // why: AI2' step 2 "when uw is missing or fails". Five failure modes,
+        //      each over the same fresh shifted transcript: no such binary (by
+        //      path, and by a bare name not on PATH, the shipped default's
+        //      form), exit 1, exit 0 with junk, and a hang (uw_timeout 500 ms). All
         //      must end in source `transcripts`, on_credits true, and the
         //      hang must not block the check for its own length (30 s).
         // proves: CLAIM(AI2')
@@ -601,6 +602,9 @@ mod tests {
         let projects = tempfile::tempdir().unwrap();
         fresh(projects.path(), "p", "S1", &shifted(), 30);
         let missing = dir.path().join("no-such-uw");
+        // A bare name is looked up on PATH, as the default `uw` is: a host
+        // without usagewindow must behave exactly like a missing binary.
+        let not_on_path = PathBuf::from("vigil-test-no-such-uw-on-path");
         let fails = fake_uw(dir.path(), "echo oops >&2\nexit 1");
         let junk = {
             let sub = dir.path().join("junk");
@@ -612,7 +616,7 @@ mod tests {
             std::fs::create_dir_all(&sub).unwrap();
             fake_uw(&sub, "sleep 30")
         };
-        for (name, uw) in [("missing", missing), ("exit 1", fails), ("junk", junk), ("hang", hangs)] {
+        for (name, uw) in [("missing", missing), ("not on PATH", not_on_path), ("exit 1", fails), ("junk", junk), ("hang", hangs)] {
             let started = std::time::Instant::now();
             let state = probe(&uw, projects.path()).check(spec_instant()).await;
             assert!(started.elapsed() < Duration::from_secs(5), "{name}: waited {:?}", started.elapsed());

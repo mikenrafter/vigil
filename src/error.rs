@@ -31,8 +31,9 @@ pub enum CreateError {
     },
     #[error("fire = condition needs at least one input with a `want`")]
     ConditionNeedsWant,
-    #[error("the judge is unreachable")]
-    JudgeUnreachable,
+    /// D5: `fire = judge` needs the judge, checked at create (`GET /health`).
+    #[error("fire = judge needs the judge (a Jev-style typed-decision endpoint, such as Laya), and none answered at {url}: start one, or set VIGIL_JUDGE_URL to where it listens. fire = change, condition and hold do not need a judge")]
+    JudgeUnreachable { url: String },
     /// V12: at most 16 inputs per watch.
     #[error("a watch has at most 16 inputs, got {0}")]
     TooManyInputs(usize),
@@ -82,6 +83,10 @@ pub enum CreateError {
     /// W36 (H3): qex did not say which job a name or id prefix is.
     #[error("cannot resolve qex job {job:?} to a job id: {reason}")]
     QexJobUnresolved { job: String, reason: String },
+    /// `qex:` and `idle:` work is sensed by running `qex`; without it the
+    /// hold could never end, so it is refused at create.
+    #[error("{0} needs qex, a local job queue, and `qex` is not on PATH: install it (https://github.com/stephenc/qex), or wait on the work another way (pid:N, file:PATH, until:RFC3339, none)")]
+    QexMissing(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }

@@ -518,6 +518,11 @@ pub trait InputReader: Send + Sync {
     fn resolve_qex<'a>(&'a self, job: &'a str) -> crate::judge::BoxFuture<'a, Result<String, crate::error::CreateError>> {
         Box::pin(resolve_qex_job(job))
     }
+    /// Whether the program `name` (an optional tool such as `qex`) is on
+    /// `path` (the `PATH` the binary read at its edge).
+    fn has_program(&self, name: &str, path: Option<&str>) -> bool {
+        crate::config::find_on_path(name, path).is_some()
+    }
 }
 
 /// W36 (H3): ask `qex status JOB --json --no-logs` which job `job` is.

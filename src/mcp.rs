@@ -24,17 +24,22 @@ use crate::error::VigilError;
 use crate::keepalive::{KeepaliveRequest, ProgressSink, ProgressUpdate};
 use crate::watch::{CreateRequest, WatchId};
 
-/// Server `instructions`: under 512 characters; says to create a watch, then
-/// call `keepalive` repeatedly, and (V20) to stop calling when `next` is not
-/// exactly "call keepalive again" ("act on events" means act on them; the
-/// ended text means create a new watch only if still needed).
-pub fn server_instructions() -> String {
-    "vigil keeps your turn open while a cheap judge watches things. watch_create says what to watch; then call \
-     keepalive again and again. A main session with background shells runs \
-     `vigil keepalive <id> --orchestrator` in the background instead. Read `next`: while it is exactly \"call keepalive \
-     again\", call it again; otherwise stop (\"act on events\": act on them; \"watch ended; create a new watch if still \
-     needed\"). Results carry `advice`. When done, call `cold`, post an inline BabelTele summary, end the turn."
-        .to_string()
+/// Server `instructions`: under 512 characters with the default summary
+/// phrase; says to create a watch, then call `keepalive` repeatedly, and (V20)
+/// to stop calling when `next` is not exactly "call keepalive again" ("act on
+/// events" means act on them; the ended text means create a new watch only if
+/// still needed). `summary` is what to post when going cold
+/// (`Config::cold_summary`, `VIGIL_COLD_SUMMARY`); with the default, the
+/// short form "post a short summary" is used here and `cold` gives the rest.
+pub fn server_instructions(summary: &str) -> String {
+    let summary = if summary == crate::config::DEFAULT_COLD_SUMMARY { "post a short summary" } else { summary };
+    format!(
+        "vigil keeps your turn open while a cheap judge watches things. watch_create says what to watch; then call \
+         keepalive again and again. A main session with background shells runs \
+         `vigil keepalive <id> --orchestrator` in the background instead. Read `next`: while it is exactly \"call keepalive \
+         again\", call it again; otherwise stop (\"act on events\": act on them; \"watch ended; create a new watch if still \
+         needed\"). Results carry `advice`. When done, call `cold`, {summary}, end the turn."
+    )
 }
 
 /// Serve on stdin/stdout until the client disconnects.
@@ -89,7 +94,8 @@ pub struct CreateArgs {
     /// The token an orchestrator challenge gave; only with orchestrator: true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirm: Option<String>,
-    /// fire = judge: Laya questions keyed by id, types noul, choice, score.
+    /// fire = judge: questions for the judge (a Jev-style typed-decision
+    /// endpoint, VIGIL_JUDGE_URL) keyed by id, types noul, choice, score.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<serde_json::Map<String, Value>>")]
     pub judge_questions: Option<Value>,
@@ -106,8 +112,10 @@ pub struct HoldArgs {
     pub id: Option<String>,
     /// Work to wait on, one item each: `qex:JOB`, `pid:N`, `file:PATH` (ends
     /// when it exists), `until:RFC3339`, `idle:DIR` (no qex job at or under
-    /// DIR is running), or `none` (a T3 delegate: needs `label`, ended by
-    /// `hold_done`). Omit for a bare hold that lives until cancelled.
+    /// DIR is running; needs qex), or `none` (a delegated run with no pid or
+    /// file to watch, such as a T3 Code delegate task: needs `label`, ended by
+    /// `hold_done`). `qex:` and `idle:` need qex on PATH. Omit for a bare hold
+    /// that lives until cancelled.
     #[serde(default, rename = "for")]
     #[schemars(rename = "for")]
     pub work: Vec<String>,
@@ -133,8 +141,9 @@ pub struct HoldArgs {
 pub struct HoldAddArgs {
     /// The live hold to add to.
     pub watch_id: String,
-    /// The work: `qex:JOB`, `pid:N`, `file:PATH`, `until:RFC3339`, `idle:DIR`,
-    /// or `none` (a T3 delegate: needs `label`, ended by `hold_done`).
+    /// The work: `qex:JOB`, `pid:N`, `file:PATH`, `until:RFC3339`, `idle:DIR`
+    /// (the qex kinds need qex on PATH), or `none` (a delegated run with no
+    /// pid or file to watch: needs `label`, ended by `hold_done`).
     #[serde(rename = "for")]
     #[schemars(rename = "for")]
     pub work: String,
@@ -371,7 +380,7 @@ impl VigilServer {
         VigilServer { vigil, tool_router: Self::tool_router() }
     }
 
-    #[tool(description = "Create a watch: inputs to sense, an interval, a deadline, and a fire rule (judge, change, condition or hold). No tick runs until keepalive.")]
+    #[tool(description = "Create a watch: inputs to sense, an interval, a deadline, and a fire rule (judge, change, condition or hold). Only fire = judge needs the judge, a Jev-style typed-decision endpoint at VIGIL_JUDGE_URL; create fails if it is unreachable. No tick runs until keepalive.")]
     async fn watch_create(&self, Parameters(args): Parameters<CreateArgs>, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
         let request = serde_json::to_value(&args)
             .and_then(serde_json::from_value::<CreateRequest>)
@@ -387,7 +396,7 @@ impl VigilServer {
         })
     }
 
-    #[tool(description = "Going cold (your work is done): cancels the named watch_ids (an empty list cancels nothing), or with watch_ids omitted the watches this server created, and returns what to do next (post an inline BabelTele summary, end your turn) plus the ids still pending.")]
+    #[tool(description = "Going cold (your work is done): cancels the named watch_ids (an empty list cancels nothing), or with watch_ids omitted the watches this server created, and returns what to do next (post a summary of the session, end your turn) plus the ids still pending.")]
     async fn cold(&self, Parameters(args): Parameters<ColdArgs>) -> Result<CallToolResult, ErrorData> {
         let ids = match args.watch_ids {
             Some(ids) => ids.iter().map(|raw| parse_id(raw)).collect::<Result<Vec<_>, _>>().map(Some),
@@ -407,7 +416,7 @@ impl VigilServer {
         })
     }
 
-    #[tool(description = "Hold the session in cache by watching the work itself, one item per spec: qex jobs, pids, marker files, times, a qex queue, or none for a T3 delegate (for: [\"qex:ID\", \"pid:N\", \"file:PATH\", \"until:RFC3339\", \"idle:DIR\", \"none\"]). Each item that ends raises \"item ended: LABEL: WHY\"; when all have ended keepalive returns \"hold released: ...\". With no work it lives until cancelled. Then call keepalive.")]
+    #[tool(description = "Hold the session in cache by watching the work itself, one item per spec: qex jobs, pids, marker files, times, a qex queue (the qex kinds need qex on PATH), or none for a delegated run with no pid or file to watch, such as a T3 Code delegate task (for: [\"qex:ID\", \"pid:N\", \"file:PATH\", \"until:RFC3339\", \"idle:DIR\", \"none\"]). Each item that ends raises \"item ended: LABEL: WHY\"; when all have ended keepalive returns \"hold released: ...\". With no work it lives until cancelled. Then call keepalive.")]
     async fn hold(&self, Parameters(args): Parameters<HoldArgs>, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
         let request = crate::hold::HoldRequest {
             id: args.id,
@@ -427,7 +436,7 @@ impl VigilServer {
         })
     }
 
-    #[tool(description = "Add one item of work to a live hold (for: one spec, or \"none\" with a label for a T3 delegate). The same keepalive on the hold covers it; it raises \"item ended\" when it ends and \"item overdue\" past 1.5x expect_s.")]
+    #[tool(description = "Add one item of work to a live hold (for: one spec, or \"none\" with a label for a delegated run with no pid or file to watch). The same keepalive on the hold covers it; it raises \"item ended\" when it ends and \"item overdue\" past 1.5x expect_s.")]
     async fn hold_add(&self, Parameters(args): Parameters<HoldAddArgs>) -> Result<CallToolResult, ErrorData> {
         Ok(match parse_id(&args.watch_id) {
             Ok(id) => reply(self.vigil.hold_add(&id, crate::hold::HoldItemRequest { work: args.work, expect_s: args.expect_s, label: args.label, cap: args.cap }).await),
@@ -559,12 +568,12 @@ impl VigilServer {
 impl ServerHandler for VigilServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(server_instructions())
+            .with_instructions(server_instructions(&self.vigil.config.cold_summary))
             .with_protocol_version(ProtocolVersion::V_2025_11_25)
     }
 
     // Claude Code does not register a server that negotiates 2026-07-28
-    // (FINDINGS section 2), so never offer it.
+    // (docs/findings.md section 2), so never offer it.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
     }
@@ -584,12 +593,25 @@ mod tests {
         //      agent to stop when `next` is anything else, and mention both
         //      other values. The e2e test checks the same text over the wire.
         // proves: CLAIM(instructions)
-        let text = server_instructions();
+        let text = server_instructions(crate::config::DEFAULT_COLD_SUMMARY);
         assert!(text.chars().count() < 512, "{} chars", text.chars().count());
-        for needle in ["watch_create", "keepalive", "call keepalive again", "act on events", "watch ended"] {
+        for needle in ["watch_create", "keepalive", "call keepalive again", "act on events", "watch ended", "post a short summary"] {
             assert!(text.contains(needle), "instructions must mention {needle:?}: {text}");
         }
         assert!(text.to_lowercase().contains("stop"), "must say when to stop: {text}");
+        assert!(!text.contains("BabelTele"), "the shipped text names no private format: {text}");
+    }
+
+    #[test]
+    fn vigil_cold_summary_replaces_the_summary_phrase_in_the_instructions() {
+        // why: VIGIL_COLD_SUMMARY lets an operator name their own summary
+        //      format; the instructions must carry it in place of the
+        //      default and still fit in 512 characters for a short phrase.
+        // proves: CLAIM(cold-summary)
+        let text = server_instructions("post an inline BabelTele summary");
+        assert!(text.contains("call `cold`, post an inline BabelTele summary, end the turn."), "{text}");
+        assert!(!text.contains("post a short summary"), "{text}");
+        assert!(text.chars().count() < 512, "{} chars", text.chars().count());
     }
 
     #[tokio::test(start_paused = true)]

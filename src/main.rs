@@ -10,7 +10,16 @@ use vigil::store::state_root;
 use vigil::{Config, CreateRequest, Envelope, KeepaliveRequest, PersistNote, SystemClock, Vigil, WatchId};
 
 #[derive(Debug, Parser)]
-#[command(name = "vigil", version, about = "Keep an agent's turn open while a cheap judge watches things")]
+#[command(
+    name = "vigil",
+    version,
+    about = "Keep an agent's turn open while a cheap judge watches things",
+    long_about = "Keep an agent's turn open while a cheap judge watches builds, logs, commands, ports, processes and URLs.\n\n\
+                  Only watches with fire = judge use the judge, a Jev-style typed-decision endpoint (POST /v1/predict; \
+                  Laya is one implementation) at VIGIL_JUDGE_URL (default http://127.0.0.1:4010). Optional tools: qex for \
+                  qex: and idle: hold items, boat for the first-use boat-budget advisory, uw for the credit check. \
+                  VIGIL_COLD_SUMMARY sets what `cold` tells the agent to post."
+)]
 struct Cli {
     /// State root; default `$XDG_STATE_HOME/vigil`, else `~/.local/state/vigil`.
     #[arg(long, global = true)]
@@ -31,11 +40,11 @@ enum Command {
     List,
     Cancel { id: String },
     /// Going cold (the work is done): cancel the named watches and holds, then
-    /// print the instruction to post a BabelTele summary and end the turn, and
-    /// the ids still pending. With no ids it cancels nothing: the CLI cannot
+    /// print the instruction to post a summary of the session and end the turn
+    /// (VIGIL_COLD_SUMMARY changes what to post), and the ids still pending. With no ids it cancels nothing: the CLI cannot
     /// tell which watches are this session's.
     Cold { ids: Vec<String> },
-    /// Read or set the owner's expiring Claude run limits (default work/review: 1/1).
+    /// Read or set the expiring limits on counted Claude runs (default work/review: 1/1).
     Cap {
         #[command(subcommand)]
         command: Option<CapCommand>,
@@ -63,7 +72,9 @@ enum Command {
     /// Hold the session: a watch on the work itself. Each `--for` is one item
     /// of work: `qex:JOB`, `pid:N`, `file:PATH` (ends when it exists),
     /// `until:RFC3339`, `idle:DIR` (no qex job at or under DIR is running), or
-    /// `none` (a T3 delegate: needs --label, ended by `vigil hold done`). Each
+    /// `none` (a delegated run with no pid or file to watch, such as a T3 Code
+    /// delegate task: needs --label, ended by `vigil hold done`). `qex:` and
+    /// `idle:` need qex on PATH (https://github.com/stephenc/qex). Each
     /// autonomous end wakes keepalive; `hold done` queues a quiet note.
     /// Up to 16 live items; ended history retains 64. The hold releases
     /// when every item has ended. With no work it is a bare hold, live until
@@ -166,7 +177,7 @@ enum HoldItemCommand {
     Add {
         id: String,
         /// The work: qex:JOB, pid:N, file:PATH, until:RFC3339, idle:DIR, or
-        /// none (a T3 delegate; needs --label).
+        /// none (a delegated run with no pid or file to watch; needs --label).
         #[arg(long = "for", value_name = "SPEC")]
         work: String,
         /// Name of the item (default: its spec). Unique per hold.

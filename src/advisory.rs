@@ -578,11 +578,13 @@ pub fn probe_body(probe: &Input, reading: &Reading) -> Result<String, String> {
     }
 }
 
-/// The advisory seeded into a fresh file (SPEC "Default advisory").
-pub fn default_boat_budget(home: Option<&str>) -> (AdvisoryId, AdvisorySpec) {
-    let boat = home.filter(|home| !home.is_empty()).map_or_else(|| "boat".to_string(), |home| format!("{home}/.local/bin/boat"));
+/// The advisory seeded into a fresh file when `boat` is on PATH (SPEC
+/// "Default advisory"). `boat` is the command the probe runs: the path found
+/// on PATH at seed time, so a hook started with a narrower PATH still finds
+/// it, or `boat` for the commented example written when it is absent.
+pub fn default_boat_budget(boat: &str) -> (AdvisoryId, AdvisorySpec) {
     let spec = AdvisorySpec {
-        probe: Input::Cmd { argv: ["env", "BOAT_NO_UPDATE=1", boat.as_str(), "limits", "--json"].map(String::from).to_vec(), timeout_s: Some(15.0), cwd: None },
+        probe: Input::Cmd { argv: ["env", "BOAT_NO_UPDATE=1", boat, "limits", "--json"].map(String::from).to_vec(), timeout_s: Some(15.0), cwd: None },
         extract: ExtractSpec {
             name: Some("pct".to_string()),
             json: Some("planIncluded.vmHoursRemaining".to_string()),
@@ -592,8 +594,8 @@ pub fn default_boat_budget(home: Option<&str>) -> (AdvisoryId, AdvisorySpec) {
         },
         params: BTreeMap::from([("threshold".to_string(), 10.0)]),
         condition: "pct <= threshold".to_string(),
-        message_when_true: "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): run heavy jobs (builds, test suites) through qex on this host instead of Boat.".to_string(),
-        message_when_false: "Boat has {pct}% of its hours left (above the {threshold}% threshold): prefer Boat for heavy work (builds, test runs) via edge.research/bin/boat-run; use qex locally only for one or two quick runs.".to_string(),
+        message_when_true: "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): run heavy jobs (builds, test suites) on this host, through a queue such as qex, instead of Boat.".to_string(),
+        message_when_false: "Boat has {pct}% of its hours left (above the {threshold}% threshold): prefer Boat for heavy work (builds, test runs); run only one or two quick jobs locally.".to_string(),
         cache_s: Some(DEFAULT_CACHE_S),
     };
     (AdvisoryId("boat-budget".to_string()), spec)
@@ -946,14 +948,14 @@ mod tests {
     }
 
     #[test]
-    fn the_default_boat_budget_advisory_follows_the_owner_rule() {
-        // why: owner request 2026-11-12: "prefer Boat; when Boat's remaining
-        //      hours are at or below 10%, use qex locally". Total 555.56 h:
+    fn the_default_boat_budget_advisory_prefers_boat_until_ten_percent_is_left() {
+        // why: the seeded rule: "prefer Boat; when Boat's remaining hours
+        //      are at or below 10%, run heavy work locally". Total 555.56 h:
         //      10% is 55.556 h. 55.556 -> exactly 10 -> TRUE (at or below);
         //      55.5 -> 9.99 -> TRUE; 56 -> 10.08 -> FALSE; 479.01 (the live
         //      sample) -> 86.22 -> FALSE; 0 -> TRUE.
         // proves: CLAIM(advisory-boat-budget)
-        let (name, default) = default_boat_budget(Some("/home/u"));
+        let (name, default) = default_boat_budget("/opt/bin/boat");
         assert_eq!(name.as_str(), "boat-budget");
         let advisory = Advisory::new(name, default.clone()).unwrap();
         assert_eq!(advisory.spec().params["threshold"], 10.0);
@@ -972,25 +974,24 @@ mod tests {
         let (value, verdict) = judge(479.01);
         assert!((value - 86.2).abs() < 0.05, "479.01 / 555.56 = 0.8622 {value}");
         assert!(!verdict.condition_true);
-        assert!(verdict.message.contains("86.2") && verdict.message.contains("boat-run"), "prefer Boat via boat-run: {}", verdict.message);
+        assert!(verdict.message.contains("86.2") && verdict.message.contains("prefer Boat"), "prefer Boat: {}", verdict.message);
         let (_, low) = judge(0.0);
         assert!(low.condition_true);
-        assert!(low.message.contains("qex") && low.message.contains('0') && low.message.contains("10"), "use qex locally: {}", low.message);
+        assert!(low.message.contains("this host") && low.message.contains('0') && low.message.contains("10"), "run locally: {}", low.message);
     }
 
     #[test]
-    fn the_default_probe_is_found_under_home_when_boat_lives_there() {
-        // why: hooks and MCP servers may start with a PATH lacking
-        //      ~/.local/bin (where `boat` lives on this host). The seed uses
-        //      `env BOAT_NO_UPDATE=1 boat ...` (as boat-run does, so the CLI
-        //      does not self-update during a probe) and an absolute boat path
-        //      when HOME is known.
+    fn the_default_probe_runs_the_boat_it_was_given_without_self_update() {
+        // why: hooks and MCP servers may start with a PATH that lacks the
+        //      directory `boat` was found in, so the seed stores the path the
+        //      seeder resolved. `env BOAT_NO_UPDATE=1` keeps the CLI from
+        //      updating itself during a probe.
         // proves: CLAIM(advisory-boat-budget)
-        let argv = |home: Option<&str>| match default_boat_budget(home).1.probe {
+        let argv = |boat: &str| match default_boat_budget(boat).1.probe {
             Input::Cmd { argv, .. } => argv,
             other => panic!("{other:?}"),
         };
-        assert_eq!(argv(Some("/home/u")), ["env", "BOAT_NO_UPDATE=1", "/home/u/.local/bin/boat", "limits", "--json"]);
-        assert_eq!(argv(None), ["env", "BOAT_NO_UPDATE=1", "boat", "limits", "--json"]);
+        assert_eq!(argv("/opt/bin/boat"), ["env", "BOAT_NO_UPDATE=1", "/opt/bin/boat", "limits", "--json"]);
+        assert_eq!(argv("boat"), ["env", "BOAT_NO_UPDATE=1", "boat", "limits", "--json"]);
     }
 }

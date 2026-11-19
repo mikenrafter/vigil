@@ -12,8 +12,10 @@
 //! threshold = 10
 //! ```
 //!
-//! Invariants: CLAIM(advisory-seed) a file that does not exist is created with
-//! the default advisory, once; a file that exists is never given defaults back.
+//! Invariants: CLAIM(advisory-seed) a file that does not exist is created
+//! once: with the default `boat-budget` advisory when `boat` is on PATH at
+//! that moment, else with no advisory (a header and a commented example). A
+//! file that exists is never given defaults back.
 //! CLAIM(advisory-lock) every edit holds `<file>.lock` across its read, check
 //! and rename, so concurrent edits do not lose each other. A refused edit
 //! leaves the file's bytes untouched.
@@ -57,19 +59,31 @@ impl AdvisorySet {
 #[derive(Debug, Clone)]
 pub struct AdvisoryStore {
     path: PathBuf,
-    /// For the default advisory's absolute `boat` path.
-    home: Option<String>,
+    /// The `PATH` searched for `boat` when the file is seeded.
+    search_path: Option<String>,
 }
 
 const TABLE: &str = "advisories";
 
-const SEED_HEADER: &str = "# vigil advisories: rules that tell agents what to do, delivered on every keepalive/wait\n\
+const SEED_HEADER: &str = "# vigil advisories: rules that tell agents what to do, delivered on every keepalive\n\
 # envelope and by `vigil advice`. vigil re-reads this file on every call, so edits apply at once.\n\
 # Change a number at runtime:  vigil advisory set boat-budget threshold=15\n\n";
 
+/// The seed when `boat` is not on PATH: nothing is active; the example shows
+/// the shape of an advisory.
+const EMPTY_SEED_HEADER: &str = "# vigil advisories: rules that tell agents what to do, delivered on every keepalive\n\
+# envelope and by `vigil advice`. vigil re-reads this file on every call, so edits apply at once.\n\
+# Add one with `vigil advisory add ID JSON`, or write a table here by hand.\n\
+#\n\
+# No advisory is active: `boat` was not on PATH when this file was created.\n\
+# An example that warns when a Boat plan runs low (remove the leading `# `):\n\
+#\n";
+
 impl AdvisoryStore {
-    pub fn new(path: PathBuf, home: Option<String>) -> AdvisoryStore {
-        AdvisoryStore { path, home }
+    /// `search_path` is the `PATH` to look for `boat` in when the file is
+    /// first seeded.
+    pub fn new(path: PathBuf, search_path: Option<String>) -> AdvisoryStore {
+        AdvisoryStore { path, search_path }
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -79,15 +93,16 @@ impl AdvisoryStore {
         AdvisoryError::File { path: self.path.display().to_string(), reason: reason.to_string() }
     }
 
-    /// The text of the file we would seed.
+    /// The text of the file we would seed: the `boat-budget` advisory with
+    /// the `boat` found on PATH, or, with no `boat`, no advisory at all.
     fn seed_text(&self) -> String {
-        let (id, spec) = default_boat_budget(self.home.as_deref());
-        let mut doc = DocumentMut::new();
-        let mut advisories = Table::new();
-        advisories.set_implicit(true);
-        advisories.insert(id.as_str(), Item::Table(spec_to_table(&spec)));
-        doc.insert(TABLE, Item::Table(advisories));
-        format!("{SEED_HEADER}{doc}")
+        match crate::config::find_on_path("boat", self.search_path.as_deref()) {
+            Some(boat) => format!("{SEED_HEADER}{}", boat_budget_doc(&boat.to_string_lossy())),
+            None => {
+                let example: String = boat_budget_doc("boat").to_string().lines().map(|line| format!("# {line}\n")).collect();
+                format!("{EMPTY_SEED_HEADER}{example}")
+            }
+        }
     }
 
     /// Read the file now. A missing file yields (and writes, best effort) the
@@ -219,6 +234,17 @@ impl AdvisoryStore {
             None => Err(AdvisoryError::Unknown { id: id.to_string(), known: known_list(&ids) }),
         }
     }
+}
+
+/// A document holding only the `boat-budget` advisory that runs `boat`.
+fn boat_budget_doc(boat: &str) -> DocumentMut {
+    let (id, spec) = default_boat_budget(boat);
+    let mut doc = DocumentMut::new();
+    let mut advisories = Table::new();
+    advisories.set_implicit(true);
+    advisories.insert(id.as_str(), Item::Table(spec_to_table(&spec)));
+    doc.insert(TABLE, Item::Table(advisories));
+    doc
 }
 
 fn known_list(ids: &[String]) -> String {
@@ -381,8 +407,18 @@ mod tests {
     use crate::advisory::default_boat_budget;
     use serde_json::json;
 
+    /// A `bin` directory under `dir` holding an executable `boat`; its path.
+    fn boat_bin(dir: &tempfile::TempDir) -> PathBuf {
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        crate::testing::write_script(&bin.join("boat"), "exit 0");
+        bin
+    }
+
+    /// A store whose PATH has `boat` on it (the seed has `boat-budget`).
     fn store_in(dir: &tempfile::TempDir) -> AdvisoryStore {
-        AdvisoryStore::new(dir.path().join("cfg/advisories.toml"), Some("/home/u".to_string()))
+        let bin = boat_bin(dir);
+        AdvisoryStore::new(dir.path().join("cfg/advisories.toml"), Some(format!("/nonexistent:{}", bin.display())))
     }
 
     fn spec(extra: serde_json::Value) -> AdvisorySpec {
@@ -409,19 +445,43 @@ mod tests {
 
     #[test]
     fn a_missing_file_yields_the_default_and_writes_it_once() {
-        // why: owner: "Seed it only if absent". First use on a host has no
-        //      file; the default boat-budget must be there and be on disk so
-        //      the operator can see and edit it.
+        // why: "Seed it only if absent". First use on a host that has `boat`
+        //      on PATH has no file; the default boat-budget must be there,
+        //      running the `boat` that was found, and be on disk so the
+        //      operator can see and edit it.
         // proves: CLAIM(advisory-seed)
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(&dir);
         assert!(!store.path().exists());
         let set = store.load().unwrap();
         assert_eq!(set.ids(), ["boat-budget"]);
-        assert_eq!(ready(&set, "boat-budget").spec(), &default_boat_budget(Some("/home/u")).1);
+        let boat = dir.path().join("bin/boat");
+        assert_eq!(ready(&set, "boat-budget").spec(), &default_boat_budget(&boat.to_string_lossy()).1);
         let text = std::fs::read_to_string(store.path()).expect("seeded to disk");
         assert!(text.contains("[advisories.boat-budget]") && text.contains("threshold"), "{text}");
         assert_eq!(store.load().unwrap().ids(), ["boat-budget"], "and it loads back");
+    }
+
+    #[test]
+    fn without_boat_on_path_the_seed_has_no_advisory_and_a_commented_example() {
+        // why: `boat` is optional. A host without it must not get an advisory
+        //      that fails on every call; the seeded file explains why it is
+        //      empty and shows the example, which parses once uncommented.
+        //      PATH entries that do not exist, or hold no `boat`, count as
+        //      absent; so does no PATH at all.
+        // proves: CLAIM(advisory-seed), CLAIM(tool-presence)
+        for search_path in [None, Some("/nonexistent:/also-not-there".to_string())] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = AdvisoryStore::new(dir.path().join("cfg/advisories.toml"), search_path.clone());
+            let set = store.load().unwrap();
+            assert!(set.entries.is_empty(), "{search_path:?}: {:?}", set.ids());
+            let text = std::fs::read_to_string(store.path()).expect("seeded to disk");
+            assert!(text.contains("`boat` was not on PATH") && text.contains("# [advisories.boat-budget]"), "{text}");
+            assert!(text.lines().all(|line| line.is_empty() || line.starts_with('#')), "nothing active: {text}");
+            let example: String = text[text.find("# [advisories.").unwrap()..].lines().map(|line| format!("{}\n", line.strip_prefix("# ").unwrap_or(line))).collect();
+            std::fs::write(store.path(), &example).unwrap();
+            assert_eq!(ready(&store.load().unwrap(), "boat-budget").spec(), &default_boat_budget("boat").1, "the example is the default with a bare `boat`");
+        }
     }
 
     #[test]

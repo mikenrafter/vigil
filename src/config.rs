@@ -1,4 +1,24 @@
 //! Runtime configuration read from the environment at the binary edge.
+//!
+//! Environment variables (all optional):
+//!
+//! - `VIGIL_JUDGE_URL`: the judge, a Jev-style typed-decision endpoint
+//!   (`POST /v1/predict`, `GET /health`; Laya is one implementation). Default
+//!   `http://127.0.0.1:4010`. Only watches with `fire = "judge"` use it.
+//! - `VIGIL_JUDGE_STATE_BYTES`, `VIGIL_DIGEST_MAX_BYTES`: size limits (W2, W3).
+//! - `VIGIL_CLAUDE_PROJECTS_DIR`, `CLAUDE_CONFIG_DIR`: where Claude Code keeps
+//!   session transcripts (AI1').
+//! - `VIGIL_UW_COMMAND`: the usagewindow `uw` binary (default `uw`); a missing
+//!   `uw` is the same as "not available" (AI2').
+//! - `VIGIL_ON_CREDIT_CHANGE`: a hook run when the credit state changes (AI8).
+//! - `VIGIL_ADVISORIES_FILE`, `VIGIL_REMINDERS_FILE`: config files (`off`
+//!   turns each off).
+//! - `VIGIL_COLD_SUMMARY`: the summary instruction `cold` gives, replacing
+//!   [`DEFAULT_COLD_SUMMARY`] (for example "post an inline BabelTele
+//!   summary").
+//! - `VIGIL_ORCHESTRATOR_CONFIRM`: `off` turns the orchestrator challenge off.
+//! - `PATH`: searched for `boat` when the advisories file is first seeded, and
+//!   for `qex` when a hold names `qex:` or `idle:` work.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,6 +38,9 @@ pub const DEFAULT_UW_COMMAND: &str = "uw";
 pub const DEFAULT_CREDIT_CHECK_EVERY: Duration = Duration::from_secs(240);
 /// AI8: the credit-change hook is killed after this long (10 s).
 pub const DEFAULT_CREDIT_HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+/// What `cold` tells the agent to post before it ends its turn, unless
+/// `VIGIL_COLD_SUMMARY` says otherwise.
+pub const DEFAULT_COLD_SUMMARY: &str = "post a short summary of this session (task, progress, in-flight ids, tools, the user's standing rules)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -50,8 +73,12 @@ pub struct Config {
     /// `$HOME/.config/vigil/advisories.toml`; `None` when off or no place can be
     /// formed. No file means no advisories and no `advice` key anywhere.
     pub advisories_file: Option<PathBuf>,
-    /// `$HOME`, for the default advisory's absolute `boat` path.
-    pub home: Option<String>,
+    /// `$PATH`: where the first-use seed looks for `boat` and a hold looks
+    /// for `qex`.
+    pub path: Option<String>,
+    /// `VIGIL_COLD_SUMMARY`, else [`DEFAULT_COLD_SUMMARY`]: the instruction
+    /// phrase in `cold`'s `next` and in the MCP server instructions.
+    pub cold_summary: String,
     /// Reminder config, re-read at delivery; off disables reminders.
     pub reminders_file: Option<PathBuf>,
     /// Orchestrator mode asks for the day's token (owner 2026-11-14,
@@ -101,10 +128,22 @@ impl Config {
                     .map(|dir| PathBuf::from(dir).join("vigil/reminders.toml"))
                     .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".config/vigil/reminders.toml"))),
             },
-            home: non_empty("HOME"),
+            path: non_empty("PATH"),
+            cold_summary: non_empty("VIGIL_COLD_SUMMARY").map_or_else(|| DEFAULT_COLD_SUMMARY.to_string(), |text| text.trim().to_string()),
             orchestrator_confirm: lookup("VIGIL_ORCHESTRATOR_CONFIRM").as_deref() != Some("off"),
         }
     }
+}
+
+/// The first executable file called `name` in the directories of `path` (a
+/// `PATH` value), or `None`. Used to decide, before anything else happens,
+/// whether an optional tool (`boat`, `qex`) is there at all.
+pub fn find_on_path(name: &str, path: Option<&str>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| std::fs::metadata(candidate).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0))
 }
 
 #[cfg(test)]
@@ -254,8 +293,44 @@ mod tests {
         assert_eq!(file(&[("HOME", "/home/u"), ("VIGIL_ADVISORIES_FILE", "off")]), None);
         assert_eq!(file(&[]), None);
         assert_eq!(file(&[("HOME", "")]), None);
-        assert_eq!(Config::from_lookup(lookup(&[("HOME", "/home/u")])).home.as_deref(), Some("/home/u"));
-        assert_eq!(Config::from_lookup(lookup(&[("HOME", "")])).home, None);
+        assert_eq!(Config::from_lookup(lookup(&[("PATH", "/bin:/usr/bin")])).path.as_deref(), Some("/bin:/usr/bin"));
+        assert_eq!(Config::from_lookup(lookup(&[("PATH", "")])).path, None);
+    }
+
+    #[test]
+    fn the_cold_summary_defaults_to_a_generic_phrase_and_can_be_replaced() {
+        // why: `cold` tells the agent what to post before it ends its turn.
+        //      The shipped text names no private format; VIGIL_COLD_SUMMARY
+        //      replaces the phrase (e.g. with a BabelTele instruction). Blank
+        //      counts as unset.
+        // proves: CLAIM(cold-summary)
+        assert_eq!(Config::from_lookup(lookup(&[])).cold_summary, DEFAULT_COLD_SUMMARY);
+        assert_eq!(Config::from_lookup(lookup(&[("VIGIL_COLD_SUMMARY", "")])).cold_summary, DEFAULT_COLD_SUMMARY);
+        assert_eq!(Config::from_lookup(lookup(&[("VIGIL_COLD_SUMMARY", "post an inline BabelTele summary")])).cold_summary, "post an inline BabelTele summary");
+        assert!(!DEFAULT_COLD_SUMMARY.contains("BabelTele"));
+    }
+
+    #[test]
+    fn find_on_path_finds_only_executable_files() {
+        // why: presence decides whether `boat` is seeded and whether a qex
+        //      hold may be created. A directory, a non-executable file, an
+        //      empty PATH entry and no PATH at all are all "absent"; the first
+        //      executable match wins.
+        // proves: CLAIM(tool-presence)
+        use std::os::unix::fs::PermissionsExt;
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        std::fs::create_dir(one.path().join("tool")).unwrap();
+        std::fs::write(one.path().join("plain"), "x").unwrap();
+        let exe = two.path().join("tool");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(":{}:{}", one.path().display(), two.path().display());
+        assert_eq!(find_on_path("tool", Some(&path)), Some(exe));
+        assert_eq!(find_on_path("plain", Some(&path)), None);
+        assert_eq!(find_on_path("missing", Some(&path)), None);
+        assert_eq!(find_on_path("tool", None), None);
+        assert_eq!(find_on_path("tool", Some("")), None);
     }
 
     #[test]
