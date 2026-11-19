@@ -107,7 +107,10 @@ impl Rig {
         env.config.reminders_file = Some(env.dir.path().join("reminders.toml"));
         let cwd = env.dir.path().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
-        env.vigil = env.another_process_in(&cwd);
+        // Reminder latency is measured in virtual time, including the credit
+        // check. A real `uw` child can run past a paused-time timeout.
+        env.vigil = env.another_process_in(&cwd)
+            .with_credit_probe(ScriptedCreditProbe::new(credit_unknown(crate::credit::CreditSource::Transcripts)));
         Self { env, cwd }
     }
     fn add(&self, extra: Value) {
@@ -580,7 +583,8 @@ async fn a_background_probe_cannot_hold_a_watch_fired_by_another_process() {
 #[tokio::test(start_paused = true)]
 async fn a_completed_background_probe_is_delivered_on_a_later_pass() {
     // WHY: R2: spawning alone is insufficient; a later sense pass must pick
-    // up the cached due result and claim one early event without ending the watch.
+    // up the cached zero-TTL result and claim one early event without ending
+    // the watch. A new background refresh may start while delivering it.
     let rig = Rig::new("2026-11-11T16:00:00Z");
     rig.add(json!({"probe":["release-probe"], "cache_s":0}));
     rig.env.reader.set_text("cmd:release-probe", "exit=0\nready");
@@ -591,7 +595,7 @@ async fn a_completed_background_probe_is_delivered_on_a_later_pass() {
     assert_eq!(result.status, crate::WatchStatus::Pending);
     assert_eq!(result.events.len(), 1);
     assert_eq!(result.events[0].input, "reminder:release");
-    assert_eq!(rig.env.reader.started_count("cmd:release-probe"), 1);
+    assert_eq!(result.reminders.unwrap()[0].checked_at, at("2026-11-11T16:00:03Z"), "delivery reuses the first probe's snapshot at the 30s pass");
 }
 
 #[tokio::test(start_paused = true)]

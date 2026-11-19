@@ -9,12 +9,14 @@ use serde_json::{Value, json};
 
 use crate::hold::HoldRequest;
 use crate::keepalive::KeepaliveRequest;
-use crate::testing::{Env, TokioClock, default_config, spec_instant};
+use crate::testing::{Env, ScriptedCreditProbe, TokioClock, credit_unknown, default_config, spec_instant};
 use crate::watch::WatchId;
 
 fn env() -> Env {
     let mut env = Env::with_clock(Arc::new(TokioClock::new(spec_instant())));
-    env.vigil = env.vigil.with_session_key(Some("pilot-session".into()));
+    // Real `uw` I/O races paused time and changes the peer timing assertions.
+    env.vigil = env.vigil.with_session_key(Some("pilot-session".into()))
+        .with_credit_probe(ScriptedCreditProbe::new(credit_unknown(crate::credit::CreditSource::Transcripts)));
     env
 }
 
@@ -107,7 +109,8 @@ async fn foreign_orchestrator_ends_the_call_once_per_record() {
     }
     assert!(path.exists(), "the foreign call is still in flight");
     // A fresh engine also must not repeat this same peer record (CLI calls).
-    let other = env.another_process().with_session_key(Some("pilot-session".into()));
+    let other = env.another_process().with_session_key(Some("pilot-session".into()))
+        .with_credit_probe(ScriptedCreditProbe::new(credit_unknown(crate::credit::CreditSource::Transcripts)));
     let again = other.keepalive(request(Some(true))).await.unwrap();
     assert!(again.events.is_empty(), "raised once per record across calls");
     assert_eq!(again.waited_s, Some(30));
@@ -321,7 +324,8 @@ async fn ordinary_watch_metadata_is_registered_and_an_error_unregisters_it() {
 fn gated_env() -> Env {
     let config = crate::config::Config { orchestrator_confirm: true, ..default_config() };
     let mut env = Env::with_clock_and_config(Arc::new(TokioClock::new(spec_instant())), config);
-    env.vigil = env.vigil.with_session_key(Some("pilot-session".into()));
+    env.vigil = env.vigil.with_session_key(Some("pilot-session".into()))
+        .with_credit_probe(ScriptedCreditProbe::new(credit_unknown(crate::credit::CreditSource::Transcripts)));
     env
 }
 
