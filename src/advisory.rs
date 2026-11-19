@@ -100,9 +100,10 @@ pub struct ExtractSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Dotted path into the probe's JSON, e.g. `planIncluded.vmHoursRemaining`.
+    /// Several paths joined by `+` are summed: `plan.left+credit.left`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json: Option<String>,
-    /// With `json`: a second path; the result is `json / of`.
+    /// With `json`: a second path (or `+` sum); the result is `json / of`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub of: Option<String>,
     /// With `json`: multiplier applied last (100 turns a ratio into a percent).
@@ -167,9 +168,9 @@ impl Extract {
             (Some(path), None) => {
                 for (label, text) in [("json", Some(path)), ("of", spec.of.as_ref())] {
                     if let Some(text) = text
-                        && (text.is_empty() || text.split('.').any(str::is_empty))
+                        && text.split('+').any(|term| term.trim().is_empty() || term.trim().split('.').any(str::is_empty))
                     {
-                        return Err(bad(&format!("{label} must be a dotted path like a.b.0.c, got {text:?}")));
+                        return Err(bad(&format!("{label} must be dotted paths like a.b.0.c, joined by + to sum, got {text:?}")));
                     }
                 }
                 let scale = spec.scale.unwrap_or(1.0);
@@ -198,11 +199,11 @@ impl Extract {
         let number = match self {
             Extract::Json { path, of, scale } => {
                 let root: Value = serde_json::from_str(text).map_err(|error| format!("probe output is not JSON: {error}"))?;
-                let numerator = number_at(&root, path)?;
+                let numerator = sum_at(&root, path)?;
                 let ratio = match of {
                     None => numerator,
                     Some(of) => {
-                        let denominator = number_at(&root, of)?;
+                        let denominator = sum_at(&root, of)?;
                         if denominator == 0.0 {
                             return Err(format!("{of} is 0, cannot divide {path} by it"));
                         }
@@ -221,6 +222,11 @@ impl Extract {
         };
         if number.is_finite() { Ok(number) } else { Err("the extracted value is not a finite number".to_string()) }
     }
+}
+
+/// `a.b+c.d`: the sum of the numbers at each `+`-separated path.
+fn sum_at(root: &Value, paths: &str) -> Result<f64, String> {
+    paths.split('+').map(|path| number_at(root, path.trim())).sum()
 }
 
 fn number_at(root: &Value, path: &str) -> Result<f64, String> {
@@ -585,17 +591,19 @@ pub fn probe_body(probe: &Input, reading: &Reading) -> Result<String, String> {
 pub fn default_boat_budget(boat: &str) -> (AdvisoryId, AdvisorySpec) {
     let spec = AdvisorySpec {
         probe: Input::Cmd { argv: ["env", "BOAT_NO_UPDATE=1", boat, "limits", "--json"].map(String::from).to_vec(), timeout_s: Some(15.0), cwd: None },
+        // Plan hours run out mid-period and starts then draw on prepaid
+        // credit, so the plan's share alone reads 0% while Boat still starts.
         extract: ExtractSpec {
-            name: Some("pct".to_string()),
-            json: Some("planIncluded.vmHoursRemaining".to_string()),
-            of: Some("planIncluded.vmHours".to_string()),
-            scale: Some(100.0),
+            name: Some("hours".to_string()),
+            json: Some("planIncluded.vmHoursRemaining+creditBalanceHours".to_string()),
+            of: None,
+            scale: None,
             regex: None,
         },
         params: BTreeMap::from([("threshold".to_string(), 10.0)]),
-        condition: "pct <= threshold".to_string(),
-        message_when_true: "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): run heavy jobs (builds, test suites) on this host, through a queue such as qex, instead of Boat.".to_string(),
-        message_when_false: "Boat has {pct}% of its hours left (above the {threshold}% threshold): prefer Boat for heavy work (builds, test runs); run only one or two quick jobs locally.".to_string(),
+        condition: "hours <= threshold".to_string(),
+        message_when_true: "Boat has {hours} hours left, plan and credit together (at or below {threshold}): run heavy jobs (builds, test suites) on this host, through a queue such as qex, instead of Boat.".to_string(),
+        message_when_false: "Boat has {hours} hours left, plan and credit together (above {threshold}): prefer Boat for heavy work (builds, test runs); run only one or two quick jobs locally.".to_string(),
         cache_s: Some(DEFAULT_CACHE_S),
     };
     (AdvisoryId("boat-budget".to_string()), spec)
@@ -679,6 +687,27 @@ mod tests {
         }))).unwrap();
         assert_eq!(plain.extract_value(r#"{"a":[{"b":1},{"b":12.5}]}"#), Ok(12.5));
         assert_eq!(plain.extract_value(r#"{"a":[{"b":1},{"b":"7.5"}]}"#), Ok(7.5), "a numeric string is a number");
+    }
+
+    #[test]
+    fn extraction_sums_paths_joined_by_plus() {
+        // why: Boat's usable hours are plan hours plus prepaid credit; the
+        //      plan alone read 0% while 127 credit hours remained.
+        // catches: reading only the first term of a + sum.
+        let sum = Advisory::new(id("s"), spec(json!({
+            "probe": {"kind": "cmd", "argv": ["x"]},
+            "extract": {"name": "hours", "json": "plan.left+credit"},
+            "condition": "hours <= 10", "message_when_true": "t", "message_when_false": "f"
+        }))).unwrap();
+        assert_eq!(sum.extract_value(r#"{"plan":{"left":0},"credit":127.5}"#), Ok(127.5));
+        assert_eq!(sum.extract_value(r#"{"plan":{"left":2},"credit":3}"#), Ok(5.0));
+        let error = sum.extract_value(r#"{"plan":{"left":2}}"#).expect_err("missing term");
+        assert!(error.contains("credit"), "{error}");
+        let empty_term = Advisory::new(id("e"), spec(json!({
+            "probe": {"kind": "cmd", "argv": ["x"]}, "extract": {"json": "a+"},
+            "condition": "value > 1", "message_when_true": "t", "message_when_false": "f"
+        })));
+        assert!(empty_term.is_err(), "an empty + term is refused at load");
     }
 
     #[test]
@@ -941,19 +970,22 @@ mod tests {
         assert_eq!(probe_body(&file, &reading("12.5\n", false)), Ok("12.5\n".to_string()));
     }
 
-    /// A trimmed copy of a real `boat limits --json` (captured 2026-11-12) with
-    /// the two fields the default advisory reads.
-    fn boat_sample(remaining: f64) -> String {
-        format!(r#"{{"accessTier":"standard","planIncluded":{{"periodEnd":"2026-12-11T05:35:10.000Z","vmHours":555.56,"vmHoursRemaining":{remaining}}},"starts":{{"day":{{"limit":200}}}}}}"#)
+    /// A trimmed copy of a real `boat limits --json` (captured 2026-11-19) with
+    /// the fields the default advisory reads.
+    fn boat_sample(plan_left: f64, credit: f64) -> String {
+        format!(r#"{{"accessTier":"standard","canStart":true,"creditBalanceHours":{credit},"planIncluded":{{"periodEnd":"2026-12-11T05:35:10.000Z","vmHours":555.56,"vmHoursRemaining":{plan_left}}},"starts":{{"day":{{"limit":200}}}}}}"#)
     }
 
     #[test]
-    fn the_default_boat_budget_advisory_prefers_boat_until_ten_percent_is_left() {
-        // why: the seeded rule: "prefer Boat; when Boat's remaining hours
-        //      are at or below 10%, run heavy work locally". Total 555.56 h:
-        //      10% is 55.556 h. 55.556 -> exactly 10 -> TRUE (at or below);
-        //      55.5 -> 9.99 -> TRUE; 56 -> 10.08 -> FALSE; 479.01 (the live
-        //      sample) -> 86.22 -> FALSE; 0 -> TRUE.
+    fn the_default_boat_budget_advisory_counts_plan_and_credit_hours() {
+        // why: the seeded rule: "prefer Boat; when Boat's usable hours are at
+        //      or below 10, run heavy work locally". Usable hours are the
+        //      plan's remaining hours plus prepaid credit: on 2026-11-19 the
+        //      plan read 0 of 555.56 while 127.57 credit hours remained and
+        //      Boat started fine, but the old percent-of-plan rule said 0%.
+        //      0 + 127.57 -> prefer Boat; 4 + 6 = 10 -> TRUE (at the
+        //      threshold); 0 + 9.9 -> TRUE; 0 + 0 -> TRUE; 479.01 + 0 -> FALSE.
+        // catches: reading only planIncluded (the bug), or only credit.
         // proves: CLAIM(advisory-boat-budget)
         let (name, default) = default_boat_budget("/opt/bin/boat");
         assert_eq!(name.as_str(), "boat-budget");
@@ -962,20 +994,18 @@ mod tests {
         assert_eq!(advisory.cache_s(), 600);
         let Input::Cmd { argv, .. } = advisory.probe() else { panic!("the probe is a cmd") };
         assert!(argv.windows(2).any(|pair| pair == ["limits", "--json"]) && argv.iter().any(|a| a.ends_with("boat")), "{argv:?}");
-        let judge = |remaining: f64| {
-            let value = advisory.extract_value(&boat_sample(remaining)).expect("the sample has the fields");
+        let judge = |plan: f64, credit: f64| {
+            let value = advisory.extract_value(&boat_sample(plan, credit)).expect("the sample has the fields");
             (value, advisory.judge(value))
         };
-        let (value, verdict) = judge(55.556);
-        assert!((value - 10.0).abs() < 1e-9, "{value}");
-        assert!(verdict.condition_true, "10% is at the threshold");
-        assert!(judge(55.5).1.condition_true);
-        assert!(!judge(56.0).1.condition_true);
-        let (value, verdict) = judge(479.01);
-        assert!((value - 86.2).abs() < 0.05, "479.01 / 555.56 = 0.8622 {value}");
-        assert!(!verdict.condition_true);
-        assert!(verdict.message.contains("86.2") && verdict.message.contains("prefer Boat"), "prefer Boat: {}", verdict.message);
-        let (_, low) = judge(0.0);
+        let (value, verdict) = judge(0.0, 127.57);
+        assert!((value - 127.57).abs() < 1e-9, "{value}");
+        assert!(!verdict.condition_true, "credit counts: {}", verdict.message);
+        assert!(verdict.message.contains("127.6") && verdict.message.contains("prefer Boat"), "{}", verdict.message);
+        assert!(judge(4.0, 6.0).1.condition_true, "10 hours is at the threshold");
+        assert!(judge(0.0, 9.9).1.condition_true);
+        assert!(!judge(479.01, 0.0).1.condition_true, "plan hours count too");
+        let (_, low) = judge(0.0, 0.0);
         assert!(low.condition_true);
         assert!(low.message.contains("this host") && low.message.contains('0') && low.message.contains("10"), "run locally: {}", low.message);
     }

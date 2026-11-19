@@ -43,7 +43,7 @@ fn tools_dir(sandbox: &Sandbox) -> PathBuf {
 }
 
 fn boat_json(remaining: f64) -> String {
-    format!(r#"{{"accessTier":"standard","planIncluded":{{"periodEnd":"2026-12-11T05:35:10.000Z","vmHours":555.56,"vmHoursRemaining":{remaining}}}}}"#)
+    format!(r#"{{"accessTier":"standard","planIncluded":{{"periodEnd":"2026-12-11T05:35:10.000Z","vmHours":555.56,"vmHoursRemaining":{remaining}}},"creditBalanceHours":0}}"#)
 }
 
 impl Rig {
@@ -100,7 +100,7 @@ fn only(advice: &Value) -> &Value {
 fn advice_runs_the_shipped_boat_budget_advisory_and_seeds_the_file() {
     // why: `vigil advice [--json]` is what hooks call; with `boat` on PATH
     //      the default boat-budget is seeded when the file is absent and,
-    //      with 479.01 of 555.56 hours left (86%), says to prefer Boat. The
+    //      with 479.01 plan hours and no credit left, says to prefer Boat. The
     //      plain form prints `id: message`, one line.
     // proves: CLAIM(advisory-boat-budget), CLAIM(advisory-seed), CLAIM(advisory-delivery)
     let rig = Rig::new(479.01);
@@ -110,7 +110,7 @@ fn advice_runs_the_shipped_boat_budget_advisory_and_seeds_the_file() {
     assert_eq!(entry["id"], "boat-budget");
     assert_eq!(entry["kind"], "advice");
     let message = entry["message"].as_str().unwrap();
-    assert!(message.contains("86.2") && message.contains("prefer Boat"), "{message}");
+    assert!(message.contains("479") && message.contains("prefer Boat"), "{message}");
     let seeded = std::fs::read_to_string(&rig.advisories).unwrap();
     assert!(seeded.contains("[advisories.boat-budget]") && seeded.contains(&format!("{:?}", rig.boat().display().to_string())), "the probe runs the boat found on PATH: {seeded}");
 
@@ -140,20 +140,20 @@ fn without_boat_on_path_nothing_is_seeded_and_advice_is_empty() {
 #[test]
 fn set_threshold_changes_the_advice_immediately_with_no_new_probe() {
     // why: `vigil advisory set boat-budget threshold=15` takes effect at
-    //      once. 86% left: prefer Boat. Threshold 90: 86 <= 90, so run heavy
+    //      once. 479 hours left: prefer Boat. Threshold 500: 479 <= 500, so run heavy
     //      work locally. The probe ran once for both answers.
     // proves: CLAIM(advisory-immediate), CLAIM(advisory-set)
     let rig = Rig::new(479.01);
     assert!(only(&rig.advice_json())["message"].as_str().unwrap().contains("prefer Boat"));
-    let set = rig.run(&["advisory", "set", "boat-budget", "threshold=90"]);
+    let set = rig.run(&["advisory", "set", "boat-budget", "threshold=500"]);
     assert!(set.status.success(), "{}", stderr_of(&set));
-    assert_eq!(stdout_json(&set)["spec"]["params"]["threshold"], 90.0);
+    assert_eq!(stdout_json(&set)["spec"]["params"]["threshold"], 500.0);
     let message = only(&rig.advice_json())["message"].as_str().unwrap().to_string();
-    assert!(message.contains("qex") && message.contains("86.2") && message.contains("90"), "{message}");
+    assert!(message.contains("qex") && message.contains("479") && message.contains("500"), "{message}");
     assert_eq!(rig.probe_runs(), 1);
     // And a hand edit is the same thing.
     let text = std::fs::read_to_string(&rig.advisories).unwrap();
-    std::fs::write(&rig.advisories, text.replace("threshold = 90", "threshold = 5")).unwrap();
+    std::fs::write(&rig.advisories, text.replace("threshold = 500", "threshold = 5")).unwrap();
     assert!(only(&rig.advice_json())["message"].as_str().unwrap().contains("prefer Boat"));
 }
 
@@ -309,7 +309,7 @@ fn json_of(result: &CallToolResult) -> Value {
 async fn the_mcp_tools_list_show_set_add_remove_and_advise() {
     // why: owner item 3: "matching MCP tools (advisory_set, advisory_list,
     //      ...)". The model drives the same file: list sees the default, set
-    //      threshold=90 flips the advice at once (probe ran once), add and rm
+    //      threshold=500 flips the advice at once (probe ran once), add and rm
     //      work, and every failure is isError with the CLI's message.
     // proves: CLAIM(advisory-set), CLAIM(advisory-immediate), CLAIM(advisory-valid)
     let rig = Rig::new(479.01);
@@ -322,13 +322,13 @@ async fn the_mcp_tools_list_show_set_add_remove_and_advise() {
     assert_eq!(listed[0]["id"], "boat-budget");
     let advice = json_of(&call(&client, "advice", json!({})).await);
     assert!(advice["advice"][0]["message"].as_str().unwrap().contains("prefer Boat"), "{advice}");
-    let set = json_of(&call(&client, "advisory_set", json!({"id": "boat-budget", "settings": {"threshold": 90}})).await);
-    assert_eq!(set["spec"]["params"]["threshold"], 90.0);
+    let set = json_of(&call(&client, "advisory_set", json!({"id": "boat-budget", "settings": {"threshold": 500}})).await);
+    assert_eq!(set["spec"]["params"]["threshold"], 500.0);
     let advice = json_of(&call(&client, "advice", json!({})).await);
     assert!(advice["advice"][0]["message"].as_str().unwrap().contains("qex"), "{advice}");
     assert_eq!(rig.probe_runs(), 1);
     let shown = json_of(&call(&client, "advisory_show", json!({"id": "boat-budget"})).await);
-    assert_eq!(shown["spec"]["extract"]["name"], "pct");
+    assert_eq!(shown["spec"]["extract"]["name"], "hours");
 
     for (tool, arguments, needle) in [
         ("advisory_set", json!({"id": "nope", "settings": {"threshold": 1}}), "no advisory named"),

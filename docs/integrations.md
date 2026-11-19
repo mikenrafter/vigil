@@ -108,10 +108,10 @@ example, or add it with `vigil advisory add`:
 ```toml
 [advisories.boat-budget]
 probe = { kind = "cmd", argv = ["env", "BOAT_NO_UPDATE=1", "boat", "limits", "--json"], timeout_s = 15 }
-extract = { name = "pct", json = "planIncluded.vmHoursRemaining", of = "planIncluded.vmHours", scale = 100 }
-condition = "pct <= threshold"
-message_when_true = "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): run heavy jobs (builds, test suites) on this host, through a queue such as qex, instead of Boat."
-message_when_false = "Boat has {pct}% of its hours left (above the {threshold}% threshold): prefer Boat for heavy work (builds, test runs); run only one or two quick jobs locally."
+extract = { name = "hours", json = "planIncluded.vmHoursRemaining+creditBalanceHours" }
+condition = "hours <= threshold"
+message_when_true = "Boat has {hours} hours left, plan and credit together (at or below {threshold}): run heavy jobs (builds, test suites) on this host, through a queue such as qex, instead of Boat."
+message_when_false = "Boat has {hours} hours left, plan and credit together (above {threshold}): prefer Boat for heavy work (builds, test runs); run only one or two quick jobs locally."
 cache_s = 600
 
 [advisories.boat-budget.params]

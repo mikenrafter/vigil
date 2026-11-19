@@ -5,8 +5,8 @@
 //! ```toml
 //! [advisories.boat-budget]
 //! probe = { kind = "cmd", argv = ["boat", "limits", "--json"] }
-//! extract = { name = "pct", json = "planIncluded.vmHoursRemaining", of = "planIncluded.vmHours", scale = 100 }
-//! condition = "pct <= threshold"
+//! extract = { name = "hours", json = "planIncluded.vmHoursRemaining+creditBalanceHours" }
+//! condition = "hours <= threshold"
 //! ...
 //! [advisories.boat-budget.params]
 //! threshold = 10

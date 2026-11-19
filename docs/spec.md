@@ -1139,8 +1139,9 @@ message_when_false, cache_s}` under an id `[A-Za-z0-9_-]{1,64}`:
   2xx, else the probe failed. `port`, `process` and `glob` cannot give text and
   are refused.
 - `extract`: how to get one number from the probe's output. Either
-  `json = "a.b.0.c"` (dotted path; array indices; a numeric string counts), with
-  optional `of = "a.d"` (divide by that path; a zero denominator is a failure)
+  `json = "a.b.0.c"` (dotted path; array indices; a numeric string counts;
+  several paths joined by `+` are summed, `a.b+c`), with
+  optional `of = "a.d"` (divide by that path or sum; a zero denominator is a failure)
   and `scale = 100` (multiply last); or `regex = "..."` (group 1, else the whole
   match; at most 256 bytes). `name` (default `value`) is what the number is
   called in the condition and messages; `value` always works as an alias.
@@ -1167,10 +1168,10 @@ advisory:
 ```toml
 [advisories.boat-budget]
 probe = { kind = "cmd", argv = ["env", "BOAT_NO_UPDATE=1", "/usr/local/bin/boat", "limits", "--json"], timeout_s = 15 }
-extract = { name = "pct", json = "planIncluded.vmHoursRemaining", of = "planIncluded.vmHours", scale = 100 }
-condition = "pct <= threshold"
-message_when_true = "Boat has {pct}% of its hours left (at or below the {threshold}% threshold): ..."
-message_when_false = "Boat has {pct}% of its hours left (above the {threshold}% threshold): prefer Boat ..."
+extract = { name = "hours", json = "planIncluded.vmHoursRemaining+creditBalanceHours" }
+condition = "hours <= threshold"
+message_when_true = "Boat has {hours} hours left, plan and credit together (at or below {threshold}): ..."
+message_when_false = "Boat has {hours} hours left, plan and credit together (above {threshold}): prefer Boat ..."
 cache_s = 600
 [advisories.boat-budget.params]
 threshold = 10
@@ -1228,9 +1229,10 @@ as `isError` with the CLI's message.
 when `boat` is on `PATH` when the file is created. Probe `env BOAT_NO_UPDATE=1
 <boat> limits --json`, where `<boat>` is the path found on `PATH` then
 (read-only; `env` keeps the CLI from self-updating, and the absolute path
-survives a hook whose `PATH` lacks that directory). `pct =
-planIncluded.vmHoursRemaining / planIncluded.vmHours * 100`, `threshold = 10`,
-true when `pct <= threshold` (exactly 10% counts): run heavy jobs on this host,
+survives a hook whose `PATH` lacks that directory). `hours =
+planIncluded.vmHoursRemaining + creditBalanceHours` (the plan's hours run out
+mid-period, and starts then draw on prepaid credit), `threshold = 10`, true
+when `hours <= threshold` (exactly 10 counts): run heavy jobs on this host,
 through a queue such as qex; false: prefer Boat for builds and test runs, and
 run only one or two quick jobs locally. To change the threshold: `vigil
 advisory set boat-budget threshold=15` (or the MCP tool `advisory_set`, or edit
