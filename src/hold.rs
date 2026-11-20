@@ -236,6 +236,8 @@ pub fn qex_idle_reading(cmd_text: &str) -> String {
 /// `vigil hold` / the `hold` tool (H11).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HoldRequest {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meta: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// `qex:ID`, `pid:N`, `file:PATH`, `until:RFC3339`, `idle:DIR`.
@@ -267,6 +269,8 @@ pub struct HoldRequest {
 /// `hold done` (or `expect_s`) acts on (W42-H5).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HoldItemRequest {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meta: std::collections::BTreeMap<String, String>,
     #[serde(rename = "for")]
     pub work: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,6 +401,8 @@ impl Vigil {
             // `added_at` is set by `create_with_items` to the hold's `created_at`.
             let mut item = HoldItem::new(draft.label, input, draft.expect_s, self.clock.now());
             item.cap = request.cap;
+            item.meta = request.meta.clone();
+            item.cwd = Some(self.cwd.clone());
             items.push(item);
         }
         let request = CreateRequest {
@@ -456,6 +462,8 @@ impl Vigil {
         };
         let mut item = HoldItem::new(draft.label, input, draft.expect_s, now);
         item.cap = request.cap;
+        item.meta = request.meta.clone();
+        item.cwd = Some(self.cwd.clone());
         item.sequence = Some(watch.next_item_sequence);
         watch.next_item_sequence += 1;
         watch.items.get_or_insert_with(Vec::new).push(item.clone());
@@ -489,9 +497,11 @@ impl Vigil {
         }
         let index = watch.items.as_ref().unwrap().iter().position(|item| item.label == label).unwrap();
         crate::items::record_done(&mut watch, index, now);
+        let ledger = self.record_items(&mut watch, None);
         let item = watch.items.as_ref().unwrap()[index].clone();
         crate::items::compact_history(&mut watch, false);
         self.store.save_async(&watch).await?;
+        ledger.publish();
         Ok(ItemReport::of(&watch, &item))
     }
 }

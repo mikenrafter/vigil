@@ -125,3 +125,17 @@ The file, URL, port and process inputs follow [mcp-await](https://github.com/ric
 ## License
 
 MIT; see LICENSE.
+
+Finished hold items append a JSON record to `$XDG_STATE_HOME/vigil/items.jsonl`
+(default `~/.local/state/vigil/items.jsonl`). Records include the estimate,
+start and end times, completion outcome, overdue flag, session when known, and
+working directory. Use repeatable `--meta k=v` on `hold` or `hold add` for opaque
+metadata such as `--meta model=opus --meta kind=review --meta brief=/work/brief.md
+--meta items=3`; MCP `hold` and `hold_add` accept a `meta` object of string values.
+Duplicate CLI keys keep the last value. Pass brief paths, never brief text or
+secrets. Vigil reads no report or brief contents into the ledger. Each item
+records its first end, including when a sensed job later retries; cancellation,
+`cold`, and deadline release also record items still open. Ledger writes run
+outside keepalive, make one append attempt, and log errors to stderr. This is
+best-effort history: a crash, shutdown timeout, or failed state save can lose a
+record; it is not a transactional audit log.

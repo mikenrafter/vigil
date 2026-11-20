@@ -138,9 +138,11 @@ impl Vigil {
             if out_of_budget() {
                 return Ok(TickReport::without_changes(TickOutcome::OutOfBudget));
             }
-            let expired = expired_if_overdue(watch, now);
+            let mut expired = expired_if_overdue(watch, now);
+            let ledger = self.record_items(&mut expired, Some("released"));
             let report = |persisted| TickReport::wrote(TickOutcome::Finished(expired.status), expired.clone(), persisted);
             let persisted = self.persist_retaining(retained, budget_end, &expired, report).await?;
+            if !matches!(persisted, crate::engine::Persisted::NotSaved(_)) { ledger.publish(); }
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
         if !is_due(&watch, now) {
@@ -186,9 +188,11 @@ impl Vigil {
         }
         let after = self.clock.now();
         if unticked.is_overdue(after) {
-            let expired = expired_if_overdue(unticked, after);
+            let mut expired = expired_if_overdue(unticked, after);
+            let ledger = self.record_items(&mut expired, Some("released"));
             let report = |persisted| TickReport::wrote(TickOutcome::Finished(expired.status), expired.clone(), persisted);
             let persisted = self.persist_retaining(retained, budget_end, &expired, report).await?;
+            if !matches!(persisted, crate::engine::Persisted::NotSaved(_)) { ledger.publish(); }
             return Ok(TickReport::wrote(TickOutcome::Finished(expired.status), expired, persisted));
         }
 
@@ -197,6 +201,7 @@ impl Vigil {
         watch.last_tick_at = Some(now);
         watch.activity = Some(activity_after(&watch, &readings, now));
         watch.input_states = readings.into_iter().map(|reading| reading.state).collect();
+        let ledger = self.record_items(&mut watch, None);
         if watch.items.is_some() { crate::items::compact_history(&mut watch, false); }
         if !fired_events.is_empty() {
             let terminal = Terminal {
@@ -220,6 +225,7 @@ impl Vigil {
             raised_attention,
         };
         let persisted = self.persist_retaining(retained, budget_end, &watch, report).await?;
+        if !matches!(persisted, crate::engine::Persisted::NotSaved(_)) { ledger.publish(); }
         Ok(TickReport { outcome: TickOutcome::Ticked, changed, after: Some(watch), persisted, redelivered, raised_attention })
     }
 

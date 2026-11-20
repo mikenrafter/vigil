@@ -108,6 +108,9 @@ pub struct CreateArgs {
 /// `hold` arguments (SPEC "Holds", H11).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HoldArgs {
+    /// Opaque metadata, stored verbatim on each item. Use paths for briefs, never brief text or secrets.
+    #[serde(default)]
+    pub meta: std::collections::BTreeMap<String, String>,
     /// Optional stable id, `[A-Za-z0-9_-]{1,64}`; generated when absent.
     pub id: Option<String>,
     /// Work to wait on, one item each: `qex:JOB`, `pid:N`, `file:PATH` (ends
@@ -139,6 +142,9 @@ pub struct HoldArgs {
 /// `hold_add` arguments (W42-H2): one item per call.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HoldAddArgs {
+    /// Opaque metadata, stored verbatim on each item. Use paths for briefs, never brief text or secrets.
+    #[serde(default)]
+    pub meta: std::collections::BTreeMap<String, String>,
     /// The live hold to add to.
     pub watch_id: String,
     /// The work: `qex:JOB`, `pid:N`, `file:PATH`, `until:RFC3339`, `idle:DIR`
@@ -419,6 +425,7 @@ impl VigilServer {
     #[tool(description = "Hold the session in cache by watching the work itself, one item per spec: qex jobs, pids, marker files, times, a qex queue (the qex kinds need qex on PATH), or none for a delegated run with no pid or file to watch, such as a T3 Code delegate task (for: [\"qex:ID\", \"pid:N\", \"file:PATH\", \"until:RFC3339\", \"idle:DIR\", \"none\"]). Each item that ends raises \"item ended: LABEL: WHY\"; when all have ended keepalive returns \"hold released: ...\". With no work it lives until cancelled. Then call keepalive.")]
     async fn hold(&self, Parameters(args): Parameters<HoldArgs>, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
         let request = crate::hold::HoldRequest {
+            meta: args.meta,
             id: args.id,
             work: args.work,
             until_idle: args.until_idle,
@@ -439,7 +446,7 @@ impl VigilServer {
     #[tool(description = "Add one item of work to a live hold (for: one spec, or \"none\" with a label for a delegated run with no pid or file to watch). The same keepalive on the hold covers it; it raises \"item ended\" when it ends and \"item overdue\" past 1.5x expect_s.")]
     async fn hold_add(&self, Parameters(args): Parameters<HoldAddArgs>) -> Result<CallToolResult, ErrorData> {
         Ok(match parse_id(&args.watch_id) {
-            Ok(id) => reply(self.vigil.hold_add(&id, crate::hold::HoldItemRequest { work: args.work, expect_s: args.expect_s, label: args.label, cap: args.cap }).await),
+            Ok(id) => reply(self.vigil.hold_add(&id, crate::hold::HoldItemRequest { work: args.work, expect_s: args.expect_s, label: args.label, cap: args.cap, meta: args.meta }).await),
             Err(error) => reply::<()>(Err(error)),
         })
     }

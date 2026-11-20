@@ -140,6 +140,9 @@ enum RemindCommand {
 
 #[derive(Debug, clap::Args)]
 struct HoldArgs {
+    /// Opaque item metadata, repeatable (model, kind, brief path, items).
+    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_meta)]
+    meta: Vec<(String, String)>,
     /// Count every initial item as a Claude work or review run; omit for uncounted work.
     #[arg(long, value_enum)]
     cap: Option<vigil::cap::CapClass>,
@@ -175,6 +178,9 @@ struct HoldArgs {
 enum HoldItemCommand {
     /// Add one item of work to the live hold ID; one keepalive on ID covers it.
     Add {
+        /// Opaque item metadata, repeatable.
+        #[arg(long, value_name = "KEY=VALUE", value_parser = parse_meta)]
+        meta: Vec<(String, String)>,
         id: String,
         /// The work: qex:JOB, pid:N, file:PATH, until:RFC3339, idle:DIR, or
         /// none (a delegated run with no pid or file to watch; needs --label).
@@ -361,12 +367,12 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&vigil.create(request).await?)?;
             Ok(0)
         }
-        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator, cap, confirm } } => {
-            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label, cap, confirm }).await?)?;
+        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator, cap, confirm, meta } } => {
+            print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label, cap, confirm, meta: meta.into_iter().collect() }).await?)?;
             Ok(0)
         }
-        Command::Hold { item: Some(HoldItemCommand::Add { id, work, label, expect_s, cap }), .. } => {
-            print_json(&vigil.hold_add(&WatchId::parse(&id)?, vigil::HoldItemRequest { work, expect_s, label, cap }).await?)?;
+        Command::Hold { item: Some(HoldItemCommand::Add { id, work, label, expect_s, cap, meta }), .. } => {
+            print_json(&vigil.hold_add(&WatchId::parse(&id)?, vigil::HoldItemRequest { work, expect_s, label, cap, meta: meta.into_iter().collect() }).await?)?;
             Ok(0)
         }
         Command::Hold { item: Some(HoldItemCommand::Done { id, label }), .. } => {
@@ -478,4 +484,10 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Mcp => vigil::mcp::serve_stdio(Arc::new(vigil.with_transport(vigil::peers::CallTransport::Mcp))).await.map(|()| 0),
     }
+}
+
+fn parse_meta(text: &str) -> Result<(String, String), String> {
+    let (key, value) = text.split_once('=').ok_or("expected KEY=VALUE")?;
+    if key.is_empty() { return Err("metadata key must not be empty".into()); }
+    Ok((key.into(), value.into()))
 }

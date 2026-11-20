@@ -1199,3 +1199,20 @@ async fn mcp_session_selection_and_brief_output_use_the_same_engine() {
     assert_eq!(text.lines().count(), 2);
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn item_metadata_survives_both_mcp_front_doors() {
+    // why: CLI metadata alone leaves MCP agents unable to attribute estimator samples.
+    // catches: accepting but discarding meta in either MCP request adapter.
+    let sandbox = Sandbox::new();
+    let (client, _) = connect(&sandbox).await;
+    let peer = client.peer();
+    let first = call(peer, "hold", serde_json::json!({"id":"metadata", "for":["none"], "label":"first", "orchestrator":false, "meta":{"model":"opus", "brief":"/work/brief.md"}})).await;
+    assert_ne!(first.is_error, Some(true), "{first:?}");
+    let second = call(peer, "hold_add", serde_json::json!({"watch_id":"metadata", "for":"none", "label":"second", "meta":{"kind":"review", "items":"3"}})).await;
+    assert_ne!(second.is_error, Some(true), "{second:?}");
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(sandbox.state_root().join("watches/metadata.json")).unwrap()).unwrap();
+    assert_eq!(stored["items"][0]["meta"], serde_json::json!({"model":"opus", "brief":"/work/brief.md"}));
+    assert_eq!(stored["items"][1]["meta"], serde_json::json!({"kind":"review", "items":"3"}));
+    client.cancel().await.unwrap();
+}

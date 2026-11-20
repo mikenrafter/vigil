@@ -39,7 +39,7 @@ fn wid(id: &str) -> WatchId {
 }
 
 fn item(work: &str, expect_s: Option<u64>, label: Option<&str>) -> HoldItemRequest {
-    HoldItemRequest { work: work.into(), expect_s, label: label.map(String::from), cap: None }
+    HoldItemRequest { work: work.into(), expect_s, label: label.map(String::from), cap: None, meta: Default::default() }
 }
 
 /// `hold_add` that must succeed, failing by assertion (not by unwrap) so a

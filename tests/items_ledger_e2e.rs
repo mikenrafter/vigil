@@ -4,7 +4,7 @@ use std::process::Command;
 
 fn run(root: &std::path::Path, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_vigil"))
-        .args(args).env("XDG_STATE_HOME", root).env("VIGIL_ORCHESTRATOR_CONFIRM", "false")
+        .args(args).env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default())).env("VIGIL_ADVISORIES_FILE", "off").env("XDG_STATE_HOME", root).env("VIGIL_ORCHESTRATOR_CONFIRM", "false")
         .output().unwrap();
     assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
     serde_json::from_slice(&output.stdout).unwrap()
@@ -74,4 +74,26 @@ fn item_ledger_sensed_ends_and_ledger_failure_do_not_break_completion() {
     run(root, &["hold", "--id", "bad", "--for", "none", "--label", "bad", "--orchestrator", "false"]);
     run(root, &["hold", "done", "bad", "bad"]);
     run(root, &["cancel", "bad"]);
+}
+
+#[test]
+fn item_ledger_qex_completion_and_deadline_release() {
+    // why: qex ends and a hold expiring with open items take distinct completion paths.
+    // catches: logging only explicit done and cancellation, or using done for every spec.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("bin")).unwrap();
+    let qex = root.join("bin/qex");
+    std::fs::write(&qex, "#!/bin/sh\nprintf '%s\\n' '{\"id\":\"00000000-0000-0000-0000-000000000001\",\"state\":\"completed\"}'\n").unwrap();
+    std::fs::set_permissions(&qex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    run(root, &["hold", "--id", "q", "--for", "qex:job", "--label", "job", "--orchestrator", "false"]);
+    run(root, &["keepalive", "q", "--max-s", "1"]);
+    let entries = rows(root);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["spec_kind"], "qex");
+    assert_eq!(entries[0]["outcome"], "exited");
+    run(root, &["hold", "--id", "expired", "--for", "none", "--label", "late", "--deadline-s", "1", "--orchestrator", "false"]);
+    run(root, &["keepalive", "expired", "--max-s", "2"]);
+    assert_eq!(rows(root)[1]["outcome"], "released");
 }

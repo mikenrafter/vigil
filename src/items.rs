@@ -50,6 +50,12 @@ pub const NONE_SPEC: &str = "none";
 /// One unit of work of a hold, as stored in the watch file (`items`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HoldItem {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meta: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ledger_recorded: bool,
     /// Unique in the hold. `--label`, else the `--for` spec as given (D5).
     pub label: String,
     /// Absent on old files: their original vector index is the identity.
@@ -156,7 +162,7 @@ impl HoldItem {
 
     /// A live item added at `added_at`, sensed by `spec.inputs[input]` if any.
     pub fn new(label: String, input: Option<usize>, expect_s: Option<u64>, added_at: Timestamp) -> HoldItem {
-        HoldItem { label, sequence: None, end_reading: None, cap: None, input, expect_s, added_at, ended_at: None, overdue_raised: false, far_overdue_raised: false, last_end_event: None }
+        HoldItem { meta: Default::default(), cwd: None, ledger_recorded: false, label, sequence: None, end_reading: None, cap: None, input, expect_s, added_at, ended_at: None, overdue_raised: false, far_overdue_raised: false, last_end_event: None }
     }
 }
 

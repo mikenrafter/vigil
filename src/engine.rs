@@ -422,7 +422,7 @@ impl Vigil {
             // W46-C6: an unknown id must not prevent cancellation of valid ids.
             let result = async {
                 let was_pending = !self.store.load(&id)?.status.is_finished();
-                let envelope = self.cancel(&id).await?;
+                let envelope = self.cancel_with_outcome(&id, "cold").await?;
                 Ok::<_, VigilError>((was_pending, envelope))
             }
             .await;
@@ -445,6 +445,10 @@ impl Vigil {
     /// result unchanged (V4). A pending watch past its deadline is already
     /// expired (V16) and cancel returns that.
     pub async fn cancel(&self, id: &WatchId) -> Result<Envelope, VigilError> {
+        self.cancel_with_outcome(id, "cancelled").await
+    }
+
+    async fn cancel_with_outcome(&self, id: &WatchId, outcome: &str) -> Result<Envelope, VigilError> {
         let (_lock, mut watch) = self.lock_and_load(id).await?;
         let now = self.clock.now();
         // DF5a: a cancel that cannot be saved is still answered; the envelope
@@ -453,7 +457,9 @@ impl Vigil {
         if watch.is_overdue(now) {
             // W5: the deadline passed before the cancel arrived; expiry wins.
             watch = expired_if_overdue(watch, now);
+            let ledger = self.record_items(&mut watch, Some("released"));
             persisted = self.persist(&watch, None).await?;
+            if !matches!(persisted, Persisted::NotSaved(_)) { ledger.publish(); }
         } else if !watch.status.is_finished() {
             let terminal = Terminal {
                 status: TerminalStatus::Cancelled,
@@ -462,7 +468,9 @@ impl Vigil {
                 digest: watch.last_digest.clone(),
             };
             watch.finish(terminal).expect("a pending watch accepts its terminal result");
+            let ledger = self.record_items(&mut watch, Some(outcome));
             persisted = self.persist(&watch, None).await?;
+            if !matches!(persisted, Persisted::NotSaved(_)) { ledger.publish(); }
         }
         let mut envelope = self.envelope_for(&watch, now)?;
         // A cancel's envelope always has a terminal status: at risk if unsaved.
