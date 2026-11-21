@@ -265,10 +265,10 @@ async fn a_killed_server_is_replaced_by_one_that_continues_the_same_watch() {
     client_b.cancel().await.unwrap();
 }
 
-/// Records every progress notification and forwards it on an async channel,
-/// so a test can AWAIT the next one (with a timeout) instead of polling.
 type ProgressEvent = (f64, Option<String>);
 
+/// Records every progress notification and forwards it on an async channel,
+/// so a test can AWAIT the next one (with a timeout) instead of polling.
 #[derive(Clone)]
 struct ProgressRecorder {
     seen: Arc<Mutex<Vec<ProgressEvent>>>,
