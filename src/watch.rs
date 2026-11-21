@@ -85,17 +85,12 @@ impl<'de> Deserialize<'de> for WatchId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GlobReport {
     /// Report matches that appeared since the last tick.
+    #[default]
     Created,
-}
-
-impl Default for GlobReport {
-    fn default() -> Self {
-        GlobReport::Created
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

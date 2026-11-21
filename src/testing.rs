@@ -107,6 +107,12 @@ struct ScriptState {
 /// request. Safe under paused tokio time (no sockets).
 pub struct ScriptedJudge(Mutex<ScriptState>);
 
+impl Default for ScriptedJudge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScriptedJudge {
     /// Fallback answer is "unreachable" so an unscripted call is loud.
     pub fn new() -> ScriptedJudge {
@@ -221,6 +227,12 @@ pub struct ScriptedReader {
     started: tokio::sync::Notify,
 }
 
+impl Default for ScriptedReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScriptedReader {
     pub fn new() -> ScriptedReader {
         ScriptedReader { state: Mutex::new(ReaderState::default()), started: tokio::sync::Notify::new() }
@@ -333,8 +345,7 @@ impl InputReader for ScriptedReader {
             }
             let text = text.unwrap_or_else(|| "ok".to_string());
             let changed = previous.hash.as_ref().is_some_and(|h| *h != text);
-            let mut state = InputState::default();
-            state.hash = Some(text.clone());
+            let state = InputState { hash: Some(text.clone()), ..Default::default() };
             self.state.lock().unwrap().reads[index].finished = Some(tokio::time::Instant::now());
             let want_met = Some(crate::hold::ended(input, &text));
             let is_error = text.starts_with("error:");
