@@ -642,10 +642,8 @@ pub fn blocked_flock_waiters(lock_file: &Path) -> Vec<u32> {
         let same = u64::from_str_radix(maj, 16).ok() == Some(major)
             && u64::from_str_radix(min, 16).ok() == Some(minor)
             && ino.parse::<u64>().ok() == Some(inode);
-        if same {
-            if let Ok(pid) = pid.parse() {
-                waiters.push(pid);
-            }
+        if same && let Ok(pid) = pid.parse() {
+            waiters.push(pid);
         }
     }
     waiters

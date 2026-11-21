@@ -318,13 +318,13 @@ impl Vigil {
         let id = spec.id.clone();
         // W46-K3: check every initial classed item before the hold's lock file or id
         // exist or any part of it is written. A new hold has no items to race with.
-        if let Some(items) = &items {
-            if items.iter().any(|item| item.cap.is_some()) {
-                let limits = self.cap_limits()?;
-                for class in [crate::cap::CapClass::Work, crate::cap::CapClass::Review] {
-                    let labels: Vec<_> = items.iter().filter(|item| item.cap == Some(class)).map(|item| item.label.as_str()).collect();
-                    limits.admit(class, &[], &labels)?;
-                }
+        if let Some(items) = &items
+            && items.iter().any(|item| item.cap.is_some())
+        {
+            let limits = self.cap_limits()?;
+            for class in [crate::cap::CapClass::Work, crate::cap::CapClass::Review] {
+                let labels: Vec<_> = items.iter().filter(|item| item.cap == Some(class)).map(|item| item.label.as_str()).collect();
+                limits.admit(class, &[], &labels)?;
             }
         }
         let _watch_lock = self.lock_watch(&id).await?;

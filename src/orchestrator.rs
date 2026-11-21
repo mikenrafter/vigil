@@ -24,12 +24,11 @@ impl Vigil {
     fn orchestrator_token(&self) -> Result<String, VigilError> {
         let path = self.orchestrator_dir().join("token.json");
         let today = self.clock.now().0.format("%Y-%m-%d").to_string();
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok((day, token)) = serde_json::from_slice::<(String, String)>(&bytes) {
-                if day == today {
-                    return Ok(token);
-                }
-            }
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok((day, token)) = serde_json::from_slice::<(String, String)>(&bytes)
+            && day == today
+        {
+            return Ok(token);
         }
         let mut raw = [0u8; 4];
         std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut raw)).map_err(crate::error::StoreError::io)?;

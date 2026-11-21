@@ -1160,10 +1160,11 @@ async fn fix1_mcp_keepalive_accepts_confirm_and_registers_mcp_transport() {
             loop {
                 if let Ok(entries) = std::fs::read_dir(sandbox.state_root().join("calls")) {
                     for entry in entries.flatten() {
-                        if entry.path().extension().is_some_and(|ext| ext == "json") {
-                            if let Ok(bytes) = std::fs::read(entry.path()) {
-                                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) { return record; }
-                            }
+                        if entry.path().extension().is_some_and(|ext| ext == "json")
+                            && let Ok(bytes) = std::fs::read(entry.path())
+                            && let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        {
+                            return record;
                         }
                     }
                 }
