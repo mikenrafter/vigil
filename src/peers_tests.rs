@@ -501,13 +501,18 @@ fn an_agy_parent_or_ancestor_is_the_antigravity_process_tree_signal() {
     // why: agy 1.5.13 spawns `vigil mcp` with no ANTIGRAVITY_* variable, but
     //      the child's parent comm is `agy` (evidence-neon-mcp-live.md, run 2;
     //      `agy acp` shell children have the same parent, report-neon-ttl.md).
-    //      A wrapper (sh, a nix `.agy-wrapped`) may sit between them, so the
-    //      WHOLE chain is searched, not only the direct parent. Mixed chains
-    //      (a claude above agy, or agy above a claude) still count: S4 says
-    //      any Antigravity signal makes the limits stricter.
-    // catches: reading only the env, reading only pid 1's parent, stopping at
-    //          the first claude/codex ancestor, an exact-prefix match such as
-    //          `agyx`, or a case-insensitive match on `Agy`.
+    //      Walk up from the parent skipping unknown names (e.g. sh, bash, node);
+    //      the FIRST known agent name decides (shared with ancestor_session:
+    //      claude, .claude-wrapped, codex, .codex-wrapped, agy, .agy-wrapped).
+    //      True only when that nearest known agent is agy / .agy-wrapped, so a
+    //      Claude or Codex session launched under agy is not throttled by the
+    //      tree signal (env markers are still ORed separately), while T3's
+    //      node -> agy -> sh -> vigil chain is true. The process itself is not
+    //      an ancestor.
+    // catches: reading only the env, reading only the direct parent, walking
+    //          past a nearer claude/codex ancestor, matching the process itself,
+    //          an exact-prefix match such as `agyx`, or a case-insensitive
+    //          match on `Agy`.
     // proves: CLAIM(neon-mcp-bound)
     let signal = |entries: &[(u32, &str, u32)]| {
         let root = fake_proc(entries);
@@ -515,16 +520,22 @@ fn an_agy_parent_or_ancestor_is_the_antigravity_process_tree_signal() {
     };
     assert!(signal(&[(100, "vigil", 90), (90, "agy", 1), (1, "systemd", 0)]), "direct parent is agy (vigil mcp)");
     assert!(signal(&[(100, "vigil", 95), (95, "sh", 90), (90, "agy", 1), (1, "systemd", 0)]), "a wrapper between vigil and agy");
+    assert!(signal(&[(100, "vigil", 95), (95, "sh", 90), (90, "agy", 80), (80, "node", 1), (1, "systemd", 0)]), "T3 chain: node -> agy -> sh -> vigil");
     assert!(signal(&[(100, "vigil", 95), (95, "bash", 90), (90, ".agy-wrapped", 1), (1, "systemd", 0)]), "the nix wrapper name");
-    assert!(signal(&[(100, "vigil", 95), (95, "claude", 90), (90, "agy", 1), (1, "systemd", 0)]), "claude started under agy: mixed, still Antigravity");
-    assert!(signal(&[(100, "vigil", 95), (95, "agy", 90), (90, "claude", 1), (1, "systemd", 0)]), "agy started under claude");
+    assert!(signal(&[(100, "vigil", 95), (95, "agy", 90), (90, "claude", 1), (1, "systemd", 0)]), "agy started under claude: nearest known agent is agy");
+    assert!(signal(&[(100, "vigil", 95), (95, "sh", 90), (90, ".agy-wrapped", 80), (80, "codex", 1), (1, "systemd", 0)]), ".agy-wrapped under codex");
+    assert!(!signal(&[(100, "vigil", 95), (95, "claude", 90), (90, "agy", 1), (1, "systemd", 0)]), "claude under agy: nearest known agent is claude");
+    assert!(!signal(&[(100, "vigil", 95), (95, ".claude-wrapped", 90), (90, "agy", 1), (1, "systemd", 0)]), ".claude-wrapped under agy");
+    assert!(!signal(&[(100, "vigil", 95), (95, "codex", 90), (90, "agy", 1), (1, "systemd", 0)]), "codex under agy: nearest known agent is codex");
+    assert!(!signal(&[(100, "vigil", 95), (95, ".codex-wrapped", 90), (90, "agy", 1), (1, "systemd", 0)]), ".codex-wrapped under agy");
     assert!(!signal(&[(100, "vigil", 90), (90, "claude", 1), (1, "systemd", 0)]), "claude alone is not Antigravity");
     assert!(!signal(&[(100, "vigil", 90), (90, "codex", 1), (1, "systemd", 0)]), "codex alone is not Antigravity");
     assert!(!signal(&[(100, "vigil", 90), (90, "bash", 1), (1, "systemd", 0)]), "no agent at all");
     assert!(!signal(&[(100, "vigil", 90), (90, "agyx", 1), (1, "systemd", 0)]), "only the exact name counts");
     assert!(!signal(&[(100, "vigil", 90), (90, "Agy", 1), (1, "systemd", 0)]), "names are case-sensitive");
     assert!(!signal(&[(100, "vigil", 90), (90, "my-agy", 1), (1, "systemd", 0)]), "a suffix match is not enough");
-    // The process itself being `agy` is not an ancestor, but a pid that is its own parent chain must stop.
+    assert!(!signal(&[(100, "agy", 1), (1, "systemd", 0)]), "the process itself is not an ancestor");
+    assert!(!signal(&[(100, "agy", 100)]), "self-parent cycle with comm agy terminates with no signal");
     assert!(!signal(&[(100, "vigil", 100)]), "a self-parent cycle terminates with no signal");
     assert!(!signal(&[(100, "vigil", 90), (90, "bash", 100)]), "a two-step cycle terminates with no signal");
     assert!(!signal(&[(100, "vigil", 90)]), "a parent whose stat file is missing ends the walk with no signal");
