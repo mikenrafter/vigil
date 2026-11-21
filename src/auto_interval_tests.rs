@@ -113,11 +113,15 @@ impl Rig {
 }
 
 fn claude() -> AgentEnv {
-    AgentEnv { claude_session_id: Some("sess-1".into()), codex: false }
+    AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: false }
 }
 
 fn codex() -> AgentEnv {
-    AgentEnv { claude_session_id: None, codex: true }
+    AgentEnv { claude_session_id: None, codex: true, antigravity: false }
+}
+
+fn antigravity() -> AgentEnv {
+    AgentEnv { claude_session_id: None, codex: false, antigravity: true }
 }
 
 fn quiet_probe() -> Arc<ScriptedCreditProbe> {
@@ -1296,7 +1300,7 @@ async fn an_orchestrator_with_both_a_claude_and_a_codex_signal_keeps_270_s_but_s
     let rig = Rig::new();
     rig.one_hour_cache();
     let probe = quiet_probe();
-    let ambiguous = rig.vigil(AgentEnv { claude_session_id: Some("sess-1".into()), codex: true }, &probe);
+    let ambiguous = rig.vigil(AgentEnv { claude_session_id: Some("sess-1".into()), codex: true, antigravity: false }, &probe);
     let (id, _) = quiet_watch(&rig, &ambiguous, "w", 600, 20_000, |_| {}).await;
     let envelope = call(&ambiguous, &id, None, Some(true)).await;
     assert_eq!(envelope["waited_s"], 270);
@@ -1308,6 +1312,45 @@ async fn an_orchestrator_with_both_a_claude_and_a_codex_signal_keeps_270_s_but_s
     let claude_only = rig.vigil(claude(), &control_probe);
     let control = call(&claude_only, &id, None, Some(true)).await;
     assert_eq!((&control["waited_s"], &control["cache"]["ttl"]), (&json!(3000), &json!("1h")), "control");
+}
+
+#[tokio::test(start_paused = true)]
+async fn antigravity_orchestrator_waits_180_s_and_mixed_signals_wait_270_s() {
+    // why: engine-level proof that Vigil::keepalive honours the 180 s measured
+    //      Antigravity window for an orchestrator, keeps subagents at 270 s,
+    //      and falls back to 270 s unknown/default when Antigravity mixes with
+    //      Claude or Codex.
+    // catches: choosing 180 s in choose_window but capping or clamping the call
+    //          budget back to 270 s inside keepalive.
+    // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(S4)
+    let rig = Rig::new();
+    rig.one_hour_cache();
+    let probe = quiet_probe();
+    let agy = rig.vigil(antigravity(), &probe);
+    let (id, _) = quiet_watch(&rig, &agy, "w", 600, 20_000, |_| {}).await;
+
+    let orch = call(&agy, &id, None, Some(true)).await;
+    assert_eq!(orch["waited_s"], 180);
+    assert_eq!(orch["max_s"], 180);
+    assert_eq!(cache_without_start_check(&orch), json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180}));
+    assert_eq!(probe.asked_count(), 1, "one start check, no mid-call recheck for 180 s");
+
+    let sub = call(&agy, &id, None, Some(false)).await;
+    assert_eq!(sub["waited_s"], 270);
+    assert_eq!(sub["max_s"], 270);
+    assert_eq!(sub["cache"], json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+
+    let mixed_claude = rig.vigil(AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: true }, &quiet_probe());
+    let env_mc = call(&mixed_claude, &id, None, Some(true)).await;
+    assert_eq!(env_mc["waited_s"], 270);
+    assert_eq!(env_mc["cache"]["ttl"], "unknown");
+    assert_eq!(env_mc["cache"]["source"], "default");
+
+    let mixed_codex = rig.vigil(AgentEnv { claude_session_id: None, codex: true, antigravity: true }, &quiet_probe());
+    let env_mx = call(&mixed_codex, &id, None, Some(true)).await;
+    assert_eq!(env_mx["waited_s"], 270);
+    assert_eq!(env_mx["cache"]["ttl"], "unknown");
+    assert_eq!(env_mx["cache"]["source"], "default");
 }
 
 // ------------------------------------------------ S5: tri-state ----

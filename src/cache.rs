@@ -24,6 +24,10 @@ use crate::credit::CreditCheck;
 
 /// AI1': the default window, and the window for a 5-minute or unknown TTL.
 pub const DEFAULT_WINDOW_S: u64 = 270;
+/// Measured per-conversation prompt-cache lifetime for Antigravity / Gemini 4
+/// Neon is 4-5 minutes (cached at 4 m, uncached at 5 m; 2026-11-21); 180 s
+/// (3 minutes) leaves a 1-minute margin below the last measured hit.
+pub const ANTIGRAVITY_WINDOW_S: u64 = 180;
 /// AI1' / D1: a 1 h TTL minus a 10 minute margin (3000 s). Owner 2026-11-13:
 /// at most 50 minutes. Was 3300 s (5 minute margin).
 pub const ONE_HOUR_WINDOW_S: u64 = 3000;
@@ -53,6 +57,7 @@ pub enum Ttl {
 pub enum TtlSource {
     ClaudeTranscript,
     CodexDefault,
+    AntigravityMeasured,
     Default,
     Explicit,
 }
@@ -85,21 +90,24 @@ pub struct AgentEnv {
     pub claude_session_id: Option<String>,
     /// `AGENT=codex` or any variable named `CODEX_*`.
     pub codex: bool,
+    /// `ANTIGRAVITY_CONVERSATION_ID` (non-empty) or `ANTIGRAVITY_AGENT=1`.
+    pub antigravity: bool,
 }
 
 /// Who is calling, as far as vigil can tell (S4). Derived from [`AgentEnv`]
-/// once, so every decision matches on the same four cases.
+/// once, so every decision matches on the same five cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Identity<'a> {
-    /// Claude Code, and nothing suggests Codex: its transcript can be trusted.
+    /// Claude Code, and nothing suggests Codex or Antigravity: its transcript can be trusted.
     Claude { session_id: &'a str },
-    /// Codex, and nothing suggests Claude Code: 5 minutes, 300 s tool timeout.
+    /// Codex, and nothing suggests Claude Code or Antigravity: 5 minutes, 300 s tool timeout.
     Codex,
-    /// Both signals are present (a Claude Code started from a Codex shell, or
-    /// the reverse): vigil cannot say which one is calling, so it assumes the
-    /// stricter limits of both (S4).
+    /// Antigravity, and nothing suggests Claude Code or Codex: measured 4-5 m cache -> 180 s window.
+    Antigravity,
+    /// Two or more agent signals are present (a nested agent shell): vigil
+    /// cannot say which one is calling, so it assumes the stricter limits (S4).
     Ambiguous,
-    /// Neither signal.
+    /// No agent signal.
     Unknown,
 }
 
@@ -107,14 +115,14 @@ impl Identity<'_> {
     /// The largest window an explicit `max_s` may ask for (A2): 3000 (50 min,
     /// owner 2026-11-13: at most 50 minutes), the
     /// largest vigil ever picks itself. Codex's tool timeout (300 s) is a hard
-    /// limit, so a caller that may be Codex, and one that is both Claude and
-    /// Codex, get 270 (R2-A1, S4). The old fixed 270 ceiling is gone for every
+    /// limit, so a caller that may be Codex, and one whose signals mix
+    /// (`Ambiguous`), get 270 (R2-A1, S4). The old fixed 270 ceiling is gone for every
     /// other caller: the engine tests that ask for 3000 without any agent
     /// signal pin that.
     pub const fn window_ceiling_s(self) -> u64 {
         match self {
             Identity::Codex | Identity::Ambiguous => CODEX_MAX_WINDOW_S,
-            Identity::Claude { .. } | Identity::Unknown => ONE_HOUR_WINDOW_S,
+            Identity::Claude { .. } | Identity::Antigravity | Identity::Unknown => ONE_HOUR_WINDOW_S,
         }
     }
 }
@@ -128,17 +136,22 @@ impl AgentEnv {
                 agent.claude_session_id = Some(value);
             } else if name == "AGENT" && value == "codex" || name.starts_with("CODEX_") {
                 agent.codex = true;
+            } else if (name == "ANTIGRAVITY_CONVERSATION_ID" && !value.is_empty())
+                || (name == "ANTIGRAVITY_AGENT" && value == "1")
+            {
+                agent.antigravity = true;
             }
         }
         agent
     }
 
     pub fn identity(&self) -> Identity<'_> {
-        match (self.claude_session_id.as_deref(), self.codex) {
-            (Some(_), true) => Identity::Ambiguous,
-            (Some(session_id), false) => Identity::Claude { session_id },
-            (None, true) => Identity::Codex,
-            (None, false) => Identity::Unknown,
+        match (self.claude_session_id.as_deref(), self.codex, self.antigravity) {
+            (Some(session_id), false, false) => Identity::Claude { session_id },
+            (None, true, false) => Identity::Codex,
+            (None, false, true) => Identity::Antigravity,
+            (None, false, false) => Identity::Unknown,
+            _ => Identity::Ambiguous,
         }
     }
 }
@@ -169,6 +182,7 @@ pub fn choose_window(request: &WindowRequest<'_>) -> CacheNote {
     }
     match identity {
         Identity::Codex => CacheNote { ttl: Ttl::FiveMinutes, source: TtlSource::CodexDefault, interval_s: DEFAULT_WINDOW_S, credit_check: None },
+        Identity::Antigravity => CacheNote { ttl: Ttl::FiveMinutes, source: TtlSource::AntigravityMeasured, interval_s: ANTIGRAVITY_WINDOW_S, credit_check: None },
         Identity::Ambiguous | Identity::Unknown => CacheNote::unknown_default(),
         Identity::Claude { session_id } => match request.projects_dir.and_then(|dir| ttl_of_session(dir, session_id)) {
             Some(Ttl::OneHour) => CacheNote { ttl: Ttl::OneHour, source: TtlSource::ClaudeTranscript, interval_s: ONE_HOUR_WINDOW_S, credit_check: None },
@@ -596,21 +610,32 @@ mod tests {
     #[test]
     fn the_agent_is_read_from_the_environment() {
         // why: A3 / AI1: Claude by CLAUDE_CODE_SESSION_ID; Codex by AGENT=codex
-        //      or any CODEX_* name. `AGENT=claude` (set on the dev machine)
-        //      and an empty session id are not signals. Both present: both
-        //      fields set; what that means (ambiguous, S4) is choose_window's.
+        //      or any CODEX_* name; Antigravity by non-empty
+        //      ANTIGRAVITY_CONVERSATION_ID or ANTIGRAVITY_AGENT=1.
+        //      `AGENT=claude` (set on the dev machine) and an empty session id
+        //      are not signals. Multiple present: all fields set; what that
+        //      means (ambiguous, S4) is choose_window's.
         // proves: CLAIM(AI1')
-        assert_eq!(env_of(&[]), AgentEnv { claude_session_id: None, codex: false });
-        assert_eq!(env_of(&[("CLAUDE_CODE_SESSION_ID", "abc-1")]), AgentEnv { claude_session_id: Some("abc-1".into()), codex: false });
+        assert_eq!(env_of(&[]), AgentEnv { claude_session_id: None, codex: false, antigravity: false });
+        assert_eq!(env_of(&[("CLAUDE_CODE_SESSION_ID", "abc-1")]), AgentEnv { claude_session_id: Some("abc-1".into()), codex: false, antigravity: false });
         assert_eq!(env_of(&[("CLAUDE_CODE_SESSION_ID", "")]), AgentEnv::default());
         assert_eq!(env_of(&[("AGENT", "claude")]), AgentEnv::default());
-        assert_eq!(env_of(&[("AGENT", "codex")]), AgentEnv { claude_session_id: None, codex: true });
-        assert_eq!(env_of(&[("CODEX_HOME", "/x")]), AgentEnv { claude_session_id: None, codex: true });
-        assert_eq!(env_of(&[("CODEX_THREAD_ID", "t")]), AgentEnv { claude_session_id: None, codex: true });
+        assert_eq!(env_of(&[("AGENT", "codex")]), AgentEnv { claude_session_id: None, codex: true, antigravity: false });
+        assert_eq!(env_of(&[("CODEX_HOME", "/x")]), AgentEnv { claude_session_id: None, codex: true, antigravity: false });
+        assert_eq!(env_of(&[("CODEX_THREAD_ID", "t")]), AgentEnv { claude_session_id: None, codex: true, antigravity: false });
         assert_eq!(env_of(&[("NOT_CODEX_X", "1"), ("MYCODEX_", "1")]), AgentEnv::default(), "only a CODEX_ prefix counts");
+        assert_eq!(env_of(&[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]), AgentEnv { claude_session_id: None, codex: false, antigravity: true });
+        assert_eq!(env_of(&[("ANTIGRAVITY_CONVERSATION_ID", "")]), AgentEnv::default());
+        assert_eq!(env_of(&[("ANTIGRAVITY_AGENT", "1")]), AgentEnv { claude_session_id: None, codex: false, antigravity: true });
+        assert_eq!(env_of(&[("ANTIGRAVITY_AGENT", "0")]), AgentEnv::default());
+        assert_eq!(env_of(&[("ANTIGRAVITY_GEMINI_DIR", "/x")]), AgentEnv::default());
         assert_eq!(
             env_of(&[("CLAUDE_CODE_SESSION_ID", "s"), ("CODEX_HOME", "/x")]),
-            AgentEnv { claude_session_id: Some("s".into()), codex: true }
+            AgentEnv { claude_session_id: Some("s".into()), codex: true, antigravity: false }
+        );
+        assert_eq!(
+            env_of(&[("CLAUDE_CODE_SESSION_ID", "s"), ("ANTIGRAVITY_CONVERSATION_ID", "c")]),
+            AgentEnv { claude_session_id: Some("s".into()), codex: false, antigravity: true }
         );
     }
 
@@ -628,7 +653,7 @@ mod tests {
 
     fn choose(explicit_s: Option<u64>, orchestrator: bool, claude: bool, codex: bool, transcript: Transcript) -> CacheNote {
         let root = tempfile::tempdir().unwrap();
-        let agent = AgentEnv { claude_session_id: claude.then(|| "sess-1".to_string()), codex };
+        let agent = AgentEnv { claude_session_id: claude.then(|| "sess-1".to_string()), codex, antigravity: false };
         match transcript {
             Transcript::OneHourWrite => drop(write_transcript(root.path(), "p", "sess-1", &[assistant_line(0, 500), assistant_line(900, 0)])),
             Transcript::FiveMinuteWrite => drop(write_transcript(root.path(), "p", "sess-1", &[assistant_line(900, 0), assistant_line(0, 500)])),
@@ -716,6 +741,7 @@ mod tests {
         let cases = [
             (note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3000), r#"{"ttl":"1h","source":"claude-transcript","interval_s":3000}"#),
             (note(Ttl::FiveMinutes, TtlSource::CodexDefault, 270), r#"{"ttl":"5m","source":"codex-default","interval_s":270}"#),
+            (note(Ttl::FiveMinutes, TtlSource::AntigravityMeasured, 180), r#"{"ttl":"5m","source":"antigravity-measured","interval_s":180}"#),
             (note(Ttl::Unknown, TtlSource::Default, 270), r#"{"ttl":"unknown","source":"default","interval_s":270}"#),
             (note(Ttl::Unknown, TtlSource::Explicit, 60), r#"{"ttl":"unknown","source":"explicit","interval_s":60}"#),
         ];
@@ -747,7 +773,7 @@ mod tests {
             (agent.clone(), choose_window(&WindowRequest { explicit_s: None, orchestrator: true, agent: &agent, projects_dir: Some(root.path()) }))
         };
         let (claude_only, note_claude) = window_for(&[("CLAUDE_CODE_SESSION_ID", "sess-1")]);
-        assert_eq!(claude_only, AgentEnv { claude_session_id: Some("sess-1".into()), codex: false });
+        assert_eq!(claude_only, AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: false });
         assert_eq!(note_claude, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3000), "control: Claude alone is trusted");
 
         let nestings = [
@@ -757,7 +783,7 @@ mod tests {
         ];
         for (name, pairs) in nestings {
             let (agent, got) = window_for(&pairs);
-            assert_eq!(agent, AgentEnv { claude_session_id: Some("sess-1".into()), codex: true }, "{name}: both signals are kept");
+            assert_eq!(agent, AgentEnv { claude_session_id: Some("sess-1".into()), codex: true, antigravity: false }, "{name}: both signals are kept");
             assert_eq!(got, note(Ttl::Unknown, TtlSource::Default, 270), "{name}");
         }
     }
@@ -774,6 +800,113 @@ mod tests {
         assert_eq!(choose(Some(9999), true, true, false, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 3000), "control: Claude alone");
         assert_eq!(choose(Some(9999), true, true, true, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 270));
         assert_eq!(choose(Some(60), true, true, true, OneHourWrite), note(Ttl::Unknown, TtlSource::Explicit, 60));
+    }
+
+    #[test]
+    fn antigravity_orchestrator_gets_180_s_measured_window_and_subagent_stays_270_s() {
+        // why: measured Gemini 4 Neon per-conversation cache lifetime is 4-5 m
+        //      (cached at 4 m in ttl-probe-fine.log, uncached at 5 m in
+        //      ttl-probe-large.log; 2026-11-21); 180 s (3 m) leaves a 1-minute
+        //      margin. Only orchestrators get the TTL-derived window; subagents
+        //      and non-marker ANTIGRAVITY_* vars stay at 270 s unknown/default.
+        // catches: ignoring ANTIGRAVITY_CONVERSATION_ID or ANTIGRAVITY_AGENT=1,
+        //          leaving Antigravity at 270 s, accepting empty/0 markers,
+        //          applying 180 s to non-orchestrators, or clamping explicit
+        //          max_s to 180/270 instead of the 3000 s ceiling.
+        // proves: CLAIM(AI1'), CLAIM(AI3)
+        let root = tempfile::tempdir().unwrap();
+        let ask = |explicit_s: Option<u64>, orchestrator: bool, pairs: &[(&str, &str)]| {
+            let agent = env_of(pairs);
+            serde_json::to_value(choose_window(&WindowRequest {
+                explicit_s,
+                orchestrator,
+                agent: &agent,
+                projects_dir: Some(root.path()),
+            }))
+            .unwrap()
+        };
+
+        let want_agy = serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180});
+        let want_default = serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270});
+
+        assert_eq!(ask(None, true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]), want_agy);
+        assert_eq!(ask(None, true, &[("ANTIGRAVITY_AGENT", "1")]), want_agy);
+        assert_eq!(ask(None, true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1"), ("ANTIGRAVITY_AGENT", "1")]), want_agy);
+        assert_eq!(ask(None, false, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]), want_default);
+        assert_eq!(ask(None, false, &[("ANTIGRAVITY_AGENT", "1")]), want_default);
+        assert_eq!(ask(None, true, &[("ANTIGRAVITY_CONVERSATION_ID", "")]), want_default);
+        assert_eq!(ask(None, true, &[("ANTIGRAVITY_AGENT", "0")]), want_default);
+        assert_eq!(ask(None, true, &[("ANTIGRAVITY_AGENT", "")]), want_default);
+        assert_eq!(ask(None, true, &[("ANTIGRAVITY_GEMINI_DIR", "/tmp/g")]), want_default);
+        assert_eq!(ask(None, true, &[]), want_default);
+
+        assert_eq!(
+            ask(Some(100), true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+            serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 100})
+        );
+        assert_eq!(
+            ask(Some(5), true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+            serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 30})
+        );
+        assert_eq!(
+            ask(Some(9999), true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+            serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 3000})
+        );
+    }
+
+    #[test]
+    fn antigravity_mixed_with_claude_or_codex_is_ambiguous_and_gets_270_s() {
+        // why: S4 ambiguous identity rules apply whenever signals from two or
+        //      more agents appear in the same environment (nested shells):
+        //      vigil falls back to 270 s unknown/default and clamps explicit
+        //      max_s to the 270 s Codex ceiling.
+        // catches: letting Claude 1h, Codex codex-default, or Antigravity 180 s
+        //          win when mixed, or allowing explicit 9999 -> 3000 on mixed
+        //          Claude+Antigravity or Codex+Antigravity.
+        // proves: CLAIM(S4)
+        let root = tempfile::tempdir().unwrap();
+        write_transcript(root.path(), "p", "sess-1", &[assistant_line(0, 500), assistant_line(900, 0)]);
+        let ask = |explicit_s: Option<u64>, pairs: &[(&str, &str)]| {
+            let agent = env_of(pairs);
+            serde_json::to_value(choose_window(&WindowRequest {
+                explicit_s,
+                orchestrator: true,
+                agent: &agent,
+                projects_dir: Some(root.path()),
+            }))
+            .unwrap()
+        };
+
+        // Positive controls: each single agent gets its own window.
+        assert_eq!(
+            ask(None, &[("CLAUDE_CODE_SESSION_ID", "sess-1")]),
+            serde_json::json!({"ttl": "1h", "source": "claude-transcript", "interval_s": 3000}),
+            "control: Claude alone"
+        );
+        assert_eq!(
+            ask(None, &[("CODEX_HOME", "/x")]),
+            serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}),
+            "control: Codex alone"
+        );
+        assert_eq!(
+            ask(None, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+            serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180}),
+            "control: Antigravity alone"
+        );
+
+        let want_ambiguous = serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270});
+        let want_explicit_cap = serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 270});
+        let mixed = [
+            ("claude + antigravity conv id", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+            ("claude + antigravity agent flag", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("ANTIGRAVITY_AGENT", "1")]),
+            ("codex home + antigravity conv id", vec![("CODEX_HOME", "/x"), ("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+            ("agent=codex + antigravity agent flag", vec![("AGENT", "codex"), ("ANTIGRAVITY_AGENT", "1")]),
+            ("all three agents", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("CODEX_HOME", "/x"), ("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+        ];
+        for (name, pairs) in mixed {
+            assert_eq!(ask(None, &pairs), want_ambiguous, "{name}");
+            assert_eq!(ask(Some(9999), &pairs), want_explicit_cap, "{name} explicit ceiling");
+        }
     }
 
     // ---- S8: bounded reads ----
@@ -924,7 +1057,7 @@ mod tests {
         let len = std::fs::metadata(&big).unwrap().len();
         assert!(len > 2_500_000, "the fixture must dwarf the cap, it is {len} bytes");
         let tap = crate::meter::ReadTap::on(root.path());
-        let agent = AgentEnv { claude_session_id: Some("sess-1".into()), codex: false };
+        let agent = AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: false };
         let got = choose_window(&WindowRequest { explicit_s: None, orchestrator: true, agent: &agent, projects_dir: Some(root.path()) });
         assert_eq!(got, note(Ttl::OneHour, TtlSource::ClaudeTranscript, 3000));
         let tally = tap.of(&big);

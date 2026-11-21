@@ -391,7 +391,7 @@ async fn fix1_probe_a_mixed_no_id_call_registers_plain_and_gets_plain_window() {
     ]);
     let mut env = Env::with_clock_and_config(Arc::new(TokioClock::new(spec_instant())), config);
     env.vigil = env.vigil.with_session_key(Some("pilot-session".into())).with_agent_env(crate::cache::AgentEnv {
-        claude_session_id: Some("pilot-session".into()), codex: false,
+        claude_session_id: Some("pilot-session".into()), codex: false, antigravity: false,
     });
     hold(&env, "main").await;
     confirm(&env, "main");

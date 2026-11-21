@@ -1213,6 +1213,62 @@ fn codex_is_recognised_from_the_environment_and_gets_the_codex_default() {
 }
 
 #[test]
+fn antigravity_is_recognised_from_the_environment_and_gets_180_s_window() {
+    // why: AI1' / AI3 / S4 through the real vigil CLI binary:
+    //      ANTIGRAVITY_CONVERSATION_ID or ANTIGRAVITY_AGENT=1 with --orchestrator
+    //      selects 180 s (5m / antigravity-measured); without --orchestrator
+    //      stays 270 s (unknown / default); mixed with Claude or Codex becomes
+    //      ambiguous (270 s, unknown / default).
+    // catches: forgetting to wire Antigravity detection in AgentEnv::from_vars
+    //          at the binary edge or breaking S4 ambiguity over CLI env vars.
+    // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(S4)
+    for (id, env_var, val) in [
+        ("agy-conv", "ANTIGRAVITY_CONVERSATION_ID", "conv-1"),
+        ("agy-flag", "ANTIGRAVITY_AGENT", "1"),
+    ] {
+        let (case_sandbox, case_uw) = auto_sandbox(true);
+        assert!(create_with(&case_sandbox, id, serde_json::json!({})).status.success());
+        let envelope = fire_and_keepalive(&case_sandbox, &case_uw, id, &["--orchestrator"], &[(env_var, val)]);
+        assert_eq!(envelope["max_s"], 180, "{id}");
+        assert_eq!(
+            cache_without_credit_check(&envelope),
+            serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180}),
+            "{id}"
+        );
+    }
+
+    let (sandbox, fake_uw) = auto_sandbox(true);
+
+    assert!(create_with(&sandbox, "agy-sub", serde_json::json!({})).status.success());
+    let sub = fire_and_keepalive(&sandbox, &fake_uw, "agy-sub", &[], &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]);
+    assert_eq!(sub["max_s"], 270);
+    assert_eq!(sub["cache"], serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+
+    // Positive control: Claude alone with the 1h transcript still gets 3000 s.
+    assert!(create_with(&sandbox, "claude-ctrl", serde_json::json!({})).status.success());
+    let ctrl = fire_and_keepalive(&sandbox, &fake_uw, "claude-ctrl", &["--orchestrator"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
+    assert_eq!(ctrl["cache"]["interval_s"], 3000);
+
+    for (id, extra) in [
+        ("agy-claude", ("CLAUDE_CODE_SESSION_ID", SESSION)),
+        ("agy-codex", ("AGENT", "codex")),
+    ] {
+        assert!(create_with(&sandbox, id, serde_json::json!({})).status.success());
+        let mixed = fire_and_keepalive(
+            &sandbox,
+            &fake_uw,
+            id,
+            &["--orchestrator"],
+            &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1"), extra],
+        );
+        assert_eq!(mixed["max_s"], 270, "{id}");
+        assert_eq!(mixed["cache"]["ttl"], "unknown", "{id}");
+        assert_eq!(mixed["cache"]["source"], "default", "{id}");
+        assert_eq!(mixed["cache"]["interval_s"], 270, "{id}");
+    }
+}
+
+#[test]
 fn creating_a_watch_with_a_zero_expect_s_fails() {
     // why: A16 through the CLI: exit status 1 and a message on stderr, nothing
     //      on stdout. (Engine-level coverage is in auto_interval_tests.)

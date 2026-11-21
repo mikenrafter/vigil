@@ -243,7 +243,7 @@ fn claude_vigil(env: &Env, projects: &std::path::Path) -> Vigil {
     let probe = ScriptedCreditProbe::new(credit_state(false, CreditSource::Uw));
     Vigil::new(env.root(), env.clock.clone(), env.judge.clone(), config)
         .with_reader(env.reader.clone())
-        .with_agent_env(AgentEnv { claude_session_id: Some("sess-1".into()), codex: false })
+        .with_agent_env(AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: false })
         .with_credit_probe(probe)
 }
 
