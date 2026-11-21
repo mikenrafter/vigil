@@ -33,6 +33,7 @@ enum Command {
     /// Project reminders, delivered only inside vigil calls.
     Remind { #[command(subcommand)] command: RemindCommand },
     /// One-time announcements delivered once per session.
+    /// For this release, restart long-lived `vigil mcp` servers after installing.
     Notice { #[command(subcommand)] command: NoticeCommand },
     /// Print the notices not yet shown to this agent session and record them as
     /// delivered (for SessionStart / UserPromptSubmit hooks). Text form: one

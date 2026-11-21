@@ -98,8 +98,7 @@ a harness whose field differs from the table is a one-line fix in
    that finds expired notices, never between claim and print. A record is
    removed only when every delivered generation is removed or expired. All
    writers, releasers and cleanup share one delivery-directory lock
-   (`notice-delivery/.lock`), which is never unlinked; cleanup also retires any
-   legacy per-record `.lock` files.
+   (`notice-delivery/.lock`), which is never unlinked; cleanup retains legacy per-record `.lock` files for one release.
 5. **Codex child environments.** Fable's round-2 live check found
    `CODEX_SESSION_ID`, `CODEX_THREAD_ID` and `T3CODE_THREAD_ID` in shell
    children, and only `T3CODE_THREAD_ID` in MCP children. Both CODEX names
@@ -128,6 +127,13 @@ thread id, the session id remains a fallback name.
 names. Outside T3, a Codex MCP child with no session environment variable or
 payload still falls back to its shared ancestor record and remains disjoint
 from named threads until a call sees both.
+
+
+After installing, restart long-lived `vigil mcp` servers. Older servers use
+per-record locks and cannot coordinate with the new directory lock. For one
+release, cleanup retains legacy `<hash>.lock` files, including orphan locks,
+to preserve the inodes still used by older processes. Restarting is required
+before relying on once-per-session delivery across old and new callers.
 
 ## Topic snippets with cadence (residual-cli's guru pattern), later
 

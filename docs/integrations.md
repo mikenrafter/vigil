@@ -282,3 +282,9 @@ When `CODEX_THREAD_ID` is non-blank, notice identity excludes
 be shared by an app-server hosting several threads; its live scope remains
 unverified. Distinct thread ids keep those threads independent. Without a
 thread id, the session id remains a fallback name.
+
+After installing, restart long-lived `vigil mcp` servers. Older servers use
+per-record locks and cannot coordinate with the new directory lock. For one
+release, cleanup retains legacy `<hash>.lock` files, including orphan locks,
+to preserve the inodes still used by older processes. Restarting is required
+before relying on once-per-session delivery across old and new callers.

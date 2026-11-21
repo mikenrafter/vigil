@@ -1425,8 +1425,7 @@ link names without printing again. Existing single-name `<hash>.json` records
 remain readable without migration. Stale generations are pruned from touched
 records. The stale-record sweep runs on `vigil notice rm` and on `notice list`
 when expired notices are present, outside the delivery path. A record is
-deleted only when every delivered generation is removed or expired (retiring
-any legacy per-record `.lock` file beside it). All writers, releasers and
+deleted only when every delivered generation is removed or expired . All writers, releasers and
 cleanup serialize on one delivery-directory lock (`notice-delivery/.lock`),
 which is never unlinked. Records for live notices survive idle periods.
 
@@ -1498,3 +1497,9 @@ When `CODEX_THREAD_ID` is non-blank, notice identity excludes
 be shared by an app-server hosting several threads; its live scope remains
 unverified. Distinct thread ids keep those threads independent. Without a
 thread id, the session id remains a fallback name.
+
+After installing, restart long-lived `vigil mcp` servers. Older servers use
+per-record locks and cannot coordinate with the new directory lock. For one
+release, cleanup retains legacy `<hash>.lock` files, including orphan locks,
+to preserve the inodes still used by older processes. Restarting is required
+before relying on once-per-session delivery across old and new callers.

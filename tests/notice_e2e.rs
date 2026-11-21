@@ -770,11 +770,11 @@ fn antigravity_env_links_with_hook_payload_and_t3_thread() {
 fn legacy_single_record_and_lock_files_remain_readable_linkable_and_prunable() {
     // why: invariant: existing notice records written by vigil 17236db must stay
     //      readable without migration, bridge to new names, and prune cleanly
-    //      including any legacy per-record .lock files.
+    //      while retaining legacy per-record .lock files for rollout.
     //      Independent oracle: `printf 'agent:legacy-t3' | sha256sum | cut -c1-32`
     //      == `01c62e9f52b2ee2cdc8a54665190c303`.
     // catches: changing the record hash format or JSON schema incompatibly;
-    //          leaving legacy .lock files behind on cleanup.
+    //          unlinking legacy lock inodes during rollout.
     let sandbox = Sandbox::new();
     let added = run(&sandbox, &["notice", "add", "neon", "--message", "m"]);
     let created_at = added["created_at"].as_str().unwrap();
@@ -805,12 +805,21 @@ fn legacy_single_record_and_lock_files_remain_readable_linkable_and_prunable() {
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
 
-    // Removing the notice cleans all dead records AND the legacy .lock file.
+    // Removing the notice cleans dead records but preserves the legacy lock inode.
     run(&sandbox, &["notice", "rm", "neon"]);
     let leftovers: Vec<_> = std::fs::read_dir(&delivery_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.file_name().is_some_and(|name| name != ".lock"))
         .collect();
-    assert!(leftovers.is_empty(), "leftover files after rm: {leftovers:?}");
+    assert_eq!(leftovers, vec![legacy_lock], "retain legacy locks for one release");
+}
+
+#[test]
+fn notice_help_explains_server_restart_after_installing() {
+    let sandbox = Sandbox::new();
+    let result = sandbox.command().args(["notice", "--help"]).output().unwrap();
+    assert!(result.status.success());
+    let output = String::from_utf8(result.stdout).unwrap();
+    assert!(output.contains("restart long-lived `vigil mcp` servers after installing"), "{output}");
 }

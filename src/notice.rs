@@ -596,9 +596,8 @@ impl NoticeStore {
 
     /// Maintenance on notice removal or an operator listing expired notices.
     /// Runs under the single delivery-directory lock (which is never unlinked),
-    /// retires records whose
-    /// delivered generations are all dead (along with any legacy per-record
-    /// `.lock` files).
+    /// retires records whose delivered generations are all dead. Legacy
+    /// per-record locks remain for one release to preserve old lock inodes.
     pub(crate) fn prune_stale_records(&self, now: Timestamp) {
         let dir = self.delivery_dir();
         if !dir.exists() {
@@ -616,19 +615,11 @@ impl NoticeStore {
             let Ok(record) = serde_json::from_slice::<SessionRecord>(&bytes) else { continue };
             if record.delivered.iter().all(|(id, created_at)| {
                 !notices.iter().any(|notice| notice.id == *id && notice.created_at == *created_at && !notice.is_expired(now))
-            }) && std::fs::remove_file(path).is_ok()
-            {
-                let _ = std::fs::remove_file(&path.with_extension("lock"));
-            }
-        }
-        for path in &paths {
-            if path.file_name().is_some_and(|name| name != ".lock")
-                && path.extension().is_some_and(|ext| ext == "lock")
-                && !path.with_extension("json").exists()
-            {
+            }) {
                 let _ = std::fs::remove_file(path);
             }
         }
+
     }
 }
 
