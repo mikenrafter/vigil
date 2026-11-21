@@ -583,3 +583,32 @@ fn a_claim_with_nothing_pending_leaves_the_state_root_untouched() {
     assert_eq!(rig.deliver("s"), ids(&[]));
     assert_eq!(tree(&rig.env.root()), delivered, "all delivered: claim wrote files");
 }
+
+#[test]
+fn old_records_and_lock_inodes_survive_while_any_delivered_notice_is_live() {
+    // CLAIM(notice-once): a long-idle session must never hear a live notice twice.
+    use std::time::{Duration, SystemTime};
+    let rig = Rig::new();
+    rig.add("live", "m");
+    rig.deliver("idle");
+    rig.deliver("unlocked-idle");
+    let dir = rig.env.root().join("notice-delivery");
+    let paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let old = SystemTime::now() - Duration::from_secs(40 * 86400);
+    let locks: Vec<_> = paths.iter().filter(|p| p.extension().is_some_and(|e| e == "lock")).take(1)
+        .map(|p| { let f = std::fs::File::options().write(true).open(p).unwrap(); f.lock().unwrap(); f }).collect();
+    for path in &paths {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
+    }
+    rig.deliver("new-session"); // triggers global pruning
+    for path in &paths { assert!(path.exists(), "pruned {}", path.display()); }
+    drop(locks);
+    assert_eq!(rig.deliver("idle"), ids(&[]));
+    assert_eq!(rig.deliver("unlocked-idle"), ids(&[]));
+    rig.env.vigil.notice_rm("live").unwrap();
+    rig.add("replacement", "m");
+    rig.deliver("cleanup-trigger");
+    for path in &paths {
+        assert_eq!(path.exists(), path.extension().is_some_and(|ext| ext == "lock"), "{}", path.display());
+    }
+}

@@ -43,7 +43,7 @@ pub const MAX_NOTICES: usize = 64;
 pub const MAX_MESSAGE_BYTES: usize = 2000;
 const MAX_SCOPES: usize = 16;
 const MAX_SESSION_BYTES: usize = 512;
-/// A session record unused for this long is deleted by the next delivery.
+/// Minimum age for pruning records whose delivered notices are all no longer live.
 const RECORD_RETENTION: Duration = Duration::from_secs(30 * 86_400);
 /// How long a claim waits for another process holding the same record's lock.
 /// The critical section is one small read and one rename, so this is a bound
@@ -377,7 +377,7 @@ impl NoticeStore {
             })?
         };
         if !claimed.is_empty() {
-            self.prune_stale_records();
+            self.prune_stale_records(now);
         }
         let (identity, label, note) = match session {
             NoticeSession::Agent(id) => (NoticeIdentity::Session, Some(id.clone()), None),
@@ -408,19 +408,31 @@ impl NoticeStore {
         })
     }
 
-    /// Best-effort removal of records not touched for [`RECORD_RETENTION`]
-    /// (a run-keyed record outlives its process).
-    fn prune_stale_records(&self) {
+    /// Best-effort removal of old records only after every delivered generation
+    /// is removed or expired. Lock files stay in place so their inode is stable.
+    fn prune_stale_records(&self, now: Timestamp) {
         let Ok(entries) = std::fs::read_dir(self.delivery_dir()) else { return };
         for entry in entries.filter_map(std::result::Result::ok) {
-            let stale = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "json") {
+                continue;
+            }
+            let stale = entry.metadata().and_then(|meta| meta.modified()).ok()
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age > RECORD_RETENTION);
-            if stale {
-                let _ = std::fs::remove_file(entry.path());
+            if !stale {
+                continue;
+            }
+            let Ok(_lock) = Self::lock(&path.with_extension("lock")) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(record) = serde_json::from_slice::<SessionRecord>(&bytes) else { continue };
+            // Read the current live set while holding the record lock: a
+            // concurrent delivery must not be pruned using an older snapshot.
+            let Ok(notices) = self.list() else { continue };
+            if record.delivered.iter().all(|(id, created_at)| {
+                !notices.iter().any(|notice| notice.id == *id && notice.created_at == *created_at && !notice.is_expired(now))
+            }) {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
