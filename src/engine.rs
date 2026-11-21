@@ -284,25 +284,21 @@ impl Vigil {
         self.advice_until(None).await
     }
 
-    /// Like [`Vigil::advice`], sharing `deadline` across the serial pass so
-    /// finished entries survive and cut-off or unreached entries become
-    /// individual `unavailable` entries.
+    /// Like [`Vigil::advice`], starting all uncached probes concurrently under
+    /// `deadline` and returning results in file order so finished entries
+    /// survive and cut-off entries become individual `unavailable` entries.
     pub async fn advice_until(
         &self,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<Vec<crate::advisory_eval::Advice>, crate::advisory::AdvisoryError> {
         let set = self.advisory_store()?.load()?;
-        Ok(crate::advisory_eval::advise(&set, self.reader.as_ref(), self.clock.as_ref(), &self.advisory_cache_dir(), deadline).await)
+        Ok(crate::advisory_eval::advise(&set, self.reader.clone(), self.clock.clone(), &self.advisory_cache_dir(), deadline).await)
     }
 
-    /// The `advice` of an envelope: `None` when advisories are off. A file that
-    /// cannot be read is one explicit `unavailable` entry, never silence and
-    /// never a failure of the call it rides on (CLAIM(advisory-unavailable)).
-    pub async fn envelope_advice(&self) -> Option<Vec<crate::advisory_eval::Advice>> {
-        self.envelope_advice_until(None).await
-    }
-
-    /// [`Vigil::envelope_advice`] bounded by a shared `deadline`.
+    /// The `advice` of an envelope bounded by a shared `deadline`: `None` when
+    /// advisories are off. A file that cannot be read is one explicit
+    /// `unavailable` entry, never silence and never a failure of the call it
+    /// rides on (CLAIM(advisory-unavailable)).
     pub async fn envelope_advice_until(
         &self,
         deadline: Option<tokio::time::Instant>,

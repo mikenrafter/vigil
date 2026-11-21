@@ -33,12 +33,16 @@ fn waited_secs(waited: Duration) -> u64 {
 pub const OUTBOX_POLL: Duration = Duration::from_secs(5);
 
 /// CLAIM(neon-mcp-bound): the most a call spends on advisories AFTER its
-/// window. Advisories run serially and each uncached probe gets at most
-/// `min(PROBE_DEADLINE, time remaining)` against this shared deadline, so N
-/// slow probes cannot push a call past a fixed transport timeout (agy: 180 s).
-/// Finished entries (including cache hits) survive; cut-off or unreached
-/// advisories become individual `unavailable` entries naming them
-/// [auto_interval_tests::an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_probe_is_slow].
+/// window, on every host. All uncached probes start concurrently under this
+/// shared deadline, each getting at most `min(PROBE_DEADLINE, time remaining)`,
+/// and results return in file order. The cap keeps fixed-timeout transports
+/// under their tool limits: Antigravity's 150 s window stays under agy's 180 s
+/// MCP timeout, and Codex's 270 s window plus unbounded advice could otherwise
+/// pass Codex's 300 s tool timeout. Finished entries (including cache hits)
+/// survive; any probe cut off by the deadline becomes an individual
+/// `unavailable` entry naming it (not cached as a probe failure)
+/// [auto_interval_tests::a_slow_first_probe_never_starves_a_healthy_second_probe_on_claude_or_antigravity,
+///  auto_interval_tests::an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_probe_is_slow].
 pub const ADVICE_TAIL_BUDGET: Duration = Duration::from_secs(15);
 
 pub const MIN_MAX_S: u64 = 30;

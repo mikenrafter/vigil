@@ -40,8 +40,8 @@ impl Vigil {
     /// reminder or config diagnostic can be delivered.
     ///
     /// Under any Antigravity signal, shares `ADVICE_TAIL_BUDGET` across the
-    /// serial advisory pass so the MCP `advice` tool stays inside agy's 180 s
-    /// timeout while preserving finished entries.
+    /// concurrent advisory pass so the MCP `advice` tool stays inside agy's
+    /// 180 s timeout while preserving finished entries in file order.
     pub async fn advice_report(&self) -> Result<Value, AdvisoryError> {
         // CLAIM(neon-mcp-bound) ↳ Antigravity MCP `advice` calls stay under 180 s
         let deadline = self
@@ -69,7 +69,7 @@ impl Vigil {
     pub async fn advisory_show(&self, id: &str) -> Result<Value, AdvisoryError> {
         let advisory = self.advisory_store()?.get(id)?;
         let set = AdvisorySet { entries: vec![Entry::Ready(Box::new(advisory.clone()))] };
-        let advice = advise(&set, self.reader.as_ref(), self.clock.as_ref(), &self.advisory_cache_dir(), None).await;
+        let advice = advise(&set, self.reader.clone(), self.clock.clone(), &self.advisory_cache_dir(), None).await;
         let mut shown = detail(&advisory);
         shown["advice"] = serde_json::to_value(&advice[0]).expect("advice serializes");
         Ok(shown)
