@@ -1,4 +1,4 @@
-//! Notices: one-time announcements every agent session sees exactly once.
+//! Notices: one-time announcements delivered once per session.
 //!
 //! A notice is operator-written text ("Gemini Neon is now a reviewer; reread
 //! these skills") with an optional expiry and optional directory scopes. It is
@@ -323,7 +323,7 @@ impl NoticeStore {
     fn read_record(&self, session: &NoticeSession) -> Result<SessionRecord> {
         match std::fs::read(self.record_path(session)) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| NoticeError::State(format!("corrupt delivery record {}: {error}", self.record_path(session).display()))),
+                .map_err(|error| NoticeError::State(format!("corrupt delivery record {}: {error}; delete this file to reset; live notices are then shown to this session once more", self.record_path(session).display()))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SessionRecord::default()),
             Err(error) => Err(error.into()),
         }

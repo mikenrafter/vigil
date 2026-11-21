@@ -364,3 +364,39 @@ async fn codex_t3_shell_and_mcp_share_notices_with_different_session_env() {
     assert_eq!(records, 1);
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn notice_help_and_mcp_descriptions_say_once_per_session() {
+    // The documented crash limit must also be reflected in discoverable help.
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["--help"]);
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(!help.contains("exactly once"), "{help}");
+    assert!(help.contains("once per session"), "{help}");
+    let client = connect(&sandbox, "help-session").await;
+    let tools = client.list_all_tools().await.unwrap();
+    let tool = tools.iter().find(|tool| tool.name == "notice_add").unwrap();
+    let description = tool.description.as_deref().unwrap();
+    assert!(!description.contains("exactly once"), "{description}");
+    assert!(description.contains("once per session"), "{description}");
+    client.cancel().await.unwrap();
+}
+
+#[test]
+fn corrupt_record_error_explains_the_reset_and_its_replay_cost() {
+    let sandbox = Sandbox::new();
+    add(&sandbox, "neon", "m");
+    assert_eq!(text(&sandbox, &["notices", "--session", "s"]), "neon: m\n");
+    let path = std::fs::read_dir(sandbox.state_root().join("notice-delivery")).unwrap()
+        .map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|ext| ext == "json")).unwrap();
+    std::fs::write(&path, b"{broken").unwrap();
+    let output = sandbox.run(&["notices", "--session", "s"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.trim_end().ends_with("delete this file to reset; live notices are then shown to this session once more"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(text(&sandbox, &["notices", "--session", "s"]), "neon: m\n");
+    assert_eq!(text(&sandbox, &["notices", "--session", "s"]), "");
+}

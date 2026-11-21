@@ -32,14 +32,14 @@ struct Cli {
 enum Command {
     /// Project reminders, delivered only inside vigil calls.
     Remind { #[command(subcommand)] command: RemindCommand },
-    /// One-time announcements: each agent session sees a notice exactly once.
+    /// One-time announcements delivered once per session.
     Notice { #[command(subcommand)] command: NoticeCommand },
     /// Print the notices not yet shown to this agent session and record them as
     /// delivered (for SessionStart / UserPromptSubmit hooks). Text form: one
     /// `id: message` line each, nothing when none. The session is `--session`,
-    /// else the hook payload on stdin with `--from-hook` (`session_id`,
-    /// `conversationId`, `threadId`, ...), else the environment identity, else one
-    /// run of the calling process (the output then says so).
+    /// else T3, Claude or Codex session environment, else a hook payload id
+    /// with `--from-hook`, else an agent ancestor. Unidentified hooks fail;
+    /// other unidentified calls use one run of the calling process and say so.
     Notices {
         #[arg(long)]
         session: Option<String>,

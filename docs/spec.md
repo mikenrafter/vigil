@@ -1386,7 +1386,7 @@ try-locks, reporting contention instead of blocking a call.
 
 ## Notices
 
-A notice is a one-time announcement every agent session sees exactly once:
+A notice is a one-time announcement delivered once per session:
 "Gemini Neon is now a build-loop reviewer; reread these skill files". An
 advisory repeats on every return (probe-backed state), and a reminder marked
 done by one agent disappears for all. A notice needs neither a probe nor a
@@ -1425,7 +1425,7 @@ its lock file while holding that lock and the delivery-directory lock. Writers
 open record locks under the same directory lock, preventing split lock inodes.
 Records for live notices survive idle periods.
 
-**Exactly once.** `claim` runs under the record's lock with a short bounded
+**Once per session.** `claim` runs under the record's lock with a short bounded
 wait. It records the pending notices and returns them. The caller then prints
 and keeps the claim, or releases it on a failed print. Release removes only
 the generation that claim recorded. Racing callers share the record, so they

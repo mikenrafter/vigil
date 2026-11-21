@@ -553,7 +553,7 @@ impl VigilServer {
         Ok(notice_reply(self.vigil.claim_notices(args.session.as_deref(), args.cwd.as_deref().map(std::path::Path::new))
             .and_then(|claim| serde_json::to_value(claim.keep()).map_err(|e| crate::notice::NoticeError::State(e.to_string())))))
     }
-    #[tool(description = "Add a notice: text every agent session sees exactly once, with an optional expiry (RFC 3339) and absolute directory scopes.")]
+    #[tool(description = "Add a notice: text delivered once per session, with an optional expiry (RFC 3339) and absolute directory scopes.")]
     async fn notice_add(&self, Parameters(args): Parameters<NoticeAddArgs>) -> Result<CallToolResult, ErrorData> {
         let expires_at = match args.expires_at.as_deref().map(chrono::DateTime::parse_from_rfc3339).transpose() {
             Ok(at) => at.map(|at| crate::clock::Timestamp(at.with_timezone(&chrono::Utc))),

@@ -166,8 +166,8 @@ case rather than a second mechanism.
 
 ### What carries over unchanged
 
-- the claim / print / keep-or-release protocol and the lock (exactly once per
-  session, no lost record);
+- the claim / print / keep-or-release protocol and the lock (once per session, subject to
+  the crash guarantee above);
 - hashed session file names and the notice identity order (explicit, T3, Claude, Codex,
   hook payload, ancestor, process run);
 - "silence writes nothing": a turn with no relevant topic must not rewrite the
