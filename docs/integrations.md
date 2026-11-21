@@ -265,8 +265,14 @@ The session id each harness gives a hook or child process:
 | Antigravity `agy` 1.5 | `conversationId` | `ANTIGRAVITY_CONVERSATION_ID` and `ANTIGRAVITY_TRAJECTORY_ID` are named in the binary | payload recorded in the agy integration report; the env var was not observed on a live child process |
 | T3 Code | no hooks | `T3CODE_THREAD_ID` | observed in a T3 thread's environment |
 
-`--from-hook`, keepalive and MCP use the notice-only order: `T3CODE_THREAD_ID`,
-`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, hook payload id, then an agent
-ancestor. A hook with no identity exits non-zero without printing notices. A harness
-that has no hook but runs the MCP server (T3) is covered by the keepalive
-envelope and the `notices` tool: the server resolves its own identity.
+`--from-hook`, keepalive and MCP collect every notice-only session name the
+call sees: all present identity environment variables (`T3CODE_THREAD_ID`,
+`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`,
+`ANTIGRAVITY_CONVERSATION_ID`) plus any hook payload ids (`--from-hook`), using
+an agent ancestor only when none exist. A notice is pending only when no record
+under any of those names contains it, and delivery is recorded under every name
+the call sees so overlapping calls bridge across surfaces. Disjoint name sets
+cannot be joined until some call sees both. A hook with no identity exits
+non-zero without printing notices. A harness that has no hook but runs the MCP
+server (T3) is covered by the keepalive envelope and the `notices` tool: the
+server resolves its own identity.

@@ -1409,27 +1409,38 @@ added again; `expires_at` must be in the future when added; scopes are absolute
 directories (at most 16), matched by path components like reminder scopes, and
 no scope means everywhere.
 
-**Delivery.** A session's record is `<state root>/notice-delivery/<hash>.json`
-(a SHA-256 prefix of the session text, so a hostile session id never names a
-file): the notices it has been shown, as id to creation time. A notice is
-pending for a session when it is not expired, the caller's directory is inside
-its scope and the record does not hold it. Expiry is exclusive:
-`now >= expires_at` is expired and never shown. A notice outside the caller's
-scope is not recorded, so a session that later works inside the scope still
-gets it. Removing a notice and adding the same id again is a new notice, shown
-again to every session. The record is pruned of notices that no longer exist.
-The stale-record sweep runs on `vigil notice rm` and on `notice list` when
-expired notices are present, outside the delivery path. A record is deleted
-only when every delivered generation is removed or expired. Cleanup removes
-its lock file while holding that lock and the delivery-directory lock. Writers
-open record locks under the same directory lock, preventing split lock inodes.
-Records for live notices survive idle periods.
+**Delivery.** Each session name's record is
+`<state root>/notice-delivery/<hash>.json` (a SHA-256 prefix of `agent:<name>`
+or `run:<pid:start>`, so a hostile session id never names a file): the notices
+it has been shown, as id to creation time. A call may see several names for the
+same session. A notice is pending for a call when it is not expired, the
+caller's directory is inside its scope and no record under any name the call
+sees holds its generation. Expiry is exclusive: `now >= expires_at` is expired
+and never shown. A notice outside the caller's scope is not recorded, so a
+session that later works inside the scope still gets it. Removing a notice and
+adding the same id again is a new notice, shown again to every session.
+Deliveries—and any already-delivered live generations found on another name in
+the call's set—are recorded under every name the call sees so bridging calls
+link names without printing again. Existing single-name `<hash>.json` records
+remain readable without migration. Stale generations are pruned from touched
+records. The stale-record sweep runs on `vigil notice rm` and on `notice list`
+when expired notices are present, outside the delivery path. A record is
+deleted only when every delivered generation is removed or expired (retiring
+any legacy per-record `.lock` file beside it). All writers, releasers and
+cleanup serialize on one delivery-directory lock (`notice-delivery/.lock`),
+which is never unlinked. Records for live notices survive idle periods.
 
-**Once per session.** `claim` runs under the record's lock with a short bounded
-wait. It records the pending notices and returns them. The caller then prints
-and keeps the claim, or releases it on a failed print. Release removes only
-the generation that claim recorded. Racing callers share the record, so they
-never both print a notice.
+**Once per session.** `claim` runs under `notice-delivery/.lock` with a short
+bounded wait. Multi-record updates use a durable undo journal
+(`notice-delivery/.tx`) written before touching target records and removed once
+all target writes are synced; any mid-commit write error or crash recovers via
+`.tx` before the next claim, release or cleanup reads state, so half the names
+are never left claimed or released. `claim` records the pending notices across
+every name the call sees and returns them. The caller then prints and keeps the
+claim, or releases it on a failed print. Release removes only the generations
+that claim recorded across those names, keeping bridged deliveries and newer
+generations intact. Racing callers with identical or overlapping name sets
+serialize on the directory lock, so they never both print a notice.
 
 Delivery is at most once on a crash between the durable claim and the print,
 or on a transport failure after the MCP handler returns. That delivery can be
@@ -1438,9 +1449,10 @@ before commit releases the claim for retry. Release is best effort if the state
 cannot be locked or written. A crash can lose the claimed batch, at most one
 delivery, rather than replaying notices already claimed.
 
-When nothing is pending the claim reads the record and writes nothing
-(no record, no lock file): every keepalive claims, and the state root must not
-fill with files for sessions that have nothing to see.
+When nothing is pending, no names need bridging, no dead entries need pruning
+and no `.tx` journal needs recovery, the claim reads the records and writes
+nothing (no record, no lock file): every keepalive claims, and the state root
+must not fill with files for sessions that have nothing to see.
 
 **Surfaces.**
 
@@ -1460,15 +1472,20 @@ fill with files for sessions that have nothing to see.
   `advice --json` never carry or consume notices.
 - Advisories and reminders are unchanged.
 
-**Session identity.** An explicit `--session ID` selects a session; a blank
-value is an error. Otherwise notice-only detection prefers
-`T3CODE_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, then `CODEX_SESSION_ID`.
-With `--from-hook`, when none of those is present, use the first non-blank
-payload field among `session_id`,
-`sessionId`, `conversationId`, `conversation_id`, `thread_id`, `threadId`.
-A `claude`/`codex` ancestor is the last fallback, below the payload.
-A hook with no key, payload id or ancestor fails without printing.
-Peer and hold ownership keep their existing identity order.
+**Session identity.** An explicit `--session ID` (or MCP `session`) selects
+only that named session; a blank value is an error. Otherwise notice-only
+detection collects every non-blank name the call sees, deduplicated in order:
+all present identity environment variables (`T3CODE_THREAD_ID`,
+`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`,
+`ANTIGRAVITY_CONVERSATION_ID`), plus with `--from-hook` every non-blank payload
+field among `session_id`, `sessionId`, `conversationId`, `conversation_id`,
+`thread_id`, `threadId`. The first collected name is the display label in
+`delivery.session`. A `claude`/`codex` ancestor is used last and only when
+neither environment nor payload provides a name, so multiple threads under one
+shared Codex app-server never collide on the ancestor record. A hook with no
+environment variable, payload id or ancestor fails without printing. Disjoint
+name sets cannot be joined until some call sees both. Peer and hold ownership
+keep their existing identity order.
 The payload's `cwd` applies when `--cwd` is absent. Other unidentified calls
 fall back to one process run. A process run is keyed by pid and start time of the calling process: the CLI's parent, or
 the MCP server itself. Its output says `no agent session identity: these notices
@@ -1477,4 +1494,4 @@ them to an agent session`. Which id each harness exposes, and how sure we are,
 is tabulated in `docs/integrations.md`.
 
 CLAIMs (proofs in `src/notice_tests.rs` and `tests/notice_e2e.rs`):
-`notice-once`, `notice-records`, `notice-expiry`, `notice-generation`.
+`notice-once`, `notice-records`, `notice-tx`, `notice-expiry`, `notice-generation`.

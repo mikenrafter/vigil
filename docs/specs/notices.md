@@ -42,9 +42,12 @@ delivery, rather than replaying notices already claimed.
 
 Design choices worth keeping when this grows:
 
-- **One record per session, one lock per record.** Concurrent sessions touch
-  different files, so no session can overwrite another's delivery state. Racing
-  processes of one session serialize on one `flock`.
+- **One record per session name, one directory lock, durable multi-record tx.**
+  Different sessions keep separate files so corruption stays isolated to one
+  name, while all claims, releases and maintenance serialize on
+  `notice-delivery/.lock` (never unlinked). Multi-name updates write a durable
+  undo journal (`notice-delivery/.tx`) before touching target records so a
+  crash never leaves half the names claimed or released.
 - **The session id is text from outside** (a hook payload field), so it only
   ever names a file through a hash.
 - **Silence writes nothing.** The common claim finds nothing pending and
@@ -74,11 +77,13 @@ a harness whose field differs from the table is a one-line fix in
 
 ## Open questions
 
-1. **Shared identity pilot.** Notices prefer `T3CODE_THREAD_ID`, then
-   `CLAUDE_CODE_SESSION_ID`, then `CODEX_SESSION_ID`, then a hook payload id,
-   then an agent ancestor. Explicit session arguments select a named session.
-   This order is separate from peers and hold ownership. It makes Codex T3
-   shell children and MCP children share the T3 record.
+1. **Set-of-names identity.** Notices collect every session name a call sees:
+   all present identity environment variables (`T3CODE_THREAD_ID`,
+   `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`,
+   `ANTIGRAVITY_CONVERSATION_ID`), plus hook payload ids (`--from-hook`).
+   Ancestry is used last and only when neither environment nor payload provides
+   a name. Explicit `--session` selects only that named session. This is
+   separate from peers and hold ownership.
 2. **Compaction.** After `/compact` the agent has lost the notice text but the
    record says it was shown. A SessionStart hook with source `compact` could
    re-deliver unexpired notices (a `--again` flag that ignores the record for
@@ -91,33 +96,34 @@ a harness whose field differs from the table is a one-line fix in
    event claim would need its own once-per-session machinery.
 4. **Retention.** The sweep runs on notice removal and on an operator list
    that finds expired notices, never between claim and print. A record is
-   removed only when every delivered generation is removed or expired. Its
-   lock file is removed while both record and directory locks are held.
-   Writers also hold the directory lock before opening a record lock.
+   removed only when every delivered generation is removed or expired. All
+   writers, releasers and cleanup share one delivery-directory lock
+   (`notice-delivery/.lock`), which is never unlinked; cleanup also retires any
+   legacy per-record `.lock` files.
 5. **Codex child environments.** Fable's round-2 live check found
    `CODEX_SESSION_ID`, `CODEX_THREAD_ID` and `T3CODE_THREAD_ID` in shell
    children, and only `T3CODE_THREAD_ID` in MCP children. Both CODEX names
    exist in the 0.170 binary. The hook environment remains unverified.
    One app-server hosts several threads, so ancestry cannot distinguish them.
 
-## Hardening follow-up: identity as a set of names
+## Identity as a set of names (implemented)
 
-Design only; this pilot does not implement it. Collect every session name a
-call sees, including all session environment variables and the hook payload
-id. A notice is pending only when none of those names' records contains its
-generation. Record a delivery under every name the call sees, even when one
-name already records it, so that a bridging call links the names without
-printing again. The Codex shell call links its Codex and T3 names; MCP can
-then find the delivery through its T3 name alone.
+Implemented in `src/notice.rs` and `src/notice_ops.rs` (`CLAIM(notice-tx)`).
+Every call collects all present identity environment variables and hook payload
+ids, using ancestry only when none exist. A notice is pending only when no
+record under any of those names contains its generation. Every delivery—and any
+live delivered generation already present on another name in the set—is
+recorded under every name the call sees, so a bridging call links names without
+printing again. Reads and updates serialize on `notice-delivery/.lock`; writes
+touching more than one record use a durable undo journal
+(`notice-delivery/.tx`) recovered before any later claim, release or cleanup,
+so a crash never leaves half the names claimed or released. Release removes
+only generations claimed by that call across those names.
 
-Read and update all names under one delivery-directory lock, with a durable
-transaction for multi-record writes or a single atomic shared record. A crash
-must not leave half the names claimed. Release must remove only generations
-claimed by that call across those names. Ancestry is used only when no session
-name or payload exists. Disjoint name sets cannot be joined until some call
-sees both; the implementation must state this limit and test both bridge
-orders, simultaneous overlapping name sets, partial-write recovery and
-cancellation. This is the follow-up to the T3-first stopgap, not part of it.
+**Known limit:** disjoint name sets cannot be joined until some call sees both
+names. Outside T3, a Codex MCP child with no session environment variable or
+payload still falls back to its shared ancestor record and remains disjoint
+from named threads until a call sees both.
 
 ## Topic snippets with cadence (residual-cli's guru pattern), later
 
@@ -168,8 +174,9 @@ case rather than a second mechanism.
 
 - the claim / print / keep-or-release protocol and the lock (once per session, subject to
   the crash guarantee above);
-- hashed session file names and the notice identity order (explicit, T3, Claude, Codex,
-  hook payload, ancestor, process run);
+- hashed session file names and the set-of-names notice identity (explicit,
+  else all present identity env vars plus hook payload ids, else ancestor,
+  else process run);
 - "silence writes nothing": a turn with no relevant topic must not rewrite the
   record. The turn counter is the one wrinkle: bumping it every prompt writes
   every prompt. Options: derive `turn` from the harness (the hook payload has a
