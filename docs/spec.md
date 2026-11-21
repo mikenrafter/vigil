@@ -1383,3 +1383,84 @@ still carry the due reminder. Removing and re-adding an id resets suppression
 and event state and deletes its probe cache, even if the old state is corrupt;
 hand edits keep state. Config and state writers use immediate
 try-locks, reporting contention instead of blocking a call.
+
+## Notices
+
+A notice is a one-time announcement every agent session sees exactly once:
+"Gemini Neon is now a build-loop reviewer; reread these skill files". An
+advisory repeats on every return (probe-backed state), and a reminder marked
+done by one agent disappears for all. A notice needs neither a probe nor a
+schedule; it needs per-session memory. Design note and the topic-snippet
+extension: `docs/specs/notices.md`.
+
+```sh
+vigil notice add ID --message TEXT [--expires RFC3339] [--scope DIR...]
+vigil notice list      # oldest first; each entry has `expired`
+vigil notice rm ID
+vigil notices [--session ID] [--cwd DIR] [--from-hook] [--json]
+```
+
+MCP: `notice_add {id,message,expires_at?,scope?}`, `notice_list`,
+`notice_rm {id}`, `notices {session?,cwd?}`. Notices need no config file: they
+live under `<state root>/notices/<id>.json`, so they are per user, like watches.
+There are at most 64 notices; a message is 1..=2000 bytes after trimming; an id
+matches `[A-Za-z0-9_-]{1,64}`; an existing id must be removed before it is
+added again; `expires_at` must be in the future when added; scopes are absolute
+directories (at most 16), matched by path components like reminder scopes, and
+no scope means everywhere.
+
+**Delivery.** A session's record is `<state root>/notice-delivery/<hash>.json`
+(a SHA-256 prefix of the session text, so a hostile session id never names a
+file): the notices it has been shown, as id to creation time. A notice is
+pending for a session when it is not expired, the caller's directory is inside
+its scope and the record does not hold it. Expiry is exclusive:
+`now >= expires_at` is expired and never shown. A notice outside the caller's
+scope is not recorded, so a session that later works inside the scope still
+gets it. Removing a notice and adding the same id again is a new notice, shown
+again to every session. The record is pruned of notices that no longer exist.
+A record not rewritten for 30 days is deleted by the next delivery, so a notice
+with no expiry that lives longer than 30 days is shown again to a session that
+idled that long.
+
+**Exactly once.** `claim` runs under the record's `flock` (bounded wait, 5 s):
+it records the pending notices and returns them. The caller then prints and
+keeps the claim, or, when printing failed, releases it, which removes only the
+generation that claim recorded. So a hook and a keepalive racing in one session
+never both print a notice, and a notice that never reached the agent is shown
+again. When nothing is pending the claim reads the record and writes nothing
+(no record, no lock file): every keepalive claims, and the state root must not
+fill with files for sessions that have nothing to see.
+
+**Surfaces.**
+
+- Keepalive and wait envelopes (CLI and MCP, JSON and `--brief`) carry
+  `notices: [{id,message,expires_at?}]` for notices newly delivered by that
+  return, absent when none; `notices_note` when they were keyed to a process
+  run (below); `notices_error` when the state could not be read. The claim rides
+  in the call's `Delivery`: the CLI prints, then commits (N3), and an MCP call
+  cancelled before its answer is sent drops the `Delivery`, which releases the
+  claim. `--brief` adds one `notice ID: TEXT` item per notice. A notice does not
+  wake a long keepalive; it arrives on the next return (at most one window, 50
+  minutes for a 1-hour cache, later). Hooks cover the gap.
+- `vigil notices` prints pending notices and records them, for SessionStart and
+  UserPromptSubmit hooks. Text: one `id: message` line per notice and nothing
+  when none, so a hook script can pipe it straight into `additionalContext`.
+  `--json` always prints `{identity, session, notices, note?}`. `advice` and
+  `advice --json` never carry or consume notices.
+- Advisories and reminders are unchanged.
+
+**Session identity.** In order: `--session ID` (a blank value is an error, never
+a fallback); with `--from-hook`, the id in the JSON hook payload on stdin, first
+non-blank of `session_id`, `sessionId`, `conversationId`, `conversation_id`,
+`thread_id`, `threadId`, and its `cwd` when `--cwd` is absent; the process's
+agent identity (`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`,
+`ANTIGRAVITY_CONVERSATION_ID`, `T3CODE_THREAD_ID`, else a `claude`/`codex`
+ancestor process, the same detection peers use); else one process run. A process
+run is keyed by pid and start time of the calling process: the CLI's parent, or
+the MCP server itself. Its output says `no agent session identity: these notices
+are shown at most once per run of the calling process; pass --session ID to key
+them to an agent session`. Which id each harness exposes, and how sure we are,
+is tabulated in `docs/integrations.md`.
+
+CLAIMs (proofs in `src/notice_tests.rs` and `tests/notice_e2e.rs`):
+`notice-once`, `notice-records`, `notice-expiry`, `notice-generation`.

@@ -240,3 +240,31 @@ harness can run it before heavy shell commands (builds, test suites) and pass
 the lines to the agent as extra context. Make the hook do nothing when
 `vigil advice` fails or prints nothing, so a broken probe never blocks a
 command.
+
+## Notices in a hook
+
+`vigil notices` is built to be a hook command. Wire it to the events that fire
+at the start of a session and before each turn, and put its stdout into the
+agent's context. Nothing is printed when no notice is pending, and a notice is
+printed to a session once, across hooks, keepalive and the MCP `notices` tool.
+
+```sh
+# Claude Code / Codex SessionStart and UserPromptSubmit (hook JSON on stdin)
+out="$(timeout 5 vigil notices --from-hook 2>/dev/null)" || exit 0
+[ -n "$out" ] || exit 0
+jq -n --arg event "$EVENT" --arg text "vigil notices:\n$out" \
+  '{hookSpecificOutput: {hookEventName: $event, additionalContext: $text}}'
+```
+
+The session id each harness gives a hook or child process:
+
+| Harness | Hook payload field | Environment | Status |
+|---|---|---|---|
+| Claude Code | `session_id` | `CLAUDE_CODE_SESSION_ID` (same value as the transcript file name under `~/.claude/projects`) | payload read by `bin/compact-advice-hook` and `bin/skill-watch-hook`; env var and transcript name checked on this host |
+| Codex 0.170 | `session_id` (`turn_id` also present) | none found: no `CODEX_SESSION_ID` or `CODEX_THREAD_ID` string in the binary | payload field from the same mstack hooks; env absence from the binary only, not a live session |
+| Antigravity `agy` 1.5 | `conversationId` | `ANTIGRAVITY_CONVERSATION_ID` and `ANTIGRAVITY_TRAJECTORY_ID` are named in the binary | payload recorded in the agy integration report; the env var was not observed on a live child process |
+| T3 Code | no hooks | `T3CODE_THREAD_ID` | observed in a T3 thread's environment |
+
+`--from-hook` takes whichever of those payload fields is present. A harness
+that has no hook but runs the MCP server (T3) is covered by the keepalive
+envelope and the `notices` tool: the server resolves its own identity.

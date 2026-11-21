@@ -364,14 +364,12 @@ impl NoticeStore {
             Vec::new()
         } else {
             self.update_record(session, |record| {
-                // Forget notices that were removed or replaced: the record stays
-                // bounded by the live set.
+                // Forget notices that were removed or replaced (same id, other
+                // creation time): the record stays bounded by the live set, and
+                // a replaced notice is pending again.
+                // ↳ CLAIM(notice-generation)
                 record.delivered.retain(|id, created_at| live.get(id.as_str()) == Some(created_at));
-                let pending: Vec<&Notice> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|notice| record.delivered.get(&notice.id) != Some(&notice.created_at))
-                    .collect();
+                let pending: Vec<&Notice> = candidates.iter().copied().filter(|notice| !record.delivered.contains_key(&notice.id)).collect();
                 for notice in &pending {
                     record.delivered.insert(notice.id.clone(), notice.created_at);
                 }

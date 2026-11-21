@@ -7,7 +7,8 @@
 //! `attention` (early wake rules), `hold` + `items` (holds and their work
 //! items), `credit` + `monitor` (the orchestrator's
 //! credit check and hook), `advisory`/`advisory_store`/`advisory_eval` (rules
-//! that tell agents what to do, on every envelope), `envelope` (what the agent reads), `mcp` (the
+//! that tell agents what to do, on every envelope), `notice`/`notice_ops`
+//! (one-time announcements, delivered once per agent session), `envelope` (what the agent reads), `mcp` (the
 //! server front), `fault`/`meter`/`testing` (test seams).
 #![allow(dead_code, unused_variables)] // fixtures in testing.rs and some seams are used only by tests
 
