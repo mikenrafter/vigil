@@ -234,7 +234,7 @@ fn ancestor_session(root: &Path, mut pid: u32) -> Option<String> {
 /// The binary reads environment at its edge; no session env is mutated by the
 /// engine or tests. Empty values count as absent. Ancestry is the last resort.
 pub fn session_key_from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
-    for name in ["CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "ANTIGRAVITY_CONVERSATION_ID", "T3CODE_THREAD_ID"] {
+    for name in ["CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "T3CODE_THREAD_ID"] {
         if let Some(value) = lookup(name).filter(|value| !value.trim().is_empty()) {
             return Some(value);
         }

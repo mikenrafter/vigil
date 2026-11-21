@@ -471,3 +471,13 @@ async fn fix1_terminal_primary_keeps_watch_ended_when_a_peer_event_arrives() {
     assert_eq!(answer["next"], "watch ended; create a new watch if still needed");
     assert!(answer["events"].as_array().unwrap().iter().any(|event| event["kind"] == "foreign_orchestrator"));
 }
+
+#[test]
+fn antigravity_does_not_change_hold_ownership() {
+    // Notice-only identity must not override the existing T3 owner key.
+    assert_eq!(crate::peers::session_key_from_lookup(|name| match name {
+        "ANTIGRAVITY_CONVERSATION_ID" => Some("conversation".into()),
+        "T3CODE_THREAD_ID" => Some("thread".into()),
+        _ => None,
+    }), Some("thread".into()));
+}
