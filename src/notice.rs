@@ -6,7 +6,7 @@
 //! has already seen is stored under `<state root>/notice-delivery/<hash>.json`:
 //! a map from notice id to the creation time of the notice that was delivered.
 //! A call may see several names for the same session (for example
-//! `T3CODE_THREAD_ID`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID` and a hook payload
+//! `T3CODE_THREAD_ID`, `CODEX_THREAD_ID` and a hook payload
 //! id); a notice is pending only when none of those names records its
 //! generation, and deliveries are recorded under every name the call sees under
 //! one delivery-directory lock (`notice-delivery/.lock`); each name is written in turn.
@@ -156,7 +156,7 @@ impl RecordKey {
 /// Who a delivery is recorded against.
 ///
 /// An agent session may be visible under several names at once (for example
-/// `T3CODE_THREAD_ID`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID` and a hook
+/// `T3CODE_THREAD_ID`, `CODEX_THREAD_ID` and a hook
 /// payload id). The first name is the primary display label; deliveries are
 /// checked against the union of all names and recorded under every name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,7 +462,7 @@ impl NoticeStore {
             }
             atomic_write(&path, bytes)?;
         }
-        if writes.len() > 1 {
+        if !writes.is_empty() {
             sync_dir(&self.delivery_dir())?;
         }
         Ok(())
@@ -624,7 +624,6 @@ impl NoticeStore {
                 let _ = std::fs::remove_file(path);
             }
         }
-
     }
 }
 

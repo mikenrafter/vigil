@@ -1425,12 +1425,13 @@ link names without printing again. Existing single-name `<hash>.json` records
 remain readable without migration. Stale generations are pruned from touched
 records. The stale-record sweep runs on `vigil notice rm` and on `notice list`
 when expired notices are present, outside the delivery path. A record is
-deleted only when every delivered generation is removed or expired . All writers, releasers and
+deleted only when every delivered generation is removed or expired. All writers, releasers and
 cleanup serialize on one delivery-directory lock (`notice-delivery/.lock`),
 which is never unlinked. Records for live notices survive idle periods.
 
 **Once per session.** Claims, releases and cleanup serialize on
-`notice-delivery/.lock`. Each name's record is written in turn under that lock.
+`notice-delivery/.lock`. Each name's record is written in turn under that lock. Every nonempty commit,
+including a single-record rename, syncs the delivery directory before returning.
 Printing only follows a full commit, so a crash can lose a notice under some
 names but never deliver it twice. A partial claim that writes A but stops
 before B prints nothing. Later A calls skip the notice; B-only calls can

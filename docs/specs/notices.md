@@ -30,7 +30,7 @@ session**. That per-session record is the part to reuse.
 A delivery record maps notice id to the creation time of the notice that was
 shown. A pending notice is one that is not expired, is in scope for the
 caller's directory and is not in the record. `claim` records and returns the
-pending set under the record's lock; the caller prints and keeps the claim, or
+pending set under the directory lock; the caller prints and keeps the claim, or
 releases it when printing failed. Details and claims: SPEC "Notices".
 
 Each name's record is written in turn under the one directory lock.
