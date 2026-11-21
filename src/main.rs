@@ -511,7 +511,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 if !payload.is_object() {
                     anyhow::bail!("hook payload on stdin is not a JSON object");
                 }
-                if session.is_none() {
+                if session.is_none() && !matches!(vigil.notice_session(None)?, vigil::notice::NoticeSession::Agent(_)) {
                     session = vigil::notice_ops::hook_session_id(&payload);
                 }
                 if cwd.is_none() {

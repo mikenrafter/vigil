@@ -288,3 +288,32 @@ async fn mcp_tools_mirror_the_cli_and_share_its_record() {
     assert_eq!(run(&sandbox, &["notice", "list"]), json!([]));
     client.cancel().await.unwrap();
 }
+
+#[test]
+fn codex_hook_and_keepalive_children_share_the_ancestor_record() {
+    // CLAIM(notice-once): Codex supplies a payload id but no session env.
+    let sandbox = Sandbox::new();
+    add(&sandbox, "neon", "m");
+    let input = sandbox.input("trigger");
+    std::fs::write(&input, "old").unwrap();
+    run(&sandbox, &["create", &json!({"id":"w", "inputs":[{"kind":"file","path":input}], "fire":"change"}).to_string()]);
+    std::fs::write(&input, "new").unwrap();
+    let harness = sandbox.cwd().join("codex");
+    std::fs::copy("/bin/sh", &harness).unwrap();
+    let output = std::process::Command::new(&harness)
+        .args(["-c", r#"printf '%s' '{"session_id":"payload-only"}' | "$VIGIL" --root "$ROOT" notices --from-hook
+"$VIGIL" --root "$ROOT" keepalive w"#])
+        .env_clear().env("PATH", "/usr/bin:/bin")
+        .env("VIGIL", common::vigil_bin()).env("ROOT", sandbox.state_root())
+        .env("HOME", sandbox.home()).env("VIGIL_ADVISORIES_FILE", "off")
+        .current_dir(sandbox.cwd()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (hook, envelope) = stdout.split_once('\n').unwrap();
+    assert_eq!(hook, "neon: m");
+    let envelope: Value = serde_json::from_str(envelope).unwrap();
+    assert!(envelope.get("notices").is_none(), "{envelope}");
+    let records = std::fs::read_dir(sandbox.state_root().join("notice-delivery")).unwrap()
+        .filter_map(Result::ok).filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json")).count();
+    assert_eq!(records, 1);
+}
