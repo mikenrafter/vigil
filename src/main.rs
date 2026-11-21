@@ -36,10 +36,12 @@ enum Command {
     Notice { #[command(subcommand)] command: NoticeCommand },
     /// Print the notices not yet shown to this agent session and record them as
     /// delivered (for SessionStart / UserPromptSubmit hooks). Text form: one
-    /// `id: message` line each, nothing when none. The session is `--session`,
-    /// else T3, Claude or Codex session environment, else a hook payload id
-    /// with `--from-hook`, else an agent ancestor. Unidentified hooks fail;
-    /// other unidentified calls use one run of the calling process and say so.
+    /// `id: message` line each, nothing when none. With `--session`, uses only
+    /// that id; otherwise checks and records every session name the call sees
+    /// (all present identity environment variables plus hook payload ids with
+    /// `--from-hook`, falling back to an agent ancestor only when none exist).
+    /// Unidentified hooks fail; other unidentified calls use one run of the
+    /// calling process and say so.
     Notices {
         #[arg(long)]
         session: Option<String>,
@@ -336,8 +338,8 @@ fn build_vigil(root: Option<PathBuf>) -> anyhow::Result<Vigil> {
     // A3, S4: who is calling is read here, once, from the whole environment.
     let agent = vigil::cache::AgentEnv::from_vars(std::env::vars());
     let session = vigil::peers::session_key_from_lookup(|name| std::env::var(name).ok());
-    let notice_session = vigil::notice_ops::session_key_from_lookup(|name| std::env::var(name).ok(), None);
-    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent).with_session_key(session).with_notice_session_key(notice_session))
+    let notice_sessions = vigil::notice_ops::session_keys_from_lookup::<&str>(|name| std::env::var(name).ok(), &[]);
+    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent).with_session_key(session).with_notice_session_keys(notice_sessions))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
@@ -503,8 +505,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&result)?;
             Ok(0)
         }
-        Command::Notices { session, cwd, from_hook, json } => {
-            let (mut session, mut cwd) = (session, cwd);
+        Command::Notices { session, mut cwd, from_hook, json } => {
+            let mut vigil = vigil;
             if from_hook {
                 let mut raw = String::new();
                 tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut raw).await?;
@@ -513,11 +515,12 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                     anyhow::bail!("hook payload on stdin is not a JSON object");
                 }
                 if session.is_none() {
-                    let payload_session = vigil::notice_ops::hook_session_id(&payload);
-                    session = vigil::notice_ops::session_key_from_lookup(|name| std::env::var(name).ok(), payload_session.as_deref());
-                    if session.is_none() {
+                    let payload_ids = vigil::notice_ops::hook_session_ids(&payload);
+                    let names = vigil::notice_ops::session_keys_from_lookup(|name| std::env::var(name).ok(), &payload_ids);
+                    if names.is_empty() {
                         anyhow::bail!("hook has no session identity in payload, environment or ancestry");
                     }
+                    vigil = vigil.with_notice_session_keys(names);
                 }
                 if cwd.is_none() {
                     cwd = payload["cwd"].as_str().filter(|dir| !dir.is_empty()).map(PathBuf::from);

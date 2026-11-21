@@ -321,7 +321,7 @@ fn concurrent_claims_by_one_session_deliver_each_notice_exactly_once() {
             let now = rig.clock.now();
             std::thread::spawn(move || {
                 barrier.wait();
-                let session = NoticeSession::Agent("same".into());
+                let session = NoticeSession::single("same").unwrap();
                 store.claim(&session, now, &cwd).unwrap().keep().notices.into_iter().map(|n| n.id).collect::<Vec<_>>()
             })
         })
@@ -350,7 +350,7 @@ fn concurrent_sessions_each_get_every_notice_and_none_loses_its_record() {
             let cwd = rig.cwd.clone();
             let now = rig.clock.now();
             std::thread::spawn(move || {
-                let session = NoticeSession::Agent(format!("session-{s}"));
+                let session = NoticeSession::single(&format!("session-{s}")).unwrap();
                 barrier.wait();
                 let first = store.claim(&session, now, &cwd).unwrap().keep().notices.len();
                 let second = store.claim(&session, now, &cwd).unwrap().keep().notices.len();
@@ -582,8 +582,9 @@ fn a_claim_with_nothing_pending_leaves_the_state_root_untouched() {
 }
 
 #[test]
-fn old_records_and_lock_inodes_survive_while_any_delivered_notice_is_live() {
-    // CLAIM(notice-once): a long-idle session must never hear a live notice twice.
+fn old_records_survive_while_any_delivered_notice_is_live() {
+    // CLAIM(notice-once): a long-idle session must never hear a live notice twice,
+    // and the delivery directory uses one `.lock` file rather than per-record locks.
     use std::time::{Duration, SystemTime};
     let rig = Rig::new();
     rig.add("live", "m");
@@ -591,15 +592,14 @@ fn old_records_and_lock_inodes_survive_while_any_delivered_notice_is_live() {
     rig.deliver("unlocked-idle");
     let dir = rig.env.root().join("notice-delivery");
     let paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.file_name().unwrap() != ".lock").collect();
+    assert_eq!(paths.len(), 2, "only the two .json records (no per-record .lock files): {paths:?}");
+    assert!(paths.iter().all(|p| p.extension().is_some_and(|ext| ext == "json")));
     let old = SystemTime::now() - Duration::from_secs(40 * 86400);
-    let locks: Vec<_> = paths.iter().filter(|p| p.extension().is_some_and(|e| e == "lock")).take(1)
-        .map(|p| { let f = std::fs::File::options().write(true).open(p).unwrap(); f.lock().unwrap(); f }).collect();
     for path in &paths {
         std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
     }
     rig.deliver("new-session"); // delivery does not run maintenance
     for path in &paths { assert!(path.exists(), "pruned {}", path.display()); }
-    drop(locks);
     assert_eq!(rig.deliver("idle"), ids(&[]));
     assert_eq!(rig.deliver("unlocked-idle"), ids(&[]));
     rig.env.vigil.notice_rm("live").unwrap();
@@ -608,6 +608,7 @@ fn old_records_and_lock_inodes_survive_while_any_delivered_notice_is_live() {
     for path in &paths {
         assert!(!path.exists(), "{}", path.display());
     }
+    assert!(dir.join(".lock").exists(), "the single directory lock is never unlinked");
 }
 
 #[test]
@@ -643,7 +644,7 @@ fn a_claim_does_not_erase_a_delivery_added_after_its_snapshot() {
     let rig = Rig::new();
     rig.add("first", "m");
     let store = rig.vigil().notice_store();
-    let session = NoticeSession::Agent("s".into());
+    let session = NoticeSession::single("s").unwrap();
     let claim = store.claim_with_snapshot_hook(&session, rig.clock.now(), &rig.cwd, || {
         rig.add("x", "new");
         assert_eq!(rig.deliver("s"), ids(&["first", "x"]));
@@ -662,7 +663,7 @@ fn notice_cleanup_runs_on_remove_and_expiry_but_not_during_delivery() {
     let dir = rig.env.root().join("notice-delivery");
     let record = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|ext| ext == "json")).unwrap();
-    let lock = record.with_extension("lock");
+    assert!(!record.with_extension("lock").exists(), "single directory lock creates no per-record lock");
     std::fs::File::options().write(true).open(&record).unwrap()
         .set_modified(SystemTime::now() - Duration::from_secs(40 * 86400)).unwrap();
     // Simulate an operator removing a notice file before this delivery.
@@ -672,7 +673,6 @@ fn notice_cleanup_runs_on_remove_and_expiry_but_not_during_delivery() {
     assert!(record.exists(), "delivery must not sweep other sessions");
     rig.env.vigil.notice_rm("new").unwrap();
     assert!(!record.exists(), "notice rm must sweep dead records");
-    assert!(!lock.exists(), "cleanup must retire the matching lock");
 
     rig.env.vigil.notice_add(NoticeRequest {
         id: "expires".into(), message: "m".into(),
@@ -684,27 +684,375 @@ fn notice_cleanup_runs_on_remove_and_expiry_but_not_during_delivery() {
     rig.clock.advance_secs(2);
     assert_eq!(rig.env.vigil.notice_list().unwrap()[0]["expired"], true);
     assert!(!record.exists(), "listing expired notices must sweep dead records");
-    assert!(!record.with_extension("lock").exists());
 }
 
 #[test]
-fn cleanup_cannot_unlink_a_held_record_lock() {
-    // A busy record remains intact; a later cleanup retires it after unlock.
+fn cleanup_skips_while_directory_lock_is_held_and_never_unlinks_directory_lock() {
+    // A busy delivery directory leaves records intact; a later cleanup retires
+    // dead records after unlock, and the single `.lock` file is never unlinked.
     let rig = Rig::new();
     rig.add("old", "m");
     rig.deliver("s");
     let dir = rig.env.root().join("notice-delivery");
     let record = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|ext| ext == "json")).unwrap();
-    let lock_path = record.with_extension("lock");
-    let lock = std::fs::File::options().write(true).open(&lock_path).unwrap();
+    let dir_lock_path = dir.join(".lock");
+    let lock = std::fs::File::options().write(true).open(&dir_lock_path).unwrap();
     lock.lock().unwrap();
     rig.env.vigil.notice_rm("old").unwrap();
-    assert!(record.exists());
-    assert!(lock_path.exists());
+    assert!(record.exists(), "held directory lock must defer cleanup");
+    assert!(dir_lock_path.exists());
     drop(lock);
     rig.add("trigger", "m");
     rig.env.vigil.notice_rm("trigger").unwrap();
     assert!(!record.exists());
-    assert!(!lock_path.exists());
+    assert!(dir_lock_path.exists(), "directory lock must never be unlinked");
+}
+
+// ---- set-of-names identity, bridging, transactions, cancellation --------
+
+#[test]
+fn identity_collection_gathers_all_env_and_payload_names_and_uses_ancestor_only_last() {
+    // why: SPEC "Notices": all present identity env vars plus hook payload ids
+    //      are collected in order and deduplicated; ancestry is used only when
+    //      nothing else exists.
+    // catches: first-match stopping after T3CODE_THREAD_ID; including ancestor
+    //          alongside env or payload; failing to deduplicate or skip blanks.
+    use crate::notice_ops::{hook_session_ids, session_keys_with_ancestor};
+    use serde_json::json;
+
+    let all_env = |name: &str| match name {
+        "T3CODE_THREAD_ID" => Some(" t3-1 ".into()),
+        "CLAUDE_CODE_SESSION_ID" => Some("claude-1".into()),
+        "CODEX_SESSION_ID" => Some("codex-1".into()),
+        "CODEX_THREAD_ID" => Some("codex-1".into()), // duplicate of CODEX_SESSION_ID
+        "ANTIGRAVITY_CONVERSATION_ID" => Some("agy-1".into()),
+        _ => None,
+    };
+    let payload = hook_session_ids(&json!({"session_id": "payload-1", "thread_id": "t3-1", "conversationId": "  "}));
+    assert_eq!(payload, vec!["payload-1", "t3-1"]);
+    let collected = session_keys_with_ancestor(all_env, &payload, || Some("ancestor:999".into()));
+    assert_eq!(
+        collected,
+        vec!["t3-1", "claude-1", "codex-1", "agy-1", "payload-1"],
+        "must collect all env + payload names without duplicates and without ancestor"
+    );
+
+    // Payload alone suppresses ancestor.
+    let payload_only = session_keys_with_ancestor(|_| None, &["hook-only"], || Some("ancestor:999".into()));
+    assert_eq!(payload_only, vec!["hook-only"]);
+
+    // Blank env and blank payload fall back to ancestor.
+    let ancestor_only = session_keys_with_ancestor(|_| Some("  ".into()), &["   "], || Some("ancestor:999".into()));
+    assert_eq!(ancestor_only, vec!["ancestor:999"]);
+
+    // Nothing anywhere returns empty.
+    let none = session_keys_with_ancestor::<&str>(|_| None, &[], || None);
+    assert!(none.is_empty());
+}
+
+#[test]
+fn bridging_links_names_in_both_orders_including_out_of_scope_calls_and_states_disjoint_limit() {
+    // why: a bridging call seeing {A, B} suppresses notices already in A or B
+    //      and copies live delivered generations to every name in the set, even
+    //      when called outside a notice's scope; disjoint sets stay separate
+    //      until a call sees both.
+    // proves: CLAIM(notice-once)
+    // catches: skipping write when pending is empty (breaks bridging); checking
+    //          only the first name; only bridging in-scope notices.
+    let rig = Rig::new();
+    let store = rig.vigil().notice_store();
+    let now = rig.clock.now();
+    let proj = rig.env.dir.path().join("proj");
+    let other = rig.env.dir.path().join("other");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+
+    // Order 1: A -> {A, B} -> B (with scoped notice bridged from outside scope!).
+    rig.env
+        .vigil
+        .notice_add(NoticeRequest { id: "scoped".into(), message: "m".into(), scope: vec![proj.clone()], ..Default::default() })
+        .unwrap();
+    let a = NoticeSession::single("a").unwrap();
+    let b = NoticeSession::single("b").unwrap();
+    let ab = NoticeSession::agent(["a", "b"]).unwrap();
+
+    assert_eq!(store.claim(&a, now, &proj).unwrap().keep().notices.len(), 1);
+    // Bridge runs in `other` (outside `proj`), prints nothing, links `scoped` to `b`.
+    assert!(store.claim(&ab, now, &other).unwrap().keep().notices.is_empty());
+    assert!(store.claim(&b, now, &proj).unwrap().keep().notices.is_empty(), "b must see bridged out-of-scope delivery");
+
+    // Steady-state silence on {A, B} writes nothing.
+    let snapshot = tree(&rig.env.root());
+    assert!(store.claim(&ab, now, &proj).unwrap().keep().notices.is_empty());
+    assert_eq!(tree(&rig.env.root()), snapshot, "already-bridged steady state must not rewrite files");
+
+    // Order 2: B -> {A, B} -> A.
+    rig.add("second", "2");
+    assert_eq!(store.claim(&b, now, &proj).unwrap().keep().notices.len(), 1);
+    assert!(store.claim(&ab, now, &proj).unwrap().keep().notices.is_empty());
+    assert!(store.claim(&a, now, &proj).unwrap().keep().notices.is_empty());
+
+    // Disjoint limit: X and Y share nothing until a call sees both {X, Y}.
+    let x = NoticeSession::single("disjoint-x").unwrap();
+    let y = NoticeSession::single("disjoint-y").unwrap();
+    let xy = NoticeSession::agent(["disjoint-x", "disjoint-y"]).unwrap();
+    assert_eq!(store.claim(&x, now, &proj).unwrap().keep().notices.len(), 2);
+    assert_eq!(store.claim(&y, now, &proj).unwrap().keep().notices.len(), 2);
+    rig.add("after-bridge", "3");
+    assert_eq!(store.claim(&xy, now, &proj).unwrap().keep().notices.len(), 1);
+    assert!(store.claim(&x, now, &proj).unwrap().keep().notices.is_empty());
+    assert!(store.claim(&y, now, &proj).unwrap().keep().notices.is_empty());
+}
+
+#[test]
+fn concurrent_overlapping_name_sets_deliver_each_notice_exactly_once() {
+    // why: racing threads seeing overlapping subsets ({a,b}, {b,c}, {a}, {c},
+    //      {a,b,c}) must serialize on the directory lock and deliver each notice
+    //      exactly once across the whole group.
+    // proves: CLAIM(notice-once)
+    // catches: missing directory lock; split locks per record; partial visibility.
+    let rig = Rig::new();
+    for n in 0..8 {
+        rig.add(&format!("n{n}"), "m");
+    }
+    let shapes: Vec<Vec<&str>> = vec![
+        vec!["a", "b"],
+        vec!["b", "c"],
+        vec!["a", "b", "c"],
+        vec!["a", "b"],
+        vec!["b", "c"],
+        vec!["a", "b", "c"],
+        vec!["a", "c"],
+        vec!["a", "b", "c"],
+    ];
+    let barrier = Arc::new(Barrier::new(shapes.len()));
+    let handles: Vec<_> = shapes
+        .into_iter()
+        .map(|names| {
+            let store = NoticeStore { root: rig.env.root() };
+            let barrier = barrier.clone();
+            let cwd = rig.cwd.clone();
+            let now = rig.clock.now();
+            let session = NoticeSession::agent(names).unwrap();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.claim(&session, now, &cwd).unwrap().keep().notices.into_iter().map(|n| n.id).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let mut all: Vec<String> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+    all.sort();
+    let mut expected: Vec<String> = (0..8).map(|n| format!("n{n}")).collect();
+    expected.sort();
+    assert_eq!(all, expected, "every notice delivered exactly once across overlapping sets");
+
+    let store = rig.vigil().notice_store();
+    for name in ["a", "b", "c"] {
+        let single = NoticeSession::single(name).unwrap();
+        assert!(
+            store.claim(&single, rig.clock.now(), &rig.cwd).unwrap().keep().notices.is_empty(),
+            "name {name} missed a delivery"
+        );
+    }
+}
+
+#[test]
+fn mid_commit_write_error_rolls_back_all_records_atomically() {
+    // why: CLAIM(notice-tx): an I/O error on record 2 of 2 must roll back
+    //      record 1 to its exact prior state and remove `.tx`, never leaving
+    //      half the names claimed.
+    // proves: CLAIM(notice-tx)
+    // catches: committing per-file without rollback; wiping prior deliveries
+    //          on rollback; leaving `.tx` behind after a successful rollback.
+    use crate::notice::WriteAction;
+
+    let rig = Rig::new();
+    let store = rig.vigil().notice_store();
+    let now = rig.clock.now();
+    let a = NoticeSession::single("tx-a").unwrap();
+    let b = NoticeSession::single("tx-b").unwrap();
+    let ab = NoticeSession::agent(["tx-a", "tx-b"]).unwrap();
+
+    // Seed `prior` under `a` only.
+    rig.add("prior", "old");
+    assert_eq!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.len(), 1);
+
+    // Add `next`; fail on the 2nd write (index 1) of `{a, b}`.
+    rig.add("next", "new");
+    let err = store.claim_with_write_hook(&ab, now, &rig.cwd, |index, _| {
+        if index == 1 {
+            WriteAction::Fail(std::io::Error::other("simulated disk full"))
+        } else {
+            WriteAction::Continue
+        }
+    });
+    assert!(err.is_err(), "injected write failure must fail the claim");
+    assert!(!rig.env.root().join("notice-delivery/.tx").exists(), "rollback must clear .tx");
+
+    // `a` still has `prior` and does NOT have `next`; `b` does not exist yet
+    // (still has neither). A clean retry on `{a, b}` delivers ONLY `next` and
+    // bridges `prior` to `b`.
+    let retried = store.claim(&ab, now, &rig.cwd).unwrap().keep();
+    let retried_ids: Vec<_> = retried.notices.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(retried_ids, vec!["next"], "prior must survive rollback and next must be retried");
+    assert!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.is_empty());
+    assert!(store.claim(&b, now, &rig.cwd).unwrap().keep().notices.is_empty());
+}
+
+#[test]
+fn partial_write_crash_recovers_before_any_later_claim_or_cleanup() {
+    // why: CLAIM(notice-tx): a SIGKILL after writing record 1 of 2 leaves `.tx`
+    //      and a half-written state on disk. Every next caller—whether it sees
+    //      only record 1 (fast path), only record 2, both, or maintenance—must
+    //      recover `.tx` first so half-claimed state is never observed.
+    // proves: CLAIM(notice-tx)
+    // catches: fast-path skipping lock when `.tx` exists; recovery that fails
+    //          to delete newly-created files or restore pre-tx contents;
+    //          crash during release leaving half the names released.
+    use crate::notice::WriteAction;
+
+    // Case 1: crash during claim after writing A (which had `prior`) before B;
+    // next caller sees ONLY A (must NOT skip lock on fast path!).
+    let rig = Rig::new();
+    let store = rig.vigil().notice_store();
+    let now = rig.clock.now();
+    let a = NoticeSession::single("crash-a").unwrap();
+    let b = NoticeSession::single("crash-b").unwrap();
+    let ab = NoticeSession::agent(["crash-a", "crash-b"]).unwrap();
+
+    rig.add("prior", "1");
+    assert_eq!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.len(), 1);
+    rig.add("fresh", "2");
+
+    let crashed = store.claim_with_write_hook(&ab, now, &rig.cwd, |index, _| {
+        if index == 1 { WriteAction::Crash } else { WriteAction::Continue }
+    });
+    assert!(crashed.is_err());
+    assert!(rig.env.root().join("notice-delivery/.tx").exists(), "simulated crash must leave .tx on disk");
+
+    // Next call sees ONLY `a` — even though `a`'s on-disk file temporarily holds
+    // `fresh`, `.tx` forces recovery back to `{prior}`, so `a` gets `fresh`!
+    let recovered = store.claim(&a, now, &rig.cwd).unwrap().keep();
+    let recovered_ids: Vec<_> = recovered.notices.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(recovered_ids, vec!["fresh"], "single-name caller must recover .tx instead of trusting half-written record");
+    assert!(!rig.env.root().join("notice-delivery/.tx").exists());
+
+    // Case 2: crash during release after removing `rel` from A before B;
+    // recovery restores both A and B to consistently delivered (at-most-once).
+    rig.add("rel", "3");
+    let claim = store.claim(&ab, now, &rig.cwd).unwrap();
+    assert_eq!(claim.delivery().notices.len(), 1);
+    let release_crash = claim.release_internal(|index, _| {
+        if index == 1 { WriteAction::Crash } else { WriteAction::Continue }
+    });
+    assert!(release_crash.is_err());
+    assert!(rig.env.root().join("notice-delivery/.tx").exists());
+
+    // After recovery by calling `a` alone, `rel` is consistently kept across both.
+    assert!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.is_empty());
+    assert!(!rig.env.root().join("notice-delivery/.tx").exists());
+    assert!(store.claim(&b, now, &rig.cwd).unwrap().keep().notices.is_empty());
+
+    // Case 3: maintenance (`notice_rm`) also recovers `.tx` before pruning.
+    rig.add("c3", "4");
+    let x = NoticeSession::single("clean-x").unwrap();
+    let y = NoticeSession::single("clean-y").unwrap();
+    let xy = NoticeSession::agent(["clean-x", "clean-y"]).unwrap();
+    let crashed = store.claim_with_write_hook(&xy, now, &rig.cwd, |index, _| {
+        if index == 1 { WriteAction::Crash } else { WriteAction::Continue }
+    });
+    assert!(crashed.is_err());
+    assert!(rig.env.root().join("notice-delivery/.tx").exists());
+    rig.env.vigil.notice_rm("c3").unwrap();
+    assert!(!rig.env.root().join("notice-delivery/.tx").exists(), "cleanup must recover .tx");
+    let _ = (x, y);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_keepalive_releases_multi_name_claim_across_all_names_and_keeps_bridged_and_newer() {
+    // why: N3 cancellation on a multi-name session must release ONLY the
+    //      generations that call claimed across all names, preserving bridged
+    //      deliveries and never undoing a newer re-added generation.
+    // proves: CLAIM(notice-once)
+    // catches: releasing only the primary name; releasing bridged notices;
+    //          releasing by id without checking generation timestamp.
+    let clock = Arc::new(TokioClock::new(spec_instant()));
+    let mut rig = Rig::new();
+    rig.env = Env::with_clock(clock);
+    let one = fired_watch(&rig, "w1").await;
+    let two = fired_watch(&rig, "w2").await;
+
+    rig.env.vigil.notice_add(NoticeRequest { id: "prior".into(), message: "old".into(), ..Default::default() }).unwrap();
+    let only_t3 = rig.env.another_process().with_notice_session_keys(vec!["t3".into()]);
+    assert_eq!(only_t3.claim_notices(None, None).unwrap().keep().notices.len(), 1);
+
+    rig.env.vigil.notice_add(NoticeRequest { id: "fresh".into(), message: "new".into(), ..Default::default() }).unwrap();
+    let both = rig.env.another_process().with_notice_session_keys(vec!["t3".into(), "codex".into()]);
+    let (envelope, delivery) = both
+        .keepalive_uncommitted(request(one), &crate::keepalive::NoProgress, std::future::pending::<()>())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(envelope.notices.len(), 1);
+    assert_eq!(envelope.notices[0].id, "fresh");
+    drop(delivery); // cancelled before commit!
+
+    // Calling via `codex` alone sees `fresh` (released on every name) and does
+    // NOT see `prior` (bridged before release, never claimed by the cancelled call).
+    let only_codex = rig.env.another_process().with_notice_session_keys(vec!["codex".into()]);
+    let retried = only_codex.keepalive(request(two)).await.unwrap();
+    let retried_ids: Vec<_> = retried.notices.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(retried_ids, vec!["fresh"]);
+
+    // Stale multi-name release does not undo a newer generation of a re-added id.
+    rig.env.vigil.notice_add(NoticeRequest { id: "gen".into(), message: "v1".into(), ..Default::default() }).unwrap();
+    let stale = both.claim_notices(None, None).unwrap();
+    rig.env.vigil.notice_rm("gen").unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    rig.env.vigil.notice_add(NoticeRequest { id: "gen".into(), message: "v2".into(), ..Default::default() }).unwrap();
+    assert_eq!(both.claim_notices(None, None).unwrap().keep().notices[0].message, "v2");
+    stale.release();
+    assert!(only_t3.claim_notices(None, None).unwrap().keep().notices.is_empty());
+    assert!(only_codex.claim_notices(None, None).unwrap().keep().notices.is_empty());
+}
+
+#[test]
+fn corrupt_record_is_isolated_to_calls_seeing_that_name() {
+    // why: CLAIM(notice-records): corrupting one name's record errors any call
+    //      that includes that name without overwriting any file, while another
+    //      name that does not include the corrupt file continues working.
+    // proves: CLAIM(notice-records)
+    // catches: single shared file where one corrupt byte breaks every session;
+    //          multi-name claim partially updating healthy records before
+    //          detecting a corrupt sibling record.
+    let rig = Rig::new();
+    rig.add("live", "m");
+    let store = rig.vigil().notice_store();
+    let now = rig.clock.now();
+    let a = NoticeSession::single("iso-a").unwrap();
+    let b = NoticeSession::single("iso-b").unwrap();
+    let ab = NoticeSession::agent(["iso-a", "iso-b"]).unwrap();
+
+    assert_eq!(store.claim(&b, now, &rig.cwd).unwrap().keep().notices.len(), 1);
+    let b_path = std::fs::read_dir(rig.env.root().join("notice-delivery"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    std::fs::write(&b_path, b"{corrupt").unwrap();
+
+    // `{a, b}` errors without writing `a` or modifying `b`.
+    let err = store.claim(&ab, now, &rig.cwd);
+    assert!(err.is_err());
+    assert_eq!(std::fs::read(&b_path).unwrap(), b"{corrupt");
+    let json_count = std::fs::read_dir(rig.env.root().join("notice-delivery"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert_eq!(json_count, 1, "failed multi-name claim must not create sibling record");
+
+    // `a` alone is completely unaffected by `b`'s corruption.
+    assert_eq!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.len(), 1);
 }

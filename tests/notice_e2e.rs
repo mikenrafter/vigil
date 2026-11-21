@@ -332,10 +332,13 @@ async fn codex_t3_shell_and_mcp_share_notices_with_different_session_env() {
     let sandbox = Sandbox::new();
     add(&sandbox, "neon", "m");
     let command = || {
-        // Preserve inherited environment; only pin the session names for this shape.
+        // Preserve non-session inherited environment; pin the session names for this shape.
         let mut command = std::process::Command::new(common::vigil_bin());
         command.args(["--root", sandbox.state_root().to_str().unwrap()])
-            .current_dir(sandbox.cwd()).env("HOME", sandbox.home()).env("VIGIL_ADVISORIES_FILE", "off");
+            .current_dir(sandbox.cwd()).env("HOME", sandbox.home()).env("VIGIL_ADVISORIES_FILE", "off")
+            .env_remove("T3CODE_THREAD_ID").env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CODEX_SESSION_ID").env_remove("CODEX_THREAD_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID");
         command
     };
     let mut child = command().env("CODEX_SESSION_ID", "codex-session")
@@ -346,8 +349,7 @@ async fn codex_t3_shell_and_mcp_share_notices_with_different_session_env() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "neon: m\n");
     let mut mcp = command();
-    mcp.arg("mcp").env("T3CODE_THREAD_ID", "t3-thread").env_remove("CODEX_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID").env_remove("CLAUDE_CODE_SESSION_ID");
+    mcp.arg("mcp").env("T3CODE_THREAD_ID", "t3-thread");
     let transport = TokioChildProcess::new(tokio::process::Command::from(mcp)).unwrap();
     let client = ().serve(transport).await.unwrap();
     let reply = body(&call(&client, "notices", json!({})).await);
@@ -359,9 +361,14 @@ async fn codex_t3_shell_and_mcp_share_notices_with_different_session_env() {
         .env("T3CODE_THREAD_ID", "t3-thread").arg("notices").output().unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty(), "MCP delivery must be visible to shell");
+    // Every distinct name seen (`t3-thread`, `codex-session`, `payload-session`)
+    // holds a record; a Codex-only call sees `later` bridged from `t3-thread`.
+    let codex_only = command().env("CODEX_SESSION_ID", "codex-session").arg("notices").output().unwrap();
+    assert!(codex_only.status.success());
+    assert!(codex_only.stdout.is_empty(), "bridged shell call must link codex-session to later");
     let records = std::fs::read_dir(sandbox.state_root().join("notice-delivery")).unwrap()
         .filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|ext| ext == "json")).count();
-    assert_eq!(records, 1);
+    assert_eq!(records, 3);
     client.cancel().await.unwrap();
 }
 
@@ -399,4 +406,411 @@ fn corrupt_record_error_explains_the_reset_and_its_replay_cost() {
     std::fs::remove_file(path).unwrap();
     assert_eq!(text(&sandbox, &["notices", "--session", "s"]), "neon: m\n");
     assert_eq!(text(&sandbox, &["notices", "--session", "s"]), "");
+}
+
+// ---- set-of-names identity (hardening follow-up) ------------------------
+
+#[tokio::test]
+async fn codex_t3_bridge_both_orders_links_codex_payload_and_t3_names() {
+    // why: SPEC "Notices": a notice is pending only if no record under any name
+    //      the call sees has it, and delivery is recorded under every name the
+    //      call sees, including bridging calls that print nothing.
+    // proves: CLAIM(notice-once)
+    // catches: first-match identity (T3-only ignores CODEX_SESSION_ID,
+    //          CODEX_THREAD_ID, payload); bridging call that skips writing
+    //          missing names when one name already holds the notice.
+    let sandbox = Sandbox::new();
+    let base_cmd = || {
+        let mut command = sandbox.command();
+        command
+            .env_remove("T3CODE_THREAD_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CODEX_SESSION_ID")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID");
+        command
+    };
+
+    // Order 1: payload-only hook delivers n1 -> bridge sees {T3, CODEX_SESSION_ID,
+    // CODEX_THREAD_ID, payload} (prints nothing, links all) -> T3-only MCP and
+    // Codex-only shell calls see n1 as already delivered.
+    add(&sandbox, "n1", "first notice");
+    let mut hook1 = base_cmd();
+    hook1.args(["notices", "--from-hook"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = hook1.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"payload-1"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "n1: first notice\n");
+
+    let mut bridge1 = base_cmd();
+    bridge1
+        .env("T3CODE_THREAD_ID", "t3-1")
+        .env("CODEX_SESSION_ID", "cs-1")
+        .env("CODEX_THREAD_ID", "ct-1")
+        .args(["notices", "--from-hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = bridge1.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"payload-1"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "bridge must not repeat n1 already seen under payload-1");
+
+    let mut mcp_cmd = base_cmd();
+    mcp_cmd.arg("mcp").env("T3CODE_THREAD_ID", "t3-1");
+    let transport = TokioChildProcess::new(tokio::process::Command::from(mcp_cmd)).unwrap();
+    let client = ().serve(transport).await.unwrap();
+    let reply = body(&call(&client, "notices", json!({})).await);
+    assert_eq!(reply["session"], "t3-1");
+    assert_eq!(reply["notices"], json!([]), "MCP with T3CODE_THREAD_ID only must see bridged n1");
+
+    let out = base_cmd().env("CODEX_SESSION_ID", "cs-1").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CODEX_SESSION_ID only must see bridged n1");
+
+    let out = base_cmd().env("CODEX_THREAD_ID", "ct-1").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CODEX_THREAD_ID only must see bridged n1");
+
+    // Order 2: T3-only MCP delivers n2 -> bridge sees all 4 names (prints nothing,
+    // links all) -> payload-only, CODEX_SESSION_ID-only, CODEX_THREAD_ID-only all
+    // see n2 as delivered.
+    add(&sandbox, "n2", "second notice");
+    let reply = body(&call(&client, "notices", json!({})).await);
+    assert_eq!(reply["notices"], json!([{"id": "n2", "message": "second notice"}]));
+
+    let mut bridge2 = base_cmd();
+    bridge2
+        .env("T3CODE_THREAD_ID", "t3-1")
+        .env("CODEX_SESSION_ID", "cs-1")
+        .env("CODEX_THREAD_ID", "ct-1")
+        .args(["notices", "--from-hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = bridge2.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"payload-1"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "bridge must not repeat n2 delivered by MCP");
+
+    let mut payload_only = base_cmd();
+    payload_only.args(["notices", "--from-hook"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = payload_only.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"payload-1"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "payload-only hook must see bridged n2");
+
+    let out = base_cmd().env("CODEX_SESSION_ID", "cs-1").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CODEX_SESSION_ID only must see bridged n2");
+
+    let out = base_cmd().env("CODEX_THREAD_ID", "ct-1").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CODEX_THREAD_ID only must see bridged n2");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_t3_shell_hook_and_mcp_share_notices_in_both_orders() {
+    // why: Claude-in-T3 can expose CLAUDE_CODE_SESSION_ID and T3CODE_THREAD_ID
+    //      together on one call and either one alone on another.
+    // proves: CLAIM(notice-once)
+    // catches: T3-first dropping CLAUDE_CODE_SESSION_ID when both are set.
+    let sandbox = Sandbox::new();
+    let base_cmd = || {
+        let mut command = sandbox.command();
+        command
+            .env_remove("T3CODE_THREAD_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CODEX_SESSION_ID")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID");
+        command
+    };
+
+    // Order 1: CLAUDE_CODE_SESSION_ID-only -> bridge {T3, CLAUDE} -> T3-only MCP.
+    add(&sandbox, "c1", "claude first");
+    let out = base_cmd().env("CLAUDE_CODE_SESSION_ID", "claude-s1").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "c1: claude first\n");
+
+    let out = base_cmd()
+        .env("T3CODE_THREAD_ID", "t3-c1")
+        .env("CLAUDE_CODE_SESSION_ID", "claude-s1")
+        .arg("notices")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "bridge must see CLAUDE_CODE_SESSION_ID delivery");
+
+    let mut mcp_cmd = base_cmd();
+    mcp_cmd.arg("mcp").env("T3CODE_THREAD_ID", "t3-c1");
+    let transport = TokioChildProcess::new(tokio::process::Command::from(mcp_cmd)).unwrap();
+    let client = ().serve(transport).await.unwrap();
+    assert_eq!(body(&call(&client, "notices", json!({})).await)["notices"], json!([]), "T3-only MCP must see bridged c1");
+
+    // Order 2: T3-only MCP -> bridge {T3, CLAUDE, payload=claude-s1} -> CLAUDE-only hook.
+    add(&sandbox, "c2", "claude second");
+    assert_eq!(
+        body(&call(&client, "notices", json!({})).await)["notices"],
+        json!([{"id": "c2", "message": "claude second"}])
+    );
+
+    let mut bridge = base_cmd();
+    bridge
+        .env("T3CODE_THREAD_ID", "t3-c1")
+        .env("CLAUDE_CODE_SESSION_ID", "claude-s1")
+        .args(["notices", "--from-hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = bridge.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"claude-s1"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "bridge must see T3 MCP delivery");
+
+    let mut claude_only = base_cmd();
+    claude_only
+        .env("CLAUDE_CODE_SESSION_ID", "claude-s1")
+        .args(["notices", "--from-hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = claude_only.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"claude-s1"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CLAUDE-only hook must see bridged c2");
+
+    client.cancel().await.unwrap();
+}
+
+#[test]
+fn codex_outside_t3_two_threads_on_one_app_server_each_get_notices_once() {
+    // why: outside T3, one codex app-server hosts multiple threads. Each thread
+    //      has its own env/payload names and must NOT write the shared ancestor
+    //      record, while recording under all of its own names.
+    // proves: CLAIM(notice-once)
+    // catches: including ancestor when env/payload exists (hides notice from
+    //          thread 2); first-match ignoring payload id when CODEX_SESSION_ID
+    //          is also present (repeats notice on payload-only hook).
+    let sandbox = Sandbox::new();
+    add(&sandbox, "neon", "m");
+    let harness = sandbox.cwd().join("codex");
+    std::fs::copy("/bin/sh", &harness).unwrap();
+    let script = r#"
+printf 'A1=%s\n' "$(printf '%s' '{"session_id":"hook-a"}' | CODEX_SESSION_ID=codex-a "$VIGIL" --root "$ROOT" notices --from-hook)"
+printf 'A2=%s\n' "$(CODEX_SESSION_ID=codex-a "$VIGIL" --root "$ROOT" notices)"
+printf 'A3=%s\n' "$(printf '%s' '{"session_id":"hook-a"}' | "$VIGIL" --root "$ROOT" notices --from-hook)"
+printf 'B1=%s\n' "$(printf '%s' '{"session_id":"hook-b"}' | CODEX_SESSION_ID=codex-b "$VIGIL" --root "$ROOT" notices --from-hook)"
+printf 'B2=%s\n' "$(CODEX_SESSION_ID=codex-b "$VIGIL" --root "$ROOT" notices)"
+printf 'B3=%s\n' "$(printf '%s' '{"session_id":"hook-b"}' | "$VIGIL" --root "$ROOT" notices --from-hook)"
+printf 'ANC1=%s\n' "$("$VIGIL" --root "$ROOT" notices)"
+printf 'ANC2=%s\n' "$("$VIGIL" --root "$ROOT" notices)"
+"#;
+    let output = std::process::Command::new(&harness)
+        .args(["-c", script])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("VIGIL", common::vigil_bin())
+        .env("ROOT", sandbox.state_root())
+        .env("HOME", sandbox.home())
+        .env("VIGIL_ADVISORIES_FILE", "off")
+        .current_dir(sandbox.cwd())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let lines: Vec<&str> = std::str::from_utf8(&output.stdout).unwrap().lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "A1=neon: m",
+            "A2=",
+            "A3=",
+            "B1=neon: m",
+            "B2=",
+            "B3=",
+            "ANC1=neon: m",
+            "ANC2=",
+        ],
+        "each thread gets neon once across all its names without colliding on the shared codex ancestor"
+    );
+}
+
+#[test]
+fn simultaneous_overlapping_name_sets_deliver_each_notice_exactly_once() {
+    // why: racing processes of one session that see overlapping subsets of its
+    //      names must serialize on one delivery lock and never duplicate.
+    // proves: CLAIM(notice-once)
+    // catches: per-record locks deadlocking or letting overlapping name sets
+    //          both claim the same notice; dropping secondary names.
+    let sandbox = Sandbox::new();
+    for n in 0..5 {
+        add(&sandbox, &format!("n{n}"), "m");
+    }
+    struct Shape<'a> {
+        envs: &'a [(&'a str, &'a str)],
+        payload: Option<&'a str>,
+    }
+    let shapes = [
+        Shape { envs: &[("T3CODE_THREAD_ID", "shared"), ("CODEX_SESSION_ID", "codex-1")], payload: None },
+        Shape { envs: &[("T3CODE_THREAD_ID", "shared"), ("CODEX_SESSION_ID", "codex-1")], payload: None },
+        Shape { envs: &[("T3CODE_THREAD_ID", "shared")], payload: None },
+        Shape { envs: &[("T3CODE_THREAD_ID", "shared")], payload: None },
+        Shape { envs: &[("T3CODE_THREAD_ID", "shared"), ("CODEX_THREAD_ID", "thread-1")], payload: Some(r#"{"session_id":"payload-1"}"#) },
+        Shape { envs: &[("T3CODE_THREAD_ID", "shared"), ("CODEX_THREAD_ID", "thread-1")], payload: Some(r#"{"session_id":"payload-1"}"#) },
+    ];
+    let mut children = Vec::new();
+    for shape in shapes {
+        let mut cmd = sandbox.command();
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        for (k, v) in shape.envs {
+            cmd.env(k, v);
+        }
+        if let Some(body) = shape.payload {
+            cmd.args(["notices", "--from-hook"]).stdin(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+            children.push(child);
+        } else {
+            cmd.arg("notices");
+            children.push(cmd.spawn().unwrap());
+        }
+    }
+    let mut printed: Vec<String> = children
+        .into_iter()
+        .flat_map(|c| {
+            let out = c.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().lines().map(str::to_string).collect::<Vec<_>>()
+        })
+        .collect();
+    printed.sort();
+    assert_eq!(printed, (0..5).map(|n| format!("n{n}: m")).collect::<Vec<_>>());
+
+    // Every single participating name now holds all five deliveries.
+    for (env_k, env_v) in [("T3CODE_THREAD_ID", "shared"), ("CODEX_SESSION_ID", "codex-1"), ("CODEX_THREAD_ID", "thread-1")] {
+        let out = sandbox.command().env(env_k, env_v).arg("notices").output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "{env_k}={env_v} repeated a notice");
+    }
+    assert_eq!(with_stdin(&sandbox, &["notices", "--from-hook"], r#"{"session_id":"payload-1"}"#), "");
+}
+
+#[test]
+fn failed_stdout_write_releases_every_name_without_undoing_bridged_deliveries() {
+    // why: a failed print on a multi-name call must release only the notices
+    //      that call claimed across every name, keeping already-delivered
+    //      bridged notices intact.
+    // proves: CLAIM(notice-once)
+    // catches: releasing only the primary name (leaving aliases stuck);
+    //          releasing already-delivered notices bridged by the same call.
+    let sandbox = Sandbox::new();
+    add(&sandbox, "old", "already seen");
+    let out = sandbox.command().env("T3CODE_THREAD_ID", "t3-rel").arg("notices").output().unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "old: already seen\n");
+
+    add(&sandbox, "fresh", "must retry");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "printf '%s' '{{\"session_id\":\"ps-rel\"}}' | exec {} --root \"$ROOT\" notices --from-hook >/dev/full",
+            common::vigil_bin()
+        ))
+        .env("ROOT", sandbox.state_root())
+        .env("HOME", sandbox.home())
+        .env("VIGIL_ADVISORIES_FILE", "off")
+        .env("T3CODE_THREAD_ID", "t3-rel")
+        .env("CODEX_SESSION_ID", "cs-rel")
+        .current_dir(sandbox.cwd())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "writing to /dev/full must fail");
+
+    // Every participating name released `fresh` AND kept `old` bridged.
+    let out = sandbox.command().env("CODEX_SESSION_ID", "cs-rel").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "fresh: must retry\n");
+    assert_eq!(with_stdin(&sandbox, &["notices", "--from-hook"], r#"{"session_id":"ps-rel"}"#), "fresh: must retry\n");
+    let out = sandbox.command().env("T3CODE_THREAD_ID", "t3-rel").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "fresh: must retry\n");
+}
+
+#[test]
+fn antigravity_env_links_with_hook_payload_and_t3_thread() {
+    // why: Antigravity exposes ANTIGRAVITY_CONVERSATION_ID and conversationId.
+    //      All present identity env vars plus payload are linked together.
+    // proves: CLAIM(notice-once)
+    // catches: omitting ANTIGRAVITY_CONVERSATION_ID from the notice env set.
+    let sandbox = Sandbox::new();
+    add(&sandbox, "neon", "m");
+    let out = sandbox
+        .command()
+        .env("T3CODE_THREAD_ID", "t3-agy")
+        .env("ANTIGRAVITY_CONVERSATION_ID", "agy-conv-1")
+        .arg("notices")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "neon: m\n");
+    assert_eq!(with_stdin(&sandbox, &["notices", "--from-hook"], r#"{"conversationId":"agy-conv-1"}"#), "");
+    let out = sandbox.command().env("T3CODE_THREAD_ID", "t3-agy").arg("notices").output().unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+}
+
+#[test]
+fn legacy_single_record_and_lock_files_remain_readable_linkable_and_prunable() {
+    // why: invariant: existing notice records written by vigil 17236db must stay
+    //      readable without migration, bridge to new names, and prune cleanly
+    //      including any legacy per-record .lock files.
+    //      Independent oracle: `printf 'agent:legacy-t3' | sha256sum | cut -c1-32`
+    //      == `01c62e9f52b2ee2cdc8a54665190c303`.
+    // catches: changing the record hash format or JSON schema incompatibly;
+    //          leaving legacy .lock files behind on cleanup.
+    let sandbox = Sandbox::new();
+    let added = run(&sandbox, &["notice", "add", "neon", "--message", "m"]);
+    let created_at = added["created_at"].as_str().unwrap();
+    let delivery_dir = sandbox.state_root().join("notice-delivery");
+    std::fs::create_dir_all(&delivery_dir).unwrap();
+    let record_path = delivery_dir.join("01c62e9f52b2ee2cdc8a54665190c303.json");
+    let legacy_lock = delivery_dir.join("01c62e9f52b2ee2cdc8a54665190c303.lock");
+    std::fs::write(
+        &record_path,
+        json!({"session": "agent:legacy-t3", "delivered": {"neon": created_at}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&legacy_lock, b"").unwrap();
+
+    // Bridge call sees legacy-t3 + new-codex: must read the literal 17236db
+    // record, print nothing, and link new-codex.
+    let out = sandbox
+        .command()
+        .env("T3CODE_THREAD_ID", "legacy-t3")
+        .env("CODEX_SESSION_ID", "new-codex")
+        .arg("notices")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+
+    let out = sandbox.command().env("CODEX_SESSION_ID", "new-codex").arg("notices").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+
+    // Removing the notice cleans all dead records AND the legacy .lock file.
+    run(&sandbox, &["notice", "rm", "neon"]);
+    let leftovers: Vec<_> = std::fs::read_dir(&delivery_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().is_some_and(|name| name != ".lock"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover files after rm: {leftovers:?}");
 }
