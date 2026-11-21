@@ -32,6 +32,9 @@ fn waited_secs(waited: Duration) -> u64 {
 /// Each look is one small file read per covered watch.
 pub const OUTBOX_POLL: Duration = Duration::from_secs(5);
 
+/// Stub (red commit): the advice step is not capped yet.
+pub const ADVICE_TAIL_BUDGET: Duration = Duration::from_secs(15);
+
 pub const MIN_MAX_S: u64 = 30;
 pub const MAX_MAX_S: u64 = 270;
 pub const DEFAULT_MAX_S: u64 = 270;

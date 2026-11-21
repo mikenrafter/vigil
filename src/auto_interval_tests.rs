@@ -1315,14 +1315,16 @@ async fn an_orchestrator_with_both_a_claude_and_a_codex_signal_keeps_270_s_but_s
 }
 
 #[tokio::test(start_paused = true)]
-async fn antigravity_orchestrator_waits_180_s_and_mixed_signals_wait_270_s() {
-    // why: engine-level proof that Vigil::keepalive honours the 180 s measured
-    //      Antigravity window for an orchestrator, keeps subagents at 270 s,
-    //      and falls back to 270 s unknown/default when Antigravity mixes with
-    //      Claude or Codex.
-    // catches: choosing 180 s in choose_window but capping or clamping the call
-    //          budget back to 270 s inside keepalive.
-    // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(S4)
+async fn antigravity_calls_wait_150_s_on_every_path_and_mixed_signals_are_bounded_too() {
+    // why: engine-level proof that Vigil::keepalive honours the 150 s bound
+    //      (agy kills an MCP call at 180 s) for an orchestrator, a subagent
+    //      and an explicit max_s, and that Antigravity mixed with Claude or
+    //      Codex keeps the bound instead of the old 270 s ambiguous window.
+    //      Controls: Claude+Codex without Antigravity still waits 270 s.
+    // catches: choosing 150 s in choose_window but clamping the call budget
+    //          back to 270 s inside keepalive; leaving the non-orchestrator
+    //          default or the mixed identity at 270 s.
+    // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(S4), CLAIM(neon-mcp-bound)
     let rig = Rig::new();
     rig.one_hour_cache();
     let probe = quiet_probe();
@@ -1330,27 +1332,76 @@ async fn antigravity_orchestrator_waits_180_s_and_mixed_signals_wait_270_s() {
     let (id, _) = quiet_watch(&rig, &agy, "w", 600, 20_000, |_| {}).await;
 
     let orch = call(&agy, &id, None, Some(true)).await;
-    assert_eq!(orch["waited_s"], 180);
-    assert_eq!(orch["max_s"], 180);
-    assert_eq!(cache_without_start_check(&orch), json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180}));
-    assert_eq!(probe.asked_count(), 1, "one start check, no mid-call recheck for 180 s");
+    assert_eq!(orch["waited_s"], 150);
+    assert_eq!(orch["max_s"], 150);
+    assert_eq!(cache_without_start_check(&orch), json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 150}));
+    assert_eq!(probe.asked_count(), 1, "one start check, no mid-call recheck for 150 s");
 
     let sub = call(&agy, &id, None, Some(false)).await;
-    assert_eq!(sub["waited_s"], 270);
-    assert_eq!(sub["max_s"], 270);
-    assert_eq!(sub["cache"], json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+    assert_eq!(sub["waited_s"], 150);
+    assert_eq!(sub["max_s"], 150);
+    assert_eq!(sub["cache"], json!({"ttl": "unknown", "source": "default", "interval_s": 150}));
+
+    let explicit = call(&agy, &id, Some(9999), Some(false)).await;
+    assert_eq!((&explicit["waited_s"], &explicit["max_s"]), (&json!(150), &json!(150)));
 
     let mixed_claude = rig.vigil(AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: true }, &quiet_probe());
     let env_mc = call(&mixed_claude, &id, None, Some(true)).await;
-    assert_eq!(env_mc["waited_s"], 270);
+    assert_eq!(env_mc["waited_s"], 150);
     assert_eq!(env_mc["cache"]["ttl"], "unknown");
     assert_eq!(env_mc["cache"]["source"], "default");
 
     let mixed_codex = rig.vigil(AgentEnv { claude_session_id: None, codex: true, antigravity: true }, &quiet_probe());
     let env_mx = call(&mixed_codex, &id, None, Some(true)).await;
-    assert_eq!(env_mx["waited_s"], 270);
+    assert_eq!(env_mx["waited_s"], 150);
     assert_eq!(env_mx["cache"]["ttl"], "unknown");
     assert_eq!(env_mx["cache"]["source"], "default");
+
+    let claude_and_codex = rig.vigil(AgentEnv { claude_session_id: Some("sess-1".into()), codex: true, antigravity: false }, &quiet_probe());
+    let control = call(&claude_and_codex, &id, None, Some(true)).await;
+    assert_eq!(control["waited_s"], 270, "control: ambiguity without Antigravity keeps 270 s");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_probe_is_slow() {
+    // why: agy kills an MCP call at 3m0s. The window is 150 s, but the
+    //      envelope is finished AFTER the window: advisories are evaluated one
+    //      after another and each probe may take up to 19 s. Three advisories
+    //      with 19 s probes used to add 57 s (150 + 57 = 207 s > 180). The
+    //      advice step is capped at ADVICE_TAIL_BUDGET (15 s), so the whole
+    //      call, measured on the paused wall clock, stays under 180 s on all
+    //      four paths. Lower bound: the call really waited its 150 s window
+    //      and really carried advice, so a call that returned early or
+    //      skipped the probes cannot pass.
+    // catches: no cap on the advice step; a cap longer than 29 s; a cap that
+    //          drops the advice list; applying the cap to a single path only.
+    // proves: CLAIM(neon-mcp-bound)
+    let advisories = tempfile::tempdir().unwrap();
+    let file = advisories.path().join("vigil/advisories.toml");
+    let mut toml = String::new();
+    for n in 1..=3 {
+        toml.push_str(&format!(
+            "[advisories.slow{n}]\nprobe = {{ kind = \"cmd\", argv = [\"p{n}\"] }}\nextract = {{ name = \"free\", json = \"free\" }}\ncondition = \"free < floor\"\nmessage_when_true = \"Low\"\nmessage_when_false = \"Plenty\"\ncache_s = 1\n[advisories.slow{n}.params]\nfloor = 20\n"
+        ));
+    }
+    write_file(&file, &toml);
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(file.clone()));
+    for n in 1..=3 {
+        rig.env.reader.set_text(&format!("cmd:p{n}"), "exit=0\n{\"free\": 15}");
+        rig.env.reader.set_sleep(&format!("cmd:p{n}"), Duration::from_secs(19));
+    }
+    let agy = rig.vigil(antigravity(), &quiet_probe());
+    let (id, _) = quiet_watch(&rig, &agy, "w", 600, 20_000, |_| {}).await;
+    for (explicit_s, orchestrator) in [(None, Some(true)), (None, Some(false)), (Some(9999), Some(true)), (Some(9999), Some(false))] {
+        let started = Instant::now();
+        let envelope = call(&agy, &id, explicit_s, orchestrator).await;
+        let elapsed = started.elapsed();
+        let path = format!("explicit {explicit_s:?}, orchestrator {orchestrator:?}");
+        assert_eq!(envelope["max_s"], 150, "{path}");
+        assert!(elapsed >= Duration::from_secs(150), "{path}: waited only {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(180), "{path}: the call took {elapsed:?}, agy kills it at 180 s");
+        assert!(envelope["advice"].as_array().is_some_and(|advice| !advice.is_empty()), "{path}: advice is still delivered: {envelope}");
+    }
 }
 
 // ------------------------------------------------ S5: tri-state ----

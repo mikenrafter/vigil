@@ -481,3 +481,93 @@ fn antigravity_does_not_change_hold_ownership() {
         _ => None,
     }), Some("thread".into()));
 }
+
+// ---- process-tree signal for Antigravity (neon-mcp-bound) ----
+
+/// A fake procfs in a tempdir: `<root>/<pid>/stat` for each `(pid, comm, ppid)`,
+/// in the kernel's format `pid (comm) S ppid ...`. Never the real /proc.
+fn fake_proc(entries: &[(u32, &str, u32)]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    for (pid, comm, parent) in entries {
+        let dir = root.path().join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), format!("{pid} ({comm}) S {parent} {pid} {pid} 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 1 1000 100 18446744073709551615\n")).unwrap();
+    }
+    root
+}
+
+#[test]
+fn an_agy_parent_or_ancestor_is_the_antigravity_process_tree_signal() {
+    // why: agy 1.5.13 spawns `vigil mcp` with no ANTIGRAVITY_* variable, but
+    //      the child's parent comm is `agy` (evidence-neon-mcp-live.md, run 2;
+    //      `agy acp` shell children have the same parent, report-neon-ttl.md).
+    //      A wrapper (sh, a nix `.agy-wrapped`) may sit between them, so the
+    //      WHOLE chain is searched, not only the direct parent. Mixed chains
+    //      (a claude above agy, or agy above a claude) still count: S4 says
+    //      any Antigravity signal makes the limits stricter.
+    // catches: reading only the env, reading only pid 1's parent, stopping at
+    //          the first claude/codex ancestor, an exact-prefix match such as
+    //          `agyx`, or a case-insensitive match on `Agy`.
+    // proves: CLAIM(neon-mcp-bound)
+    let signal = |entries: &[(u32, &str, u32)]| {
+        let root = fake_proc(entries);
+        crate::peers::antigravity_in_ancestry(root.path(), entries[0].0)
+    };
+    assert!(signal(&[(100, "vigil", 90), (90, "agy", 1), (1, "systemd", 0)]), "direct parent is agy (vigil mcp)");
+    assert!(signal(&[(100, "vigil", 95), (95, "sh", 90), (90, "agy", 1), (1, "systemd", 0)]), "a wrapper between vigil and agy");
+    assert!(signal(&[(100, "vigil", 95), (95, "bash", 90), (90, ".agy-wrapped", 1), (1, "systemd", 0)]), "the nix wrapper name");
+    assert!(signal(&[(100, "vigil", 95), (95, "claude", 90), (90, "agy", 1), (1, "systemd", 0)]), "claude started under agy: mixed, still Antigravity");
+    assert!(signal(&[(100, "vigil", 95), (95, "agy", 90), (90, "claude", 1), (1, "systemd", 0)]), "agy started under claude");
+    assert!(!signal(&[(100, "vigil", 90), (90, "claude", 1), (1, "systemd", 0)]), "claude alone is not Antigravity");
+    assert!(!signal(&[(100, "vigil", 90), (90, "codex", 1), (1, "systemd", 0)]), "codex alone is not Antigravity");
+    assert!(!signal(&[(100, "vigil", 90), (90, "bash", 1), (1, "systemd", 0)]), "no agent at all");
+    assert!(!signal(&[(100, "vigil", 90), (90, "agyx", 1), (1, "systemd", 0)]), "only the exact name counts");
+    assert!(!signal(&[(100, "vigil", 90), (90, "Agy", 1), (1, "systemd", 0)]), "names are case-sensitive");
+    assert!(!signal(&[(100, "vigil", 90), (90, "my-agy", 1), (1, "systemd", 0)]), "a suffix match is not enough");
+    // The process itself being `agy` is not an ancestor, but a pid that is its own parent chain must stop.
+    assert!(!signal(&[(100, "vigil", 100)]), "a self-parent cycle terminates with no signal");
+    assert!(!signal(&[(100, "vigil", 90), (90, "bash", 100)]), "a two-step cycle terminates with no signal");
+    assert!(!signal(&[(100, "vigil", 90)]), "a parent whose stat file is missing ends the walk with no signal");
+}
+
+#[test]
+fn the_ancestry_walk_never_reads_another_process_environment() {
+    // why: invariant: vigil never reads another process's environment, only
+    //      names and parent pids. Every process in a tree with NO agy gets an
+    //      `environ` and `cmdline` that SAY Antigravity; a detection that
+    //      looked there would find the marker and report true. Control: the
+    //      same files with an agy comm and empty environ files still report
+    //      true, so the false result comes from comm names alone.
+    // catches: a detection that reads /proc/<pid>/environ or cmdline.
+    // proves: CLAIM(neon-mcp-bound)
+    let plant = |root: &tempfile::TempDir, pids: &[u32], environ: &[u8]| {
+        for pid in pids {
+            std::fs::write(root.path().join(pid.to_string()).join("environ"), environ).unwrap();
+            std::fs::write(root.path().join(pid.to_string()).join("cmdline"), b"/usr/bin/agy\0acp\0").unwrap();
+        }
+    };
+    let decoy = fake_proc(&[(100, "vigil", 90), (90, "bash", 1), (1, "systemd", 0)]);
+    plant(&decoy, &[100, 90, 1], b"ANTIGRAVITY_AGENT=1\0ANTIGRAVITY_CONVERSATION_ID=c\0");
+    assert!(!crate::peers::antigravity_in_ancestry(decoy.path(), 100));
+
+    let real = fake_proc(&[(100, "vigil", 90), (90, "agy", 1), (1, "systemd", 0)]);
+    plant(&real, &[100, 90, 1], b"");
+    assert!(crate::peers::antigravity_in_ancestry(real.path(), 100));
+}
+
+#[test]
+fn an_agy_ancestor_does_not_change_session_keys_for_claude_or_codex() {
+    // why: `ancestor:<pid>` keys (hold ownership, notices) name the nearest
+    //      claude/codex process. The Antigravity signal is separate: agy must
+    //      not become a session key, and a claude chain keeps resolving to
+    //      its claude pid whether or not agy sits above or below it.
+    // catches: adding `agy` to the names ancestor_session matches, which
+    //          would give a vigil under agy an `ancestor:<agy pid>` owner.
+    // proves: CLAIM(peers-ancestor-keys)
+    let agy_only = fake_proc(&[(100, "vigil", 90), (90, "agy", 1), (1, "systemd", 0)]);
+    assert_eq!(crate::peers::ancestor_session(agy_only.path(), 100), None);
+    let claude_chain = fake_proc(&[(100, "vigil", 95), (95, "bash", 90), (90, "claude", 80), (80, "agy", 1), (1, "systemd", 0)]);
+    assert_eq!(crate::peers::ancestor_session(claude_chain.path(), 100), Some("ancestor:90".into()));
+    let codex_chain = fake_proc(&[(100, "vigil", 90), (90, "codex", 80), (80, "agy", 1), (1, "systemd", 0)]);
+    assert_eq!(crate::peers::ancestor_session(codex_chain.path(), 100), Some("ancestor:90".into()));
+}

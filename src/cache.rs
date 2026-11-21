@@ -145,6 +145,11 @@ impl AgentEnv {
         agent
     }
 
+    /// Stub (red commit): the process-tree signal is not wired yet.
+    pub fn with_antigravity_signal(self, _present: bool) -> AgentEnv {
+        self
+    }
+
     pub fn identity(&self) -> Identity<'_> {
         match (self.claude_session_id.as_deref(), self.codex, self.antigravity) {
             (Some(session_id), false, false) => Identity::Claude { session_id },
@@ -803,17 +808,18 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_orchestrator_gets_180_s_measured_window_and_subagent_stays_270_s() {
-        // why: measured Gemini 4 Neon per-conversation cache lifetime is 4-5 m
-        //      (cached at 4 m in ttl-probe-fine.log, uncached at 5 m in
-        //      ttl-probe-large.log; 2026-11-21); 180 s (3 m) leaves a 1-minute
-        //      margin. Only orchestrators get the TTL-derived window; subagents
-        //      and non-marker ANTIGRAVITY_* vars stay at 270 s unknown/default.
-        // catches: ignoring ANTIGRAVITY_CONVERSATION_ID or ANTIGRAVITY_AGENT=1,
-        //          leaving Antigravity at 270 s, accepting empty/0 markers,
-        //          applying 180 s to non-orchestrators, or failing to cap explicit
-        //          max_s at 270 s.
-        // proves: CLAIM(AI1'), CLAIM(AI3)
+    fn every_antigravity_window_is_150_s_and_only_the_orchestrator_is_labelled_measured() {
+        // why: agy kills any MCP tool call at 3m0s (evidence-neon-mcp-live.md,
+        //      measured 2026-11-21). The call must return in under 180 s, so
+        //      the window is 150 s on EVERY path: orchestrator auto window,
+        //      non-orchestrator default, and a clamped explicit max_s. Only
+        //      the orchestrator's auto window says `5m / antigravity-measured`
+        //      (the cache TTL is 4-5 m); everyone else says `unknown / default`.
+        //      Non-Antigravity callers keep 270.
+        // catches: leaving the window at 180 (equals the timeout), leaving the
+        //          non-orchestrator default at 270, ignoring either marker,
+        //          accepting an empty or 0 marker, or a 270 explicit ceiling.
+        // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(neon-mcp-bound)
         let root = tempfile::tempdir().unwrap();
         let ask = |explicit_s: Option<u64>, orchestrator: bool, pairs: &[(&str, &str)]| {
             let agent = env_of(pairs);
@@ -826,19 +832,21 @@ mod tests {
             .unwrap()
         };
 
-        let want_agy = serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180});
+        let want_agy = serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 150});
+        let want_agy_default = serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 150});
         let want_default = serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270});
 
         assert_eq!(ask(None, true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]), want_agy);
         assert_eq!(ask(None, true, &[("ANTIGRAVITY_AGENT", "1")]), want_agy);
         assert_eq!(ask(None, true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1"), ("ANTIGRAVITY_AGENT", "1")]), want_agy);
-        assert_eq!(ask(None, false, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]), want_default);
-        assert_eq!(ask(None, false, &[("ANTIGRAVITY_AGENT", "1")]), want_default);
+        assert_eq!(ask(None, false, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]), want_agy_default);
+        assert_eq!(ask(None, false, &[("ANTIGRAVITY_AGENT", "1")]), want_agy_default);
         assert_eq!(ask(None, true, &[("ANTIGRAVITY_CONVERSATION_ID", "")]), want_default);
         assert_eq!(ask(None, true, &[("ANTIGRAVITY_AGENT", "0")]), want_default);
         assert_eq!(ask(None, true, &[("ANTIGRAVITY_AGENT", "")]), want_default);
         assert_eq!(ask(None, true, &[("ANTIGRAVITY_GEMINI_DIR", "/tmp/g")]), want_default);
         assert_eq!(ask(None, true, &[]), want_default);
+        assert_eq!(ask(None, false, &[]), want_default, "control: a non-orchestrator with no signal keeps 270");
 
         assert_eq!(
             ask(Some(100), true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
@@ -850,20 +858,21 @@ mod tests {
         );
         assert_eq!(
             ask(Some(9999), true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
-            serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 270})
+            serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 150})
         );
     }
 
     #[test]
-    fn antigravity_explicit_windows_are_capped_at_270_s_for_every_caller_role() {
-        // why: AI1' / A2 cap Antigravity at 270 s while its MCP timeout is
-        //      unknown and its measured cache lasts 4-5 minutes.
-        // catches: retaining the 3000 s ceiling, capping at the automatic
-        //          180 s window, or applying the cap only to orchestrators.
-        // proves: CLAIM(AI1'), CLAIM(A2-explicit)
+    fn antigravity_explicit_windows_are_capped_at_150_s_for_every_caller_role() {
+        // why: the explicit ceiling must sit below the 180 s MCP timeout with
+        //      room for the post-window tail (advice, notices): 150 s. Table
+        //      around the boundary, both roles.
+        // catches: a 270 or 180 ceiling, a ceiling that is off by one (149 or
+        //          151), or a cap applied to orchestrators only.
+        // proves: CLAIM(A2-explicit), CLAIM(neon-mcp-bound)
         let agent = env_of(&[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]);
         for orchestrator in [false, true] {
-            for (explicit_s, expected_s) in [(0, 30), (180, 180), (269, 269), (270, 270), (271, 270), (9999, 270)] {
+            for (explicit_s, expected_s) in [(0, 30), (149, 149), (150, 150), (151, 150), (180, 150), (270, 150), (9999, 150)] {
                 assert_eq!(
                     choose_window(&WindowRequest { explicit_s: Some(explicit_s), orchestrator, agent: &agent, projects_dir: None }),
                     note(Ttl::Unknown, TtlSource::Explicit, expected_s),
@@ -874,22 +883,25 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_mixed_with_claude_or_codex_is_ambiguous_and_gets_270_s() {
-        // why: S4 ambiguous identity rules apply whenever signals from two or
-        //      more agents appear in the same environment (nested shells):
-        //      vigil falls back to 270 s unknown/default and clamps explicit
-        //      max_s to the 270 s Codex ceiling.
-        // catches: letting Claude 1h, Codex codex-default, or Antigravity 180 s
-        //          win when mixed, or allowing explicit 9999 -> 3000 on mixed
-        //          Claude+Antigravity or Codex+Antigravity.
-        // proves: CLAIM(S4)
+    fn antigravity_mixed_with_claude_or_codex_is_ambiguous_but_still_bounded_by_150_s() {
+        // why: S4 "stricter limits": any Antigravity signal, alone or with
+        //      Claude or Codex, must honour the MCP timeout. Ambiguous used to
+        //      mean 270 (the Codex ceiling), which agy kills at 180. With an
+        //      Antigravity signal among the mixed ones: unknown/default and a
+        //      150 s auto window, explicit capped at 150. Claude+Codex WITHOUT
+        //      Antigravity keeps 270 (control), so the 150 comes from the
+        //      Antigravity signal and not from ambiguity itself.
+        // catches: letting Claude 1h or Codex 270 win when mixed with
+        //          Antigravity, an Ambiguous ceiling of 270 whatever the
+        //          signals, or dropping Antigravity from a mixed identity.
+        // proves: CLAIM(S4), CLAIM(neon-mcp-bound)
         let root = tempfile::tempdir().unwrap();
         write_transcript(root.path(), "p", "sess-1", &[assistant_line(0, 500), assistant_line(900, 0)]);
-        let ask = |explicit_s: Option<u64>, pairs: &[(&str, &str)]| {
+        let ask = |explicit_s: Option<u64>, orchestrator: bool, pairs: &[(&str, &str)]| {
             let agent = env_of(pairs);
             serde_json::to_value(choose_window(&WindowRequest {
                 explicit_s,
-                orchestrator: true,
+                orchestrator,
                 agent: &agent,
                 projects_dir: Some(root.path()),
             }))
@@ -898,23 +910,26 @@ mod tests {
 
         // Positive controls: each single agent gets its own window.
         assert_eq!(
-            ask(None, &[("CLAUDE_CODE_SESSION_ID", "sess-1")]),
+            ask(None, true, &[("CLAUDE_CODE_SESSION_ID", "sess-1")]),
             serde_json::json!({"ttl": "1h", "source": "claude-transcript", "interval_s": 3000}),
             "control: Claude alone"
         );
         assert_eq!(
-            ask(None, &[("CODEX_HOME", "/x")]),
+            ask(None, true, &[("CODEX_HOME", "/x")]),
             serde_json::json!({"ttl": "5m", "source": "codex-default", "interval_s": 270}),
             "control: Codex alone"
         );
         assert_eq!(
-            ask(None, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
-            serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180}),
+            ask(None, true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
+            serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 150}),
             "control: Antigravity alone"
         );
+        let claude_and_codex = [("CLAUDE_CODE_SESSION_ID", "sess-1"), ("CODEX_HOME", "/x")];
+        assert_eq!(ask(None, true, &claude_and_codex), serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270}), "control: ambiguous without Antigravity");
+        assert_eq!(ask(Some(9999), true, &claude_and_codex), serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 270}), "control: ambiguous ceiling without Antigravity");
 
-        let want_ambiguous = serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270});
-        let want_explicit_cap = serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 270});
+        let want_ambiguous = serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 150});
+        let want_explicit_cap = serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 150});
         let mixed = [
             ("claude + antigravity conv id", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
             ("claude + antigravity agent flag", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("ANTIGRAVITY_AGENT", "1")]),
@@ -923,9 +938,34 @@ mod tests {
             ("all three agents", vec![("CLAUDE_CODE_SESSION_ID", "sess-1"), ("CODEX_HOME", "/x"), ("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
         ];
         for (name, pairs) in mixed {
-            assert_eq!(ask(None, &pairs), want_ambiguous, "{name}");
-            assert_eq!(ask(Some(9999), &pairs), want_explicit_cap, "{name} explicit ceiling");
+            assert_eq!(ask(None, true, &pairs), want_ambiguous, "{name}: orchestrator auto");
+            assert_eq!(ask(None, false, &pairs), want_ambiguous, "{name}: non-orchestrator default");
+            assert_eq!(ask(Some(9999), true, &pairs), want_explicit_cap, "{name}: explicit ceiling");
+            assert_eq!(ask(Some(9999), false, &pairs), want_explicit_cap, "{name}: explicit ceiling, non-orchestrator");
         }
+    }
+
+    #[test]
+    fn the_process_tree_signal_counts_as_antigravity_and_never_clears_an_env_marker() {
+        // why: agy spawns `vigil mcp` WITHOUT any ANTIGRAVITY_* variable, so
+        //      the binary edge reads the process tree and hands the result in
+        //      as one bool. It is OR-ed with the environment: present makes
+        //      the identity Antigravity (alone) or ambiguous-with-Antigravity
+        //      (beside Claude / Codex), so the 150 s bound applies; absent
+        //      changes nothing, in particular it must not erase an env marker.
+        // catches: a signal that is ignored, one that replaces the env flag
+        //          (false clears a real marker), or one that drops Claude.
+        // proves: CLAIM(neon-mcp-bound), CLAIM(S4)
+        let signalled = env_of(&[]).with_antigravity_signal(true);
+        assert_eq!(signalled, AgentEnv { claude_session_id: None, codex: false, antigravity: true });
+        assert_eq!(signalled.identity(), Identity::Antigravity);
+        let absent = env_of(&[("ANTIGRAVITY_AGENT", "1")]).with_antigravity_signal(false);
+        assert_eq!(absent.identity(), Identity::Antigravity, "an env marker survives a false tree signal");
+        assert_eq!(env_of(&[]).with_antigravity_signal(false), AgentEnv::default(), "no signal anywhere stays Unknown");
+        let mixed = env_of(&[("CLAUDE_CODE_SESSION_ID", "sess-1")]).with_antigravity_signal(true);
+        assert_eq!(mixed, AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: true });
+        let note_for_mixed = choose_window(&WindowRequest { explicit_s: None, orchestrator: true, agent: &mixed, projects_dir: None });
+        assert_eq!(note_for_mixed, note(Ttl::Unknown, TtlSource::Default, 150));
     }
 
     // ---- S8: bounded reads ----

@@ -219,7 +219,12 @@ fn pid_dead(pid: u32) -> bool {
     }
 }
 
-fn ancestor_session(root: &Path, mut pid: u32) -> Option<String> {
+/// Stub (red commit): the process-tree signal is not read yet.
+pub fn antigravity_in_ancestry(_root: &Path, _pid: u32) -> bool {
+    false
+}
+
+pub(crate) fn ancestor_session(root: &Path, mut pid: u32) -> Option<String> {
     let mut seen = std::collections::BTreeSet::new();
     while pid != 0 && seen.insert(pid) {
         let (name, _, parent) = proc_stat(root, pid).ok()?;

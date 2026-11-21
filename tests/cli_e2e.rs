@@ -1213,12 +1213,13 @@ fn codex_is_recognised_from_the_environment_and_gets_the_codex_default() {
 }
 
 #[test]
-fn antigravity_is_recognised_from_the_environment_and_gets_180_s_window() {
+fn antigravity_is_recognised_from_the_environment_and_gets_a_150_s_window() {
     // why: AI1' / AI3 / S4 through the real vigil CLI binary:
     //      ANTIGRAVITY_CONVERSATION_ID or ANTIGRAVITY_AGENT=1 with --orchestrator
-    //      selects 180 s (5m / antigravity-measured); without --orchestrator
-    //      stays 270 s (unknown / default); mixed with Claude or Codex becomes
-    //      ambiguous (270 s, unknown / default).
+    //      selects 150 s (5m / antigravity-measured); without --orchestrator
+    //      it is 150 s too (unknown / default); mixed with Claude or Codex
+    //      stays bounded at 150 s (unknown / default). agy kills a tool call
+    //      at 180 s.
     // catches: forgetting to wire Antigravity detection in AgentEnv::from_vars
     //          at the binary edge or breaking S4 ambiguity over CLI env vars.
     // proves: CLAIM(AI1'), CLAIM(AI3), CLAIM(S4)
@@ -1229,10 +1230,10 @@ fn antigravity_is_recognised_from_the_environment_and_gets_180_s_window() {
         let (case_sandbox, case_uw) = auto_sandbox(true);
         assert!(create_with(&case_sandbox, id, serde_json::json!({})).status.success());
         let envelope = fire_and_keepalive(&case_sandbox, &case_uw, id, &["--orchestrator"], &[(env_var, val)]);
-        assert_eq!(envelope["max_s"], 180, "{id}");
+        assert_eq!(envelope["max_s"], 150, "{id}");
         assert_eq!(
             cache_without_credit_check(&envelope),
-            serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 180}),
+            serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 150}),
             "{id}"
         );
     }
@@ -1241,8 +1242,8 @@ fn antigravity_is_recognised_from_the_environment_and_gets_180_s_window() {
 
     assert!(create_with(&sandbox, "agy-sub", serde_json::json!({})).status.success());
     let sub = fire_and_keepalive(&sandbox, &fake_uw, "agy-sub", &[], &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]);
-    assert_eq!(sub["max_s"], 270);
-    assert_eq!(sub["cache"], serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 270}));
+    assert_eq!(sub["max_s"], 150);
+    assert_eq!(sub["cache"], serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 150}));
 
     // Positive control: Claude alone with the 1h transcript still gets 3000 s.
     assert!(create_with(&sandbox, "claude-ctrl", serde_json::json!({})).status.success());
@@ -1261,11 +1262,72 @@ fn antigravity_is_recognised_from_the_environment_and_gets_180_s_window() {
             &["--orchestrator"],
             &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1"), extra],
         );
-        assert_eq!(mixed["max_s"], 270, "{id}");
+        assert_eq!(mixed["max_s"], 150, "{id}");
         assert_eq!(mixed["cache"]["ttl"], "unknown", "{id}");
         assert_eq!(mixed["cache"]["source"], "default", "{id}");
-        assert_eq!(mixed["cache"]["interval_s"], 270, "{id}");
+        assert_eq!(mixed["cache"]["interval_s"], 150, "{id}");
     }
+}
+
+/// `vigil keepalive <id> <args>` run by a shell whose process name (comm) is
+/// `parent_name`, after one write to the watch's input. The environment is
+/// cleared except for what `fire_and_keepalive` would pass, so the only
+/// Antigravity evidence is the process tree.
+fn fire_and_keepalive_under(sandbox: &Sandbox, fake_uw: &std::path::Path, parent_name: &str, id: &str, args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
+    append_once(&sandbox.input(&format!("{id}.log")), "go");
+    let bin_dir = sandbox.dir.path().join("fake-parents");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let parent = bin_dir.join(parent_name);
+    if !parent.exists() {
+        // The kernel names a process after the path it was exec'd by, so a
+        // symlink called `agy` to /bin/sh runs as comm `agy`.
+        std::os::unix::fs::symlink("/bin/sh", &parent).unwrap();
+    }
+    let mut command = std::process::Command::new(&parent);
+    sandbox.configure(&mut command);
+    // `"$@"; exit $?` keeps the shell alive as vigil's parent (no exec of the last command).
+    command.args(["-c", "\"$@\"; exit $?", "sh", vigil_bin(), "keepalive", id]).args(args).env("VIGIL_UW_COMMAND", fake_uw);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = finish_within(piped(command), Duration::from_secs(10));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    stdout_json(&output)
+}
+
+#[test]
+fn a_vigil_whose_parent_is_agy_gets_the_150_s_bound_without_any_antigravity_variable() {
+    // why: agy 1.5.13 spawns `vigil mcp` WITHOUT ANTIGRAVITY_* (evidence-neon-
+    //      mcp-live.md), so the binary must read the process tree at its edge.
+    //      Here the env is cleared and the only signal is a parent process
+    //      named `agy`. Every path is bounded: orchestrator auto, plain call,
+    //      explicit max_s 9999, and agy-parent plus a Claude session id
+    //      (mixed, S4). Controls: the same shell under another name keeps 270
+    //      / 3000 (explicit), so the bound comes from the name.
+    // catches: not wiring antigravity_in_ancestry into main.rs, matching the
+    //          wrong comm, or applying the tree signal only to orchestrators.
+    // proves: CLAIM(neon-mcp-bound)
+    let (sandbox, fake_uw) = auto_sandbox(true);
+    let run = |parent: &str, id: &str, args: &[&str], env: &[(&str, &str)]| {
+        assert!(create_with(&sandbox, id, serde_json::json!({})).status.success());
+        fire_and_keepalive_under(&sandbox, &fake_uw, parent, id, args, env)
+    };
+
+    let orchestrator = run("agy", "agy-orch", &["--orchestrator"], &[]);
+    assert_eq!(orchestrator["max_s"], 150);
+    assert_eq!(cache_without_credit_check(&orchestrator), serde_json::json!({"ttl": "5m", "source": "antigravity-measured", "interval_s": 150}));
+    let plain = run("agy", "agy-plain", &[], &[]);
+    assert_eq!(plain["max_s"], 150);
+    assert_eq!(plain["cache"], serde_json::json!({"ttl": "unknown", "source": "default", "interval_s": 150}));
+    let explicit = run("agy", "agy-explicit", &["--max-s", "9999"], &[]);
+    assert_eq!(explicit["max_s"], 150);
+    let mixed = run("agy", "agy-mixed", &["--orchestrator", "--max-s", "9999"], &[("CLAUDE_CODE_SESSION_ID", SESSION)]);
+    assert_eq!(mixed["max_s"], 150, "claude env + agy parent is the live run 1 shape");
+
+    let other_plain = run("notagy", "ctl-plain", &[], &[]);
+    assert_eq!(other_plain["max_s"], 270, "control: same shell, other name");
+    let other_explicit = run("notagy", "ctl-explicit", &["--max-s", "9999"], &[]);
+    assert_eq!(other_explicit["max_s"], 3000, "control: same shell, other name, explicit");
 }
 
 #[test]
