@@ -322,7 +322,8 @@ impl NoticeStore {
 
     fn read_record(&self, session: &NoticeSession) -> Result<SessionRecord> {
         match std::fs::read(self.record_path(session)) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| NoticeError::State(format!("corrupt delivery record {}: {error}", self.record_path(session).display()))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SessionRecord::default()),
             Err(error) => Err(error.into()),
         }

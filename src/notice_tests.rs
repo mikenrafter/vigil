@@ -612,3 +612,17 @@ fn old_records_and_lock_inodes_survive_while_any_delivered_notice_is_live() {
         assert_eq!(path.exists(), path.extension().is_some_and(|ext| ext == "lock"), "{}", path.display());
     }
 }
+
+#[test]
+fn corrupt_record_errors_without_redelivery_or_overwrite() {
+    // CLAIM(notice-once): corruption must not silently reset delivery memory.
+    let rig = Rig::new();
+    rig.add("live", "m");
+    rig.deliver("s");
+    let path = std::fs::read_dir(rig.env.root().join("notice-delivery")).unwrap()
+        .map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+    std::fs::write(&path, b"{broken").unwrap();
+    let result = rig.vigil().claim_notices(Some("s"), None);
+    assert!(result.is_err(), "corrupt record was silently treated as empty");
+    assert_eq!(std::fs::read(path).unwrap(), b"{broken");
+}
