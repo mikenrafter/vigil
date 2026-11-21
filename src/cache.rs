@@ -33,7 +33,7 @@ pub const ANTIGRAVITY_WINDOW_S: u64 = 180;
 pub const ONE_HOUR_WINDOW_S: u64 = 3000;
 /// A2: explicit windows are clamped to at least this ...
 pub const MIN_WINDOW_S: u64 = 30;
-/// ... and at most `ONE_HOUR_WINDOW_S`, or `CODEX_MAX_WINDOW_S` for Codex.
+/// ... and at most `ONE_HOUR_WINDOW_S`, or 270 s for Codex, Antigravity or Ambiguous.
 pub const CODEX_MAX_WINDOW_S: u64 = 270;
 /// AI1' / D4: only this much of a transcript's end is read.
 pub const TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
@@ -115,14 +115,14 @@ impl Identity<'_> {
     /// The largest window an explicit `max_s` may ask for (A2): 3000 (50 min,
     /// owner 2026-11-13: at most 50 minutes), the
     /// largest vigil ever picks itself. Codex's tool timeout (300 s) is a hard
-    /// limit, so a caller that may be Codex, and one whose signals mix
-    /// (`Ambiguous`), get 270 (R2-A1, S4). The old fixed 270 ceiling is gone for every
-    /// other caller: the engine tests that ask for 3000 without any agent
-    /// signal pin that.
+    /// limit. Codex, mixed signals (`Ambiguous`), and Antigravity get 270
+    /// (R2-A1, S4, AI1'). Antigravity's MCP timeout is unknown and its measured
+    /// cache lasts 4-5 minutes [docs/specs/auto-interval.md AI1']. Claude and
+    /// Unknown retain 3000 s.
     pub const fn window_ceiling_s(self) -> u64 {
         match self {
-            Identity::Codex | Identity::Ambiguous => CODEX_MAX_WINDOW_S,
-            Identity::Claude { .. } | Identity::Antigravity | Identity::Unknown => ONE_HOUR_WINDOW_S,
+            Identity::Codex | Identity::Antigravity | Identity::Ambiguous => CODEX_MAX_WINDOW_S,
+            Identity::Claude { .. } | Identity::Unknown => ONE_HOUR_WINDOW_S,
         }
     }
 }
