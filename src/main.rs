@@ -86,7 +86,7 @@ enum Command {
         #[command(subcommand)]
         item: Option<HoldItemCommand>,
         #[command(flatten)]
-        create: HoldArgs,
+        create: Box<HoldArgs>,
     },
     /// Print the current advice (operator rules for agents), for hooks and
     /// scripts: one `id: message` line per advisory, or JSON with --json.
@@ -370,7 +370,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print_json(&vigil.create(request).await?)?;
             Ok(0)
         }
-        Command::Hold { item: None, create: HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator, cap, confirm, meta } } => {
+        Command::Hold { item: None, create } => {
+            let HoldArgs { id, work, label, until_idle, deadline_s, expect_s, orchestrator, cap, confirm, meta } = *create;
             print_json(&vigil.hold(vigil::HoldRequest { id, work, until_idle, deadline_s, expect_s, orchestrator, label, cap, confirm, meta: meta.into_iter().collect() }).await?)?;
             Ok(0)
         }
