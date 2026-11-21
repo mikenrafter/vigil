@@ -197,6 +197,30 @@ pub struct AdvisoryIdArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoticeAddArgs {
+    /// Stable id, `[A-Za-z0-9_-]{1,64}`.
+    pub id: String,
+    /// The announcement (1..=2000 bytes).
+    pub message: String,
+    /// RFC 3339 instant after which it is never shown.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Absolute directories: only sessions under one of them get the notice.
+    #[serde(default)]
+    pub scope: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoticesArgs {
+    /// Session id to deliver for; default: this server's agent session.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Directory deciding which scoped notices apply; default: the server's cwd.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AdvisorySetArgs {
     /// The advisory's id, e.g. `boat-budget`.
     pub id: String,
@@ -524,6 +548,29 @@ impl VigilServer {
         Ok(reminder_reply(self.vigil.remind_rm(&args.id)))
     }
 
+    #[tool(description = "The notices this agent session has not seen yet (one-time announcements), recorded as delivered. Every keepalive result also carries newly delivered `notices`; each notice reaches a session once across both.")]
+    async fn notices(&self, Parameters(args): Parameters<NoticesArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(notice_reply(self.vigil.claim_notices(args.session.as_deref(), args.cwd.as_deref().map(std::path::Path::new))
+            .and_then(|claim| serde_json::to_value(claim.keep()).map_err(|e| crate::notice::NoticeError::State(e.to_string())))))
+    }
+    #[tool(description = "Add a notice: text every agent session sees exactly once, with an optional expiry (RFC 3339) and absolute directory scopes.")]
+    async fn notice_add(&self, Parameters(args): Parameters<NoticeAddArgs>) -> Result<CallToolResult, ErrorData> {
+        let expires_at = match args.expires_at.as_deref().map(chrono::DateTime::parse_from_rfc3339).transpose() {
+            Ok(at) => at.map(|at| crate::clock::Timestamp(at.with_timezone(&chrono::Utc))),
+            Err(error) => return Ok(text_result(true, format!("expires_at is not RFC 3339: {error}"))),
+        };
+        let request = crate::notice::NoticeRequest { id: args.id, message: args.message, expires_at, scope: args.scope.into_iter().map(Into::into).collect() };
+        Ok(notice_reply(self.vigil.notice_add(request).and_then(|n| serde_json::to_value(n).map_err(|e| crate::notice::NoticeError::State(e.to_string())))))
+    }
+    #[tool(description = "List notices, oldest first, each with `expired`.")]
+    async fn notice_list(&self) -> Result<CallToolResult, ErrorData> {
+        Ok(notice_reply(self.vigil.notice_list()))
+    }
+    #[tool(description = "Remove a notice.")]
+    async fn notice_rm(&self, Parameters(args): Parameters<AdvisoryIdArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(notice_reply(self.vigil.notice_rm(&args.id)))
+    }
+
     #[tool(description = "List advisories: id, status, parameters (e.g. threshold), condition and cache time.")]
     async fn advisory_list(&self) -> Result<CallToolResult, ErrorData> {
         Ok(advisory_reply(self.vigil.advisory_list()))
@@ -584,6 +631,10 @@ impl ServerHandler for VigilServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
     }
+}
+
+fn notice_reply(result: crate::notice::Result<Value>) -> CallToolResult {
+    match result { Ok(value) => text_result(false, value.to_string()), Err(error) => text_result(true, error.to_string()) }
 }
 
 fn reminder_reply(result: crate::reminder::Result<Value>) -> CallToolResult {

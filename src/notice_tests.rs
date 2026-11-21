@@ -144,7 +144,8 @@ fn only_notices_added_after_a_delivery_are_new() {
     assert_eq!(rig.deliver("s"), ids(&["two"]));
     rig.add("three", "third");
     rig.add("four", "fourth");
-    assert_eq!(rig.deliver("s"), ids(&["three", "four"]), "oldest first, then by id on a tie");
+    // Same instant (manual clock), so the tie breaks by id: "four" < "three".
+    assert_eq!(rig.deliver("s"), ids(&["four", "three"]), "oldest first, then by id on a tie");
     assert_eq!(rig.deliver("s"), ids(&[]));
 }
 
@@ -270,7 +271,7 @@ fn removing_a_notice_prunes_it_from_every_record_on_next_use() {
     rig.env.vigil.notice_rm("gone").unwrap();
     rig.deliver("s");
     let dir = rig.env.root().join("notice-delivery");
-    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
     assert_eq!(files.len(), 1);
     let record = std::fs::read_to_string(&files[0]).unwrap();
     assert!(!record.contains("gone"), "{record}");
@@ -541,4 +542,44 @@ async fn an_envelope_with_no_identity_labels_its_notices() {
     let envelope = vigil.keepalive(request(one)).await.unwrap();
     assert_eq!(envelope.notices.len(), 1);
     assert!(envelope.notices_note.as_deref().is_some_and(|n| n.contains("no agent session identity")), "{:?}", envelope.notices_note);
+}
+
+fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                files.push((path, bytes));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+#[test]
+fn a_claim_with_nothing_pending_leaves_the_state_root_untouched() {
+    // why: every keepalive claims. A session with nothing pending (no notices at
+    //      all, or all delivered) must write no record and no lock, or every
+    //      vigil user's state root fills with files (cli_e2e's
+    //      nothing_is_written_outside_the_state_root pins the same for keepalive).
+    // catches: a claim that creates its record and lock before looking for work.
+    // Positive control: the same probe sees the files a real delivery creates.
+    let rig = Rig::new();
+    let before = tree(&rig.env.root());
+    assert_eq!(rig.deliver("s"), ids(&[]));
+    assert_eq!(tree(&rig.env.root()), before, "no notices: claim wrote files");
+    rig.add("neon", "m");
+    let with_notice = tree(&rig.env.root());
+    assert_eq!(rig.deliver("s"), ids(&["neon"]));
+    let delivered = tree(&rig.env.root());
+    assert_ne!(delivered, with_notice, "control: a delivery must change the tree");
+    assert_eq!(rig.deliver("s"), ids(&[]));
+    assert_eq!(tree(&rig.env.root()), delivered, "all delivered: claim wrote files");
 }

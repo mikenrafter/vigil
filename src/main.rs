@@ -32,6 +32,26 @@ struct Cli {
 enum Command {
     /// Project reminders, delivered only inside vigil calls.
     Remind { #[command(subcommand)] command: RemindCommand },
+    /// One-time announcements: each agent session sees a notice exactly once.
+    Notice { #[command(subcommand)] command: NoticeCommand },
+    /// Print the notices not yet shown to this agent session and record them as
+    /// delivered (for SessionStart / UserPromptSubmit hooks). Text form: one
+    /// `id: message` line each, nothing when none. The session is `--session`,
+    /// else the hook payload on stdin with `--from-hook` (`session_id`,
+    /// `conversationId`, `threadId`, ...), else the environment identity, else one
+    /// run of the calling process (the output then says so).
+    Notices {
+        #[arg(long)]
+        session: Option<String>,
+        /// Directory that decides which scoped notices apply (default: the cwd).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Read the hook's JSON payload from stdin for the session id and cwd.
+        #[arg(long)]
+        from_hook: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the stdio MCP server.
     Mcp,
     /// Create a watch from one JSON object (argument, or stdin if absent).
@@ -99,6 +119,25 @@ enum Command {
         #[command(subcommand)]
         command: AdvisoryCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum NoticeCommand {
+    /// Add a notice. Delivered once to every agent session until it expires or is removed.
+    Add {
+        id: String,
+        #[arg(long)]
+        message: String,
+        /// RFC 3339 instant after which the notice is never shown.
+        #[arg(long)]
+        expires: Option<chrono::DateTime<chrono::FixedOffset>>,
+        /// Only sessions whose directory is under one of these (absolute) directories get it.
+        #[arg(long, num_args = 1..)]
+        scope: Vec<PathBuf>,
+    },
+    /// Every notice, oldest first, with `expired`.
+    List,
+    Rm { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -450,6 +489,58 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             };
             print_json(&result)?;
             Ok(0)
+        }
+        Command::Notice { command } => {
+            let result = match command {
+                NoticeCommand::Add { id, message, expires, scope } => {
+                    let expires_at = expires.map(|at| vigil::Timestamp(at.with_timezone(&chrono::Utc)));
+                    serde_json::to_value(vigil.notice_add(vigil::notice::NoticeRequest { id, message, expires_at, scope })?)?
+                }
+                NoticeCommand::List => vigil.notice_list()?,
+                NoticeCommand::Rm { id } => vigil.notice_rm(&id)?,
+            };
+            print_json(&result)?;
+            Ok(0)
+        }
+        Command::Notices { session, cwd, from_hook, json } => {
+            let (mut session, mut cwd) = (session, cwd);
+            if from_hook {
+                let mut raw = String::new();
+                tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut raw).await?;
+                let payload: serde_json::Value = serde_json::from_str(&raw).map_err(|error| anyhow::anyhow!("hook payload on stdin is not JSON: {error}"))?;
+                if !payload.is_object() {
+                    anyhow::bail!("hook payload on stdin is not a JSON object");
+                }
+                if session.is_none() {
+                    session = vigil::notice_ops::hook_session_id(&payload);
+                }
+                if cwd.is_none() {
+                    cwd = payload["cwd"].as_str().filter(|dir| !dir.is_empty()).map(PathBuf::from);
+                }
+            }
+            let claim = vigil.claim_notices(session.as_deref(), cwd.as_deref())?;
+            let delivery = claim.delivery().clone();
+            let printed = if json {
+                deliver_json(&delivery)
+            } else if delivery.notices.is_empty() {
+                Ok(())
+            } else {
+                let mut lines: Vec<String> = delivery.notices.iter().map(|notice| format!("{}: {}", notice.id, notice.message)).collect();
+                lines.extend(delivery.note.iter().map(|note| format!("note: {note}")));
+                deliver_text(&lines.join("\n"))
+            };
+            // Recorded before printing so racing callers cannot both print it;
+            // released when printing failed so the notice is not lost.
+            match printed {
+                Ok(()) => {
+                    claim.keep();
+                    Ok(0)
+                }
+                Err(error) => {
+                    claim.release();
+                    Err(error)
+                }
+            }
         }
         Command::Advice { json } => {
             let report = vigil.advice_report().await?;

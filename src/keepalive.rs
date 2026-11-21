@@ -348,6 +348,21 @@ impl crate::engine::Vigil {
             envelope.advice = self.envelope_advice().await;
             (envelope.reminders, envelope.reminders_error) = self.reminder_report().await;
         }
+        if let Some((envelope, delivery)) = outcome.as_mut() {
+            // CLAIM(notice-once) ↳ the claim rides in the Delivery: committed with it,
+            // released when it is dropped uncommitted (the print failed or the call was cancelled).
+            match self.claim_notices(None, None) {
+                Ok(claim) if claim.delivery().notices.is_empty() => {
+                    claim.keep();
+                }
+                Ok(claim) => {
+                    envelope.notices = claim.delivery().notices.clone();
+                    envelope.notices_note = claim.delivery().note.clone();
+                    delivery.notice_claim = Some(claim);
+                }
+                Err(error) => envelope.notices_error = Some(error.to_string()),
+            }
+        }
         Ok(outcome)
     }
 
@@ -933,7 +948,7 @@ impl crate::engine::Vigil {
         envelope.cache = Some(CacheNote { credit_check: call.credit_check.clone(), ..plan.window.clone() });
         let since_last_call_s = primary.last_call_at.map(|at| now.secs_since(at).max(0) as u64);
         envelope.clock = Some(ClockNote::new(waited_s, envelope.elapsed_s, since_last_call_s));
-        Ok((envelope, Delivery { returned: delivered, acknowledged: acknowledgements }))
+        Ok((envelope, Delivery { returned: delivered, acknowledged: acknowledgements, notice_claim: None }))
     }
 
     /// Record that a call's envelope reached the caller (V7): its terminal
@@ -941,7 +956,10 @@ impl crate::engine::Vigil {
     /// attention events it carried are acknowledged in the watch files (S6),
     /// best effort: an acknowledgement that cannot be saved leaves the event
     /// to be delivered again, flagged `redelivered`.
-    pub fn commit_delivery(&self, delivery: Delivery) {
+    pub fn commit_delivery(&self, mut delivery: Delivery) {
+        if let Some(claim) = delivery.notice_claim.take() {
+            claim.keep();
+        }
         {
             let mut session = self.session.lock().expect("session mutex poisoned");
             session.session_ticks += 1;
@@ -1000,6 +1018,17 @@ impl crate::engine::Vigil {
 pub struct Delivery {
     returned: Vec<WatchId>,
     acknowledged: Vec<(WatchId, Vec<String>)>,
+    /// Notices recorded as delivered by this envelope (see `notice.rs`).
+    notice_claim: Option<crate::notice::NoticeClaim>,
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        // Dropped without `commit_delivery`: the envelope never reached the agent.
+        if let Some(claim) = self.notice_claim.take() {
+            claim.release();
+        }
+    }
 }
 
 #[cfg(test)]

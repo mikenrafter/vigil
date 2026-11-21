@@ -275,6 +275,9 @@ impl Envelope {
             hud.push(format!("reminder: {}", line(&serde_json::to_string(reminder).unwrap_or_default())));
         }
         if let Some(error) = &self.reminders_error { hud.push(format!("reminders error: {}", line(error))); }
+        for notice in &self.notices { hud.push(format!("notice {}: {}", line(&notice.id), line(&notice.message))); }
+        if let Some(note) = &self.notices_note { hud.push(format!("notices: {}", line(note))); }
+        if let Some(error) = &self.notices_error { hud.push(format!("notices error: {}", line(error))); }
         if let Some(note) = &self.persist { hud.push(format!("persist: {}", serde_json::to_string(note).unwrap_or_default())); }
         for failure in &self.persist_failures { hud.push(format!("persist: {}: {}", failure.watch_id, line(&failure.error))); }
         if let Some(error) = &self.cap_error { hud.push(format!("cap: {}", line(error))); }

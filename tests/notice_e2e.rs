@@ -100,7 +100,8 @@ fn expired_and_out_of_scope_notices_are_not_printed_and_scope_follows_cwd() {
     let soon = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     run(&sandbox, &["notice", "add", "soon", "--message", "m", "--expires", &soon]);
     std::thread::sleep(std::time::Duration::from_millis(3100));
-    assert_eq!(text(&sandbox, &["notices", "--session", "fresh"]), "");
+    // A fresh session in the scope directory gets `scoped` but never the expired `soon`.
+    assert_eq!(text(&sandbox, &["notices", "--session", "fresh"]), "scoped: m\n");
 }
 
 #[test]
@@ -205,7 +206,9 @@ fn a_failed_write_to_stdout_leaves_the_notice_pending() {
     add(&sandbox, "neon", "m");
     let status = std::process::Command::new("sh")
         .arg("-c")
-        .arg(format!("exec {} --root \"$ROOT\" notices --session s >&-", common::vigil_bin()))
+        // /dev/full accepts the open and fails every write with ENOSPC (a closed
+        // fd 1 is reopened as /dev/null by Rust's runtime, so it would not fail).
+        .arg(format!("exec {} --root \"$ROOT\" notices --session s >/dev/full", common::vigil_bin()))
         .env("ROOT", sandbox.state_root())
         .env("HOME", sandbox.home())
         .env("VIGIL_ADVISORIES_FILE", "off")
@@ -213,7 +216,7 @@ fn a_failed_write_to_stdout_leaves_the_notice_pending() {
         .stderr(Stdio::null())
         .status()
         .unwrap();
-    assert!(!status.success(), "writing to a closed stdout must fail");
+    assert!(!status.success(), "writing to a full stdout must fail");
     assert_eq!(text(&sandbox, &["notices", "--session", "s"]), "neon: m\n", "the notice was lost");
 }
 
@@ -243,7 +246,7 @@ fn racing_notices_processes_of_one_session_print_each_notice_exactly_once() {
 // ---- MCP ----------------------------------------------------------------
 
 async fn connect(sandbox: &Sandbox, session: &str) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let transport = TokioChildProcess::new(sandbox.command().configure(|command| {
+    let transport = TokioChildProcess::new(sandbox.tokio_command().configure(|command| {
         command.arg("mcp").env("CLAUDE_CODE_SESSION_ID", session);
     }))
     .unwrap();
