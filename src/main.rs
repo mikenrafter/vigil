@@ -105,37 +105,40 @@ enum Command {
 enum RemindCommand {
     List,
     Show { id: String },
-    Add {
-        id: String,
-        #[arg(long, required = true, num_args = 1..)]
-        scope: Vec<PathBuf>,
-        #[arg(long, value_delimiter = ',', required = true)]
-        days: Vec<String>,
-        #[arg(long)]
-        window: Option<String>,
-        #[arg(long)]
-        tz: Option<String>,
-        /// JSON argv array; exits 0 due, 1 not due, others unavailable.
-        #[arg(long)]
-        probe: Option<String>,
-        /// Numeric comparison, e.g. value >= 10 (default extraction: number).
-        #[arg(long)]
-        condition: Option<String>,
-        /// Advisory extraction object as JSON; requires --condition.
-        #[arg(long)]
-        extract: Option<String>,
-        #[arg(long)]
-        message: String,
-        #[arg(long, default_value = "week", value_parser = ["day", "week"])]
-        period: String,
-        #[arg(long, default_value_t = 600)]
-        cache_s: u64,
-        #[arg(long, default_value_t = 10)]
-        timeout_s: u64,
-    },
+    Add(Box<RemindAddArgs>),
     Done { id: String },
     Snooze { id: String, duration: String },
     Rm { id: String },
+}
+
+#[derive(Debug, clap::Args)]
+struct RemindAddArgs {
+    id: String,
+    #[arg(long, required = true, num_args = 1..)]
+    scope: Vec<PathBuf>,
+    #[arg(long, value_delimiter = ',', required = true)]
+    days: Vec<String>,
+    #[arg(long)]
+    window: Option<String>,
+    #[arg(long)]
+    tz: Option<String>,
+    /// JSON argv array; exits 0 due, 1 not due, others unavailable.
+    #[arg(long)]
+    probe: Option<String>,
+    /// Numeric comparison, e.g. value >= 10 (default extraction: number).
+    #[arg(long)]
+    condition: Option<String>,
+    /// Advisory extraction object as JSON; requires --condition.
+    #[arg(long)]
+    extract: Option<String>,
+    #[arg(long)]
+    message: String,
+    #[arg(long, default_value = "week", value_parser = ["day", "week"])]
+    period: String,
+    #[arg(long, default_value_t = 600)]
+    cache_s: u64,
+    #[arg(long, default_value_t = 10)]
+    timeout_s: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -433,7 +436,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 RemindCommand::Done { id } => vigil.remind_done(&id)?,
                 RemindCommand::Snooze { id, duration } => vigil.remind_snooze(&id, &duration)?,
                 RemindCommand::Rm { id } => vigil.remind_rm(&id)?,
-                RemindCommand::Add { id, scope, days, window, tz, probe, condition, extract, message, period, cache_s, timeout_s } => {
+                RemindCommand::Add(args) => {
+                    let RemindAddArgs { id, scope, days, window, tz, probe, condition, extract, message, period, cache_s, timeout_s } = *args;
                     let probe = probe.map(|raw| serde_json::from_str::<Vec<String>>(&raw)).transpose()?;
                     let extract = extract.map(|raw| serde_json::from_str::<serde_json::Value>(&raw)).transpose()?;
                     vigil.remind_add(&id, serde_json::json!({

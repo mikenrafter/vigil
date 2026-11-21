@@ -32,7 +32,7 @@ use crate::advisory::{default_boat_budget, Advisory, AdvisoryError, AdvisoryId, 
 /// that no longer validates must not hide the other advisories).
 #[derive(Debug, Clone)]
 pub enum Entry {
-    Ready(Advisory),
+    Ready(Box<Advisory>),
     Broken { id: String, reason: String },
 }
 
@@ -229,7 +229,7 @@ impl AdvisoryStore {
         let set = self.load()?;
         let ids = set.ids();
         match set.entries.into_iter().find(|entry| entry.id() == id) {
-            Some(Entry::Ready(advisory)) => Ok(advisory),
+            Some(Entry::Ready(advisory)) => Ok(*advisory),
             Some(Entry::Broken { id, reason }) => Err(AdvisoryError::invalid(&format!("advisory {id}"), reason)),
             None => Err(AdvisoryError::Unknown { id: id.to_string(), known: known_list(&ids) }),
         }
@@ -269,7 +269,7 @@ fn table_mut<'a>(doc: &'a mut DocumentMut, path: &Path) -> Result<&'a mut Table,
 fn usable(id: &str, table: &Table) -> Result<Advisory, AdvisoryError> {
     let item = table.get(id).ok_or_else(|| unknown(id, table))?;
     match entry_of(id, item) {
-        Entry::Ready(advisory) => Ok(advisory),
+        Entry::Ready(advisory) => Ok(*advisory),
         Entry::Broken { id, reason } => Err(AdvisoryError::invalid(&format!("advisory {id}"), reason)),
     }
 }
@@ -288,7 +288,7 @@ fn entry_of(id: &str, item: &Item) -> Entry {
         Err(error) => return broken(format!("not an advisory: {error}")),
     };
     match AdvisoryId::parse(id).and_then(|parsed| Advisory::new(parsed, spec)) {
-        Ok(advisory) => Entry::Ready(advisory),
+        Ok(advisory) => Entry::Ready(Box::new(advisory)),
         Err(error) => broken(error.to_string()),
     }
 }

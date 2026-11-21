@@ -140,7 +140,7 @@ mod tests {
     }
 
     fn set_of(specs: &[(&str, AdvisorySpec)]) -> AdvisorySet {
-        AdvisorySet { entries: specs.iter().map(|(id, spec)| Entry::Ready(Advisory::new(AdvisoryId::parse(id).unwrap(), spec.clone()).unwrap())).collect() }
+        AdvisorySet { entries: specs.iter().map(|(id, spec)| Entry::Ready(Box::new(Advisory::new(AdvisoryId::parse(id).unwrap(), spec.clone()).unwrap()))).collect() }
     }
 
     struct Rig {

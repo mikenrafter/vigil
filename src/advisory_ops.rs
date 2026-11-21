@@ -58,7 +58,7 @@ impl Vigil {
     /// The spec and the current evaluation of one advisory.
     pub async fn advisory_show(&self, id: &str) -> Result<Value, AdvisoryError> {
         let advisory = self.advisory_store()?.get(id)?;
-        let set = AdvisorySet { entries: vec![Entry::Ready(advisory.clone())] };
+        let set = AdvisorySet { entries: vec![Entry::Ready(Box::new(advisory.clone()))] };
         let advice = advise(&set, self.reader.as_ref(), self.clock.as_ref(), &self.advisory_cache_dir()).await;
         let mut shown = detail(&advisory);
         shown["advice"] = serde_json::to_value(&advice[0]).expect("advice serializes");
