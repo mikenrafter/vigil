@@ -1436,6 +1436,10 @@ names but never deliver it twice. A partial claim that writes A but stops
 before B prints nothing. Later A calls skip the notice; B-only calls can
 receive it once, and overlapping calls bridge the recorded generation.
 
+Claims wait up to 100 ms for the lock; releases wait up to 2 s. This can
+delay failed-output cleanup, but reduces lost deliveries when the disk is busy.
+Release remains best effort if that wait expires or a write fails.
+
 Release removes only generations claimed by that call, preserving bridged and
 newer generations. It is best effort. A partial release that clears A but
 stops before B can lose delivery: a later {A,B} call copies B's record back

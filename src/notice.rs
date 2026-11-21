@@ -59,6 +59,7 @@ const MAX_SESSION_BYTES: usize = 512;
 /// The critical section is a few small reads and renames, so this bounds a
 /// stuck process while leaving headroom for concurrent multi-name sessions.
 const LOCK_WAIT: Duration = Duration::from_millis(100);
+const RELEASE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NoticeError {
@@ -293,7 +294,7 @@ impl NoticeClaim {
         if self.claimed.is_empty() {
             return Ok(());
         }
-        let _directory_lock = NoticeStore::lock(&self.store.delivery_lock_path())?;
+        let _directory_lock = NoticeStore::lock_with_wait(&self.store.delivery_lock_path(), RELEASE_LOCK_WAIT)?;
         let keys = self.session.record_keys();
         let mut writes = Vec::new();
         for key in &keys {
@@ -332,6 +333,10 @@ impl NoticeStore {
     /// Exclusive lock on `path`, waiting a bounded time. Dropping the guard
     /// unlocks (`StoreLock`, CLAIM(lock-guard-release)).
     fn lock(path: &Path) -> Result<StoreLock> {
+        Self::lock_with_wait(path, LOCK_WAIT)
+    }
+
+    fn lock_with_wait(path: &Path, wait: Duration) -> Result<StoreLock> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -340,7 +345,7 @@ impl NoticeStore {
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(StoreLock { file }),
-                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => return Err(NoticeError::Busy(path.to_path_buf())),

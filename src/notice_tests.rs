@@ -996,3 +996,27 @@ fn corrupt_record_is_isolated_to_calls_seeing_that_name() {
     // `a` alone is completely unaffected by `b`'s corruption.
     assert_eq!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.len(), 1);
 }
+
+#[test]
+fn release_waits_past_claim_timeout_for_a_busy_directory() {
+    // CLAIM(notice-once): failed-print release gets a longer contention budget.
+    // A handshake ensures the competing lock is held before release starts.
+    let rig = Rig::new();
+    rig.add("fresh", "m");
+    let store = rig.vigil().notice_store();
+    let session = NoticeSession::single("busy-release").unwrap();
+    let claim = store.claim(&session, rig.clock.now(), &rig.cwd).unwrap();
+    let path = rig.env.root().join("notice-delivery/.lock");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    ready_rx.recv().unwrap();
+    let result = claim.release_internal(|_, _| crate::notice::WriteAction::Continue);
+    blocker.join().unwrap();
+    result.unwrap();
+    assert_eq!(store.claim(&session, rig.clock.now(), &rig.cwd).unwrap().keep().notices[0].id, "fresh");
+}
