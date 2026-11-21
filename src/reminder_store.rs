@@ -210,6 +210,13 @@ impl ReminderStore {
     }
 }
 
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,12 +233,5 @@ mod tests {
         let next = lock(&path);
         assert!(next.is_ok(), "dropped reminder guard still locked: {:?}", next.err());
         drop(inherited);
-    }
-}
-
-fn remove_if_present(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
     }
 }

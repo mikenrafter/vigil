@@ -586,6 +586,10 @@ impl ServerHandler for VigilServer {
     }
 }
 
+fn reminder_reply(result: crate::reminder::Result<Value>) -> CallToolResult {
+    match result { Ok(value) => text_result(false, value.to_string()), Err(error) => text_result(true, error.to_string()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,8 +716,4 @@ mod tests {
         assert!(cancelled.is_none(), "the cancel ended the hold");
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
     }
-}
-
-fn reminder_reply(result: crate::reminder::Result<Value>) -> CallToolResult {
-    match result { Ok(value) => text_result(false, value.to_string()), Err(error) => text_result(true, error.to_string()) }
 }
