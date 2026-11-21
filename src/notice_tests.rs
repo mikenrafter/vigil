@@ -626,3 +626,16 @@ fn corrupt_record_errors_without_redelivery_or_overwrite() {
     assert!(result.is_err(), "corrupt record was silently treated as empty");
     assert_eq!(std::fs::read(path).unwrap(), b"{broken");
 }
+
+#[test]
+fn a_contended_notice_lock_returns_a_short_busy_error() {
+    // Busy notice state must not stall a Tokio worker for five seconds.
+    let rig = Rig::new();
+    rig.add("live", "m");
+    let lock = std::fs::File::options().write(true).open(rig.env.root().join("notices/.lock")).unwrap();
+    lock.lock().unwrap();
+    let started = std::time::Instant::now();
+    let result = rig.env.vigil.notice_add(NoticeRequest { id: "other".into(), message: "m".into(), ..Default::default() });
+    assert!(matches!(result, Err(crate::notice::NoticeError::Busy(_))));
+    assert!(started.elapsed() < std::time::Duration::from_millis(250), "lock blocked for {:?}", started.elapsed());
+}

@@ -48,7 +48,7 @@ const RECORD_RETENTION: Duration = Duration::from_secs(30 * 86_400);
 /// How long a claim waits for another process holding the same record's lock.
 /// The critical section is one small read and one rename, so this is a bound
 /// for a stuck process, not a typical wait.
-const LOCK_WAIT: Duration = Duration::from_secs(5);
+const LOCK_WAIT: Duration = Duration::from_millis(25);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NoticeError {
