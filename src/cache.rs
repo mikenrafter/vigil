@@ -36,16 +36,17 @@ pub const ANTIGRAVITY_MCP_TIMEOUT_S: u64 = 180;
 /// 4-5 minutes (cached at 4 m, uncached at 5 m; 2026-11-21), so 150 s keeps it warm.
 pub const ANTIGRAVITY_WINDOW_S: u64 = 150;
 const _: () = assert!(
-    ANTIGRAVITY_WINDOW_S + crate::keepalive::ADVICE_TAIL_BUDGET.as_secs() + 10 <= ANTIGRAVITY_MCP_TIMEOUT_S,
-    "the window plus the advice tail must leave at least 10 s below agy's MCP timeout"
+    ANTIGRAVITY_WINDOW_S + crate::keepalive::ADVICE_TAIL_BUDGET.as_secs() + 15 <= ANTIGRAVITY_MCP_TIMEOUT_S,
+    "the window plus the advice tail must leave at least 15 s below agy's MCP timeout"
 );
 /// AI1' / D1: a 1 h TTL minus a 10 minute margin (3000 s). Owner 2026-11-13:
 /// at most 50 minutes. Was 3300 s (5 minute margin).
 pub const ONE_HOUR_WINDOW_S: u64 = 3000;
-/// A2: explicit windows are clamped to at least this ...
+/// A2: explicit windows are clamped to at least this.
 pub const MIN_WINDOW_S: u64 = 30;
-/// ... and at most `ONE_HOUR_WINDOW_S`, 270 s for Codex or Ambiguous, or
-/// `ANTIGRAVITY_WINDOW_S` when any Antigravity signal is present.
+/// Explicit-window ceiling for Codex and for ambiguous identities without an
+/// Antigravity signal (Codex's tool timeout is 300 s; see
+/// [`Identity::window_ceiling_s`] for all identities).
 pub const CODEX_MAX_WINDOW_S: u64 = 270;
 /// AI1' / D4: only this much of a transcript's end is read.
 pub const TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
@@ -114,7 +115,8 @@ pub enum Identity<'a> {
     Claude { session_id: &'a str },
     /// Codex, and nothing suggests Claude Code or Antigravity: 5 minutes, 300 s tool timeout.
     Codex,
-    /// Antigravity, and nothing suggests Claude Code or Codex: measured 4-5 m cache -> 180 s window.
+    /// Antigravity, and nothing suggests Claude Code or Codex: measured 4-5 m
+    /// cache, bounded to 150 s below agy's 180 s MCP timeout.
     Antigravity,
     /// Two or more agent signals are present (a nested agent shell): vigil
     /// cannot say which one is calling, so it assumes the stricter limits (S4).
@@ -126,12 +128,19 @@ pub enum Identity<'a> {
 }
 
 impl Identity<'_> {
-    /// The largest window an explicit `max_s` may ask for (A2): 3000 (50 min,
-    /// owner 2026-11-13: at most 50 minutes), the largest vigil ever picks
-    /// itself. Codex's tool timeout (300 s) is a hard limit: Codex and mixed
-    /// signals without Antigravity get 270 (R2-A1, S4). agy's MCP timeout
-    /// (180 s, measured) is stricter: Antigravity, alone or mixed with
-    /// anything (S4), gets 150. Claude and Unknown retain 3000 s.
+    /// Whether any Antigravity signal is present (alone or mixed, S4), so
+    /// agy's 180 s MCP tool timeout applies.
+    pub const fn has_antigravity(self) -> bool {
+        matches!(self, Identity::Antigravity | Identity::Ambiguous { antigravity: true })
+    }
+
+    /// The largest window an explicit `max_s` may ask for (A2):
+    /// `ONE_HOUR_WINDOW_S` (3000 s, 50 min; owner 2026-11-13: at most 50
+    /// minutes) for Claude and Unknown, `CODEX_MAX_WINDOW_S` (270 s; Codex's
+    /// tool timeout is 300 s) for Codex and ambiguous identities without an
+    /// Antigravity signal (R2-A1, S4), and `ANTIGRAVITY_WINDOW_S` (150 s;
+    /// agy's MCP timeout is 180 s, measured) when any Antigravity signal is
+    /// present (alone or mixed, S4).
     pub const fn window_ceiling_s(self) -> u64 {
         match self {
             Identity::Antigravity | Identity::Ambiguous { antigravity: true } => ANTIGRAVITY_WINDOW_S,
@@ -144,10 +153,7 @@ impl Identity<'_> {
     /// an ambiguous or unknown identity): 270, or 150 when any Antigravity
     /// signal is present.
     pub const fn default_window_s(self) -> u64 {
-        match self {
-            Identity::Antigravity | Identity::Ambiguous { antigravity: true } => ANTIGRAVITY_WINDOW_S,
-            _ => DEFAULT_WINDOW_S,
-        }
+        if self.has_antigravity() { ANTIGRAVITY_WINDOW_S } else { DEFAULT_WINDOW_S }
     }
 }
 

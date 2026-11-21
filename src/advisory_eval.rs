@@ -66,19 +66,49 @@ pub(crate) async fn read_probe(input: &crate::watch::Input, reader: &dyn InputRe
         .await.map_err(|_| format!("probe did not answer within {}s", PROBE_DEADLINE.as_secs()))
 }
 
-async fn probe(advisory: &Advisory, reader: &dyn InputReader) -> Outcome {
-    let failed = |reason: String| Outcome::Failed { reason };
-    let reading = match read_probe(advisory.probe(), reader).await {
-        Ok(reading) => reading,
-        Err(reason) => return failed(reason),
-    };
-    match probe_body(advisory.probe(), &reading).and_then(|body| advisory.extract_value(&body)) {
-        Ok(value) => Outcome::Value { value },
-        Err(reason) => failed(reason),
-    }
+enum ProbeResult {
+    /// Probe finished (or timed out at its own `PROBE_DEADLINE`) and may be cached.
+    Finished(Outcome),
+    /// The caller's shared advice deadline ran out while this probe was running.
+    /// Not cached as a probe failure so a later call can run it once earlier
+    /// advisories are cached.
+    BudgetCutOff,
+    /// The shared advice deadline was already spent before this probe started.
+    BudgetExhausted,
 }
 
-async fn advise_one(advisory: &Advisory, reader: &dyn InputReader, clock: &dyn Clock, cache_dir: &Path) -> Advice {
+async fn probe_within(advisory: &Advisory, reader: &dyn InputReader, deadline: Option<tokio::time::Instant>) -> ProbeResult {
+    let remaining = deadline.map(|end| end.saturating_duration_since(tokio::time::Instant::now()));
+    if remaining == Some(std::time::Duration::ZERO) {
+        return ProbeResult::BudgetExhausted;
+    }
+    let (limit, capped_by_deadline) = match remaining {
+        Some(left) if left < PROBE_DEADLINE => (left, true),
+        _ => (PROBE_DEADLINE, false),
+    };
+    let reading = match tokio::time::timeout(limit, reader.read(advisory.probe(), &InputState::default())).await {
+        Ok(reading) => reading,
+        Err(_) if capped_by_deadline => return ProbeResult::BudgetCutOff,
+        Err(_) => {
+            return ProbeResult::Finished(Outcome::Failed {
+                reason: format!("probe did not answer within {}s", PROBE_DEADLINE.as_secs()),
+            });
+        }
+    };
+    let outcome = match probe_body(advisory.probe(), &reading).and_then(|body| advisory.extract_value(&body)) {
+        Ok(value) => Outcome::Value { value },
+        Err(reason) => Outcome::Failed { reason },
+    };
+    ProbeResult::Finished(outcome)
+}
+
+async fn advise_one(
+    advisory: &Advisory,
+    reader: &dyn InputReader,
+    clock: &dyn Clock,
+    cache_dir: &Path,
+    deadline: Option<tokio::time::Instant>,
+) -> Advice {
     let now = clock.now();
     let cache = ProbeCache {
         path: cache_dir.join(format!("{}.json", advisory.id())),
@@ -86,14 +116,15 @@ async fn advise_one(advisory: &Advisory, reader: &dyn InputReader, clock: &dyn C
         ttl_s: advisory.cache_s(),
         failure_ttl_s: advisory.cache_s().min(FAILURE_CACHE_S),
     };
+    let id = advisory.id().as_str();
     let record = match cache.read(now, |outcome| matches!(outcome, Outcome::Failed { .. })) {
         Some(record) => record,
-        None => {
-            let outcome = probe(advisory, reader).await;
-            cache.write(outcome, clock.now())
-        }
+        None => match probe_within(advisory, reader, deadline).await {
+            ProbeResult::Finished(outcome) => cache.write(outcome, clock.now()),
+            ProbeResult::BudgetCutOff => return Advice::unavailable(id, "probe did not finish within advice budget", clock.now()),
+            ProbeResult::BudgetExhausted => return Advice::unavailable(id, "skipped: advice budget exhausted", clock.now()),
+        },
     };
-    let id = advisory.id().as_str();
     match record.outcome {
         // CLAIM(advisory-immediate) ↳ params, condition and messages are applied to the cached number now
         Outcome::Value { value } => Advice { id: id.to_string(), kind: AdviceKind::Advice, message: advisory.judge(value).message, checked_at: record.fetched_at, value: Some(value) },
@@ -101,13 +132,25 @@ async fn advise_one(advisory: &Advisory, reader: &dyn InputReader, clock: &dyn C
     }
 }
 
-/// Evaluate every entry of `set`, in file order.
-pub async fn advise(set: &AdvisorySet, reader: &dyn InputReader, clock: &dyn Clock, cache_dir: &Path) -> Vec<Advice> {
+/// Evaluate every entry of `set`, serially in file order.
+///
+/// When `deadline` is `Some`, each uncached probe runs for at most
+/// `min(PROBE_DEADLINE, time remaining)`. Finished entries (including cache
+/// hits) are preserved; any uncached advisory cut off or not reached before
+/// `deadline` becomes an individual `unavailable` entry naming it (and is not
+/// cached as a probe failure).
+pub async fn advise(
+    set: &AdvisorySet,
+    reader: &dyn InputReader,
+    clock: &dyn Clock,
+    cache_dir: &Path,
+    deadline: Option<tokio::time::Instant>,
+) -> Vec<Advice> {
     let mut advice = Vec::with_capacity(set.entries.len());
     for entry in &set.entries {
         advice.push(match entry {
             Entry::Broken { id, reason } => Advice::unavailable(id, reason, clock.now()),
-            Entry::Ready(advisory) => advise_one(advisory, reader, clock, cache_dir).await,
+            Entry::Ready(advisory) => advise_one(advisory, reader, clock, cache_dir, deadline).await,
         });
     }
     advice
@@ -157,7 +200,7 @@ mod tests {
             self.reader.set_text(PROBE_LABEL, &format!("exit=0\n{{\"free\": {free}}}"));
         }
         async fn advise(&self, set: &AdvisorySet) -> Vec<Advice> {
-            advise(set, &self.reader, &self.clock, &self.dir.path().join("advisory-cache")).await
+            advise(set, &self.reader, &self.clock, &self.dir.path().join("advisory-cache"), None).await
         }
         fn probes(&self) -> usize {
             self.reader.started_count(PROBE_LABEL)
@@ -214,7 +257,7 @@ mod tests {
         rig.advise(&set).await;
         let second_process = ScriptedReader::new();
         second_process.set_text(PROBE_LABEL, "exit=0\n{\"free\": 99}");
-        let advice = advise(&set, &second_process, &rig.clock, &rig.dir.path().join("advisory-cache")).await;
+        let advice = advise(&set, &second_process, &rig.clock, &rig.dir.path().join("advisory-cache"), None).await;
         assert_eq!(second_process.started_count(PROBE_LABEL), 0);
         assert_eq!(advice[0].value, Some(15.0));
     }
@@ -393,5 +436,40 @@ mod tests {
         assert_eq!(serde_json::to_value(&down).unwrap(), json!({
             "id": "mem", "kind": "unavailable", "message": "advisory mem unavailable: boom", "checked_at": "2026-10-29T14:03:11Z"
         }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advise_with_a_deadline_keeps_finished_entries_and_names_cut_off_and_skipped_ones() {
+        // why: serial evaluation under a shared deadline gives each probe
+        //      min(PROBE_DEADLINE, remaining). Finished entries survive,
+        //      a probe cut off by the deadline is reported unavailable naming
+        //      itself (without poisoning the failure cache), and later uncached
+        //      probes are skipped without starting once remaining hits zero.
+        // catches: outer timeout dropping partial results; running probes after
+        //          remaining == 0; losing broken-entry diagnostics.
+        // proves: CLAIM(neon-mcp-bound), CLAIM(advisory-unavailable)
+        let rig = Rig::new();
+        rig.reader.set_text("cmd:p1", "exit=0\n{\"free\": 12}");
+        rig.reader.set_sleep("cmd:p1", std::time::Duration::from_secs(4));
+        rig.reader.set_text("cmd:p2", "exit=0\n{\"free\": 25}");
+        rig.reader.set_sleep("cmd:p2", std::time::Duration::from_secs(19));
+        rig.reader.set_text("cmd:p3", "exit=0\n{\"free\": 35}");
+        rig.reader.set_sleep("cmd:p3", std::time::Duration::from_secs(4));
+        let set = set_of(&[
+            ("first", spec(json!({"probe": {"kind": "cmd", "argv": ["p1"]}}))),
+            ("second", spec(json!({"probe": {"kind": "cmd", "argv": ["p2"]}}))),
+            ("third", spec(json!({"probe": {"kind": "cmd", "argv": ["p3"]}}))),
+        ]);
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(10);
+        let advice = advise(&set, &rig.reader, &rig.clock, &rig.dir.path().join("advisory-cache"), Some(deadline)).await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+        assert_eq!(advice.len(), 3);
+        assert_eq!((advice[0].id.as_str(), advice[0].kind, advice[0].value), ("first", AdviceKind::Advice, Some(12.0)));
+        assert_eq!((advice[1].id.as_str(), advice[1].kind, advice[1].value), ("second", AdviceKind::Unavailable, None));
+        assert!(advice[1].message.starts_with("advisory second unavailable:"), "{}", advice[1].message);
+        assert_eq!((advice[2].id.as_str(), advice[2].kind, advice[2].value), ("third", AdviceKind::Unavailable, None));
+        assert!(advice[2].message.starts_with("advisory third unavailable:"), "{}", advice[2].message);
+        assert_eq!(rig.reader.started_count("cmd:p3"), 0, "skipped probe must not start");
     }
 }

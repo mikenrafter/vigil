@@ -281,15 +281,33 @@ impl Vigil {
     /// `Err(Disabled)` when advisories are off; a file that cannot be read is
     /// an error here (the CLI reports it).
     pub async fn advice(&self) -> Result<Vec<crate::advisory_eval::Advice>, crate::advisory::AdvisoryError> {
+        self.advice_until(None).await
+    }
+
+    /// Like [`Vigil::advice`], sharing `deadline` across the serial pass so
+    /// finished entries survive and cut-off or unreached entries become
+    /// individual `unavailable` entries.
+    pub async fn advice_until(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<crate::advisory_eval::Advice>, crate::advisory::AdvisoryError> {
         let set = self.advisory_store()?.load()?;
-        Ok(crate::advisory_eval::advise(&set, self.reader.as_ref(), self.clock.as_ref(), &self.advisory_cache_dir()).await)
+        Ok(crate::advisory_eval::advise(&set, self.reader.as_ref(), self.clock.as_ref(), &self.advisory_cache_dir(), deadline).await)
     }
 
     /// The `advice` of an envelope: `None` when advisories are off. A file that
     /// cannot be read is one explicit `unavailable` entry, never silence and
     /// never a failure of the call it rides on (CLAIM(advisory-unavailable)).
     pub async fn envelope_advice(&self) -> Option<Vec<crate::advisory_eval::Advice>> {
-        match self.advice().await {
+        self.envelope_advice_until(None).await
+    }
+
+    /// [`Vigil::envelope_advice`] bounded by a shared `deadline`.
+    pub async fn envelope_advice_until(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<Vec<crate::advisory_eval::Advice>> {
+        match self.advice_until(deadline).await {
             Ok(advice) => Some(advice),
             Err(crate::advisory::AdvisoryError::Disabled) => None,
             Err(error) => Some(vec![crate::advisory_eval::Advice::unavailable("advisories", &error.to_string(), self.clock.now())]),
