@@ -283,8 +283,9 @@ be shared by an app-server hosting several threads; its live scope remains
 unverified. Distinct thread ids keep those threads independent. Without a
 thread id, the session id remains a fallback name.
 
-After installing, restart long-lived `vigil mcp` servers. Older servers use
-per-record locks and cannot coordinate with the new directory lock. For one
+After installing, restart long-lived `vigil mcp` servers. Older servers record a delivery under one name only, so a session they serve can see a notice
+again through its other names. (Their locking is compatible: they also take the
+directory lock first.) For one
 release, cleanup retains legacy `<hash>.lock` files, including orphan locks,
 to preserve the inodes still used by older processes. Restarting is required
 before relying on once-per-session delivery across old and new callers.
