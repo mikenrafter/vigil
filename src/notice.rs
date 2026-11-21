@@ -350,6 +350,7 @@ impl NoticeStore {
     /// Pending: not expired, inside scope for `cwd`, and not yet in the
     /// session's record. A notice outside scope is not recorded, so a later
     /// call from inside the scope still gets it.
+    /// A notice removed between list() and the record update can still be delivered once.
     /// ↳ CLAIM(notice-once) ↳ CLAIM(notice-records) ↳ CLAIM(notice-expiry)
     pub fn claim(&self, session: &NoticeSession, now: Timestamp, cwd: &Path) -> Result<NoticeClaim> {
         let all = self.list()?;
