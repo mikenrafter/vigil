@@ -125,11 +125,6 @@ fn from_hook_reads_each_harness_payload_and_they_share_nothing_across_ids() {
     assert_eq!(text(&sandbox, &["notices", "--session", "claude-1"]), "");
     // --session beats the payload.
     assert_eq!(with_stdin(&sandbox, &["notices", "--from-hook", "--session", "explicit"], &claude), "neon: m\n");
-    // A payload with no id and no environment identity is a run-keyed delivery, and says so.
-    add(&sandbox, "second", "2");
-    let anonymous = with_stdin(&sandbox, &["notices", "--from-hook"], &json!({"cwd": cwd}).to_string());
-    assert!(anonymous.contains("second: 2"), "{anonymous}");
-    assert!(anonymous.contains("no agent session identity"), "{anonymous}");
     // Garbage on stdin is an error, not a silent anonymous delivery.
     let mut child = sandbox.command().args(["notices", "--from-hook"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(b"not json").unwrap();
@@ -316,4 +311,17 @@ fn codex_hook_and_keepalive_children_share_the_ancestor_record() {
     let records = std::fs::read_dir(sandbox.state_root().join("notice-delivery")).unwrap()
         .filter_map(Result::ok).filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json")).count();
     assert_eq!(records, 1);
+}
+
+#[test]
+fn a_hook_without_any_identity_refuses_without_printing() {
+    let sandbox = Sandbox::new();
+    add(&sandbox, "neon", "m");
+    let mut child = sandbox.command().args(["notices", "--from-hook"]).stdin(Stdio::piped())
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("session identity"));
 }

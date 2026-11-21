@@ -513,6 +513,9 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 }
                 if session.is_none() && !matches!(vigil.notice_session(None)?, vigil::notice::NoticeSession::Agent(_)) {
                     session = vigil::notice_ops::hook_session_id(&payload);
+                    if session.is_none() {
+                        anyhow::bail!("hook has no session identity in payload, environment or ancestry");
+                    }
                 }
                 if cwd.is_none() {
                     cwd = payload["cwd"].as_str().filter(|dir| !dir.is_empty()).map(PathBuf::from);
