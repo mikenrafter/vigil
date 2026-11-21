@@ -28,15 +28,21 @@ manual tick as backup; the agent should not think about tick length.
     `ephemeral_5m_input_tokens > 0` → 5 min. Nothing found → unknown.
   - Codex (`CODEX_*` / codex env, or `AGENT=codex`): 5 min (no TTL is
     recorded; owner decision).
+  - Antigravity (non-empty `ANTIGRAVITY_CONVERSATION_ID` or
+    `ANTIGRAVITY_AGENT=1`, with no Claude or Codex signal): measured 4-5 min,
+    represented as `5m` / `antigravity-measured`; orchestrator window 180 s.
+  - Any mix of two or more of Claude, Codex and Antigravity: ambiguous,
+    `unknown` / `default` / 270 s (S4).
   - Anything else, unreadable file, parse error: unknown.
-  - Interval: 1 h → 3000 s; 5 min or unknown → 270 s. An explicit
+  - Interval: 1 h → 3000 s; Antigravity orchestrator → 180 s;
+    other 5 min or unknown → 270 s. An explicit
     `max_s`/`--max-s` still wins, clamped to the transport limit.
 - **AI2 — transport limits respected.** MCP calls from Codex never exceed
   270 s (Codex tool timeout 300 s). Detection runs at every call, so a session
   that drops from 1 h to 5 min (subscription on usage credits) is caught at the
   next tick.
 - **AI3 — the agent sees what was chosen and why.** Every envelope carries
-  `"cache": {"ttl": "1h"|"5m"|"unknown", "source": "claude-transcript"|"codex-default"|"default"|"explicit", "interval_s": n}`.
+  `"cache": {"ttl": "1h"|"5m"|"unknown", "source": "claude-transcript"|"codex-default"|"antigravity-measured"|"default"|"explicit", "interval_s": n}`.
 - **AI4 — time visibility.** Every envelope carries
   `"clock": {"waited_s", "watch_age_s", "since_last_call_s", "summary"}` where
   `summary` is one plain line, e.g. `"waited 55m 0s this call; watching for
@@ -78,7 +84,16 @@ must, to pass `--max-s 270`). Recorded in the vigil skill.
 - **AI1' — 270 s unless the caller is the orchestrator.** The default interval
   is always 270 s. Only a call that marks itself as the main orchestrator
   session (CLI `--orchestrator`; MCP `orchestrator: true`; the watch can also
-  store it at create) gets the TTL-derived interval (1 h → 3000 s). Subagents
+  store it at create) gets the TTL-derived interval: Claude 1 h → 3000 s;
+  Antigravity → 180 s with `ttl: "5m"`, `source: "antigravity-measured"`.
+  Antigravity is detected by non-empty `ANTIGRAVITY_CONVERSATION_ID` or
+  `ANTIGRAVITY_AGENT=1`, without Claude or Codex signals. Its measured cache
+  lasts 4-5 minutes (2026-11-21), so 180 s leaves a minute below the last
+  measured hit at 4 minutes. Other 5 min or unknown cases stay at 270 s.
+  Explicit `max_s` still wins, clamped to 30..=3000 for Claude or Unknown,
+  and 30..=270 for Codex, Antigravity or Ambiguous. Antigravity's MCP tool
+  timeout is unknown; the conservative 270 s ceiling also stays below the
+  upper end of its measured 4-5 minute cache lifetime. Subagents
   therefore stay at 270 s with no special instruction, which removes the
   subagent limit above.
 - **AI2' — credit check every 4 minutes, account-wide.** Usage credits can
@@ -184,8 +199,10 @@ are accepted as written, except:
   `wait` returns on an `attention` or `credit_state_changed` event with a new
   exit code **5** ("attention; the watch is still live"); 0/3/4 unchanged.
   CLI tests prove both reach the agent.
-- **S4 (reverses red default A3).** Identity is ambiguous when both Claude and
-  Codex signals are present; ambiguous → 270 s. Test both nesting directions.
+- **S4 (reverses red default A3).** Identity is ambiguous with signals from
+  any two or more of Claude, Codex and Antigravity, including all three.
+  Ambiguous → 270 s, `unknown` / `default`; explicit `max_s` is capped at
+  270 s. Test nested agents in either direction and each mix of signals.
 - **S5.** Credit state is tri-state: on / off / unknown. Unknown keeps the last
   known state and never emits an event or runs the hook.
 - **S6.** `attention` events are ordinary events: generated with distinct ids,

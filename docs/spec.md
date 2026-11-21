@@ -35,7 +35,7 @@ context the agent expects on wake.
 - Not a general scheduler, and no interaction with usagewindow or `uw-agent`.
   A long watch is just many short `keepalive` calls; vigil never resumes a
   session.
-- Targets Claude Code and Codex only.
+- Targets Claude Code, Codex and Antigravity.
 - No new model. The judge is an existing HTTP endpoint, by default
   `http://127.0.0.1:4010` (`VIGIL_JUDGE_URL`). Only `fire = "judge"` uses it.
 - No config UI. A watch is one JSON object.
@@ -118,9 +118,10 @@ prompt-cache TTL, so every `keepalive` call has a fixed window:
 
 - The window is chosen by vigil, not by the agent: **270 s** by default, and
   up to **3000 s** (50 minutes; it was 3300 s until 2026-11-13)
-  for the orchestrator on a 1-hour prompt cache (see
+  for the orchestrator on a 1-hour prompt cache, or **180 s** for an
+  Antigravity orchestrator (see
   "Cache-aware window, time and early attention"). An explicit `max_s` still
-  wins, clamped to 30..=3000 (30..=270 for Codex and for an ambiguous
+  wins, clamped to 30..=3000 (30..=270 for Codex, Antigravity and an ambiguous
   caller). Values outside the range are clamped, not rejected, and the
   envelope reports the value used (`max_s`, `waited_s`).
 - A deadline of any length (hours, days) needs no special path. Each call
@@ -249,7 +250,7 @@ Non-blocking reads and cancel. `watch_status` also reports judge reachability
   a few hundred tokens per tick, not thousands.
 - `cache` and `clock` ride on every blocking return (a `keepalive`), never on
   status or cancel:
-  `"cache": {"ttl": "1h"|"5m"|"unknown", "source": "claude-transcript"|"codex-default"|"default"|"explicit", "interval_s": 270}`
+  `"cache": {"ttl": "1h"|"5m"|"unknown", "source": "claude-transcript"|"codex-default"|"antigravity-measured"|"default"|"explicit", "interval_s": 270}`
   (plus `credit_check` after an orchestrator's credit check) and
   `"clock": {"waited_s", "watch_age_s", "since_last_call_s" (null on the first call), "summary"}`.
   `summary` is one plain line, e.g. `waited 55m 0s this call; watching for
@@ -708,7 +709,9 @@ needs a clock in the envelope and an early wake when a job looks stuck.
 
 **Window (AI1', AI3, S4).** Per call, in this order:
 1. An explicit `max_s` / `--max-s` wins, clamped to 30..=3000, or 30..=270
-   when the caller is Codex or ambiguous. `cache` is `unknown` / `explicit`.
+   when the caller is Codex, Antigravity or ambiguous. Antigravity uses the
+   conservative 270 s ceiling because its MCP tool timeout is unknown and
+   its measured per-conversation cache lasts 4-5 minutes. `cache` is `unknown` / `explicit`.
 2. A caller that is not the orchestrator gets 270 s (`unknown` / `default`).
    Subagents therefore need no special instruction.
 3. The orchestrator is a call with `orchestrator: true` (MCP), `--orchestrator`
@@ -720,9 +723,13 @@ needs a clock in the envelope and an early wake when a job looks stuck.
    with a nonzero `usage.cache_creation` write; `ephemeral_1h_input_tokens > 0`
    gives 1 h and 3000 s (600 s margin; was 3300 s with a 300 s margin until 2026-11-13), else a 5m write gives 5m and 270 s; nothing usable
    gives `unknown` and 270 s. Codex (`AGENT=codex` or any `CODEX_*` variable)
-   is `5m` / `codex-default` / 270 s. Claude and Codex signals together are
-   ambiguous (a Claude started from a Codex shell or the reverse): 270 s,
-   `unknown`.
+   is `5m` / `codex-default` / 270 s. Antigravity (non-empty
+   `ANTIGRAVITY_CONVERSATION_ID` or `ANTIGRAVITY_AGENT=1`, with no Claude or
+   Codex signal) is `5m` / `antigravity-measured` / 180 s. The `5m` wire
+   category represents a measured 4-5 minute cache; 180 s leaves a minute
+   below the last measured hit at 4 minutes. Any mix of two or more of
+   Claude, Codex and Antigravity signals is ambiguous: 270 s,
+   `unknown` / `default`, including all three signals together.
 4. The window is decided again at every call.
 
 Bounds (S8): only the last 512 KiB of a transcript is read (a seek, at most
@@ -794,7 +801,8 @@ attention not raised in time is raised by the next call.
 descriptor 1 and only then commits the delivery; a failed write (EPIPE,
 ENOSPC) exits 1 and leaves the events to be replayed by the next call.
 
-**Environment.** `CLAUDE_CODE_SESSION_ID`, `AGENT`, `CODEX_*` (identity);
+**Environment.** `CLAUDE_CODE_SESSION_ID`, `AGENT`, `CODEX_*`,
+`ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENT` (identity);
 `VIGIL_CLAUDE_PROJECTS_DIR`, `CLAUDE_CONFIG_DIR`, `HOME` (transcripts);
 `VIGIL_UW_COMMAND` (default `uw`; a `uw` that is missing, fails or is slow is
 treated exactly as "not available", silently, and the transcripts decide);

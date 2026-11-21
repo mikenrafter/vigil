@@ -262,7 +262,7 @@ The session id each harness gives a hook or child process:
 |---|---|---|---|
 | Claude Code | `session_id` | `CLAUDE_CODE_SESSION_ID` (same value as the transcript file name under `~/.claude/projects`) | payload read by `bin/compact-advice-hook` and `bin/skill-watch-hook`; env var and transcript name checked on this host |
 | Codex 0.170 | `session_id` (`turn_id` also present) | `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `T3CODE_THREAD_ID` in shell children; only `T3CODE_THREAD_ID` in MCP children | variable names checked live by Fable round-2 review; Codex hook environment unverified |
-| Antigravity `agy` 1.5 | `conversationId` | `ANTIGRAVITY_CONVERSATION_ID` and `ANTIGRAVITY_TRAJECTORY_ID` are named in the binary | payload recorded in the agy integration report; the env var was not observed on a live child process |
+| Antigravity `agy` 1.5 | `conversationId` | Non-empty `ANTIGRAVITY_CONVERSATION_ID` and `ANTIGRAVITY_AGENT=1` observed in a live `agy` 1.5.13 shell child and in binary strings | payload recorded in the agy integration report; shell markers verified 2026-11-21 in the Neon TTL report; MCP child environment unverified |
 | T3 Code | no hooks | `T3CODE_THREAD_ID` | observed in a T3 thread's environment |
 
 `--from-hook`, keepalive and MCP collect every notice-only session name the
