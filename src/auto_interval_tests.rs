@@ -1377,17 +1377,20 @@ fn write_advisories_toml(entries: &[(&str, &str, u64)]) -> (tempfile::TempDir, P
 
 #[tokio::test(start_paused = true)]
 async fn antigravity_keepalive_delivers_all_real_advice_entries_when_probes_fit_within_the_tail_budget() {
-    // why: the advice tail budget (15 s) must let probes that fit serially
-    //      deliver real `kind: advice` entries with their extracted values.
-    //      3 probes x 4 s = 12 s <= 15 s; 150 s window + 12 s tail = 162 s < 180 s.
-    // catches: setting ADVICE_TAIL_BUDGET to 0 or 1 s, dropping advice on
-    //          Antigravity, or replacing real advice with an unavailable stub.
+    // why: the advice tail budget (15 s) starts all uncached probes concurrently
+    //      and returns results in file order. Staggered durations (6 s, 2 s, 4 s)
+    //      finish in completion order a2 -> a3 -> a1 in 6 s total (156 s < 180 s),
+    //      while the envelope must preserve file order [a1, a2, a3] with exact
+    //      values and messages.
+    // catches: setting ADVICE_TAIL_BUDGET to 0 or 1 s, running probes serially
+    //          (would take 12 s -> 162 s), returning completion order instead of
+    //          file order, or replacing real advice with an unavailable stub.
     // proves: CLAIM(neon-mcp-bound), CLAIM(advisory-delivery)
     let (_dir, file) = write_advisories_toml(&[("a1", "p1", 1), ("a2", "p2", 1), ("a3", "p3", 1)]);
     let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(file.clone()));
-    for (cmd, value) in [("cmd:p1", 11), ("cmd:p2", 22), ("cmd:p3", 33)] {
+    for (cmd, value, sleep_s) in [("cmd:p1", 11, 6), ("cmd:p2", 22, 2), ("cmd:p3", 33, 4)] {
         rig.env.reader.set_text(cmd, &format!("exit=0\n{{\"free\": {value}}}"));
-        rig.env.reader.set_sleep(cmd, Duration::from_secs(4));
+        rig.env.reader.set_sleep(cmd, Duration::from_secs(sleep_s));
     }
     let agy = rig.vigil(antigravity(), &quiet_probe());
     let (id, _) = quiet_watch(&rig, &agy, "w", 600, 20_000, |_| {}).await;
@@ -1395,7 +1398,7 @@ async fn antigravity_keepalive_delivers_all_real_advice_entries_when_probes_fit_
     let envelope = call(&agy, &id, None, Some(true)).await;
     let elapsed = started.elapsed();
     assert_eq!(envelope["max_s"], 150);
-    assert_eq!(elapsed, Duration::from_secs(162), "150 s window + 3 x 4 s serial probes");
+    assert_eq!(elapsed, Duration::from_secs(156), "150 s window + max(6, 2, 4) = 6 s concurrent probes");
     let advice = envelope["advice"].as_array().expect("advice array");
     assert_eq!(advice.len(), 3, "{advice:?}");
     let got: Vec<(&str, &str, Option<f64>, &str)> = advice
@@ -1413,42 +1416,106 @@ async fn antigravity_keepalive_delivers_all_real_advice_entries_when_probes_fit_
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_probe_is_slow() {
-    // why: agy kills an MCP call at 3m0s. The window is 150 s, and advisories
-    //      run serially under a shared ADVICE_TAIL_BUDGET (15 s) deadline
-    //      passed into `advise`: each probe gets min(its own timeout, time
-    //      remaining). Finished probes MUST survive as `kind: advice` with
-    //      their values; probes cut off or not reached become individual
-    //      `unavailable` entries naming their ids (never a blanket drop of
-    //      earlier results). Tested on all 4 Antigravity paths plus a Claude
-    //      caller (no regression), and on an all-slow set.
-    // catches: no cap on the advice step; an outer timeout that drops partial
-    //          results into one blanket `unavailable` entry; starting probes
-    //          after the budget is spent; ADVICE_TAIL_BUDGET = 0 or 1 s.
+async fn a_slow_first_probe_never_starves_a_healthy_second_probe_on_claude_or_antigravity() {
+    // why: regression of Fable round 2 finding. With a stalled first advisory
+    //      (e.g. boat-budget taking >= 15 s) and cache_s = 1, serial evaluation
+    //      spent the entire 15 s ADVICE_TAIL_BUDGET on the first probe and
+    //      skipped every healthy advisory after it on every pass, on Claude and
+    //      Codex as well as Antigravity. Starting all uncached probes
+    //      concurrently under the shared 15 s deadline lets the 4 s second
+    //      probe report its real value in the same pass while keeping file
+    //      order [slow_first, healthy_second].
+    // catches: serial probe execution under ADVICE_TAIL_BUDGET, skipping probes
+    //          after a slow first entry, or dropping file order.
     // proves: CLAIM(neon-mcp-bound), CLAIM(advisory-delivery)
-    let (_dir, file) = write_advisories_toml(&[("fast1", "p1", 1), ("slow2", "p2", 1), ("unreached3", "p3", 1)]);
+    let (_dir, file) = write_advisories_toml(&[("slow_first", "slow1", 1), ("healthy_second", "fast2", 1)]);
+    let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(file.clone()));
+    rig.env.reader.set_text("cmd:slow1", "exit=0\n{\"free\": 11}");
+    rig.env.reader.set_sleep("cmd:slow1", Duration::from_secs(19));
+    rig.env.reader.set_text("cmd:fast2", "exit=0\n{\"free\": 37}");
+    rig.env.reader.set_sleep("cmd:fast2", Duration::from_secs(4));
+
+    let assert_same_pass = |advice: &[Value], context: &str| {
+        assert_eq!(advice.len(), 2, "{context}: {advice:?}");
+        assert_eq!((&advice[0]["id"], &advice[0]["kind"]), (&json!("slow_first"), &json!("unavailable")), "{context}: {advice:?}");
+        assert!(advice[0].get("value").is_none(), "{context}: {advice:?}");
+        let msg0 = advice[0]["message"].as_str().unwrap();
+        assert!(msg0.starts_with("advisory slow_first unavailable:"), "{context}: {msg0}");
+        assert!(!msg0.contains("skipped"), "{context}: {msg0}");
+        assert_eq!(
+            (&advice[1]["id"], &advice[1]["kind"], &advice[1]["value"], &advice[1]["message"]),
+            (&json!("healthy_second"), &json!("advice"), &json!(37.0), &json!("Plenty: 37")),
+            "{context}: {advice:?}"
+        );
+    };
+
+    let claude_v = rig.vigil(claude(), &quiet_probe());
+    let (id, _) = quiet_watch(&rig, &claude_v, "w", 600, 20_000, |_| {}).await;
+    for pass in 1..=2 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let started = Instant::now();
+        let envelope = call(&claude_v, &id, Some(30), Some(false)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(45), "claude pass {pass}: 30 s + 15 s");
+        assert_same_pass(envelope["advice"].as_array().expect("advice array"), &format!("claude pass {pass}"));
+        assert_eq!(rig.env.reader.started_count("cmd:fast2"), pass, "claude pass {pass}: healthy probe ran");
+    }
+
+    let agy_v = rig.vigil(antigravity(), &quiet_probe());
+    for pass in 1..=2 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let started = Instant::now();
+        let envelope = call(&agy_v, &id, None, Some(true)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(165), "antigravity pass {pass}: 150 s + 15 s");
+        assert_same_pass(envelope["advice"].as_array().expect("advice array"), &format!("antigravity pass {pass}"));
+        assert_eq!(rig.env.reader.started_count("cmd:fast2"), 2 + pass, "antigravity pass {pass}: healthy probe ran");
+    }
+
+    // Standalone Antigravity advice_report also runs both concurrently in 15 s.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let started = Instant::now();
+    let report = agy_v.advice_report().await.unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(15));
+    assert_same_pass(report["advice"].as_array().expect("advice array"), "antigravity advice_report");
+    assert_eq!(rig.env.reader.started_count("cmd:fast2"), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_probe_is_slow() {
+    // why: agy kills an MCP call at 3m0s. The window is 150 s, and uncached
+    //      advisories start concurrently under a shared ADVICE_TAIL_BUDGET
+    //      (15 s) deadline passed into `advise`: each probe gets min(its own
+    //      timeout, time remaining) and results return in file order. Healthy
+    //      probes ALWAYS report as `kind: advice` with their real values even
+    //      when an earlier probe stalls; only probes cut off by the deadline
+    //      become individual `unavailable` entries naming their ids. Tested on
+    //      all 4 Antigravity paths, a Claude caller, and an all-slow set.
+    // catches: no cap on the advice step; an outer timeout that drops partial
+    //          results; serial execution starving fast3 behind slow2; dropping
+    //          file order; ADVICE_TAIL_BUDGET = 0 or 1 s.
+    // proves: CLAIM(neon-mcp-bound), CLAIM(advisory-delivery)
+    let (_dir, file) = write_advisories_toml(&[("fast1", "p1", 1), ("slow2", "p2", 1), ("fast3", "p3", 1)]);
     let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(file.clone()));
     rig.env.reader.set_text("cmd:p1", "exit=0\n{\"free\": 15}");
     rig.env.reader.set_sleep("cmd:p1", Duration::from_secs(4));
     rig.env.reader.set_text("cmd:p2", "exit=0\n{\"free\": 25}");
     rig.env.reader.set_sleep("cmd:p2", Duration::from_secs(19));
     rig.env.reader.set_text("cmd:p3", "exit=0\n{\"free\": 35}");
-    rig.env.reader.set_sleep("cmd:p3", Duration::from_secs(4));
+    rig.env.reader.set_sleep("cmd:p3", Duration::from_secs(2));
 
     let assert_partial = |advice: &[Value], context: &str| {
         assert_eq!(advice.len(), 3, "{context}: {advice:?}");
         assert_eq!((&advice[0]["id"], &advice[0]["kind"], &advice[0]["value"], &advice[0]["message"]), (&json!("fast1"), &json!("advice"), &json!(15.0), &json!("Low: 15")), "{context}: {advice:?}");
         assert_eq!((&advice[1]["id"], &advice[1]["kind"]), (&json!("slow2"), &json!("unavailable")), "{context}: {advice:?}");
         assert!(advice[1].get("value").is_none(), "{context}: {advice:?}");
-        assert!(advice[1]["message"].as_str().unwrap().starts_with("advisory slow2 unavailable:"), "{context}: {}", advice[1]["message"]);
-        assert_eq!((&advice[2]["id"], &advice[2]["kind"]), (&json!("unreached3"), &json!("unavailable")), "{context}: {advice:?}");
-        assert!(advice[2].get("value").is_none(), "{context}: {advice:?}");
-        assert!(advice[2]["message"].as_str().unwrap().starts_with("advisory unreached3 unavailable:"), "{context}: {}", advice[2]["message"]);
+        let msg1 = advice[1]["message"].as_str().unwrap();
+        assert!(msg1.starts_with("advisory slow2 unavailable:"), "{context}: {msg1}");
+        assert!(!msg1.contains("skipped"), "{context}: {msg1}");
+        assert_eq!((&advice[2]["id"], &advice[2]["kind"], &advice[2]["value"], &advice[2]["message"]), (&json!("fast3"), &json!("advice"), &json!(35.0), &json!("Plenty: 35")), "{context}: {advice:?}");
     };
 
     let agy = rig.vigil(antigravity(), &quiet_probe());
     let (id, _) = quiet_watch(&rig, &agy, "w", 600, 20_000, |_| {}).await;
-    for (explicit_s, orchestrator) in [(None, Some(true)), (None, Some(false)), (Some(9999), Some(true)), (Some(9999), Some(false))] {
+    for (pass, (explicit_s, orchestrator)) in [(None, Some(true)), (None, Some(false)), (Some(9999), Some(true)), (Some(9999), Some(false))].into_iter().enumerate() {
         let started = Instant::now();
         let envelope = call(&agy, &id, explicit_s, orchestrator).await;
         let elapsed = started.elapsed();
@@ -1456,18 +1523,18 @@ async fn an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_pro
         assert_eq!(envelope["max_s"], 150, "{path}");
         assert_eq!(elapsed, Duration::from_secs(165), "{path}: 150 s window + 15 s advice budget");
         assert_partial(envelope["advice"].as_array().expect("advice array"), &path);
-        assert_eq!(rig.env.reader.started_count("cmd:p3"), 0, "{path}: unreached probe must not start");
+        assert_eq!(rig.env.reader.started_count("cmd:p3"), pass + 1, "{path}: healthy probe after slow2 must run");
     }
 
-    // Claude caller keeps partial results too (never a blanket unavailable).
+    // Claude caller keeps partial results and runs healthy probes concurrently too.
     let claude_v = rig.vigil(claude(), &quiet_probe());
     let claude_started = Instant::now();
     let claude_env = call(&claude_v, &id, Some(30), Some(false)).await;
     assert_eq!(claude_started.elapsed(), Duration::from_secs(45), "30 s window + 15 s advice budget");
     assert_partial(claude_env["advice"].as_array().expect("advice array"), "claude partial survival");
-    assert_eq!(rig.env.reader.started_count("cmd:p3"), 0, "claude: unreached probe must not start");
+    assert_eq!(rig.env.reader.started_count("cmd:p3"), 5, "claude: healthy probe after slow2 must run");
 
-    // All three probes slow: every advisory is named individually as unavailable and < 180 s.
+    // All three probes slow: all three start concurrently, every advisory is named individually as unavailable in file order, and < 180 s.
     let (_slow_dir, slow_file) = write_advisories_toml(&[("slow1", "s1", 1), ("slow2", "s2", 1), ("slow3", "s3", 1)]);
     let slow_rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(slow_file.clone()));
     for n in 1..=3 {
@@ -1483,9 +1550,15 @@ async fn an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_pro
     assert_eq!(slow_advice.len(), 3, "{slow_advice:?}");
     for (idx, name) in ["slow1", "slow2", "slow3"].iter().enumerate() {
         assert_eq!((&slow_advice[idx]["id"], &slow_advice[idx]["kind"]), (&json!(name), &json!("unavailable")), "{slow_advice:?}");
-        assert!(slow_advice[idx]["message"].as_str().unwrap().starts_with(&format!("advisory {name} unavailable:")), "{slow_advice:?}");
+        let msg = slow_advice[idx]["message"].as_str().unwrap();
+        assert!(msg.starts_with(&format!("advisory {name} unavailable:")), "{slow_advice:?}");
+        assert!(!msg.contains("skipped"), "{slow_advice:?}");
     }
-    assert_eq!((slow_rig.env.reader.started_count("cmd:s2"), slow_rig.env.reader.started_count("cmd:s3")), (0, 0));
+    assert_eq!(
+        (slow_rig.env.reader.started_count("cmd:s1"), slow_rig.env.reader.started_count("cmd:s2"), slow_rig.env.reader.started_count("cmd:s3")),
+        (1, 1, 1),
+        "all slow probes start concurrently under the shared deadline"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1493,26 +1566,31 @@ async fn antigravity_advice_report_respects_the_tail_budget_and_preserves_partia
     // why: the MCP `advice` tool (Vigil::advice_report) also runs inside agy's
     //      180 s tool-call timeout. For any Antigravity caller (alone or mixed
     //      with Claude/Codex), advice_report passes the same ADVICE_TAIL_BUDGET
-    //      deadline into `advise`, keeping finished entries and naming unreached
-    //      ones as unavailable. Control: Claude and Codex callers have no 15 s
-    //      cap on standalone advice_report so slow probes (> 15 s total) succeed.
-    // catches: leaving advice_report unbounded for Antigravity, dropping partial
-    //          results in advice_report, or regressing Claude/Codex advice_report.
+    //      deadline into concurrent `advise`, so healthy probes always report
+    //      in file order while only cut-off probes become unavailable. Control:
+    //      Claude and Codex standalone advice_report has no 15 s cap, so an
+    //      18 s probe (< 20 s PROBE_DEADLINE) succeeds alongside a 10 s probe.
+    // catches: leaving advice_report unbounded for Antigravity, serial
+    //          execution starving fast3, dropping file order, or capping
+    //          Claude/Codex standalone advice_report at 15 s.
     // proves: CLAIM(neon-mcp-bound), CLAIM(advisory-delivery)
-    let (_dir, file) = write_advisories_toml(&[("fast1", "p1", 1), ("slow2", "p2", 1), ("unreached3", "p3", 1)]);
+    let (_dir, file) = write_advisories_toml(&[("fast1", "p1", 1), ("slow2", "p2", 1), ("fast3", "p3", 1)]);
     let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(file.clone()));
     rig.env.reader.set_text("cmd:p1", "exit=0\n{\"free\": 15}");
     rig.env.reader.set_sleep("cmd:p1", Duration::from_secs(4));
     rig.env.reader.set_text("cmd:p2", "exit=0\n{\"free\": 25}");
     rig.env.reader.set_sleep("cmd:p2", Duration::from_secs(19));
     rig.env.reader.set_text("cmd:p3", "exit=0\n{\"free\": 35}");
-    rig.env.reader.set_sleep("cmd:p3", Duration::from_secs(4));
+    rig.env.reader.set_sleep("cmd:p3", Duration::from_secs(2));
 
-    for (label, agent) in [
+    for (pass, (label, agent)) in [
         ("antigravity", antigravity()),
         ("mixed claude+antigravity", AgentEnv { claude_session_id: Some("sess-1".into()), codex: false, antigravity: true }),
-    ] {
-        // Expire any cached fast1 entry between cases.
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Expire any cached fast1/fast3 entries between cases.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let vigil = rig.vigil(agent, &quiet_probe());
         let started = Instant::now();
@@ -1522,11 +1600,11 @@ async fn antigravity_advice_report_respects_the_tail_budget_and_preserves_partia
         assert_eq!(advice.len(), 3, "{label}: {advice:?}");
         assert_eq!((&advice[0]["id"], &advice[0]["kind"], &advice[0]["value"]), (&json!("fast1"), &json!("advice"), &json!(15.0)), "{label}");
         assert_eq!((&advice[1]["id"], &advice[1]["kind"]), (&json!("slow2"), &json!("unavailable")), "{label}");
-        assert_eq!((&advice[2]["id"], &advice[2]["kind"]), (&json!("unreached3"), &json!("unavailable")), "{label}");
-        assert_eq!(rig.env.reader.started_count("cmd:p3"), 0, "{label}: unreached3 must not start");
+        assert_eq!((&advice[2]["id"], &advice[2]["kind"], &advice[2]["value"]), (&json!("fast3"), &json!("advice"), &json!(35.0)), "{label}");
+        assert_eq!(rig.env.reader.started_count("cmd:p3"), pass + 1, "{label}: healthy fast3 must run");
     }
 
-    // 10 slow advisories (190 s unbounded > 180 s): still returns in 15 s under Antigravity.
+    // 10 slow advisories (19 s each): all start concurrently and return individually unavailable in file order in 15 s under Antigravity.
     let many_entries: Vec<(String, String, u64)> = (1..=10).map(|n| (format!("s{n}"), format!("m{n}"), 1)).collect();
     let many_refs: Vec<(&str, &str, u64)> = many_entries.iter().map(|(id, cmd, c)| (id.as_str(), cmd.as_str(), *c)).collect();
     let (_many_dir, many_file) = write_advisories_toml(&many_refs);
@@ -1542,60 +1620,66 @@ async fn antigravity_advice_report_respects_the_tail_budget_and_preserves_partia
     assert_eq!(many_advice.len(), 10);
     for n in 1..=10 {
         assert_eq!((&many_advice[n - 1]["id"], &many_advice[n - 1]["kind"]), (&json!(format!("s{n}")), &json!("unavailable")));
+        assert_eq!(many_rig.env.reader.started_count(&format!("cmd:m{n}")), 1);
     }
 
-    // Positive control: Claude and Codex standalone advice_report has no 15 s cap.
+    // Positive control: Claude and Codex standalone advice_report has no 15 s cap,
+    // so an 18 s probe (< PROBE_DEADLINE 20 s) succeeds concurrently with a 10 s probe in file order.
     let (_ctl_dir, ctl_file) = write_advisories_toml(&[("first", "c1", 1), ("second", "c2", 1)]);
     let ctl_rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(ctl_file.clone()));
     ctl_rig.env.reader.set_text("cmd:c1", "exit=0\n{\"free\": 10}");
-    ctl_rig.env.reader.set_sleep("cmd:c1", Duration::from_secs(10));
+    ctl_rig.env.reader.set_sleep("cmd:c1", Duration::from_secs(18));
     ctl_rig.env.reader.set_text("cmd:c2", "exit=0\n{\"free\": 30}");
     ctl_rig.env.reader.set_sleep("cmd:c2", Duration::from_secs(10));
     for (label, agent) in [("claude", claude()), ("codex", codex())] {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let started = Instant::now();
         let report = ctl_rig.vigil(agent, &quiet_probe()).advice_report().await.unwrap();
-        assert_eq!(started.elapsed(), Duration::from_secs(20), "{label}: both 10 s probes finish");
+        assert_eq!(started.elapsed(), Duration::from_secs(18), "{label}: max(18 s, 10 s) concurrent probes finish unbounded");
         let advice = report["advice"].as_array().expect("advice array");
         assert_eq!(advice.len(), 2, "{label}");
-        assert_eq!((&advice[0]["kind"], &advice[0]["value"]), (&json!("advice"), &json!(10.0)), "{label}");
-        assert_eq!((&advice[1]["kind"], &advice[1]["value"]), (&json!("advice"), &json!(30.0)), "{label}");
+        assert_eq!((&advice[0]["id"], &advice[0]["kind"], &advice[0]["value"]), (&json!("first"), &json!("advice"), &json!(10.0)), "{label}");
+        assert_eq!((&advice[1]["id"], &advice[1]["kind"], &advice[1]["value"]), (&json!("second"), &json!("advice"), &json!(30.0)), "{label}");
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_probe_cut_off_by_the_advice_budget_does_not_poison_the_failure_cache() {
-    // why: if probe 1 spends 12 s and probe 2 only gets 3 s remaining out of
-    //      the 15 s budget, probe 2 is not broken. Writing a 30 s failure
-    //      cache record for probe 2 would keep it unavailable on the next call
-    //      even though probe 1 is now warm in cache and probe 2 has the full
-    //      15 s. Also verify a warm cache hit AFTER a slow probe still returns
-    //      its cached value.
-    // catches: caching shared-deadline cut-offs in ProbeCache, or skipping
-    //          cache reads once remaining time hits zero.
+    // why: a probe cut off by the 15 s ADVICE_TAIL_BUDGET (below its own 20 s
+    //      PROBE_DEADLINE) must NOT write a 30 s failure cache record. On call 1,
+    //      `first` (19 s) is cut off at 15 s while `second` (4 s) finishes and
+    //      caches; once `first` recovers (4 s), an immediate call 2 (inside
+    //      FAILURE_CACHE_S = 30 s) must retry `first` and succeed while `second`
+    //      serves from warm cache. Also verify a warm cache hit alongside a slow
+    //      probe still returns its cached value without re-probing.
+    // catches: caching shared-deadline cut-offs in ProbeCache, or breaking warm
+    //          cache reads alongside a slow probe.
     // proves: CLAIM(neon-mcp-bound), CLAIM(advisory-cache)
     let (_dir, file) = write_advisories_toml(&[("first", "p1", 100), ("second", "p2", 100)]);
     let rig = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(file.clone()));
     rig.env.reader.set_text("cmd:p1", "exit=0\n{\"free\": 15}");
-    rig.env.reader.set_sleep("cmd:p1", Duration::from_secs(12));
+    rig.env.reader.set_sleep("cmd:p1", Duration::from_secs(19));
     rig.env.reader.set_text("cmd:p2", "exit=0\n{\"free\": 25}");
-    rig.env.reader.set_sleep("cmd:p2", Duration::from_secs(10));
+    rig.env.reader.set_sleep("cmd:p2", Duration::from_secs(4));
 
     let agy = rig.vigil(antigravity(), &quiet_probe());
     let first_call = agy.advice_report().await.unwrap();
     let a1 = first_call["advice"].as_array().unwrap();
-    assert_eq!((&a1[0]["id"], &a1[0]["kind"], &a1[0]["value"]), (&json!("first"), &json!("advice"), &json!(15.0)));
-    assert_eq!((&a1[1]["id"], &a1[1]["kind"]), (&json!("second"), &json!("unavailable")));
+    assert_eq!((&a1[0]["id"], &a1[0]["kind"]), (&json!("first"), &json!("unavailable")));
+    assert_eq!((&a1[1]["id"], &a1[1]["kind"], &a1[1]["value"]), (&json!("second"), &json!("advice"), &json!(25.0)));
 
-    // Immediately call again (inside FAILURE_CACHE_S = 30 s): first is cached, second runs and succeeds.
+    // Immediately call again (inside FAILURE_CACHE_S = 30 s) after `first` recovers:
+    // `first` is retried (not poisoned) and succeeds in 4 s; `second` stays cached.
+    rig.env.reader.set_sleep("cmd:p1", Duration::from_secs(4));
     let started = Instant::now();
     let second_call = agy.advice_report().await.unwrap();
-    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
     let a2 = second_call["advice"].as_array().unwrap();
     assert_eq!((&a2[0]["id"], &a2[0]["kind"], &a2[0]["value"]), (&json!("first"), &json!("advice"), &json!(15.0)));
     assert_eq!((&a2[1]["id"], &a2[1]["kind"], &a2[1]["value"]), (&json!("second"), &json!("advice"), &json!(25.0)));
+    assert_eq!(rig.env.reader.started_count("cmd:p2"), 1, "second stayed warm in cache");
 
-    // Warm cache hit AFTER a slow probe that consumes the whole 15 s budget still survives.
+    // Warm cache hit alongside a slow probe that hits the 15 s budget still survives without re-probing.
     let (_dir2, file2) = write_advisories_toml(&[("slow", "s1", 1), ("warm", "s2", 100)]);
     let rig2 = Rig::build(Arc::new(TokioClock::new(spec_instant())), |config| config.advisories_file = Some(file2.clone()));
     rig2.env.reader.set_text("cmd:s1", "exit=0\n{\"free\": 10}");
@@ -1614,6 +1698,7 @@ async fn a_probe_cut_off_by_the_advice_budget_does_not_poison_the_failure_cache(
     let a = report["advice"].as_array().unwrap();
     assert_eq!((&a[0]["id"], &a[0]["kind"]), (&json!("slow"), &json!("unavailable")));
     assert_eq!((&a[1]["id"], &a[1]["kind"], &a[1]["value"]), (&json!("warm"), &json!("advice"), &json!(42.0)));
+    assert_eq!(rig2.env.reader.started_count("cmd:s2"), 1, "warm entry must not re-probe");
 }
 
 // ------------------------------------------------ S5: tri-state ----

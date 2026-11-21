@@ -439,37 +439,46 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn advise_with_a_deadline_keeps_finished_entries_and_names_cut_off_and_skipped_ones() {
-        // why: serial evaluation under a shared deadline gives each probe
-        //      min(PROBE_DEADLINE, remaining). Finished entries survive,
-        //      a probe cut off by the deadline is reported unavailable naming
-        //      itself (without poisoning the failure cache), and later uncached
-        //      probes are skipped without starting once remaining hits zero.
-        // catches: outer timeout dropping partial results; running probes after
-        //          remaining == 0; losing broken-entry diagnostics.
+    async fn advise_with_a_deadline_runs_probes_concurrently_in_file_order_and_names_cut_off_ones() {
+        // why: concurrent evaluation under a shared deadline starts every
+        //      uncached probe at once (each gets min(PROBE_DEADLINE, remaining))
+        //      and returns entries in file order even when later probes finish
+        //      earlier or a broken entry sits between them. Only probes cut off
+        //      by the deadline become individual unavailable entries naming
+        //      themselves (never "skipped").
+        // catches: serial execution starving second/third behind first; dropping
+        //          file order (returning completion order [third, second, first]);
+        //          losing broken-entry diagnostics or emitting a skipped message.
         // proves: CLAIM(neon-mcp-bound), CLAIM(advisory-unavailable)
         let rig = Rig::new();
         rig.reader.set_text("cmd:p1", "exit=0\n{\"free\": 12}");
-        rig.reader.set_sleep("cmd:p1", std::time::Duration::from_secs(4));
+        rig.reader.set_sleep("cmd:p1", std::time::Duration::from_secs(19));
         rig.reader.set_text("cmd:p2", "exit=0\n{\"free\": 25}");
-        rig.reader.set_sleep("cmd:p2", std::time::Duration::from_secs(19));
+        rig.reader.set_sleep("cmd:p2", std::time::Duration::from_secs(6));
         rig.reader.set_text("cmd:p3", "exit=0\n{\"free\": 35}");
-        rig.reader.set_sleep("cmd:p3", std::time::Duration::from_secs(4));
-        let set = set_of(&[
+        rig.reader.set_sleep("cmd:p3", std::time::Duration::from_secs(2));
+        let mut set = set_of(&[
             ("first", spec(json!({"probe": {"kind": "cmd", "argv": ["p1"]}}))),
             ("second", spec(json!({"probe": {"kind": "cmd", "argv": ["p2"]}}))),
             ("third", spec(json!({"probe": {"kind": "cmd", "argv": ["p3"]}}))),
         ]);
+        set.entries.insert(1, Entry::Broken { id: "typo".into(), reason: "bad rule".into() });
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(10);
         let advice = advise(&set, &rig.reader, &rig.clock, &rig.dir.path().join("advisory-cache"), Some(deadline)).await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
-        assert_eq!(advice.len(), 3);
-        assert_eq!((advice[0].id.as_str(), advice[0].kind, advice[0].value), ("first", AdviceKind::Advice, Some(12.0)));
-        assert_eq!((advice[1].id.as_str(), advice[1].kind, advice[1].value), ("second", AdviceKind::Unavailable, None));
-        assert!(advice[1].message.starts_with("advisory second unavailable:"), "{}", advice[1].message);
-        assert_eq!((advice[2].id.as_str(), advice[2].kind, advice[2].value), ("third", AdviceKind::Unavailable, None));
-        assert!(advice[2].message.starts_with("advisory third unavailable:"), "{}", advice[2].message);
-        assert_eq!(rig.reader.started_count("cmd:p3"), 0, "skipped probe must not start");
+        assert_eq!(advice.len(), 4);
+        assert_eq!((advice[0].id.as_str(), advice[0].kind, advice[0].value), ("first", AdviceKind::Unavailable, None));
+        assert!(advice[0].message.starts_with("advisory first unavailable:"), "{}", advice[0].message);
+        assert!(!advice[0].message.contains("skipped"), "{}", advice[0].message);
+        assert_eq!((advice[1].id.as_str(), advice[1].kind, advice[1].value), ("typo", AdviceKind::Unavailable, None));
+        assert_eq!(advice[1].message, "advisory typo unavailable: bad rule");
+        assert_eq!((advice[2].id.as_str(), advice[2].kind, advice[2].value), ("second", AdviceKind::Advice, Some(25.0)));
+        assert_eq!((advice[3].id.as_str(), advice[3].kind, advice[3].value), ("third", AdviceKind::Advice, Some(35.0)));
+        assert_eq!(
+            (rig.reader.started_count("cmd:p1"), rig.reader.started_count("cmd:p2"), rig.reader.started_count("cmd:p3")),
+            (1, 1, 1),
+            "every uncached probe starts concurrently"
+        );
     }
 }
