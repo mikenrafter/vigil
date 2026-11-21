@@ -20,6 +20,7 @@
 //!   - An item's `expect_s` clock starts when the item is added; overdue is
 //!     min(1.5 x expect_s, expect_s + 540) from there (D2).
 //!   - `--for none` needs a label (it could never be ended otherwise).
+//!
 //! Claim ids are `W42-H1`..`W42-H5` and `W42-D1`..`W42-D8` for the round-1
 //! decisions.
 

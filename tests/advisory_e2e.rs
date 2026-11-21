@@ -259,22 +259,20 @@ fn keepalive_envelopes_carry_the_advice() {
     // proves: CLAIM(advisory-delivery)
     let rig = Rig::new(479.01);
     let input = rig.sandbox.input("w.log");
-    for (id, subcommand) in [("k", "keepalive")] {
-        std::fs::write(&input, "boot\n").unwrap();
-        assert!(rig.run(&["create", &change_watch_json(id, &input, 1)]).status.success());
-        {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&input).unwrap();
-            writeln!(file, "go").unwrap();
-        }
-        let output = rig.run(&[subcommand, id]);
-        assert!(output.status.success(), "{subcommand}: {}", stderr_of(&output));
-        let envelope = stdout_json(&output);
-        assert_eq!(envelope["status"], "fired");
-        let entry = &envelope["advice"][0];
-        assert_eq!(entry["id"], "boat-budget", "{subcommand}: {envelope}");
-        assert!(entry["message"].as_str().unwrap().contains("prefer Boat"));
+    std::fs::write(&input, "boot\n").unwrap();
+    assert!(rig.run(&["create", &change_watch_json("k", &input, 1)]).status.success());
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&input).unwrap();
+        writeln!(file, "go").unwrap();
     }
+    let output = rig.run(&["keepalive", "k"]);
+    assert!(output.status.success(), "keepalive: {}", stderr_of(&output));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["status"], "fired");
+    let entry = &envelope["advice"][0];
+    assert_eq!(entry["id"], "boat-budget", "keepalive: {envelope}");
+    assert!(entry["message"].as_str().unwrap().contains("prefer Boat"));
     let status = stdout_json(&rig.run(&["status", "k"]));
     assert!(status.get("advice").is_none(), "status does not carry advice");
 }

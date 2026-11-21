@@ -408,7 +408,7 @@ mod tests {
         assert_eq!((retried.events.len(), retried.released, items[0].ended_at, items[0].last_end_event.clone()), (0, false, None, None));
         let ended_again = tick_items(&mut items, &id, 7, &[reading("completed", true)], now);
         assert_eq!(ended_again.events.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec!["h:7:0"]);
-        assert!(tick_items(&mut [], &id, 1, &[], now).released == false, "a bare hold never releases");
+        assert!(!tick_items(&mut [], &id, 1, &[], now).released, "a bare hold never releases");
     }
 
     #[test]

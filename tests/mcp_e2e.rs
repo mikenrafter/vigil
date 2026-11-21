@@ -267,14 +267,16 @@ async fn a_killed_server_is_replaced_by_one_that_continues_the_same_watch() {
 
 /// Records every progress notification and forwards it on an async channel,
 /// so a test can AWAIT the next one (with a timeout) instead of polling.
+type ProgressEvent = (f64, Option<String>);
+
 #[derive(Clone)]
 struct ProgressRecorder {
-    seen: Arc<Mutex<Vec<(f64, Option<String>)>>>,
-    tx: tokio::sync::mpsc::UnboundedSender<(f64, Option<String>)>,
+    seen: Arc<Mutex<Vec<ProgressEvent>>>,
+    tx: tokio::sync::mpsc::UnboundedSender<ProgressEvent>,
 }
 
 impl ProgressRecorder {
-    fn new() -> (ProgressRecorder, tokio::sync::mpsc::UnboundedReceiver<(f64, Option<String>)>) {
+    fn new() -> (ProgressRecorder, tokio::sync::mpsc::UnboundedReceiver<ProgressEvent>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (ProgressRecorder { seen: Arc::new(Mutex::new(Vec::new())), tx }, rx)
     }

@@ -1651,7 +1651,7 @@ fn an_idle_hold_reads_only_active_jobs_so_a_long_history_cannot_blind_it() {
     command.args(["keepalive", "busy"]).env("PATH", qex.path());
     let mut child = piped(command);
     let active_query = format!("list --under {} --state active --json", cwd.display());
-    assert!(wait_until(Duration::from_secs(10), || qex.calls().iter().any(|call| *call == active_query)), "the hold ticked: {:?}", qex.calls());
+    assert!(wait_until(Duration::from_secs(10), || qex.calls().contains(&active_query)), "the hold ticked: {:?}", qex.calls());
     child.kill().unwrap();
     child.wait().unwrap();
     let status = stdout_json(&run_with_qex(&sandbox, &qex, &["status", "busy"]));
