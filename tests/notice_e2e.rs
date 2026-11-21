@@ -431,7 +431,7 @@ async fn codex_t3_bridge_both_orders_links_codex_payload_and_t3_names() {
         command
     };
 
-    // Order 1: payload-only hook delivers n1 -> bridge sees {T3, CODEX_SESSION_ID,
+    // Order 1: payload-only hook delivers n1 -> bridge sees {T3,
     // CODEX_THREAD_ID, payload} (prints nothing, links all) -> T3-only MCP and
     // Codex-only shell calls see n1 as already delivered.
     add(&sandbox, "n1", "first notice");
@@ -468,14 +468,14 @@ async fn codex_t3_bridge_both_orders_links_codex_payload_and_t3_names() {
 
     let out = base_cmd().env("CODEX_SESSION_ID", "cs-1").arg("notices").output().unwrap();
     assert!(out.status.success());
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CODEX_SESSION_ID only must see bridged n1");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "n1: first notice\n", "excluded session id stays independent");
 
     let out = base_cmd().env("CODEX_THREAD_ID", "ct-1").arg("notices").output().unwrap();
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CODEX_THREAD_ID only must see bridged n1");
 
-    // Order 2: T3-only MCP delivers n2 -> bridge sees all 4 names (prints nothing,
-    // links all) -> payload-only, CODEX_SESSION_ID-only, CODEX_THREAD_ID-only all
+    // Order 2: T3-only MCP delivers n2 -> bridge sees three names (prints nothing,
+    // links all) -> payload-only and CODEX_THREAD_ID-only calls
     // see n2 as delivered.
     add(&sandbox, "n2", "second notice");
     let reply = body(&call(&client, "notices", json!({})).await);
@@ -506,7 +506,7 @@ async fn codex_t3_bridge_both_orders_links_codex_payload_and_t3_names() {
 
     let out = base_cmd().env("CODEX_SESSION_ID", "cs-1").arg("notices").output().unwrap();
     assert!(out.status.success());
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "", "CODEX_SESSION_ID only must see bridged n2");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "n2: second notice\n", "excluded session id stays independent");
 
     let out = base_cmd().env("CODEX_THREAD_ID", "ct-1").arg("notices").output().unwrap();
     assert!(out.status.success());
@@ -605,11 +605,11 @@ fn codex_outside_t3_two_threads_on_one_app_server_each_get_notices_once() {
     let harness = sandbox.cwd().join("codex");
     std::fs::copy("/bin/sh", &harness).unwrap();
     let script = r#"
-printf 'A1=%s\n' "$(printf '%s' '{"session_id":"hook-a"}' | CODEX_SESSION_ID=codex-a "$VIGIL" --root "$ROOT" notices --from-hook)"
-printf 'A2=%s\n' "$(CODEX_SESSION_ID=codex-a "$VIGIL" --root "$ROOT" notices)"
+printf 'A1=%s\n' "$(printf '%s' '{"session_id":"hook-a"}' | CODEX_SESSION_ID=shared-server CODEX_THREAD_ID=codex-a "$VIGIL" --root "$ROOT" notices --from-hook)"
+printf 'A2=%s\n' "$(CODEX_SESSION_ID=shared-server CODEX_THREAD_ID=codex-a "$VIGIL" --root "$ROOT" notices)"
 printf 'A3=%s\n' "$(printf '%s' '{"session_id":"hook-a"}' | "$VIGIL" --root "$ROOT" notices --from-hook)"
-printf 'B1=%s\n' "$(printf '%s' '{"session_id":"hook-b"}' | CODEX_SESSION_ID=codex-b "$VIGIL" --root "$ROOT" notices --from-hook)"
-printf 'B2=%s\n' "$(CODEX_SESSION_ID=codex-b "$VIGIL" --root "$ROOT" notices)"
+printf 'B1=%s\n' "$(printf '%s' '{"session_id":"hook-b"}' | CODEX_SESSION_ID=shared-server CODEX_THREAD_ID=codex-b "$VIGIL" --root "$ROOT" notices --from-hook)"
+printf 'B2=%s\n' "$(CODEX_SESSION_ID=shared-server CODEX_THREAD_ID=codex-b "$VIGIL" --root "$ROOT" notices)"
 printf 'B3=%s\n' "$(printf '%s' '{"session_id":"hook-b"}' | "$VIGIL" --root "$ROOT" notices --from-hook)"
 printf 'ANC1=%s\n' "$("$VIGIL" --root "$ROOT" notices)"
 printf 'ANC2=%s\n' "$("$VIGIL" --root "$ROOT" notices)"

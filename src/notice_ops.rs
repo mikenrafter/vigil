@@ -10,7 +10,7 @@ use crate::engine::Vigil;
 use crate::notice::{Notice, NoticeClaim, NoticeRequest, NoticeSession, NoticeStore, Result};
 
 /// Notice-only session environment variables, in primary-label precedence order.
-/// Every present non-blank variable is recorded in the session's name set.
+/// CODEX_SESSION_ID is excluded when CODEX_THREAD_ID is present.
 pub const NOTICE_SESSION_ENV_VARS: &[&str] = &[
     "T3CODE_THREAD_ID",
     "CLAUDE_CODE_SESSION_ID",
@@ -73,9 +73,14 @@ pub(crate) fn session_keys_with_ancestor<S: AsRef<str>>(
     payload_ids: &[S],
     ancestor: impl FnOnce() -> Option<String>,
 ) -> Vec<String> {
+    let codex_thread = lookup("CODEX_THREAD_ID").filter(|id| !id.trim().is_empty());
     let mut names = Vec::new();
     for env_name in NOTICE_SESSION_ENV_VARS {
-        if let Some(raw) = lookup(env_name) {
+        if *env_name == "CODEX_SESSION_ID" && codex_thread.is_some() {
+            continue;
+        }
+        let raw = if *env_name == "CODEX_THREAD_ID" { codex_thread.clone() } else { lookup(env_name) };
+        if let Some(raw) = raw {
             let trimmed = raw.trim();
             if !trimmed.is_empty() && !names.iter().any(|seen| seen == trimmed) {
                 names.push(trimmed.to_string());

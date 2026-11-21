@@ -117,6 +117,13 @@ recorded under every name the call sees, so a bridging call links names without
 printing again. Updates serialize on `notice-delivery/.lock`; each record is
 written in turn. Release removes only generations claimed by that call.
 
+
+When `CODEX_THREAD_ID` is non-blank, notice identity excludes
+`CODEX_SESSION_ID`. Outside T3, we conservatively assume the session id may
+be shared by an app-server hosting several threads; its live scope remains
+unverified. Distinct thread ids keep those threads independent. Without a
+thread id, the session id remains a fallback name.
+
 **Known limit:** disjoint name sets cannot be joined until some call sees both
 names. Outside T3, a Codex MCP child with no session environment variable or
 payload still falls back to its shared ancestor record and remains disjoint

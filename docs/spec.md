@@ -1492,3 +1492,9 @@ is tabulated in `docs/integrations.md`.
 
 CLAIMs (proofs in `src/notice_tests.rs` and `tests/notice_e2e.rs`):
 `notice-once`, `notice-records`, `notice-expiry`, `notice-generation`.
+
+When `CODEX_THREAD_ID` is non-blank, notice identity excludes
+`CODEX_SESSION_ID`. Outside T3, we conservatively assume the session id may
+be shared by an app-server hosting several threads; its live scope remains
+unverified. Distinct thread ids keep those threads independent. Without a
+thread id, the session id remains a fallback name.

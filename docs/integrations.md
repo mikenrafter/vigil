@@ -276,3 +276,9 @@ cannot be joined until some call sees both. A hook with no identity exits
 non-zero without printing notices. A harness that has no hook but runs the MCP
 server (T3) is covered by the keepalive envelope and the `notices` tool: the
 server resolves its own identity.
+
+When `CODEX_THREAD_ID` is non-blank, notice identity excludes
+`CODEX_SESSION_ID`. Outside T3, we conservatively assume the session id may
+be shared by an app-server hosting several threads; its live scope remains
+unverified. Distinct thread ids keep those threads independent. Without a
+thread id, the session id remains a fallback name.
