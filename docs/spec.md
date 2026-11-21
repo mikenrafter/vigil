@@ -726,19 +726,24 @@ needs a clock in the envelope and an early wake when a job looks stuck.
    gives 1 h and 3000 s (600 s margin; was 3300 s with a 300 s margin until 2026-11-13), else a 5m write gives 5m and 270 s; nothing usable
    gives `unknown` and 270 s. Codex (`AGENT=codex` or any `CODEX_*` variable)
    is `5m` / `codex-default` / 270 s. Antigravity (non-empty
-   `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENT=1`, or an ancestor
-   process named `agy`, with no Claude or Codex signal) is `5m` /
-   `antigravity-measured` / 150 s. The `5m` wire category represents a
-   measured 4-5 minute cache; 150 s keeps it warm and leaves 30 s below agy's
-   180 s MCP timeout for the call's tail (advisories, capped at 15 s in
-   total). agy gives the `vigil mcp` it spawns no `ANTIGRAVITY_*` variable,
-   so the process tree is the signal there: the binary reads only names and
-   parent pids from `/proc` (never another process's environment) and any
-   ancestor named `agy` counts. Any mix of two or more of Claude, Codex and
-   Antigravity signals is ambiguous: 270 s, `unknown` / `default`, including
-   all three signals together, except that an Antigravity signal among them
-   makes it 150 s (stricter limit, S4). Details and the measurement:
-   `docs/specs/auto-interval.md` AI1'.
+   `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENT=1`, or nearest known
+   agent ancestor named `agy` / `.agy-wrapped`, with no Claude or Codex
+   signal) is `5m` / `antigravity-measured` / 150 s. The `5m` wire category
+   represents a measured 4-5 minute cache; 150 s keeps it warm and leaves 30 s
+   below agy's 180 s MCP timeout for the call's tail (advisories, sharing a
+   15 s deadline `ADVICE_TAIL_BUDGET` across serial evaluation, preserving
+   finished entries and cache hits). agy gives the `vigil mcp` it spawns no
+   `ANTIGRAVITY_*` variable, so the process tree is the signal there: the
+   binary walks up from the parent pid reading only names and parent pids from
+   `/proc` (never another process's environment), skipping unknown names, and
+   decides at the first known agent (`claude`, `.claude-wrapped`, `codex`,
+   `.codex-wrapped`, `agy`, `.agy-wrapped` — shared with `ancestor_session`);
+   the signal is true only if that nearest known agent is `agy` or
+   `.agy-wrapped` (env markers are still ORed in unchanged). Any mix of two or
+   more of Claude, Codex and Antigravity signals is ambiguous: 270 s, `unknown`
+   / `default`, including all three signals together, except that an
+   Antigravity signal among them makes it 150 s (stricter limit, S4). Details
+   and the measurement: `docs/specs/auto-interval.md` AI1'.
 4. The window is decided again at every call.
 
 Bounds (S8): only the last 512 KiB of a transcript is read (a seek, at most
@@ -1210,23 +1215,29 @@ a file that is not TOML is an error naming it and is never rewritten.
 Per advisory: use the cached probe result if it is younger than `cache_s` (a
 failed probe: at most 30 s), it was taken for the same probe and extraction
 (a hash), and its time is not in the future; else run the probe through the
-engine's input reader (deadline 20 s), take the number, and cache the outcome in
-`<state root>/advisory-cache/<id>.json` (atomic, best effort), so separate
-`vigil` processes share it. The condition and message are applied to the cached
-number on every call, so `advisory set ... threshold=15` shows on the very next
-return with no new probe. Every failure (probe exit code, timeout, HTTP status,
-missing field, not JSON, regex no match, bad file) becomes the entry
-`advisory <id> unavailable: <reason>`; a value older than its cache time is never
-shown, and nothing is silent. Probes run one after another, so many slow
-advisories add up (at most 32 x 20 s; keep probes cheap).
+engine's input reader (deadline 20 s), take the number, and cache the outcome in `<state root>/advisory-cache/<id>.json`
+(atomic, best effort), so separate `vigil` processes share it. The condition
+and message are applied to the cached number on every call, so `advisory set
+... threshold=15` shows on the very next return with no new probe. Every
+failure (probe exit code, timeout, HTTP status, missing field, not JSON, regex
+no match, bad file) becomes the entry `advisory <id> unavailable: <reason>`; a
+value older than its cache time is never shown, and nothing is silent. Probes
+run serially in file order. When a shared deadline is passed (`keepalive` on
+every host: `ADVICE_TAIL_BUDGET` = 15 s; `advice` / MCP `advice` under any
+Antigravity signal: same 15 s deadline so MCP `advice` stays under agy's 180 s
+timeout), each uncached probe runs for `min(20 s, time remaining)`, finished
+entries and cache hits survive, and any uncached advisory cut off or not
+reached becomes its own `unavailable` entry naming it (not cached as a probe
+failure). Standalone `vigil advice` / MCP `advice` for non-Antigravity callers
+keeps the unbounded serial pass (at most 32 x 20 s; keep probes cheap).
 
 **Delivery (CLAIM(advisory-delivery)).** `advice` is on the final envelope of
-every `keepalive` (CLI and MCP), evaluated when the call returns
-(a probe adds at most its own time, only on a cache miss). `vigil advice` prints
-one `id: message` line per advisory (`--json`: `{"advice": [...]}`) for hooks
-and scripts; it exits 0 even when a probe failed (the failure is a line), and 1
-only when advisories are off. The MCP server `instructions` say results carry
-`advice`.
+every `keepalive` (CLI and MCP), evaluated serially when the call returns
+under the 15 s `ADVICE_TAIL_BUDGET` shared deadline (partial results survive).
+`vigil advice` prints one `id: message` line per advisory (`--json`:
+`{"advice": [...]}`) for hooks and scripts; it exits 0 even when a probe
+failed (the failure is a line), and 1 only when advisories are off. The MCP
+server `instructions` say results carry `advice`.
 
 **CLI.** `vigil advice [--json]`; `vigil advisory list|show ID|add ID [JSON]
 [--replace]|set ID NAME=VALUE...|rm ID`. Output is JSON (`list`: an array;

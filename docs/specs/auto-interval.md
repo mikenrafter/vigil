@@ -29,9 +29,9 @@ manual tick as backup; the agent should not think about tick length.
   - Codex (`CODEX_*` / codex env, or `AGENT=codex`): 5 min (no TTL is
     recorded; owner decision).
   - Antigravity (non-empty `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENT=1`,
-    or an ancestor process named `agy`, with no Claude or Codex signal):
-    measured 4-5 min, represented as `5m` / `antigravity-measured`;
-    orchestrator window 150 s.
+    or nearest known agent ancestor named `agy` / `.agy-wrapped`, with no
+    Claude or Codex signal): measured 4-5 min, represented as `5m` /
+    `antigravity-measured`; orchestrator window 150 s.
   - Any mix of two or more of Claude, Codex and Antigravity: ambiguous,
     `unknown` / `default` / 270 s (S4), or 150 s when Antigravity is one of the
     signals.
@@ -97,29 +97,40 @@ must, to pass `--max-s 270`). Recorded in the vigil skill.
   must therefore return in under 180 s on every path: the orchestrator's
   automatic window, the non-orchestrator default, and an explicit `max_s`.
   All three use **150 s** (ceiling and default). The call ends later than its
-  window by its tail: advisories (`advice`) are evaluated one after another
-  after the window, each probe up to 19 s (20 s deadline), so the tail is
-  capped at 15 s in total (`ADVICE_TAIL_BUDGET`, all hosts); a longer
-  evaluation is replaced by one `unavailable` entry. Reminders at the tail
+  window by its tail: advisories (`advice`) are evaluated serially after the
+  window under a shared 15 s deadline (`ADVICE_TAIL_BUDGET`, all hosts), where
+  each uncached probe gets `min(PROBE_DEADLINE, time remaining)`. Finished
+  entries (including cache hits) survive; any uncached advisory cut off or not
+  reached before the deadline becomes its own `unavailable` entry naming it
+  (without caching the budget cut-off as a probe failure). The standalone
+  `advice` / MCP `advice` path (`advice_report`) applies the same 15 s deadline
+  when any Antigravity signal is present (leaving Claude/Codex `advice_report`
+  unbounded), so MCP `advice` also stays under 180 s. Reminders at the tail
   read only the probe cache (no probe), and notices, peers and the last-call
   record are file reads. Worst case is 150 + 15 s plus file work, 15 s below
-  the timeout. The measured Neon prompt cache lasts 4-5 minutes, so 150 s
-  keeps it warm. Subagents (non-orchestrators) are bound the same way when
-  an Antigravity signal is present; elsewhere they stay at 270 s with no
-  special instruction, which removes the subagent limit above.
+  the timeout (checked by a compile-time assert). The measured Neon prompt
+  cache lasts 4-5 minutes, so 150 s keeps it warm. Subagents (non-orchestrators)
+  are bound the same way when an Antigravity signal is present; elsewhere they
+  stay at 270 s with no special instruction, which removes the subagent limit
+  above.
 
   **Antigravity detection.** Any of: non-empty `ANTIGRAVITY_CONVERSATION_ID`;
-  `ANTIGRAVITY_AGENT=1`; or **any ancestor process whose name is `agy`** (or
-  nix's `.agy-wrapped`), found at the binary edge from `/proc/<pid>/stat`
-  (names and parent pids only, never another process's environment). The
-  `vigil mcp` child agy spawns carries no `ANTIGRAVITY_*` variable (only its
-  shell children do; measured 2026-11-21, `env -i` run), but its parent's name
-  is `agy`. The whole ancestor chain is searched because a wrapper may sit
-  between agy and vigil, and a claude or codex ancestor does not stop the
-  walk: any Antigravity signal, alone or mixed, applies the stricter limit
-  (S4). Explicit `max_s` still wins, clamped to 30..=3000 for Claude or
-  Unknown, 30..=270 for Codex or an ambiguous identity with no Antigravity
-  signal, and 30..=150 when any Antigravity signal is present.
+  `ANTIGRAVITY_AGENT=1`; or the **nearest-known-agent process-tree signal**,
+  read at the binary edge from `/proc/<pid>/stat` (names and parent pids only,
+  never another process's environment). Starting at the parent pid (the process
+  itself is not an ancestor), the walk skips unknown names (`sh`, `bash`,
+  `node`, ...) and stops at the first known agent from the single shared list
+  `{claude, .claude-wrapped, codex, .codex-wrapped, agy, .agy-wrapped}` (also
+  used by `ancestor_session` so they cannot drift). The tree signal is true
+  only if that nearest known agent is `agy` or `.agy-wrapped`, so T3's
+  `node -> agy -> sh -> vigil` is true while a Claude or Codex session started
+  under `agy` is not marked Antigravity by the tree alone (env markers are
+  still ORed in unchanged). The `vigil mcp` child agy spawns carries no
+  `ANTIGRAVITY_*` variable (only its shell children do; measured 2026-11-21,
+  `env -i` run), but its parent's name is `agy`. Explicit `max_s` still wins,
+  clamped to 30..=3000 for Claude or Unknown, 30..=270 for Codex or an
+  ambiguous identity with no Antigravity signal, and 30..=150 when any
+  Antigravity signal is present.
 - **AI2' — credit check every 4 minutes, account-wide.** Usage credits can
   start because of any session on the account, so a long call re-checks every
   240 s, independent of its own transcript:
