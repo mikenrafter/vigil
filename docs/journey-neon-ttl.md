@@ -77,3 +77,37 @@ Review found six items against the initial `pilot/neon-mcp` implementation:
    15 s (`150 + 15 + 15 <= 180`), moved the Antigravity ceiling clause out of
    `CODEX_MAX_WINDOW_S` onto `Identity::window_ceiling_s`, and fixed the stale
    `180 s` doc on `Identity::Antigravity`.
+
+## Fable round 2 -> fix round 2 (2026-11-21)
+
+Fable round 2 found a blocking bug in the round-1 serial deadline:
+
+- **Serial starvation across every host.** Under the shared 15 s
+  `ADVICE_TAIL_BUDGET`, running uncached probes serially meant a single slow
+  first entry (in the owner's config, `boat-budget` is first with a 15.0 s cmd
+  timeout) could consume the whole budget and get cut off uncached, causing
+  every uncached advisory after it to return `skipped: advice budget exhausted`
+  without starting — repeating on every pass, on Claude and Codex as well as
+  Antigravity.
+- **Why round 1 went serial, and why concurrent start is now safe.** Round 1
+  rejected `join_all` / concurrent probe starts because starting the two
+  Antigravity probes simultaneously risked colliding `agy /usage` runs. That
+  collision is now resolved in `mstack` (`d7d1066`, `90165a9`), where the probe
+  script uses `flock` plus a 60 s cache to share one `agy` run across both
+  probes, so vigil needs no argv deduplication.
+- **Fix.** Switched `advisory_eval::advise` to start all uncached probes
+  concurrently via `tokio::task::JoinSet` (following `spawn_reminder_refresh`
+  in `src/reminder_ops.rs`) under the single deadline (`min(PROBE_DEADLINE,
+  time remaining)` per probe) and return results in file order. Removed
+  `ProbeResult::BudgetExhausted` and the `"skipped"` message; cut-off probes
+  remain individual uncached `unavailable` entries naming themselves, while
+  healthy probes always report in the same pass.
+- **Nits and specs.** Removed unused `Vigil::envelope_advice()`, documented
+  the all-hosts reason on `ADVICE_TAIL_BUDGET` (Codex's 270 s window plus
+  unbounded advice could pass Codex's 300 s tool timeout), and updated
+  `docs/spec.md`, `docs/specs/auto-interval.md`, and `docs/integrations.md` to
+  record concurrent start and note that Neon has no unbounded advice path (so
+  an `agy` run of 15 s or more never reports there, while a non-Antigravity
+  `vigil advice` still fills those entries). Red tests were committed before
+  the production fix and verified with mutation checks for restored serial
+  execution and dropped file order.

@@ -97,15 +97,20 @@ must, to pass `--max-s 270`). Recorded in the vigil skill.
   must therefore return in under 180 s on every path: the orchestrator's
   automatic window, the non-orchestrator default, and an explicit `max_s`.
   All three use **150 s** (ceiling and default). The call ends later than its
-  window by its tail: advisories (`advice`) are evaluated serially after the
-  window under a shared 15 s deadline (`ADVICE_TAIL_BUDGET`, all hosts), where
-  each uncached probe gets `min(PROBE_DEADLINE, time remaining)`. Finished
-  entries (including cache hits) survive; any uncached advisory cut off or not
-  reached before the deadline becomes its own `unavailable` entry naming it
-  (without caching the budget cut-off as a probe failure). The standalone
-  `advice` / MCP `advice` path (`advice_report`) applies the same 15 s deadline
-  when any Antigravity signal is present (leaving Claude/Codex `advice_report`
-  unbounded), so MCP `advice` also stays under 180 s. Reminders at the tail
+  window by its tail: advisories (`advice`) start all uncached probes
+  concurrently after the window under a shared 15 s deadline
+  (`ADVICE_TAIL_BUDGET`, all hosts — Codex's 270 s window plus unbounded advice
+  could otherwise pass Codex's 300 s tool timeout) and return results in file
+  order, with each uncached probe getting `min(PROBE_DEADLINE, time remaining)`.
+  Finished entries (including cache hits) survive, and a slow probe costs only
+  its own entry: any probe cut off by the deadline becomes its own `unavailable`
+  entry naming it (without caching the budget cut-off as a probe failure). The
+  standalone `advice` / MCP `advice` path (`advice_report`) applies the same
+  15 s deadline when any Antigravity signal is present (leaving Claude/Codex
+  `advice_report` unbounded up to `PROBE_DEADLINE`), so MCP `advice` also stays
+  under 180 s. Because Neon has no unbounded advice path, an `agy` run of 15 s
+  or more never reports there; a non-Antigravity `vigil advice` still fills
+  those entries in the shared cache. Reminders at the tail
   read only the probe cache (no probe), and notices, peers and the last-call
   record are file reads. Worst case is 150 + 15 s plus file work, 15 s below
   the timeout (checked by a compile-time assert). The measured Neon prompt

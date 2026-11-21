@@ -730,9 +730,10 @@ needs a clock in the envelope and an early wake when a job looks stuck.
    agent ancestor named `agy` / `.agy-wrapped`, with no Claude or Codex
    signal) is `5m` / `antigravity-measured` / 150 s. The `5m` wire category
    represents a measured 4-5 minute cache; 150 s keeps it warm and leaves 30 s
-   below agy's 180 s MCP timeout for the call's tail (advisories, sharing a
-   15 s deadline `ADVICE_TAIL_BUDGET` across serial evaluation, preserving
-   finished entries and cache hits). agy gives the `vigil mcp` it spawns no
+   below agy's 180 s MCP timeout for the call's tail (advisories, starting all
+   uncached probes concurrently under a shared 15 s deadline
+   `ADVICE_TAIL_BUDGET` and returning results in file order so finished entries
+   and cache hits survive). agy gives the `vigil mcp` it spawns no
    `ANTIGRAVITY_*` variable, so the process tree is the signal there: the
    binary walks up from the parent pid reading only names and parent pids from
    `/proc` (never another process's environment), skipping unknown names, and
@@ -1221,19 +1222,25 @@ and message are applied to the cached number on every call, so `advisory set
 ... threshold=15` shows on the very next return with no new probe. Every
 failure (probe exit code, timeout, HTTP status, missing field, not JSON, regex
 no match, bad file) becomes the entry `advisory <id> unavailable: <reason>`; a
-value older than its cache time is never shown, and nothing is silent. Probes
-run serially in file order. When a shared deadline is passed (`keepalive` on
-every host: `ADVICE_TAIL_BUDGET` = 15 s; `advice` / MCP `advice` under any
-Antigravity signal: same 15 s deadline so MCP `advice` stays under agy's 180 s
-timeout), each uncached probe runs for `min(20 s, time remaining)`, finished
-entries and cache hits survive, and any uncached advisory cut off or not
-reached becomes its own `unavailable` entry naming it (not cached as a probe
-failure). Standalone `vigil advice` / MCP `advice` for non-Antigravity callers
-keeps the unbounded serial pass (at most 32 x 20 s; keep probes cheap).
+value older than its cache time is never shown, and nothing is silent. Uncached
+probes start concurrently and results return in file order. When a shared
+deadline is passed (`keepalive` on every host: `ADVICE_TAIL_BUDGET` = 15 s,
+keeping Antigravity's 150 s window below agy's 180 s MCP timeout and keeping
+Codex's 270 s window below Codex's 300 s tool timeout; `advice` / MCP `advice`
+under any Antigravity signal: same 15 s deadline so MCP `advice` stays under
+agy's 180 s timeout), all uncached probes start together and each runs for
+`min(20 s, time remaining)`: finished entries and cache hits survive, a slow
+probe costs only its own entry, and any probe cut off by the deadline becomes
+its own `unavailable` entry naming it (not cached as a probe failure). On Neon
+(Antigravity), there is no unbounded advice path, so an `agy` probe run of 15 s
+or more never reports there; a non-Antigravity `vigil advice` call (which keeps
+the unbounded concurrent pass, up to 20 s per probe; keep probes cheap) still
+fills those entries in the shared cache.
 
 **Delivery (CLAIM(advisory-delivery)).** `advice` is on the final envelope of
-every `keepalive` (CLI and MCP), evaluated serially when the call returns
-under the 15 s `ADVICE_TAIL_BUDGET` shared deadline (partial results survive).
+every `keepalive` (CLI and MCP), evaluated concurrently when the call returns
+under the 15 s `ADVICE_TAIL_BUDGET` shared deadline (partial results survive,
+returned in file order).
 `vigil advice` prints one `id: message` line per advisory (`--json`:
 `{"advice": [...]}`) for hooks and scripts; it exits 0 even when a probe
 failed (the failure is a line), and 1 only when advisories are off. The MCP
