@@ -57,7 +57,11 @@ impl Vigil {
     /// listed (and removable) but are never delivered.
     pub fn notice_list(&self) -> Result<Value> {
         let now = self.clock.now();
-        let listed = self.notice_store().list()?;
+        let store = self.notice_store();
+        let listed = store.list()?;
+        if listed.iter().any(|notice| notice.is_expired(now)) {
+            store.prune_stale_records(now);
+        }
         Ok(Value::Array(
             listed
                 .into_iter()
@@ -72,7 +76,9 @@ impl Vigil {
     }
 
     pub fn notice_rm(&self, id: &str) -> Result<Value> {
-        self.notice_store().remove(id)?;
+        let store = self.notice_store();
+        store.remove(id)?;
+        store.prune_stale_records(self.clock.now());
         Ok(json!({"removed": id}))
     }
 

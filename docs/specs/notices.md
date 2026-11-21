@@ -89,8 +89,11 @@ a harness whose field differs from the table is a one-line fix in
    keepalive (up to 50 minutes) could end early with a `kind: "notice"` event,
    as `reminder_due` does. Not built: an announcement is rarely urgent, and the
    event claim would need its own once-per-session machinery.
-4. **Retention.** Old delivery records can be removed only when every delivered
-   generation is removed or expired. Lock files stay in place.
+4. **Retention.** The sweep runs on notice removal and on an operator list
+   that finds expired notices, never between claim and print. A record is
+   removed only when every delivered generation is removed or expired. Its
+   lock file is removed while both record and directory locks are held.
+   Writers also hold the directory lock before opening a record lock.
 5. **Codex child environments.** Fable's round-2 live check found
    `CODEX_SESSION_ID`, `CODEX_THREAD_ID` and `T3CODE_THREAD_ID` in shell
    children, and only `T3CODE_THREAD_ID` in MCP children. Both CODEX names

@@ -262,19 +262,16 @@ fn a_release_does_not_undo_a_newer_delivery_of_a_readded_notice() {
 }
 
 #[test]
-fn removing_a_notice_prunes_it_from_every_record_on_next_use() {
-    // why: records stay bounded by the live notice set.
-    // catches: records that grow forever.
+fn removing_a_notice_cleans_dead_records() {
+    // notice rm performs maintenance; the next delivery remains read-only.
     let rig = Rig::new();
     rig.add("gone", "m");
     rig.deliver("s");
     rig.env.vigil.notice_rm("gone").unwrap();
-    rig.deliver("s");
-    let dir = rig.env.root().join("notice-delivery");
-    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
-    assert_eq!(files.len(), 1);
-    let record = std::fs::read_to_string(&files[0]).unwrap();
-    assert!(!record.contains("gone"), "{record}");
+    assert_eq!(rig.deliver("s"), ids(&[]));
+    let files: Vec<_> = std::fs::read_dir(rig.env.root().join("notice-delivery")).unwrap()
+        .map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
+    assert_eq!(files.len(), 0);
 }
 
 #[test]
@@ -593,14 +590,14 @@ fn old_records_and_lock_inodes_survive_while_any_delivered_notice_is_live() {
     rig.deliver("idle");
     rig.deliver("unlocked-idle");
     let dir = rig.env.root().join("notice-delivery");
-    let paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.file_name().unwrap() != ".lock").collect();
     let old = SystemTime::now() - Duration::from_secs(40 * 86400);
     let locks: Vec<_> = paths.iter().filter(|p| p.extension().is_some_and(|e| e == "lock")).take(1)
         .map(|p| { let f = std::fs::File::options().write(true).open(p).unwrap(); f.lock().unwrap(); f }).collect();
     for path in &paths {
         std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
     }
-    rig.deliver("new-session"); // triggers global pruning
+    rig.deliver("new-session"); // delivery does not run maintenance
     for path in &paths { assert!(path.exists(), "pruned {}", path.display()); }
     drop(locks);
     assert_eq!(rig.deliver("idle"), ids(&[]));
@@ -609,7 +606,7 @@ fn old_records_and_lock_inodes_survive_while_any_delivered_notice_is_live() {
     rig.add("replacement", "m");
     rig.deliver("cleanup-trigger");
     for path in &paths {
-        assert_eq!(path.exists(), path.extension().is_some_and(|ext| ext == "lock"), "{}", path.display());
+        assert!(!path.exists(), "{}", path.display());
     }
 }
 
@@ -653,4 +650,61 @@ fn a_claim_does_not_erase_a_delivery_added_after_its_snapshot() {
     }).unwrap().keep();
     assert!(claim.notices.is_empty(), "the other caller already delivered every notice");
     assert_eq!(rig.deliver("s"), ids(&[]), "stale retain erased the x delivery");
+}
+
+#[test]
+fn notice_cleanup_runs_on_remove_and_expiry_but_not_during_delivery() {
+    // CLAIM(notice-once): cleanup must not extend the durable-claim/print gap.
+    use std::time::{Duration, SystemTime};
+    let rig = Rig::new();
+    rig.add("old", "m");
+    rig.deliver("s");
+    let dir = rig.env.root().join("notice-delivery");
+    let record = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "json")).unwrap();
+    let lock = record.with_extension("lock");
+    std::fs::File::options().write(true).open(&record).unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(40 * 86400)).unwrap();
+    // Simulate an operator removing a notice file before this delivery.
+    std::fs::remove_file(rig.env.root().join("notices/old.json")).unwrap();
+    rig.add("new", "m");
+    rig.deliver("other");
+    assert!(record.exists(), "delivery must not sweep other sessions");
+    rig.env.vigil.notice_rm("new").unwrap();
+    assert!(!record.exists(), "notice rm must sweep dead records");
+    assert!(!lock.exists(), "cleanup must retire the matching lock");
+
+    rig.env.vigil.notice_add(NoticeRequest {
+        id: "expires".into(), message: "m".into(),
+        expires_at: Some(at("2026-11-20T12:00:02Z")), ..Default::default()
+    }).unwrap();
+    rig.deliver("expires-session");
+    let record = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "json")).unwrap();
+    rig.clock.advance_secs(2);
+    assert_eq!(rig.env.vigil.notice_list().unwrap()[0]["expired"], true);
+    assert!(!record.exists(), "listing expired notices must sweep dead records");
+    assert!(!record.with_extension("lock").exists());
+}
+
+#[test]
+fn cleanup_cannot_unlink_a_held_record_lock() {
+    // A busy record remains intact; a later cleanup retires it after unlock.
+    let rig = Rig::new();
+    rig.add("old", "m");
+    rig.deliver("s");
+    let dir = rig.env.root().join("notice-delivery");
+    let record = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "json")).unwrap();
+    let lock_path = record.with_extension("lock");
+    let lock = std::fs::File::options().write(true).open(&lock_path).unwrap();
+    lock.lock().unwrap();
+    rig.env.vigil.notice_rm("old").unwrap();
+    assert!(record.exists());
+    assert!(lock_path.exists());
+    drop(lock);
+    rig.add("trigger", "m");
+    rig.env.vigil.notice_rm("trigger").unwrap();
+    assert!(!record.exists());
+    assert!(!lock_path.exists());
 }

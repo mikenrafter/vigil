@@ -44,8 +44,6 @@ pub const MAX_NOTICES: usize = 64;
 pub const MAX_MESSAGE_BYTES: usize = 2000;
 const MAX_SCOPES: usize = 16;
 const MAX_SESSION_BYTES: usize = 512;
-/// Minimum age for pruning records whose delivered notices are all no longer live.
-const RECORD_RETENTION: Duration = Duration::from_secs(30 * 86_400);
 /// How long a claim waits for another process holding the same record's lock.
 /// The critical section is one small read and one rename, so this is a bound
 /// for a stuck process, not a typical wait.
@@ -335,6 +333,9 @@ impl NoticeStore {
     /// written (atomically) only when the update changed it.
     fn update_record<T>(&self, session: &NoticeSession, update: impl FnOnce(&mut SessionRecord) -> Result<T>) -> Result<T> {
         let path = self.record_path(session);
+        // All record-lock opens and removals serialize here so no waiter can
+        // hold an unlinked inode while another caller opens its replacement.
+        let _directory_lock = Self::lock(&self.delivery_dir().join(".lock"))?;
         let _lock = Self::lock(&path.with_extension("lock"))?;
         let mut record = self.read_record(session)?;
         let before = record.delivered.clone();
@@ -389,9 +390,6 @@ impl NoticeStore {
                 Ok(pending.into_iter().cloned().collect::<Vec<Notice>>())
             })?
         };
-        if !claimed.is_empty() {
-            self.prune_stale_records(now);
-        }
         let (identity, label, note) = match session {
             NoticeSession::Agent(id) => (NoticeIdentity::Session, Some(id.clone()), None),
             NoticeSession::ProcessRun(_) => (
@@ -421,19 +419,15 @@ impl NoticeStore {
         })
     }
 
-    /// Best-effort removal of old records only after every delivered generation
-    /// is removed or expired. Lock files stay in place so their inode is stable.
-    fn prune_stale_records(&self, now: Timestamp) {
+    /// Maintenance on notice removal or an operator listing expired notices.
+    /// Retire records only when all generations are dead. Hold both directory
+    /// and record locks through unlink so another writer cannot open a new inode.
+    pub(crate) fn prune_stale_records(&self, now: Timestamp) {
         let Ok(entries) = std::fs::read_dir(self.delivery_dir()) else { return };
+        let Ok(_directory_lock) = Self::lock(&self.delivery_dir().join(".lock")) else { return };
         for entry in entries.filter_map(std::result::Result::ok) {
             let path = entry.path();
             if !path.extension().is_some_and(|ext| ext == "json") {
-                continue;
-            }
-            let stale = entry.metadata().and_then(|meta| meta.modified()).ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > RECORD_RETENTION);
-            if !stale {
                 continue;
             }
             let Ok(_lock) = Self::lock(&path.with_extension("lock")) else { continue };
@@ -444,8 +438,8 @@ impl NoticeStore {
             let Ok(notices) = self.list() else { continue };
             if record.delivered.iter().all(|(id, created_at)| {
                 !notices.iter().any(|notice| notice.id == *id && notice.created_at == *created_at && !notice.is_expired(now))
-            }) {
-                let _ = std::fs::remove_file(path);
+            }) && std::fs::remove_file(&path).is_ok() {
+                let _ = std::fs::remove_file(path.with_extension("lock"));
             }
         }
     }

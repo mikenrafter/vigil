@@ -1418,9 +1418,12 @@ its scope and the record does not hold it. Expiry is exclusive:
 scope is not recorded, so a session that later works inside the scope still
 gets it. Removing a notice and adding the same id again is a new notice, shown
 again to every session. The record is pruned of notices that no longer exist.
-A record older than 30 days can be deleted only when every delivered generation
-is removed or expired. Records for live notices survive idle periods. Lock files
-are never unlinked.
+The stale-record sweep runs on `vigil notice rm` and on `notice list` when
+expired notices are present, outside the delivery path. A record is deleted
+only when every delivered generation is removed or expired. Cleanup removes
+its lock file while holding that lock and the delivery-directory lock. Writers
+open record locks under the same directory lock, preventing split lock inodes.
+Records for live notices survive idle periods.
 
 **Exactly once.** `claim` runs under the record's lock with a short bounded
 wait. It records the pending notices and returns them. The caller then prints
