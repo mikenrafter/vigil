@@ -723,6 +723,9 @@ impl Vigil {
             advice: None,
             reminders: None,
             reminders_error: None,
+            notices: Vec::new(),
+            notices_note: None,
+            notices_error: None,
             cap,
             cap_error,
         })

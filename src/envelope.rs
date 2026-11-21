@@ -225,6 +225,16 @@ pub struct Envelope {
     pub reminders: Option<Vec<crate::reminder::ReminderNotice>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminders_error: Option<String>,
+    /// One-time notices (SPEC "Notices") newly delivered to this agent session
+    /// by this return; absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::notice::DeliveredNotice>,
+    /// Present when `notices` were keyed to one process run, not to an agent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notices_note: Option<String>,
+    /// Why notices could not be checked (an unreadable state directory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notices_error: Option<String>,
     /// W46-K4: absent unless the hold contains classed items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<crate::cap::CapStatus>,
@@ -383,6 +393,9 @@ mod tests {
             advice: None,
             reminders: None,
             reminders_error: None,
+            notices: Vec::new(),
+            notices_note: None,
+            notices_error: None,
             cap: None,
             cap_error: None,
         }

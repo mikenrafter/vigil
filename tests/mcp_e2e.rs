@@ -99,8 +99,8 @@ async fn exactly_the_spec_tools_are_listed_with_descriptions() {
     let tools = client.list_all_tools().await.unwrap();
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    // The five watch tools of the SPEC, `hold` (SPEC "Holds"), `hold_add` (W42-H2), `hold_done` (W42-D7) and the six advisory tools (SPEC "Advisories"), plus six reminder tools (SPEC "Reminders").
-    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "cold", "hold", "hold_add", "hold_done", "keepalive", "remind_add", "remind_done", "remind_list", "remind_rm", "remind_show", "remind_snooze", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
+    // The five watch tools of the SPEC, `hold` (SPEC "Holds"), `hold_add` (W42-H2), `hold_done` (W42-D7) and the six advisory tools (SPEC "Advisories"), plus six reminder tools (SPEC "Reminders") and four notice tools (SPEC "Notices").
+    assert_eq!(names, vec!["advice", "advisory_add", "advisory_list", "advisory_rm", "advisory_set", "advisory_show", "cold", "hold", "hold_add", "hold_done", "keepalive", "notice_add", "notice_list", "notice_rm", "notices", "remind_add", "remind_done", "remind_list", "remind_rm", "remind_show", "remind_snooze", "watch_cancel", "watch_create", "watch_list", "watch_status"]);
     for tool in &tools {
         assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()), "{} has no description", tool.name);
     }

@@ -74,6 +74,11 @@ mod hold_items_tests;
 #[cfg(test)]
 mod peers_tests;
 
+pub mod notice;
+pub mod notice_ops;
+#[cfg(test)]
+mod notice_tests;
+
 pub mod reminder;
 pub mod reminder_store;
 pub mod reminder_ops;
