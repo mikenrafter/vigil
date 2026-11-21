@@ -265,6 +265,8 @@ The session id each harness gives a hook or child process:
 | Antigravity `agy` 1.5 | `conversationId` | `ANTIGRAVITY_CONVERSATION_ID` and `ANTIGRAVITY_TRAJECTORY_ID` are named in the binary | payload recorded in the agy integration report; the env var was not observed on a live child process |
 | T3 Code | no hooks | `T3CODE_THREAD_ID` | observed in a T3 thread's environment |
 
-`--from-hook` takes whichever of those payload fields is present. A harness
+`--from-hook` first uses the same environment or ancestor key as keepalive and
+MCP. Only when none exists does it use a payload field. With neither key nor
+payload id it exits non-zero without printing notices. A harness
 that has no hook but runs the MCP server (T3) is covered by the keepalive
 envelope and the `notices` tool: the server resolves its own identity.

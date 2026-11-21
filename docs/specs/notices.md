@@ -33,6 +33,13 @@ caller's directory and is not in the record. `claim` records and returns the
 pending set under the record's lock; the caller prints and keeps the claim, or
 releases it when printing failed. Details and claims: SPEC "Notices".
 
+Delivery is at most once on a crash between the durable claim and the print,
+or on a transport failure after the MCP handler returns. That delivery can be
+lost for the session; it is never automatically repeated. A failed print or a cancel
+before commit releases the claim for retry. Release is best effort if the state
+cannot be locked or written. A crash can lose the claimed batch, at most one
+delivery, rather than replaying notices already claimed.
+
 Design choices worth keeping when this grows:
 
 - **One record per session, one lock per record.** Concurrent sessions touch
@@ -47,8 +54,8 @@ Design choices worth keeping when this grows:
 - **Generation, not just id.** The record stores the creation time it
   delivered, so remove-and-re-add is a new announcement.
 - **Claim, then print, then keep or release.** The same shape as the keepalive
-  `Delivery` (N3): at most once under concurrency, and not lost when the output
-  never reached the agent.
+  `Delivery` (N3): at most once under concurrency, released on a failed print or cancellation before commit, subject to
+  the crash guarantee above.
 
 ## Delivery targets (hook wiring happens in phoe-nix)
 
@@ -67,14 +74,10 @@ a harness whose field differs from the table is a one-line fix in
 
 ## Open questions
 
-1. **Two names for one session.** A Claude session in a T3 thread has a Claude
-   session id (hook payload, `CLAUDE_CODE_SESSION_ID`) and a T3 thread id. The
-   vigil MCP server's identity is whichever of those it can see (peers prefer
-   the Claude id, then Codex, agy, T3). If the MCP server sees only the T3 id
-   while hooks send the Claude id, one agent sees a notice twice. Unverified: I
-   did not read an MCP server's environment. A check is cheap: have the server
-   report its resolved session through the `notices` tool (`session` in the
-   reply) and compare with the hook's.
+1. **Shared identity.** Hooks, CLI keepalive and MCP use the same environment
+   and ancestor detection. Hook payload ids are a fallback when detection
+   finds no key. Explicit session arguments still select a named session.
+   Processes with different environment keys need matching configuration.
 2. **Compaction.** After `/compact` the agent has lost the notice text but the
    record says it was shown. A SessionStart hook with source `compact` could
    re-deliver unexpired notices (a `--again` flag that ignores the record for
@@ -85,12 +88,11 @@ a harness whose field differs from the table is a one-line fix in
    keepalive (up to 50 minutes) could end early with a `kind: "notice"` event,
    as `reminder_due` does. Not built: an announcement is rarely urgent, and the
    event claim would need its own once-per-session machinery.
-4. **Retention.** A record unwritten for 30 days is deleted; a notice with no
-   expiry that outlives that is shown again. Either always set `--expires`, or
-   touch the record on read.
+4. **Retention.** Old delivery records can be removed only when every delivered
+   generation is removed or expired. Lock files stay in place.
 5. **Codex's session id in the environment.** `peers` reads `CODEX_SESSION_ID`,
-   but that string is not in the Codex 0.170 binary. Codex is reached through
-   its hook payload; the MCP server falls back to the ancestor process.
+   but that string is not in the Codex 0.170 binary. Both hooks and MCP fall back to the
+   same ancestor process when no environment key exists.
 
 ## Topic snippets with cadence (residual-cli's guru pattern), later
 
@@ -141,8 +143,8 @@ case rather than a second mechanism.
 
 - the claim / print / keep-or-release protocol and the lock (exactly once per
   session, no lost record);
-- hashed session file names and the identity order (explicit, hook payload,
-  environment, ancestor, process run);
+- hashed session file names and the identity order (explicit, environment, ancestor,
+  hook payload, process run);
 - "silence writes nothing": a turn with no relevant topic must not rewrite the
   record. The turn counter is the one wrinkle: bumping it every prompt writes
   every prompt. Options: derive `turn` from the harness (the hook payload has a

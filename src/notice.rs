@@ -13,8 +13,9 @@
 //! `vigil notices` command in `main.rs` (hook delivery).
 //!
 //! CLAIM(notice-once): a notice is handed to a session at most once, and a
-//! delivery that did not reach the agent is released so it is handed over
-//! again: claim and release run under the session record's lock
+//! failed print or cancellation before commit releases the claim for retry.
+//! Crashes and MCP transport failures after handler return can lose delivery
+//! [docs/spec.md, "Notices"]. Claim and release use the session record's lock
 //! [notice_tests::concurrent_claims_by_one_session_deliver_each_notice_exactly_once,
 //! notice_tests::releasing_a_claim_makes_the_notices_pending_again,
 //! notice_e2e::a_failed_write_to_stdout_leaves_the_notice_pending].

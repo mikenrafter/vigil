@@ -1418,16 +1418,24 @@ its scope and the record does not hold it. Expiry is exclusive:
 scope is not recorded, so a session that later works inside the scope still
 gets it. Removing a notice and adding the same id again is a new notice, shown
 again to every session. The record is pruned of notices that no longer exist.
-A record not rewritten for 30 days is deleted by the next delivery, so a notice
-with no expiry that lives longer than 30 days is shown again to a session that
-idled that long.
+A record older than 30 days can be deleted only when every delivered generation
+is removed or expired. Records for live notices survive idle periods. Lock files
+are never unlinked.
 
-**Exactly once.** `claim` runs under the record's `flock` (bounded wait, 5 s):
-it records the pending notices and returns them. The caller then prints and
-keeps the claim, or, when printing failed, releases it, which removes only the
-generation that claim recorded. So a hook and a keepalive racing in one session
-never both print a notice, and a notice that never reached the agent is shown
-again. When nothing is pending the claim reads the record and writes nothing
+**Exactly once.** `claim` runs under the record's lock with a short bounded
+wait. It records the pending notices and returns them. The caller then prints
+and keeps the claim, or releases it on a failed print. Release removes only
+the generation that claim recorded. Racing callers share the record, so they
+never both print a notice.
+
+Delivery is at most once on a crash between the durable claim and the print,
+or on a transport failure after the MCP handler returns. That delivery can be
+lost for the session; it is never automatically repeated. A failed print or a cancel
+before commit releases the claim for retry. Release is best effort if the state
+cannot be locked or written. A crash can lose the claimed batch, at most one
+delivery, rather than replaying notices already claimed.
+
+When nothing is pending the claim reads the record and writes nothing
 (no record, no lock file): every keepalive claims, and the state root must not
 fill with files for sessions that have nothing to see.
 
@@ -1438,8 +1446,8 @@ fill with files for sessions that have nothing to see.
   return, absent when none; `notices_note` when they were keyed to a process
   run (below); `notices_error` when the state could not be read. The claim rides
   in the call's `Delivery`: the CLI prints, then commits (N3), and an MCP call
-  cancelled before its answer is sent drops the `Delivery`, which releases the
-  claim. `--brief` adds one `notice ID: TEXT` item per notice. A notice does not
+  cancelled before commit drops the `Delivery`, which releases the claim.
+  `--brief` adds one `notice ID: TEXT` item per notice. A notice does not
   wake a long keepalive; it arrives on the next return (at most one window, 50
   minutes for a 1-hour cache, later). Hooks cover the gap.
 - `vigil notices` prints pending notices and records them, for SessionStart and
@@ -1449,14 +1457,15 @@ fill with files for sessions that have nothing to see.
   `advice --json` never carry or consume notices.
 - Advisories and reminders are unchanged.
 
-**Session identity.** In order: `--session ID` (a blank value is an error, never
-a fallback); with `--from-hook`, the id in the JSON hook payload on stdin, first
-non-blank of `session_id`, `sessionId`, `conversationId`, `conversation_id`,
-`thread_id`, `threadId`, and its `cwd` when `--cwd` is absent; the process's
-agent identity (`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`,
-`ANTIGRAVITY_CONVERSATION_ID`, `T3CODE_THREAD_ID`, else a `claude`/`codex`
-ancestor process, the same detection peers use); else one process run. A process
-run is keyed by pid and start time of the calling process: the CLI's parent, or
+**Session identity.** An explicit `--session ID` selects a session; a blank
+value is an error. Otherwise all paths use the same detection as peers:
+`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, `T3CODE_THREAD_ID`, then a
+`claude`/`codex` ancestor process. With `--from-hook`, only when detection
+finds no key, use the first non-blank payload field among `session_id`,
+`sessionId`, `conversationId`, `conversation_id`, `thread_id`, `threadId`.
+A hook with neither a detected key nor a payload id fails without printing.
+The payload's `cwd` applies when `--cwd` is absent. Other unidentified calls
+fall back to one process run. A process run is keyed by pid and start time of the calling process: the CLI's parent, or
 the MCP server itself. Its output says `no agent session identity: these notices
 are shown at most once per run of the calling process; pass --session ID to key
 them to an agent session`. Which id each harness exposes, and how sure we are,
