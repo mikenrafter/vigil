@@ -33,21 +33,21 @@ caller's directory and is not in the record. `claim` records and returns the
 pending set under the record's lock; the caller prints and keeps the claim, or
 releases it when printing failed. Details and claims: SPEC "Notices".
 
-Delivery is at most once on a crash between the durable claim and the print,
-or on a transport failure after the MCP handler returns. That delivery can be
-lost for the session; it is never automatically repeated. A failed print or a cancel
-before commit releases the claim for retry. Release is best effort if the state
-cannot be locked or written. A crash can lose the claimed batch, at most one
-delivery, rather than replaying notices already claimed.
+Each name's record is written in turn under the one directory lock.
+Printing only follows a full commit, so a crash can lose a notice under some
+names but never deliver it twice. A partial claim that writes A but stops
+before B prints nothing. A later A call skips it; B can receive it once.
+A partial release that clears A before stopping at B can lose delivery when
+{A,B} copies B's record back into A. If {B,C} bridges a claim from {A,B}
+before its failed-print release, C retains it; later {B,C} calls copy it back
+to B without printing. Release is best effort, preserving bridged and newer
+generations. Transport failure after MCP handler return can also lose delivery.
 
 Design choices worth keeping when this grows:
 
-- **One record per session name, one directory lock, durable multi-record tx.**
-  Different sessions keep separate files so corruption stays isolated to one
-  name, while all claims, releases and maintenance serialize on
-  `notice-delivery/.lock` (never unlinked). Multi-name updates write a durable
-  undo journal (`notice-delivery/.tx`) before touching target records so a
-  crash never leaves half the names claimed or released.
+- **One record per session name, one directory lock.** Different sessions
+  keep separate files so corruption stays isolated to one name. Claims,
+  releases and maintenance serialize on `notice-delivery/.lock`, never unlinked.
 - **The session id is text from outside** (a hook payload field), so it only
   ever names a file through a hash.
 - **Silence writes nothing.** The common claim finds nothing pending and
@@ -108,17 +108,14 @@ a harness whose field differs from the table is a one-line fix in
 
 ## Identity as a set of names (implemented)
 
-Implemented in `src/notice.rs` and `src/notice_ops.rs` (`CLAIM(notice-tx)`).
+Implemented in `src/notice.rs` and `src/notice_ops.rs` (`CLAIM(notice-once)`).
 Every call collects all present identity environment variables and hook payload
 ids, using ancestry only when none exist. A notice is pending only when no
 record under any of those names contains its generation. Every delivery—and any
 live delivered generation already present on another name in the set—is
 recorded under every name the call sees, so a bridging call links names without
-printing again. Reads and updates serialize on `notice-delivery/.lock`; writes
-touching more than one record use a durable undo journal
-(`notice-delivery/.tx`) recovered before any later claim, release or cleanup,
-so a crash never leaves half the names claimed or released. Release removes
-only generations claimed by that call across those names.
+printing again. Updates serialize on `notice-delivery/.lock`; each record is
+written in turn. Release removes only generations claimed by that call.
 
 **Known limit:** disjoint name sets cannot be joined until some call sees both
 names. Outside T3, a Codex MCP child with no session environment variable or

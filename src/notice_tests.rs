@@ -858,115 +858,55 @@ fn concurrent_overlapping_name_sets_deliver_each_notice_exactly_once() {
 }
 
 #[test]
-fn mid_commit_write_error_rolls_back_all_records_atomically() {
-    // why: CLAIM(notice-tx): an I/O error on record 2 of 2 must roll back
-    //      record 1 to its exact prior state and remove `.tx`, never leaving
-    //      half the names claimed.
-    // proves: CLAIM(notice-tx)
-    // catches: committing per-file without rollback; wiping prior deliveries
-    //          on rollback; leaving `.tx` behind after a successful rollback.
+fn interrupted_claim_keeps_written_names_without_a_journal() {
+    // CLAIM(notice-once): printing follows a full commit. An interrupted
+    // claim may lose delivery under A; B can receive it once and bridge A.
     use crate::notice::WriteAction;
-
     let rig = Rig::new();
+    rig.add("fresh", "m");
     let store = rig.vigil().notice_store();
     let now = rig.clock.now();
-    let a = NoticeSession::single("tx-a").unwrap();
-    let b = NoticeSession::single("tx-b").unwrap();
-    let ab = NoticeSession::agent(["tx-a", "tx-b"]).unwrap();
-
-    // Seed `prior` under `a` only.
-    rig.add("prior", "old");
-    assert_eq!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.len(), 1);
-
-    // Add `next`; fail on the 2nd write (index 1) of `{a, b}`.
-    rig.add("next", "new");
-    let err = store.claim_with_write_hook(&ab, now, &rig.cwd, |index, _| {
-        if index == 1 {
-            WriteAction::Fail(std::io::Error::other("simulated disk full"))
-        } else {
-            WriteAction::Continue
-        }
-    });
-    assert!(err.is_err(), "injected write failure must fail the claim");
-    assert!(!rig.env.root().join("notice-delivery/.tx").exists(), "rollback must clear .tx");
-
-    // `a` still has `prior` and does NOT have `next`; `b` does not exist yet
-    // (still has neither). A clean retry on `{a, b}` delivers ONLY `next` and
-    // bridges `prior` to `b`.
-    let retried = store.claim(&ab, now, &rig.cwd).unwrap().keep();
-    let retried_ids: Vec<_> = retried.notices.iter().map(|n| n.id.as_str()).collect();
-    assert_eq!(retried_ids, vec!["next"], "prior must survive rollback and next must be retried");
+    let a = NoticeSession::single("a").unwrap();
+    let b = NoticeSession::single("b").unwrap();
+    let ab = NoticeSession::agent(["a", "b"]).unwrap();
+    assert!(store.claim_with_write_hook(&ab, now, &rig.cwd, |index, _| {
+        if index == 1 { WriteAction::Fail(std::io::Error::other("disk full")) } else { WriteAction::Continue }
+    }).is_err());
+    assert!(!rig.env.root().join("notice-delivery/.tx").exists());
     assert!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.is_empty());
-    assert!(store.claim(&b, now, &rig.cwd).unwrap().keep().notices.is_empty());
+    assert_eq!(store.claim(&b, now, &rig.cwd).unwrap().keep().notices[0].id, "fresh");
+    assert!(store.claim(&ab, now, &rig.cwd).unwrap().keep().notices.is_empty());
 }
 
 #[test]
-fn partial_write_crash_recovers_before_any_later_claim_or_cleanup() {
-    // why: CLAIM(notice-tx): a SIGKILL after writing record 1 of 2 leaves `.tx`
-    //      and a half-written state on disk. Every next caller—whether it sees
-    //      only record 1 (fast path), only record 2, both, or maintenance—must
-    //      recover `.tx` first so half-claimed state is never observed.
-    // proves: CLAIM(notice-tx)
-    // catches: fast-path skipping lock when `.tx` exists; recovery that fails
-    //          to delete newly-created files or restore pre-tx contents;
-    //          crash during release leaving half the names released.
+fn interrupted_release_and_overlapping_bridge_can_lose_delivery() {
+    // CLAIM(notice-once): failed output releases best effort. A partial
+    // release leaves B claimed; {A,B} bridges it back without printing.
     use crate::notice::WriteAction;
-
-    // Case 1: crash during claim after writing A (which had `prior`) before B;
-    // next caller sees ONLY A (must NOT skip lock on fast path!).
     let rig = Rig::new();
+    rig.add("fresh", "m");
     let store = rig.vigil().notice_store();
     let now = rig.clock.now();
-    let a = NoticeSession::single("crash-a").unwrap();
-    let b = NoticeSession::single("crash-b").unwrap();
-    let ab = NoticeSession::agent(["crash-a", "crash-b"]).unwrap();
-
-    rig.add("prior", "1");
-    assert_eq!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.len(), 1);
-    rig.add("fresh", "2");
-
-    let crashed = store.claim_with_write_hook(&ab, now, &rig.cwd, |index, _| {
-        if index == 1 { WriteAction::Crash } else { WriteAction::Continue }
-    });
-    assert!(crashed.is_err());
-    assert!(rig.env.root().join("notice-delivery/.tx").exists(), "simulated crash must leave .tx on disk");
-
-    // Next call sees ONLY `a` — even though `a`'s on-disk file temporarily holds
-    // `fresh`, `.tx` forces recovery back to `{prior}`, so `a` gets `fresh`!
-    let recovered = store.claim(&a, now, &rig.cwd).unwrap().keep();
-    let recovered_ids: Vec<_> = recovered.notices.iter().map(|n| n.id.as_str()).collect();
-    assert_eq!(recovered_ids, vec!["fresh"], "single-name caller must recover .tx instead of trusting half-written record");
-    assert!(!rig.env.root().join("notice-delivery/.tx").exists());
-
-    // Case 2: crash during release after removing `rel` from A before B;
-    // recovery restores both A and B to consistently delivered (at-most-once).
-    rig.add("rel", "3");
+    let a = NoticeSession::single("a").unwrap();
+    let ab = NoticeSession::agent(["a", "b"]).unwrap();
     let claim = store.claim(&ab, now, &rig.cwd).unwrap();
-    assert_eq!(claim.delivery().notices.len(), 1);
-    let release_crash = claim.release_internal(|index, _| {
-        if index == 1 { WriteAction::Crash } else { WriteAction::Continue }
-    });
-    assert!(release_crash.is_err());
-    assert!(rig.env.root().join("notice-delivery/.tx").exists());
-
-    // After recovery by calling `a` alone, `rel` is consistently kept across both.
+    assert!(claim.release_internal(|index, _| {
+        if index == 1 { WriteAction::Fail(std::io::Error::other("disk full")) } else { WriteAction::Continue }
+    }).is_err());
+    let a_record: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        rig.env.root().join("notice-delivery").join("cd2c73a4b7ee7306e63a70685a60788d.json")
+    ).unwrap()).unwrap();
+    assert_eq!(a_record["delivered"], serde_json::json!({}));
+    assert!(store.claim(&ab, now, &rig.cwd).unwrap().keep().notices.is_empty());
     assert!(store.claim(&a, now, &rig.cwd).unwrap().keep().notices.is_empty());
-    assert!(!rig.env.root().join("notice-delivery/.tx").exists());
-    assert!(store.claim(&b, now, &rig.cwd).unwrap().keep().notices.is_empty());
 
-    // Case 3: maintenance (`notice_rm`) also recovers `.tx` before pruning.
-    rig.add("c3", "4");
-    let x = NoticeSession::single("clean-x").unwrap();
-    let y = NoticeSession::single("clean-y").unwrap();
-    let xy = NoticeSession::agent(["clean-x", "clean-y"]).unwrap();
-    let crashed = store.claim_with_write_hook(&xy, now, &rig.cwd, |index, _| {
-        if index == 1 { WriteAction::Crash } else { WriteAction::Continue }
-    });
-    assert!(crashed.is_err());
-    assert!(rig.env.root().join("notice-delivery/.tx").exists());
-    rig.env.vigil.notice_rm("c3").unwrap();
-    assert!(!rig.env.root().join("notice-delivery/.tx").exists(), "cleanup must recover .tx");
-    let _ = (x, y);
+    rig.add("next", "m");
+    let claim = store.claim(&ab, now, &rig.cwd).unwrap();
+    let bc = NoticeSession::agent(["b", "c"]).unwrap();
+    assert!(store.claim(&bc, now, &rig.cwd).unwrap().keep().notices.is_empty());
+    claim.release();
+    assert!(store.claim(&bc, now, &rig.cwd).unwrap().keep().notices.is_empty());
+    assert!(store.claim(&ab, now, &rig.cwd).unwrap().keep().notices.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

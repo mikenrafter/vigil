@@ -1430,27 +1430,24 @@ any legacy per-record `.lock` file beside it). All writers, releasers and
 cleanup serialize on one delivery-directory lock (`notice-delivery/.lock`),
 which is never unlinked. Records for live notices survive idle periods.
 
-**Once per session.** `claim` runs under `notice-delivery/.lock` with a short
-bounded wait. Multi-record updates use a durable undo journal
-(`notice-delivery/.tx`) written before touching target records and removed once
-all target writes are synced; any mid-commit write error or crash recovers via
-`.tx` before the next claim, release or cleanup reads state, so half the names
-are never left claimed or released. `claim` records the pending notices across
-every name the call sees and returns them. The caller then prints and keeps the
-claim, or releases it on a failed print. Release removes only the generations
-that claim recorded across those names, keeping bridged deliveries and newer
-generations intact. Racing callers with identical or overlapping name sets
-serialize on the directory lock, so they never both print a notice.
+**Once per session.** Claims, releases and cleanup serialize on
+`notice-delivery/.lock`. Each name's record is written in turn under that lock.
+Printing only follows a full commit, so a crash can lose a notice under some
+names but never deliver it twice. A partial claim that writes A but stops
+before B prints nothing. Later A calls skip the notice; B-only calls can
+receive it once, and overlapping calls bridge the recorded generation.
 
-Delivery is at most once on a crash between the durable claim and the print,
-or on a transport failure after the MCP handler returns. That delivery can be
-lost for the session; it is never automatically repeated. A failed print or a cancel
-before commit releases the claim for retry. Release is best effort if the state
-cannot be locked or written. A crash can lose the claimed batch, at most one
-delivery, rather than replaying notices already claimed.
+Release removes only generations claimed by that call, preserving bridged and
+newer generations. It is best effort. A partial release that clears A but
+stops before B can lose delivery: a later {A,B} call copies B's record back
+into A without printing. Similarly, if a claim under {A,B} is bridged by
+{B,C} before the first caller releases after failed output, C retains the
+claim. A later {B,C} call copies it back into B, losing that delivery.
+A crash after the durable claim or a transport failure after MCP handler
+return can also lose delivery. Failed prints and cancellations release for
+retry when all affected records can be updated.
 
-When nothing is pending, no names need bridging, no dead entries need pruning
-and no `.tx` journal needs recovery, the claim reads the records and writes
+When nothing is pending, no names need bridging and no dead entries need pruning, the claim reads the records and writes
 nothing (no record, no lock file): every keepalive claims, and the state root
 must not fill with files for sessions that have nothing to see.
 
@@ -1494,4 +1491,4 @@ them to an agent session`. Which id each harness exposes, and how sure we are,
 is tabulated in `docs/integrations.md`.
 
 CLAIMs (proofs in `src/notice_tests.rs` and `tests/notice_e2e.rs`):
-`notice-once`, `notice-records`, `notice-tx`, `notice-expiry`, `notice-generation`.
+`notice-once`, `notice-records`, `notice-expiry`, `notice-generation`.

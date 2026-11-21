@@ -9,8 +9,7 @@
 //! `T3CODE_THREAD_ID`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID` and a hook payload
 //! id); a notice is pending only when none of those names records its
 //! generation, and deliveries are recorded under every name the call sees under
-//! one delivery-directory lock (`notice-delivery/.lock`) and a durable undo
-//! journal (`notice-delivery/.tx`) for multi-record commits.
+//! one delivery-directory lock (`notice-delivery/.lock`); each name is written in turn.
 //! Reminders and advisories are untouched; neither can express "once per session".
 //!
 //! Mating parts: `notice_ops` (the CLI/MCP operations and session identity),
@@ -34,11 +33,6 @@
 //! file affects only calls that see that name
 //! [notice_tests::concurrent_sessions_each_get_every_notice_and_none_loses_its_record,
 //! notice_tests::corrupt_record_is_isolated_to_calls_seeing_that_name].
-//! CLAIM(notice-tx): multi-record claims and releases are atomic via a durable
-//! undo journal (`notice-delivery/.tx`); a mid-commit write error or crash
-//! never leaves half the names updated
-//! [notice_tests::mid_commit_write_error_rolls_back_all_records_atomically,
-//! notice_tests::partial_write_crash_recovers_before_any_later_claim_or_cleanup].
 //! CLAIM(notice-expiry): `expires_at` is the first instant a notice is no longer
 //! shown [notice_tests::an_expired_notice_is_never_shown_and_the_boundary_is_exclusive].
 //! CLAIM(notice-generation): the record keys on id and creation time, so a
@@ -245,39 +239,15 @@ struct SessionRecord {
     delivered: BTreeMap<String, Timestamp>,
 }
 
-/// Durable undo journal for atomic multi-record updates under `notice-delivery/.lock`.
-/// ↳ CLAIM(notice-tx)
-#[derive(Debug, Serialize, Deserialize)]
-struct PendingTx {
-    entries: Vec<TxEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TxEntry {
-    file: String,
-    /// Exact UTF-8 JSON content before the transaction, or `None` if absent.
-    previous: Option<String>,
-}
-
 #[cfg(test)]
 pub(crate) enum WriteAction {
     Continue,
     Fail(std::io::Error),
-    /// Return immediately without rolling back or deleting `.tx`, leaving the
-    /// exact disk state of a SIGKILL mid-transaction.
-    Crash,
 }
 
 #[cfg(not(test))]
 pub(crate) enum WriteAction {
     Continue,
-}
-
-fn remove_if_present(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
 }
 
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
@@ -314,7 +284,7 @@ impl NoticeClaim {
     /// the delivery directory cannot be locked or written the notices stay
     /// recorded as delivered (at most once wins over at least once for a broken
     /// state directory).
-    /// ↳ CLAIM(notice-once) ↳ CLAIM(notice-tx)
+    /// ↳ CLAIM(notice-once)
     pub fn release(self) {
         let _ = self.release_internal(|_, _| WriteAction::Continue);
     }
@@ -324,7 +294,6 @@ impl NoticeClaim {
             return Ok(());
         }
         let _directory_lock = NoticeStore::lock(&self.store.delivery_lock_path())?;
-        self.store.recover_tx_locked()?;
         let keys = self.session.record_keys();
         let mut writes = Vec::new();
         for key in &keys {
@@ -454,22 +423,6 @@ impl NoticeStore {
         self.delivery_dir().join(".lock")
     }
 
-    fn tx_path(&self) -> PathBuf {
-        self.delivery_dir().join(".tx")
-    }
-
-    fn safe_tx_target(&self, file: &str) -> Result<PathBuf> {
-        if file.is_empty()
-            || !file.ends_with(".json")
-            || file.contains('/')
-            || file.contains('\\')
-            || file.contains("..")
-        {
-            return Err(NoticeError::State(format!("invalid notice record filename in transaction: {file:?}")));
-        }
-        Ok(self.delivery_dir().join(file))
-    }
-
     fn record_path_for_key(&self, key: &RecordKey) -> PathBuf {
         self.delivery_dir().join(key.record_file_name())
     }
@@ -488,106 +441,25 @@ impl NoticeStore {
         }
     }
 
-    /// Recover any interrupted multi-record transaction before reading or writing.
-    /// Must be called while holding `notice-delivery/.lock`.
-    /// ↳ CLAIM(notice-tx)
-    fn recover_tx_locked(&self) -> Result<()> {
-        let tx_path = self.tx_path();
-        let bytes = match std::fs::read(&tx_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let tx: PendingTx = serde_json::from_slice(&bytes).map_err(|error| {
-            NoticeError::State(format!("corrupt notice transaction {}: {error}; delete this file to reset", tx_path.display()))
-        })?;
-        self.rollback_tx_locked(&tx)?;
-        remove_if_present(&tx_path)?;
-        sync_dir(&self.delivery_dir())?;
-        Ok(())
-    }
-
-    fn rollback_tx_locked(&self, tx: &PendingTx) -> Result<()> {
-        for entry in &tx.entries {
-            let path = self.safe_tx_target(&entry.file)?;
-            match &entry.previous {
-                Some(previous) => atomic_write(&path, previous.as_bytes())?,
-                None => remove_if_present(&path)?,
-            }
-        }
-        sync_dir(&self.delivery_dir())?;
-        Ok(())
-    }
-
-    /// Apply zero, one, or many record updates atomically under `notice-delivery/.lock`.
-    /// Single-file updates use one atomic rename directly; multi-file updates
-    /// write `.tx` first so any mid-commit error or crash restores every file.
-    /// ↳ CLAIM(notice-tx)
+    /// Write each name in turn under `notice-delivery/.lock`. Printing only
+    /// follows a full commit; an error leaves completed writes in place.
     fn commit_writes_locked(
         &self,
         writes: &[(String, Vec<u8>)],
         mut before_write: impl FnMut(usize, &Path) -> WriteAction,
     ) -> Result<()> {
-        if writes.is_empty() {
-            return Ok(());
-        }
-        if writes.len() == 1 {
-            let (file, bytes) = &writes[0];
-            let path = self.safe_tx_target(file)?;
-            match before_write(0, &path) {
+        for (index, (file, bytes)) in writes.iter().enumerate() {
+            let path = self.delivery_dir().join(file);
+            match before_write(index, &path) {
                 WriteAction::Continue => {}
                 #[cfg(test)]
                 WriteAction::Fail(error) => return Err(error.into()),
-                #[cfg(test)]
-                WriteAction::Crash => return Err(NoticeError::State("simulated crash".into())),
             }
             atomic_write(&path, bytes)?;
-            return Ok(());
         }
-        let mut entries = Vec::with_capacity(writes.len());
-        for (file, _) in writes {
-            let path = self.safe_tx_target(file)?;
-            let previous = match std::fs::read(&path) {
-                Ok(bytes) => Some(String::from_utf8(bytes).map_err(|error| {
-                    NoticeError::State(format!("non-utf8 delivery record {}: {error}", path.display()))
-                })?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
-            entries.push(TxEntry { file: file.clone(), previous });
+        if writes.len() > 1 {
+            sync_dir(&self.delivery_dir())?;
         }
-        let tx = PendingTx { entries };
-        let tx_bytes = serde_json::to_vec(&tx).map_err(|error| NoticeError::State(error.to_string()))?;
-        let tx_path = self.tx_path();
-        atomic_write(&tx_path, &tx_bytes)?;
-        sync_dir(&self.delivery_dir())?;
-        for (index, (file, bytes)) in writes.iter().enumerate() {
-            let path = self.safe_tx_target(file)?;
-            let step: std::result::Result<(), WriteFaultOutcome> = match before_write(index, &path) {
-                WriteAction::Continue => atomic_write(&path, bytes).map_err(WriteFaultOutcome::Io),
-                #[cfg(test)]
-                WriteAction::Fail(error) => Err(WriteFaultOutcome::Io(error)),
-                #[cfg(test)]
-                WriteAction::Crash => Err(WriteFaultOutcome::Crash),
-            };
-            match step {
-                Ok(()) => {}
-                Err(WriteFaultOutcome::Io(error)) => {
-                    if self.rollback_tx_locked(&tx).is_ok() {
-                        let _ = remove_if_present(&tx_path);
-                        let _ = sync_dir(&self.delivery_dir());
-                    }
-                    return Err(error.into());
-                }
-                #[cfg(test)]
-                Err(WriteFaultOutcome::Crash) => {
-                    return Err(NoticeError::State("simulated crash mid-transaction".into()));
-                }
-            }
-        }
-        sync_dir(&self.delivery_dir())?;
-        std::fs::remove_file(&tx_path)?;
-        sync_dir(&self.delivery_dir())?;
         Ok(())
     }
 
@@ -599,7 +471,7 @@ impl NoticeStore {
     /// them. A notice outside scope is not recorded, so a later call from
     /// inside the scope still gets it.
     /// A notice removed between list() and the record update can still be delivered once.
-    /// ↳ CLAIM(notice-once) ↳ CLAIM(notice-records) ↳ CLAIM(notice-tx) ↳ CLAIM(notice-expiry)
+    /// ↳ CLAIM(notice-once) ↳ CLAIM(notice-records) ↳ CLAIM(notice-expiry)
     pub fn claim(&self, session: &NoticeSession, now: Timestamp, cwd: &Path) -> Result<NoticeClaim> {
         self.claim_internal(session, now, cwd, || {}, |_, _| WriteAction::Continue)
     }
@@ -638,35 +510,23 @@ impl NoticeStore {
         let all = self.list()?;
         let live: BTreeMap<&str, Timestamp> = all.iter().map(|notice| (notice.id.as_str(), notice.created_at)).collect();
         let candidates: Vec<&Notice> = all.iter().filter(|notice| !notice.is_expired(now) && notice.in_scope(cwd)).collect();
-        // Fast path, no lock and no write: a keepalive in a session with
-        // nothing pending, no names to bridge, no dead entries to prune and no
-        // interrupted transaction leaves the state root untouched.
-        let tx_path = self.tx_path();
-        let nothing_to_do = if tx_path.exists() {
-            false
-        } else {
-            let records: Vec<SessionRecord> = keys.iter().map(|key| self.read_record_key(key)).collect::<Result<_>>()?;
-            if tx_path.exists() {
-                false
-            } else {
-                let mut already_delivered: BTreeMap<String, Timestamp> = BTreeMap::new();
-                for record in &records {
-                    for (id, created_at) in &record.delivered {
-                        if live.get(id.as_str()) == Some(created_at) {
-                            already_delivered.insert(id.clone(), *created_at);
-                        }
-                    }
+        // Fast path: already equal records need no lock or writes.
+        let records: Vec<SessionRecord> = keys.iter().map(|key| self.read_record_key(key)).collect::<Result<_>>()?;
+        let mut already_delivered: BTreeMap<String, Timestamp> = BTreeMap::new();
+        for record in &records {
+            for (id, created_at) in &record.delivered {
+                if live.get(id.as_str()) == Some(created_at) {
+                    already_delivered.insert(id.clone(), *created_at);
                 }
-                candidates.iter().all(|notice| already_delivered.get(&notice.id) == Some(&notice.created_at))
-                    && records.iter().all(|record| record.delivered == already_delivered)
             }
-        };
+        }
+        let nothing_to_do = candidates.iter().all(|notice| already_delivered.get(&notice.id) == Some(&notice.created_at))
+            && records.iter().all(|record| record.delivered == already_delivered);
         after_snapshot();
         let claimed = if nothing_to_do {
             Vec::new()
         } else {
             let _directory_lock = Self::lock(&self.delivery_lock_path())?;
-            self.recover_tx_locked()?;
             let all = self.list()?;
             let live: BTreeMap<&str, Timestamp> = all.iter().map(|notice| (notice.id.as_str(), notice.created_at)).collect();
             let candidates: Vec<&Notice> = all.iter().filter(|notice| !notice.is_expired(now) && notice.in_scope(cwd)).collect();
@@ -736,7 +596,7 @@ impl NoticeStore {
 
     /// Maintenance on notice removal or an operator listing expired notices.
     /// Runs under the single delivery-directory lock (which is never unlinked),
-    /// recovers any pending transaction first, and retires records whose
+    /// retires records whose
     /// delivered generations are all dead (along with any legacy per-record
     /// `.lock` files).
     pub(crate) fn prune_stale_records(&self, now: Timestamp) {
@@ -745,9 +605,6 @@ impl NoticeStore {
             return;
         }
         let Ok(_directory_lock) = Self::lock(&self.delivery_lock_path()) else { return };
-        if self.recover_tx_locked().is_err() {
-            return;
-        }
         let Ok(notices) = self.list() else { return };
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
         let paths: Vec<PathBuf> = entries.filter_map(std::result::Result::ok).map(|entry| entry.path()).collect();
@@ -761,7 +618,7 @@ impl NoticeStore {
                 !notices.iter().any(|notice| notice.id == *id && notice.created_at == *created_at && !notice.is_expired(now))
             }) && std::fs::remove_file(path).is_ok()
             {
-                let _ = remove_if_present(&path.with_extension("lock"));
+                let _ = std::fs::remove_file(&path.with_extension("lock"));
             }
         }
         for path in &paths {
@@ -769,16 +626,10 @@ impl NoticeStore {
                 && path.extension().is_some_and(|ext| ext == "lock")
                 && !path.with_extension("json").exists()
             {
-                let _ = remove_if_present(path);
+                let _ = std::fs::remove_file(path);
             }
         }
     }
-}
-
-enum WriteFaultOutcome {
-    Io(std::io::Error),
-    #[cfg(test)]
-    Crash,
 }
 
 /// Reject session text that cannot be one id: blank, over-long or with
