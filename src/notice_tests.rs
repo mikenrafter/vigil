@@ -639,3 +639,18 @@ fn a_contended_notice_lock_returns_a_short_busy_error() {
     assert!(matches!(result, Err(crate::notice::NoticeError::Busy(_))));
     assert!(started.elapsed() < std::time::Duration::from_millis(250), "lock blocked for {:?}", started.elapsed());
 }
+
+#[test]
+fn a_claim_does_not_erase_a_delivery_added_after_its_snapshot() {
+    // CLAIM(notice-once): H lists, operator adds x, K delivers x, H updates.
+    let rig = Rig::new();
+    rig.add("first", "m");
+    let store = rig.vigil().notice_store();
+    let session = NoticeSession::Agent("s".into());
+    let claim = store.claim_with_snapshot_hook(&session, rig.clock.now(), &rig.cwd, || {
+        rig.add("x", "new");
+        assert_eq!(rig.deliver("s"), ids(&["first", "x"]));
+    }).unwrap().keep();
+    assert!(claim.notices.is_empty(), "the other caller already delivered every notice");
+    assert_eq!(rig.deliver("s"), ids(&[]), "stale retain erased the x delivery");
+}

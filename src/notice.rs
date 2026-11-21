@@ -208,6 +208,7 @@ impl NoticeClaim {
                     record.delivered.remove(id);
                 }
             }
+            Ok(())
         });
     }
 }
@@ -332,13 +333,13 @@ impl NoticeStore {
 
     /// Read-modify-write one session's record under its lock; the file is
     /// written (atomically) only when the update changed it.
-    fn update_record<T>(&self, session: &NoticeSession, update: impl FnOnce(&mut SessionRecord) -> T) -> Result<T> {
+    fn update_record<T>(&self, session: &NoticeSession, update: impl FnOnce(&mut SessionRecord) -> Result<T>) -> Result<T> {
         let path = self.record_path(session);
         let _lock = Self::lock(&path.with_extension("lock"))?;
         let mut record = self.read_record(session)?;
         let before = record.delivered.clone();
         record.session = session.namespaced().chars().take(MAX_SESSION_BYTES).collect();
-        let answer = update(&mut record);
+        let answer = update(&mut record)?;
         if record.delivered != before || !path.exists() {
             let bytes = serde_json::to_vec(&record).map_err(|error| NoticeError::State(error.to_string()))?;
             atomic_write(&path, &bytes)?;
@@ -353,6 +354,11 @@ impl NoticeStore {
     /// A notice removed between list() and the record update can still be delivered once.
     /// ↳ CLAIM(notice-once) ↳ CLAIM(notice-records) ↳ CLAIM(notice-expiry)
     pub fn claim(&self, session: &NoticeSession, now: Timestamp, cwd: &Path) -> Result<NoticeClaim> {
+        self.claim_with_snapshot_hook(session, now, cwd, || {})
+    }
+
+    // The callback lets the race regression pause after the unlocked snapshot.
+    pub(crate) fn claim_with_snapshot_hook(&self, session: &NoticeSession, now: Timestamp, cwd: &Path, after_snapshot: impl FnOnce()) -> Result<NoticeClaim> {
         let all = self.list()?;
         let live: BTreeMap<&str, Timestamp> = all.iter().map(|notice| (notice.id.as_str(), notice.created_at)).collect();
         let candidates: Vec<&Notice> = all.iter().filter(|notice| !notice.is_expired(now) && notice.in_scope(cwd)).collect();
@@ -363,10 +369,14 @@ impl NoticeStore {
         let seen = self.read_record(session)?;
         let nothing_to_do = candidates.iter().all(|notice| seen.delivered.get(&notice.id) == Some(&notice.created_at))
             && seen.delivered.iter().all(|(id, created_at)| live.get(id.as_str()) == Some(created_at));
+        after_snapshot();
         let claimed = if nothing_to_do {
             Vec::new()
         } else {
             self.update_record(session, |record| {
+                let all = self.list()?;
+                let live: BTreeMap<&str, Timestamp> = all.iter().map(|notice| (notice.id.as_str(), notice.created_at)).collect();
+                let candidates: Vec<&Notice> = all.iter().filter(|notice| !notice.is_expired(now) && notice.in_scope(cwd)).collect();
                 // Forget notices that were removed or replaced (same id, other
                 // creation time): the record stays bounded by the live set, and
                 // a replaced notice is pending again.
@@ -376,7 +386,7 @@ impl NoticeStore {
                 for notice in &pending {
                     record.delivered.insert(notice.id.clone(), notice.created_at);
                 }
-                pending.into_iter().cloned().collect::<Vec<Notice>>()
+                Ok(pending.into_iter().cloned().collect::<Vec<Notice>>())
             })?
         };
         if !claimed.is_empty() {
