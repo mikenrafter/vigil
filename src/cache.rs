@@ -811,8 +811,8 @@ mod tests {
         //      and non-marker ANTIGRAVITY_* vars stay at 270 s unknown/default.
         // catches: ignoring ANTIGRAVITY_CONVERSATION_ID or ANTIGRAVITY_AGENT=1,
         //          leaving Antigravity at 270 s, accepting empty/0 markers,
-        //          applying 180 s to non-orchestrators, or clamping explicit
-        //          max_s to 180/270 instead of the 3000 s ceiling.
+        //          applying 180 s to non-orchestrators, or failing to cap explicit
+        //          max_s at 270 s.
         // proves: CLAIM(AI1'), CLAIM(AI3)
         let root = tempfile::tempdir().unwrap();
         let ask = |explicit_s: Option<u64>, orchestrator: bool, pairs: &[(&str, &str)]| {
@@ -850,8 +850,27 @@ mod tests {
         );
         assert_eq!(
             ask(Some(9999), true, &[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]),
-            serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 3000})
+            serde_json::json!({"ttl": "unknown", "source": "explicit", "interval_s": 270})
         );
+    }
+
+    #[test]
+    fn antigravity_explicit_windows_are_capped_at_270_s_for_every_caller_role() {
+        // why: AI1' / A2 cap Antigravity at 270 s while its MCP timeout is
+        //      unknown and its measured cache lasts 4-5 minutes.
+        // catches: retaining the 3000 s ceiling, capping at the automatic
+        //          180 s window, or applying the cap only to orchestrators.
+        // proves: CLAIM(AI1'), CLAIM(A2-explicit)
+        let agent = env_of(&[("ANTIGRAVITY_CONVERSATION_ID", "conv-1")]);
+        for orchestrator in [false, true] {
+            for (explicit_s, expected_s) in [(0, 30), (180, 180), (269, 269), (270, 270), (271, 270), (9999, 270)] {
+                assert_eq!(
+                    choose_window(&WindowRequest { explicit_s: Some(explicit_s), orchestrator, agent: &agent, projects_dir: None }),
+                    note(Ttl::Unknown, TtlSource::Explicit, expected_s),
+                    "explicit {explicit_s}, orchestrator {orchestrator}"
+                );
+            }
+        }
     }
 
     #[test]
