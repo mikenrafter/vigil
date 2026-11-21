@@ -337,7 +337,9 @@ fn build_vigil(root: Option<PathBuf>) -> anyhow::Result<Vigil> {
     let faults = vigil::FaultPlan::from_env_value(std::env::var(vigil::fault::ENV_VAR).ok().as_deref())
         .map_err(|error| anyhow::anyhow!("invalid {}: {error}", vigil::fault::ENV_VAR))?;
     // A3, S4: who is calling is read here, once, from the whole environment.
-    let agent = vigil::cache::AgentEnv::from_vars(std::env::vars());
+    // agy gives the vigil mcp it spawns no ANTIGRAVITY_* variable: its parent name is the signal.
+    let agent = vigil::cache::AgentEnv::from_vars(std::env::vars())
+        .with_antigravity_signal(vigil::peers::antigravity_in_ancestry(std::path::Path::new("/proc"), std::process::id()));
     let session = vigil::peers::session_key_from_lookup(|name| std::env::var(name).ok());
     let notice_sessions = vigil::notice_ops::session_keys_from_lookup::<&str>(|name| std::env::var(name).ok(), &[]);
     Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent).with_session_key(session).with_notice_session_keys(notice_sessions))

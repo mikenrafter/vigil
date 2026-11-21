@@ -32,7 +32,12 @@ fn waited_secs(waited: Duration) -> u64 {
 /// Each look is one small file read per covered watch.
 pub const OUTBOX_POLL: Duration = Duration::from_secs(5);
 
-/// Stub (red commit): the advice step is not capped yet.
+/// CLAIM(neon-mcp-bound): the most a call spends on advisories AFTER its
+/// window. Advisories run one after another and each probe may take up to
+/// `PROBE_DEADLINE` (20 s), so N slow probes would add 20 N s to a call whose
+/// transport kills it at a fixed time (agy: 180 s). Past this budget the
+/// advice list says the advisories are unavailable
+/// [auto_interval_tests::an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_probe_is_slow].
 pub const ADVICE_TAIL_BUDGET: Duration = Duration::from_secs(15);
 
 pub const MIN_MAX_S: u64 = 30;
@@ -348,7 +353,14 @@ impl crate::engine::Vigil {
         let mut outcome = self.blocking_call(request, progress, cancel).await?;
         if let Some((envelope, _)) = outcome.as_mut() {
             // CLAIM(advisory-delivery) ↳ every blocking return of keepalive carries `advice`
-            envelope.advice = self.envelope_advice().await;
+            envelope.advice = match tokio::time::timeout(ADVICE_TAIL_BUDGET, self.envelope_advice()).await {
+                Ok(advice) => advice,
+                Err(_) => Some(vec![crate::advisory_eval::Advice::unavailable(
+                    "advisories",
+                    &format!("evaluation took longer than {} s", ADVICE_TAIL_BUDGET.as_secs()),
+                    self.clock.now(),
+                )]),
+            };
             (envelope.reminders, envelope.reminders_error) = self.reminder_report().await;
         }
         if let Some((envelope, delivery)) = outcome.as_mut() {

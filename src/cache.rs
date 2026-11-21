@@ -24,16 +24,28 @@ use crate::credit::CreditCheck;
 
 /// AI1': the default window, and the window for a 5-minute or unknown TTL.
 pub const DEFAULT_WINDOW_S: u64 = 270;
-/// Measured per-conversation prompt-cache lifetime for Antigravity / Gemini 4
-/// Neon is 4-5 minutes (cached at 4 m, uncached at 5 m; 2026-11-21); 180 s
-/// (3 minutes) leaves a 1-minute margin below the last measured hit.
-pub const ANTIGRAVITY_WINDOW_S: u64 = 180;
+/// agy (Antigravity CLI 1.5.13) kills any MCP tool call after exactly 180 s
+/// (`MCP tool call to server "vigil" timed out after 3m0s`), and has no key to
+/// change it [evidence-neon-mcp-live.md, 2026-11-21].
+pub const ANTIGRAVITY_MCP_TIMEOUT_S: u64 = 180;
+/// CLAIM(neon-mcp-bound): the window for every Antigravity call: automatic,
+/// default and the explicit ceiling. 150 s = the 180 s MCP timeout minus the
+/// 15 s `ADVICE_TAIL_BUDGET` that can follow the window, minus 15 s for file
+/// work and scheduling [auto_interval_tests::an_antigravity_call_returns_in_under_180_s_even_when_every_advisory_probe_is_slow;
+/// docs/specs/auto-interval.md AI1']. The measured Neon prompt cache lasts
+/// 4-5 minutes (cached at 4 m, uncached at 5 m; 2026-11-21), so 150 s keeps it warm.
+pub const ANTIGRAVITY_WINDOW_S: u64 = 150;
+const _: () = assert!(
+    ANTIGRAVITY_WINDOW_S + crate::keepalive::ADVICE_TAIL_BUDGET.as_secs() + 10 <= ANTIGRAVITY_MCP_TIMEOUT_S,
+    "the window plus the advice tail must leave at least 10 s below agy's MCP timeout"
+);
 /// AI1' / D1: a 1 h TTL minus a 10 minute margin (3000 s). Owner 2026-11-13:
 /// at most 50 minutes. Was 3300 s (5 minute margin).
 pub const ONE_HOUR_WINDOW_S: u64 = 3000;
 /// A2: explicit windows are clamped to at least this ...
 pub const MIN_WINDOW_S: u64 = 30;
-/// ... and at most `ONE_HOUR_WINDOW_S`, or 270 s for Codex, Antigravity or Ambiguous.
+/// ... and at most `ONE_HOUR_WINDOW_S`, 270 s for Codex or Ambiguous, or
+/// `ANTIGRAVITY_WINDOW_S` when any Antigravity signal is present.
 pub const CODEX_MAX_WINDOW_S: u64 = 270;
 /// AI1' / D4: only this much of a transcript's end is read.
 pub const TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
@@ -76,9 +88,9 @@ pub struct CacheNote {
 
 impl CacheNote {
     /// The window of a caller that is not the orchestrator, or whose cache is
-    /// not known: 270 s, `unknown`, `default`.
-    pub const fn unknown_default() -> CacheNote {
-        CacheNote { ttl: Ttl::Unknown, source: TtlSource::Default, interval_s: DEFAULT_WINDOW_S, credit_check: None }
+    /// not known: `unknown`, `default`, 270 s (150 s under an Antigravity signal).
+    pub const fn unknown_default(identity: Identity<'_>) -> CacheNote {
+        CacheNote { ttl: Ttl::Unknown, source: TtlSource::Default, interval_s: identity.default_window_s(), credit_check: None }
     }
 }
 
@@ -106,23 +118,35 @@ pub enum Identity<'a> {
     Antigravity,
     /// Two or more agent signals are present (a nested agent shell): vigil
     /// cannot say which one is calling, so it assumes the stricter limits (S4).
-    Ambiguous,
+    /// `antigravity`: one of the signals is Antigravity, whose 180 s MCP
+    /// timeout is stricter than Codex's 300 s.
+    Ambiguous { antigravity: bool },
     /// No agent signal.
     Unknown,
 }
 
 impl Identity<'_> {
     /// The largest window an explicit `max_s` may ask for (A2): 3000 (50 min,
-    /// owner 2026-11-13: at most 50 minutes), the
-    /// largest vigil ever picks itself. Codex's tool timeout (300 s) is a hard
-    /// limit. Codex, mixed signals (`Ambiguous`), and Antigravity get 270
-    /// (R2-A1, S4, AI1'). Antigravity's MCP timeout is unknown and its measured
-    /// cache lasts 4-5 minutes [docs/specs/auto-interval.md AI1']. Claude and
-    /// Unknown retain 3000 s.
+    /// owner 2026-11-13: at most 50 minutes), the largest vigil ever picks
+    /// itself. Codex's tool timeout (300 s) is a hard limit: Codex and mixed
+    /// signals without Antigravity get 270 (R2-A1, S4). agy's MCP timeout
+    /// (180 s, measured) is stricter: Antigravity, alone or mixed with
+    /// anything (S4), gets 150. Claude and Unknown retain 3000 s.
     pub const fn window_ceiling_s(self) -> u64 {
         match self {
-            Identity::Codex | Identity::Antigravity | Identity::Ambiguous => CODEX_MAX_WINDOW_S,
+            Identity::Antigravity | Identity::Ambiguous { antigravity: true } => ANTIGRAVITY_WINDOW_S,
+            Identity::Codex | Identity::Ambiguous { antigravity: false } => CODEX_MAX_WINDOW_S,
             Identity::Claude { .. } | Identity::Unknown => ONE_HOUR_WINDOW_S,
+        }
+    }
+
+    /// The window of a call that gets no TTL-derived window (a non-orchestrator,
+    /// an ambiguous or unknown identity): 270, or 150 when any Antigravity
+    /// signal is present.
+    pub const fn default_window_s(self) -> u64 {
+        match self {
+            Identity::Antigravity | Identity::Ambiguous { antigravity: true } => ANTIGRAVITY_WINDOW_S,
+            _ => DEFAULT_WINDOW_S,
         }
     }
 }
@@ -145,8 +169,13 @@ impl AgentEnv {
         agent
     }
 
-    /// Stub (red commit): the process-tree signal is not wired yet.
-    pub fn with_antigravity_signal(self, _present: bool) -> AgentEnv {
+    /// Add the process-tree signal read at the binary edge (a parent named
+    /// `agy`, `peers::antigravity_in_ancestry`). agy does not put an
+    /// `ANTIGRAVITY_*` variable in the environment of the MCP server it spawns,
+    /// so the tree is the only evidence there. OR-ed with the variables: a
+    /// false signal never clears one that was read.
+    pub fn with_antigravity_signal(mut self, present: bool) -> AgentEnv {
+        self.antigravity |= present;
         self
     }
 
@@ -156,7 +185,7 @@ impl AgentEnv {
             (None, true, false) => Identity::Codex,
             (None, false, true) => Identity::Antigravity,
             (None, false, false) => Identity::Unknown,
-            _ => Identity::Ambiguous,
+            _ => Identity::Ambiguous { antigravity: self.antigravity },
         }
     }
 }
@@ -183,16 +212,16 @@ pub fn choose_window(request: &WindowRequest<'_>) -> CacheNote {
         return CacheNote { ttl: Ttl::Unknown, source: TtlSource::Explicit, interval_s, credit_check: None };
     }
     if !request.orchestrator {
-        return CacheNote::unknown_default();
+        return CacheNote::unknown_default(identity);
     }
     match identity {
         Identity::Codex => CacheNote { ttl: Ttl::FiveMinutes, source: TtlSource::CodexDefault, interval_s: DEFAULT_WINDOW_S, credit_check: None },
         Identity::Antigravity => CacheNote { ttl: Ttl::FiveMinutes, source: TtlSource::AntigravityMeasured, interval_s: ANTIGRAVITY_WINDOW_S, credit_check: None },
-        Identity::Ambiguous | Identity::Unknown => CacheNote::unknown_default(),
+        Identity::Ambiguous { .. } | Identity::Unknown => CacheNote::unknown_default(identity),
         Identity::Claude { session_id } => match request.projects_dir.and_then(|dir| ttl_of_session(dir, session_id)) {
             Some(Ttl::OneHour) => CacheNote { ttl: Ttl::OneHour, source: TtlSource::ClaudeTranscript, interval_s: ONE_HOUR_WINDOW_S, credit_check: None },
             Some(Ttl::FiveMinutes) => CacheNote { ttl: Ttl::FiveMinutes, source: TtlSource::ClaudeTranscript, interval_s: DEFAULT_WINDOW_S, credit_check: None },
-            Some(Ttl::Unknown) | None => CacheNote::unknown_default(),
+            Some(Ttl::Unknown) | None => CacheNote::unknown_default(identity),
         },
     }
 }

@@ -219,8 +219,34 @@ fn pid_dead(pid: u32) -> bool {
     }
 }
 
-/// Stub (red commit): the process-tree signal is not read yet.
-pub fn antigravity_in_ancestry(_root: &Path, _pid: u32) -> bool {
+/// Process names (`comm`, at most 15 bytes) of Antigravity's CLI: `agy`, and the
+/// nix wrapper's `.agy-wrapped`. `agy acp` (T3) and `agy --print` show `agy`
+/// as the parent of shell children [report-neon-ttl.md]; the same name as the
+/// parent of the `vigil mcp` child is measured for `--print` only
+/// [evidence-neon-mcp-live.md, run 2]. The IDE and its language server are not
+/// listed: a terminal inside the IDE would then slow every Claude session run in it.
+const ANTIGRAVITY_COMMS: [&str; 2] = ["agy", ".agy-wrapped"];
+/// A real process tree is shallower; the bound also ends a walk through a loop.
+const MAX_ANCESTRY_DEPTH: usize = 64;
+
+/// CLAIM(neon-mcp-bound): true when ANY ancestor of `pid` is named like
+/// Antigravity's CLI [peers_tests::an_agy_parent_or_ancestor_is_the_antigravity_process_tree_signal].
+/// The whole chain is walked, not only the parent, and a claude or codex
+/// ancestor does not stop the walk: a wrapper may sit between agy and vigil,
+/// and S4 says any Antigravity signal, mixed or not, applies the stricter
+/// limits. Reads only `stat` (names and parent pids), never another process's
+/// environment (peers_tests::the_ancestry_walk_never_reads_another_process_environment).
+/// An unreadable link ends the walk with `false`.
+pub fn antigravity_in_ancestry(root: &Path, pid: u32) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current = pid;
+    while current != 0 && seen.len() < MAX_ANCESTRY_DEPTH && seen.insert(current) {
+        let Ok((name, _, parent)) = proc_stat(root, current) else { return false };
+        if ANTIGRAVITY_COMMS.contains(&name.as_str()) {
+            return true;
+        }
+        current = parent;
+    }
     false
 }
 
