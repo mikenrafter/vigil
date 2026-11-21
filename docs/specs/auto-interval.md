@@ -28,13 +28,15 @@ manual tick as backup; the agent should not think about tick length.
     `ephemeral_5m_input_tokens > 0` → 5 min. Nothing found → unknown.
   - Codex (`CODEX_*` / codex env, or `AGENT=codex`): 5 min (no TTL is
     recorded; owner decision).
-  - Antigravity (non-empty `ANTIGRAVITY_CONVERSATION_ID` or
-    `ANTIGRAVITY_AGENT=1`, with no Claude or Codex signal): measured 4-5 min,
-    represented as `5m` / `antigravity-measured`; orchestrator window 180 s.
+  - Antigravity (non-empty `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENT=1`,
+    or an ancestor process named `agy`, with no Claude or Codex signal):
+    measured 4-5 min, represented as `5m` / `antigravity-measured`;
+    orchestrator window 150 s.
   - Any mix of two or more of Claude, Codex and Antigravity: ambiguous,
-    `unknown` / `default` / 270 s (S4).
+    `unknown` / `default` / 270 s (S4), or 150 s when Antigravity is one of the
+    signals.
   - Anything else, unreadable file, parse error: unknown.
-  - Interval: 1 h → 3000 s; Antigravity orchestrator → 180 s;
+  - Interval: 1 h → 3000 s; any Antigravity signal → 150 s (AI1');
     other 5 min or unknown → 270 s. An explicit
     `max_s`/`--max-s` still wins, clamped to the transport limit.
 - **AI2 — transport limits respected.** MCP calls from Codex never exceed
@@ -85,17 +87,39 @@ must, to pass `--max-s 270`). Recorded in the vigil skill.
   is always 270 s. Only a call that marks itself as the main orchestrator
   session (CLI `--orchestrator`; MCP `orchestrator: true`; the watch can also
   store it at create) gets the TTL-derived interval: Claude 1 h → 3000 s;
-  Antigravity → 180 s with `ttl: "5m"`, `source: "antigravity-measured"`.
-  Antigravity is detected by non-empty `ANTIGRAVITY_CONVERSATION_ID` or
-  `ANTIGRAVITY_AGENT=1`, without Claude or Codex signals. Its measured cache
-  lasts 4-5 minutes (2026-11-21), so 180 s leaves a minute below the last
-  measured hit at 4 minutes. Other 5 min or unknown cases stay at 270 s.
-  Explicit `max_s` still wins, clamped to 30..=3000 for Claude or Unknown,
-  and 30..=270 for Codex, Antigravity or Ambiguous. Antigravity's MCP tool
-  timeout is unknown; the conservative 270 s ceiling also stays below the
-  upper end of its measured 4-5 minute cache lifetime. Subagents
-  therefore stay at 270 s with no special instruction, which removes the
-  subagent limit above.
+  Antigravity → 150 s with `ttl: "5m"`, `source: "antigravity-measured"`.
+  Other 5 min or unknown cases stay at 270 s.
+
+  **Antigravity bound (measured 2026-11-21, CLAIM(neon-mcp-bound)).** agy
+  (Antigravity CLI 1.5.13) kills any MCP tool call after exactly 180 s
+  (`MCP tool call to server "vigil" timed out after 3m0s`) and exposes no key
+  to change that. Every keepalive an Antigravity-hosted agent makes over MCP
+  must therefore return in under 180 s on every path: the orchestrator's
+  automatic window, the non-orchestrator default, and an explicit `max_s`.
+  All three use **150 s** (ceiling and default). The call ends later than its
+  window by its tail: advisories (`advice`) are evaluated one after another
+  after the window, each probe up to 19 s (20 s deadline), so the tail is
+  capped at 15 s in total (`ADVICE_TAIL_BUDGET`, all hosts); a longer
+  evaluation is replaced by one `unavailable` entry. Reminders at the tail
+  read only the probe cache (no probe), and notices, peers and the last-call
+  record are file reads. Worst case is 150 + 15 s plus file work, 15 s below
+  the timeout. The measured Neon prompt cache lasts 4-5 minutes, so 150 s
+  keeps it warm. Subagents (non-orchestrators) are bound the same way when
+  an Antigravity signal is present; elsewhere they stay at 270 s with no
+  special instruction, which removes the subagent limit above.
+
+  **Antigravity detection.** Any of: non-empty `ANTIGRAVITY_CONVERSATION_ID`;
+  `ANTIGRAVITY_AGENT=1`; or **any ancestor process whose name is `agy`** (or
+  nix's `.agy-wrapped`), found at the binary edge from `/proc/<pid>/stat`
+  (names and parent pids only, never another process's environment). The
+  `vigil mcp` child agy spawns carries no `ANTIGRAVITY_*` variable (only its
+  shell children do; measured 2026-11-21, `env -i` run), but its parent's name
+  is `agy`. The whole ancestor chain is searched because a wrapper may sit
+  between agy and vigil, and a claude or codex ancestor does not stop the
+  walk: any Antigravity signal, alone or mixed, applies the stricter limit
+  (S4). Explicit `max_s` still wins, clamped to 30..=3000 for Claude or
+  Unknown, 30..=270 for Codex or an ambiguous identity with no Antigravity
+  signal, and 30..=150 when any Antigravity signal is present.
 - **AI2' — credit check every 4 minutes, account-wide.** Usage credits can
   start because of any session on the account, so a long call re-checks every
   240 s, independent of its own transcript:
@@ -202,7 +226,10 @@ are accepted as written, except:
 - **S4 (reverses red default A3).** Identity is ambiguous with signals from
   any two or more of Claude, Codex and Antigravity, including all three.
   Ambiguous → 270 s, `unknown` / `default`; explicit `max_s` is capped at
-  270 s. Test nested agents in either direction and each mix of signals.
+  270 s. When Antigravity is one of the signals, env or process tree, the
+  stricter agy limit applies instead: 150 s and a 150 s cap, because agy kills
+  a call at 180 s (AI1'). Test nested agents in either direction and each mix
+  of signals.
 - **S5.** Credit state is tri-state: on / off / unknown. Unknown keeps the last
   known state and never emits an event or runs the hook.
 - **S6.** `attention` events are ordinary events: generated with distinct ids,

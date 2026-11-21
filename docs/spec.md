@@ -118,11 +118,11 @@ prompt-cache TTL, so every `keepalive` call has a fixed window:
 
 - The window is chosen by vigil, not by the agent: **270 s** by default, and
   up to **3000 s** (50 minutes; it was 3300 s until 2026-11-13)
-  for the orchestrator on a 1-hour prompt cache, or **180 s** for an
-  Antigravity orchestrator (see
+  for the orchestrator on a 1-hour prompt cache, and **150 s** for every call
+  of an Antigravity-hosted agent: agy kills an MCP tool call at 180 s (see
   "Cache-aware window, time and early attention"). An explicit `max_s` still
-  wins, clamped to 30..=3000 (30..=270 for Codex, Antigravity and an ambiguous
-  caller). Values outside the range are clamped, not rejected, and the
+  wins, clamped to 30..=3000 (30..=270 for Codex and an ambiguous caller,
+  30..=150 when any Antigravity signal is present). Values outside the range are clamped, not rejected, and the
   envelope reports the value used (`max_s`, `waited_s`).
 - A deadline of any length (hours, days) needs no special path. Each call
   checks the wall clock against the deadline: has it passed, yes or no. If
@@ -709,11 +709,13 @@ needs a clock in the envelope and an early wake when a job looks stuck.
 
 **Window (AI1', AI3, S4).** Per call, in this order:
 1. An explicit `max_s` / `--max-s` wins, clamped to 30..=3000, or 30..=270
-   when the caller is Codex, Antigravity or ambiguous. Antigravity uses the
-   conservative 270 s ceiling because its MCP tool timeout is unknown and
-   its measured per-conversation cache lasts 4-5 minutes. `cache` is `unknown` / `explicit`.
-2. A caller that is not the orchestrator gets 270 s (`unknown` / `default`).
-   Subagents therefore need no special instruction.
+   when the caller is Codex or ambiguous, or 30..=150 when any Antigravity
+   signal is present: agy kills an MCP tool call after exactly 180 s
+   (measured 2026-11-21), and the window plus the post-window tail must stay
+   below that. `cache` is `unknown` / `explicit`.
+2. A caller that is not the orchestrator gets 270 s (`unknown` / `default`),
+   or 150 s under an Antigravity signal. Subagents therefore need no special
+   instruction.
 3. The orchestrator is a call with `orchestrator: true` (MCP), `--orchestrator`
    (CLI), or any covered pending watch created with `orchestrator: true`; an
    explicit `false` overrides the stored flag. Its window comes from the
@@ -724,12 +726,19 @@ needs a clock in the envelope and an early wake when a job looks stuck.
    gives 1 h and 3000 s (600 s margin; was 3300 s with a 300 s margin until 2026-11-13), else a 5m write gives 5m and 270 s; nothing usable
    gives `unknown` and 270 s. Codex (`AGENT=codex` or any `CODEX_*` variable)
    is `5m` / `codex-default` / 270 s. Antigravity (non-empty
-   `ANTIGRAVITY_CONVERSATION_ID` or `ANTIGRAVITY_AGENT=1`, with no Claude or
-   Codex signal) is `5m` / `antigravity-measured` / 180 s. The `5m` wire
-   category represents a measured 4-5 minute cache; 180 s leaves a minute
-   below the last measured hit at 4 minutes. Any mix of two or more of
-   Claude, Codex and Antigravity signals is ambiguous: 270 s,
-   `unknown` / `default`, including all three signals together.
+   `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENT=1`, or an ancestor
+   process named `agy`, with no Claude or Codex signal) is `5m` /
+   `antigravity-measured` / 150 s. The `5m` wire category represents a
+   measured 4-5 minute cache; 150 s keeps it warm and leaves 30 s below agy's
+   180 s MCP timeout for the call's tail (advisories, capped at 15 s in
+   total). agy gives the `vigil mcp` it spawns no `ANTIGRAVITY_*` variable,
+   so the process tree is the signal there: the binary reads only names and
+   parent pids from `/proc` (never another process's environment) and any
+   ancestor named `agy` counts. Any mix of two or more of Claude, Codex and
+   Antigravity signals is ambiguous: 270 s, `unknown` / `default`, including
+   all three signals together, except that an Antigravity signal among them
+   makes it 150 s (stricter limit, S4). Details and the measurement:
+   `docs/specs/auto-interval.md` AI1'.
 4. The window is decided again at every call.
 
 Bounds (S8): only the last 512 KiB of a transcript is read (a seek, at most
