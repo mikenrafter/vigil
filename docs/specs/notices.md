@@ -74,10 +74,11 @@ a harness whose field differs from the table is a one-line fix in
 
 ## Open questions
 
-1. **Shared identity.** Hooks, CLI keepalive and MCP use the same environment
-   and ancestor detection. Hook payload ids are a fallback when detection
-   finds no key. Explicit session arguments still select a named session.
-   Processes with different environment keys need matching configuration.
+1. **Shared identity pilot.** Notices prefer `T3CODE_THREAD_ID`, then
+   `CLAUDE_CODE_SESSION_ID`, then `CODEX_SESSION_ID`, then a hook payload id,
+   then an agent ancestor. Explicit session arguments select a named session.
+   This order is separate from peers and hold ownership. It makes Codex T3
+   shell children and MCP children share the T3 record.
 2. **Compaction.** After `/compact` the agent has lost the notice text but the
    record says it was shown. A SessionStart hook with source `compact` could
    re-deliver unexpired notices (a `--again` flag that ignores the record for
@@ -90,9 +91,30 @@ a harness whose field differs from the table is a one-line fix in
    event claim would need its own once-per-session machinery.
 4. **Retention.** Old delivery records can be removed only when every delivered
    generation is removed or expired. Lock files stay in place.
-5. **Codex's session id in the environment.** `peers` reads `CODEX_SESSION_ID`,
-   but that string is not in the Codex 0.170 binary. Both hooks and MCP fall back to the
-   same ancestor process when no environment key exists.
+5. **Codex child environments.** Fable's round-2 live check found
+   `CODEX_SESSION_ID`, `CODEX_THREAD_ID` and `T3CODE_THREAD_ID` in shell
+   children, and only `T3CODE_THREAD_ID` in MCP children. Both CODEX names
+   exist in the 0.170 binary. The hook environment remains unverified.
+   One app-server hosts several threads, so ancestry cannot distinguish them.
+
+## Hardening follow-up: identity as a set of names
+
+Design only; this pilot does not implement it. Collect every session name a
+call sees, including all session environment variables and the hook payload
+id. A notice is pending only when none of those names' records contains its
+generation. Record a delivery under every name the call sees, even when one
+name already records it, so that a bridging call links the names without
+printing again. The Codex shell call links its Codex and T3 names; MCP can
+then find the delivery through its T3 name alone.
+
+Read and update all names under one delivery-directory lock, with a durable
+transaction for multi-record writes or a single atomic shared record. A crash
+must not leave half the names claimed. Release must remove only generations
+claimed by that call across those names. Ancestry is used only when no session
+name or payload exists. Disjoint name sets cannot be joined until some call
+sees both; the implementation must state this limit and test both bridge
+orders, simultaneous overlapping name sets, partial-write recovery and
+cancellation. This is the follow-up to the T3-first stopgap, not part of it.
 
 ## Topic snippets with cadence (residual-cli's guru pattern), later
 
@@ -143,8 +165,8 @@ case rather than a second mechanism.
 
 - the claim / print / keep-or-release protocol and the lock (exactly once per
   session, no lost record);
-- hashed session file names and the identity order (explicit, environment, ancestor,
-  hook payload, process run);
+- hashed session file names and the notice identity order (explicit, T3, Claude, Codex,
+  hook payload, ancestor, process run);
 - "silence writes nothing": a turn with no relevant topic must not rewrite the
   record. The turn counter is the one wrinkle: bumping it every prompt writes
   every prompt. Options: derive `turn` from the harness (the hook payload has a

@@ -261,12 +261,12 @@ The session id each harness gives a hook or child process:
 | Harness | Hook payload field | Environment | Status |
 |---|---|---|---|
 | Claude Code | `session_id` | `CLAUDE_CODE_SESSION_ID` (same value as the transcript file name under `~/.claude/projects`) | payload read by `bin/compact-advice-hook` and `bin/skill-watch-hook`; env var and transcript name checked on this host |
-| Codex 0.170 | `session_id` (`turn_id` also present) | none found: no `CODEX_SESSION_ID` or `CODEX_THREAD_ID` string in the binary | payload field from the same mstack hooks; env absence from the binary only, not a live session |
+| Codex 0.170 | `session_id` (`turn_id` also present) | `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `T3CODE_THREAD_ID` in shell children; only `T3CODE_THREAD_ID` in MCP children | variable names checked live by Fable round-2 review; Codex hook environment unverified |
 | Antigravity `agy` 1.5 | `conversationId` | `ANTIGRAVITY_CONVERSATION_ID` and `ANTIGRAVITY_TRAJECTORY_ID` are named in the binary | payload recorded in the agy integration report; the env var was not observed on a live child process |
 | T3 Code | no hooks | `T3CODE_THREAD_ID` | observed in a T3 thread's environment |
 
-`--from-hook` first uses the same environment or ancestor key as keepalive and
-MCP. Only when none exists does it use a payload field. With neither key nor
-payload id it exits non-zero without printing notices. A harness
+`--from-hook`, keepalive and MCP use the notice-only order: `T3CODE_THREAD_ID`,
+`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, hook payload id, then an agent
+ancestor. A hook with no identity exits non-zero without printing notices. A harness
 that has no hook but runs the MCP server (T3) is covered by the keepalive
 envelope and the `notices` tool: the server resolves its own identity.

@@ -32,6 +32,18 @@ pub fn hook_session_id(payload: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Notice-only pilot precedence. Peers and holds retain their own identity order.
+/// A hook payload identifies a thread more precisely than a shared app-server.
+pub fn session_key_from_lookup(mut lookup: impl FnMut(&str) -> Option<String>, payload: Option<&str>) -> Option<String> {
+    for name in ["T3CODE_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID"] {
+        if let Some(key) = lookup(name).filter(|key| !key.trim().is_empty()) {
+            return Some(key);
+        }
+    }
+    payload.filter(|key| !key.trim().is_empty()).map(str::to_string)
+        .or_else(|| crate::peers::session_key_from_lookup(|_| None))
+}
+
 impl Vigil {
     pub fn notice_store(&self) -> NoticeStore {
         NoticeStore { root: self.store.root().into() }
@@ -65,14 +77,14 @@ impl Vigil {
     }
 
     /// Whose record a delivery goes to: an explicit id, else this process's
-    /// agent identity (`session_key`: Claude session id, Codex, T3 thread, or an
+    /// notice identity (T3 thread, Claude session id, Codex, or an
     /// agent ancestor), else one run of the calling process. An explicit id that
     /// is blank is an error, never the fallback.
     pub fn notice_session(&self, explicit: Option<&str>) -> Result<NoticeSession> {
         if let Some(raw) = explicit {
             return Ok(NoticeSession::Agent(check_session(raw)?));
         }
-        if let Some(key) = self.session_key.as_deref().filter(|key| !key.trim().is_empty()) {
+        if let Some(key) = self.notice_session_key.as_deref().or(self.session_key.as_deref()).filter(|key| !key.trim().is_empty()) {
             return Ok(NoticeSession::Agent(check_session(key)?));
         }
         // The MCP server is one long process; a CLI call is short, so its

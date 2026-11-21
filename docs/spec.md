@@ -1458,12 +1458,14 @@ fill with files for sessions that have nothing to see.
 - Advisories and reminders are unchanged.
 
 **Session identity.** An explicit `--session ID` selects a session; a blank
-value is an error. Otherwise all paths use the same detection as peers:
-`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, `T3CODE_THREAD_ID`, then a
-`claude`/`codex` ancestor process. With `--from-hook`, only when detection
-finds no key, use the first non-blank payload field among `session_id`,
+value is an error. Otherwise notice-only detection prefers
+`T3CODE_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, then `CODEX_SESSION_ID`.
+With `--from-hook`, when none of those is present, use the first non-blank
+payload field among `session_id`,
 `sessionId`, `conversationId`, `conversation_id`, `thread_id`, `threadId`.
-A hook with neither a detected key nor a payload id fails without printing.
+A `claude`/`codex` ancestor is the last fallback, below the payload.
+A hook with no key, payload id or ancestor fails without printing.
+Peer and hold ownership keep their existing identity order.
 The payload's `cwd` applies when `--cwd` is absent. Other unidentified calls
 fall back to one process run. A process run is keyed by pid and start time of the calling process: the CLI's parent, or
 the MCP server itself. Its output says `no agent session identity: these notices

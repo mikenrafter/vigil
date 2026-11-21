@@ -336,7 +336,8 @@ fn build_vigil(root: Option<PathBuf>) -> anyhow::Result<Vigil> {
     // A3, S4: who is calling is read here, once, from the whole environment.
     let agent = vigil::cache::AgentEnv::from_vars(std::env::vars());
     let session = vigil::peers::session_key_from_lookup(|name| std::env::var(name).ok());
-    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent).with_session_key(session))
+    let notice_session = vigil::notice_ops::session_key_from_lookup(|name| std::env::var(name).ok(), None);
+    Ok(Vigil::new(root, Arc::new(SystemClock), Arc::new(judge), config).with_write_faults(faults).with_agent_env(agent).with_session_key(session).with_notice_session_key(notice_session))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
@@ -511,8 +512,9 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 if !payload.is_object() {
                     anyhow::bail!("hook payload on stdin is not a JSON object");
                 }
-                if session.is_none() && !matches!(vigil.notice_session(None)?, vigil::notice::NoticeSession::Agent(_)) {
-                    session = vigil::notice_ops::hook_session_id(&payload);
+                if session.is_none() {
+                    let payload_session = vigil::notice_ops::hook_session_id(&payload);
+                    session = vigil::notice_ops::session_key_from_lookup(|name| std::env::var(name).ok(), payload_session.as_deref());
                     if session.is_none() {
                         anyhow::bail!("hook has no session identity in payload, environment or ancestry");
                     }

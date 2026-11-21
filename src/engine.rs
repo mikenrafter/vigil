@@ -164,6 +164,8 @@ pub struct Vigil {
     pub(crate) session: Mutex<Session>,
     /// Same-session peer identity, supplied by the binary or a test.
     pub(crate) session_key: Option<String>,
+    /// Notices use a separate precedence order from hold and peer ownership.
+    pub(crate) notice_session_key: Option<String>,
     pub(crate) transport: crate::peers::CallTransport,
     /// A3: which agent is calling; read from the environment at the binary
     /// edge and handed over with `with_agent_env`.
@@ -188,6 +190,7 @@ impl Vigil {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             session: Mutex::new(Session::default()),
             session_key: None,
+            notice_session_key: None,
             transport: crate::peers::CallTransport::Cli,
             agent: crate::cache::AgentEnv::default(),
             credit_probe,
@@ -205,6 +208,12 @@ impl Vigil {
     /// Override the session identity without changing process environment.
     pub fn with_session_key(mut self, session: Option<String>) -> Vigil {
         self.session_key = session;
+        self
+    }
+
+    /// Supply notice identity at the binary boundary without changing ownership.
+    pub fn with_notice_session_key(mut self, session: Option<String>) -> Vigil {
+        self.notice_session_key = session;
         self
     }
 

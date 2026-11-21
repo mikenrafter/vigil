@@ -285,8 +285,8 @@ async fn mcp_tools_mirror_the_cli_and_share_its_record() {
 }
 
 #[test]
-fn codex_hook_and_keepalive_children_share_the_ancestor_record() {
-    // CLAIM(notice-once): Codex supplies a payload id but no session env.
+fn codex_payload_distinguishes_threads_above_a_shared_ancestor() {
+    // A shared Codex app-server is only a fallback; payloads name its threads.
     let sandbox = Sandbox::new();
     add(&sandbox, "neon", "m");
     let input = sandbox.input("trigger");
@@ -307,10 +307,10 @@ fn codex_hook_and_keepalive_children_share_the_ancestor_record() {
     let (hook, envelope) = stdout.split_once('\n').unwrap();
     assert_eq!(hook, "neon: m");
     let envelope: Value = serde_json::from_str(envelope).unwrap();
-    assert!(envelope.get("notices").is_none(), "{envelope}");
+    assert_eq!(envelope["notices"], json!([{"id":"neon","message":"m"}]));
     let records = std::fs::read_dir(sandbox.state_root().join("notice-delivery")).unwrap()
         .filter_map(Result::ok).filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json")).count();
-    assert_eq!(records, 1);
+    assert_eq!(records, 2);
 }
 
 #[test]
@@ -324,4 +324,43 @@ fn a_hook_without_any_identity_refuses_without_printing() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("session identity"));
+}
+
+#[tokio::test]
+async fn codex_t3_shell_and_mcp_share_notices_with_different_session_env() {
+    // CLAIM(notice-once): retain the shell's Codex key while MCP sees only T3.
+    let sandbox = Sandbox::new();
+    add(&sandbox, "neon", "m");
+    let command = || {
+        // Preserve inherited environment; only pin the session names for this shape.
+        let mut command = std::process::Command::new(common::vigil_bin());
+        command.args(["--root", sandbox.state_root().to_str().unwrap()])
+            .current_dir(sandbox.cwd()).env("HOME", sandbox.home()).env("VIGIL_ADVISORIES_FILE", "off");
+        command
+    };
+    let mut child = command().env("CODEX_SESSION_ID", "codex-session")
+        .env("T3CODE_THREAD_ID", "t3-thread").args(["notices", "--from-hook"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"payload-session"}"#).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "neon: m\n");
+    let mut mcp = command();
+    mcp.arg("mcp").env("T3CODE_THREAD_ID", "t3-thread").env_remove("CODEX_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID").env_remove("CLAUDE_CODE_SESSION_ID");
+    let transport = TokioChildProcess::new(tokio::process::Command::from(mcp)).unwrap();
+    let client = ().serve(transport).await.unwrap();
+    let reply = body(&call(&client, "notices", json!({})).await);
+    assert_eq!(reply["session"], "t3-thread");
+    assert_eq!(reply["notices"], json!([]), "shell delivery must be visible to MCP");
+    add(&sandbox, "later", "l");
+    assert_eq!(body(&call(&client, "notices", json!({})).await)["notices"], json!([{"id":"later","message":"l"}]));
+    let output = command().env("CODEX_SESSION_ID", "codex-session")
+        .env("T3CODE_THREAD_ID", "t3-thread").arg("notices").output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty(), "MCP delivery must be visible to shell");
+    let records = std::fs::read_dir(sandbox.state_root().join("notice-delivery")).unwrap()
+        .filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|ext| ext == "json")).count();
+    assert_eq!(records, 1);
+    client.cancel().await.unwrap();
 }
